@@ -1221,122 +1221,177 @@ grant execute on function public.start_table_session(text, text) to service_role
 
 -- Approve table activation
 create or replace function public.approve_table_activation(
-  p_session_id uuid,
-  p_actor_id uuid default null
+  p_tenant uuid,
+  p_session uuid,
+  p_actor uuid default null
 )
 returns jsonb
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
   v_session public.table_sessions;
-  v_activated integer := 0;
-  v_orders_released integer := 0;
+  v_table uuid;
+  v_released integer := 0;
+  v_stale text;
 begin
   select * into v_session
     from public.table_sessions
-   where id = p_session_id
+   where id = p_session and tenant_id = p_tenant
    for update;
 
   if not found then
     raise exception 'SESSION_NOT_FOUND' using errcode = 'P0001';
   end if;
 
-  with approved as (
-    update public.table_sessions
-       set activation_status = 'ACTIVE',
-           status = 'ACTIVE',
-           activated_at = now(),
-           activated_by = p_actor_id,
-           updated_at = now()
-     where table_id = v_session.table_id
-       and status = 'ACTIVE'
-       and activation_status = 'PENDING'
-     returning 1
-  )
-  select count(*) into v_activated from approved;
+  if v_session.status <> 'ACTIVE' then
+    raise exception 'SESSION_ENDED' using errcode = 'P0001';
+  end if;
+
+  if v_session.activation_status = 'REJECTED' or v_session.activation_status = 'EXPIRED' then
+    raise exception 'SESSION_%', v_session.activation_status using errcode = 'P0001';
+  end if;
+
+  v_table := v_session.table_id;
+
+  perform 1 from public.table_sessions
+   where tenant_id = p_tenant and table_id = v_table and status = 'ACTIVE'
+   for update;
+
+  if v_session.activation_status = 'ACTIVE' then
+    select count(*) into v_released
+      from public.orders
+     where table_session_id = p_session and status = 'PENDING';
+    return jsonb_build_object('ok', true, 'already', true, 'released', v_released);
+  end if;
+
+  select string_agg(distinct mi.name, ', ') into v_stale
+    from public.order_items oi
+    join public.orders o on o.id = oi.order_id
+    join public.table_sessions s on s.id = o.table_session_id
+    left join public.menu_items mi on mi.id = oi.menu_item_id
+   where s.tenant_id = p_tenant
+     and s.table_id = v_table
+     and o.status = 'PENDING_ACTIVATION'
+     and (mi.id is null or mi.tenant_id <> p_tenant or mi.available = false);
+
+  if v_stale is not null then
+    raise exception 'ITEMS_UNAVAILABLE:%', v_stale using errcode = 'P0001';
+  end if;
+
+  update public.table_sessions
+     set activation_status = 'ACTIVE',
+         activated_at = now(),
+         activated_by = p_actor
+   where tenant_id = p_tenant
+     and table_id = v_table
+     and status = 'ACTIVE'
+     and activation_status = 'PENDING';
 
   with released as (
-    update public.orders
+    update public.orders o
        set status = 'PENDING',
            updated_at = now()
-     where table_id = v_session.table_id
-       and status = 'PENDING_ACTIVATION'
-     returning 1
+      from public.table_sessions s
+     where s.id = o.table_session_id
+       and s.tenant_id = p_tenant
+       and s.table_id = v_table
+       and o.status = 'PENDING_ACTIVATION'
+    returning 1
   )
-  select count(*) into v_orders_released from released;
+  select count(*) into v_released from released;
 
-  return jsonb_build_object(
-    'ok', true,
-    'table_id', v_session.table_id,
-    'sessions_activated', v_activated,
-    'orders_released', v_orders_released
-  );
+  return jsonb_build_object('ok', true, 'already', false, 'released', v_released);
 end $$;
 
-revoke execute on function public.approve_table_activation(uuid, uuid) from public, anon, authenticated;
-grant execute on function public.approve_table_activation(uuid, uuid) to service_role;
+revoke execute on function public.approve_table_activation(uuid, uuid, uuid) from public, anon, authenticated;
+grant execute on function public.approve_table_activation(uuid, uuid, uuid) to service_role;
 
 -- Refuse table activation
 create or replace function public.refuse_table_activation(
-  p_session_id uuid,
-  p_reason text default null,
-  p_actor_id uuid default null
+  p_tenant uuid,
+  p_session uuid,
+  p_reason text default null
 )
 returns jsonb
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
-  v_session public.table_sessions;
-  v_refused integer := 0;
-  v_orders_cancelled integer := 0;
+  v_cancelled integer := 0;
 begin
-  select * into v_session
-    from public.table_sessions
-   where id = p_session_id
+  perform 1 from public.table_sessions
+   where id = p_session and tenant_id = p_tenant
    for update;
 
   if not found then
     raise exception 'SESSION_NOT_FOUND' using errcode = 'P0001';
   end if;
-
-  with rejected as (
-    update public.table_sessions
-       set activation_status = 'REJECTED',
-           status = 'ENDED',
-           ended_at = now(),
-           updated_at = now()
-     where table_id = v_session.table_id
-       and status = 'ACTIVE'
-       and activation_status = 'PENDING'
-     returning 1
-  )
-  select count(*) into v_refused from rejected;
 
   with cancelled as (
     update public.orders
        set status = 'CANCELLED',
-           cancellation_reason = coalesce(p_reason, 'Table declined by staff'),
-           updated_at = now()
-     where table_id = v_session.table_id
+           updated_at = now(),
+           cancellation_reason = coalesce(p_reason, 'Table not accepted by the restaurant')
+     where table_session_id = p_session
        and status = 'PENDING_ACTIVATION'
-     returning 1
+    returning 1
   )
-  select count(*) into v_orders_cancelled from cancelled;
+  select count(*) into v_cancelled from cancelled;
 
-  return jsonb_build_object(
-    'ok', true,
-    'table_id', v_session.table_id,
-    'sessions_refused', v_refused,
-    'orders_cancelled', v_orders_cancelled
-  );
+  update public.table_sessions
+     set activation_status = 'REJECTED',
+         status = 'ENDED',
+         ended_at = now()
+   where id = p_session;
+
+  return jsonb_build_object('ok', true, 'cancelled', v_cancelled);
 end $$;
 
-revoke execute on function public.refuse_table_activation(uuid, text, uuid) from public, anon, authenticated;
-grant execute on function public.refuse_table_activation(uuid, text, uuid) to service_role;
+revoke execute on function public.refuse_table_activation(uuid, uuid, text) from public, anon, authenticated;
+grant execute on function public.refuse_table_activation(uuid, uuid, text) to service_role;
+
+-- Trigger for syncing order_items.status with orders.status
+create or replace function public.trg_sync_order_items_status()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if NEW.status is distinct from OLD.status then
+    if NEW.status in ('PREPARING', 'READY', 'SERVED') then
+      update public.order_items
+         set status = NEW.status
+       where order_id = NEW.id
+         and status <> 'CANCELLED';
+    elsif NEW.status in ('CANCELLED', 'REJECTED') then
+      update public.order_items
+         set status = 'CANCELLED'
+       where order_id = NEW.id;
+    elsif NEW.status = 'PENDING' and OLD.status = 'PENDING_ACTIVATION' then
+      update public.order_items
+         set status = 'PENDING'
+       where order_id = NEW.id
+         and status <> 'CANCELLED';
+    end if;
+  end if;
+  return NEW;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_trigger where tgname = 'sync_order_items_status'
+  ) then
+    create trigger sync_order_items_status
+    after update of status on public.orders
+    for each row
+    execute function public.trg_sync_order_items_status();
+  end if;
+end $$;
 
 -- Expire stale sessions and pending activations
 create or replace function public.expire_pending_activations(p_after interval default '15 minutes')
