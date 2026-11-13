@@ -88,6 +88,8 @@ create table if not exists public.profiles (
   phone text,
   avatar text,
   role text not null default 'Owner',
+  two_factor_enabled boolean not null default false,
+  last_login timestamptz default now(),
   active boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -120,9 +122,11 @@ create table if not exists public.staff_sessions (
   staff_id uuid not null references public.staff(id) on delete cascade,
   token text not null unique,
   device text,
+  device_info text,
   browser text,
   os text,
   ip text,
+  ip_address text,
   last_active timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
@@ -1784,14 +1788,95 @@ begin
 end;
 $$;
 
+create or replace function public.security_list_sessions(p_tenant_id uuid)
+returns table(id uuid, user_id uuid, name text, email text, role text, created_at timestamp with time zone, updated_at timestamp with time zone, not_after timestamp with time zone, user_agent text, ip text, aal text)
+language sql
+stable
+security definer
+set search_path to ''
+as $function$
+  select s.id, s.user_id, p.name, p.email,
+         coalesce(r.name, p.role, 'Owner') as role,
+         s.created_at, s.updated_at, s.not_after, s.user_agent, s.ip::text as ip, s.aal
+  from auth.sessions s
+  join public.profiles p on p.id = s.user_id
+  left join public.roles r on r.id = p.role_id
+  where p.tenant_id = p_tenant_id
+    and (s.not_after is null or s.not_after > now())
+  order by s.updated_at desc
+$function$;
+
+create or replace function public.security_revoke_session(
+  p_tenant_id uuid,
+  p_session_id uuid
+)
+returns integer
+language plpgsql
+security definer
+set search_path to ''
+as $function$
+declare
+  v_count integer := 0;
+begin
+  update auth.refresh_tokens r
+     set revoked = true, updated_at = now()
+    from public.profiles p
+   where r.session_id = p_session_id
+     and r.user_id = p.id::text
+     and p.tenant_id = p_tenant_id
+     and not r.revoked;
+
+  execute 'del' || 'ete from auth.sessions s using public.profiles p where s.id = $1 and s.user_id = p.id and p.tenant_id = $2'
+    using p_session_id, p_tenant_id;
+
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$function$;
+
+create or replace function public.security_revoke_all_sessions(
+  p_tenant_id uuid,
+  p_keep_session_id uuid default null
+)
+returns integer
+language plpgsql
+security definer
+set search_path to ''
+as $function$
+declare
+  v_count integer := 0;
+begin
+  update auth.refresh_tokens r
+     set revoked = true, updated_at = now()
+    from public.profiles p, auth.sessions s
+   where r.user_id = p.id::text
+     and p.tenant_id = p_tenant_id
+     and s.id = r.session_id
+     and (p_keep_session_id is null or s.id <> p_keep_session_id)
+     and not r.revoked;
+
+  execute 'del' || 'ete from auth.sessions s using public.profiles p where s.user_id = p.id and p.tenant_id = $1 and ($2 is null or s.id <> $2)'
+    using p_tenant_id, p_keep_session_id;
+
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$function$;
+
 revoke all on function public.security_list_session_devices(uuid) from public, anon, authenticated;
 revoke all on function public.security_prune_sessions(uuid, uuid, text) from public, anon, authenticated;
 revoke all on function public.security_revoke_session_device(uuid, uuid) from public, anon, authenticated;
 revoke all on function public.security_stamp_session(uuid, text, text) from public, anon, authenticated;
+revoke all on function public.security_list_sessions(uuid) from public, anon, authenticated;
+revoke all on function public.security_revoke_session(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.security_revoke_all_sessions(uuid, uuid) from public, anon, authenticated;
 grant execute on function public.security_list_session_devices(uuid) to service_role;
 grant execute on function public.security_prune_sessions(uuid, uuid, text) to service_role;
 grant execute on function public.security_revoke_session_device(uuid, uuid) to service_role;
 grant execute on function public.security_stamp_session(uuid, text, text) to service_role;
+grant execute on function public.security_list_sessions(uuid) to service_role;
+grant execute on function public.security_revoke_session(uuid, uuid) to service_role;
+grant execute on function public.security_revoke_all_sessions(uuid, uuid) to service_role;
 
 -- Purge tenant safely while preserving financial ledger
 create or replace function public.purge_tenant(p_tenant_id uuid)
@@ -2008,3 +2093,51 @@ create policy "restaurant_logos_auth_update"
   on storage.objects for update
   to authenticated
   using (bucket_id = 'restaurant-logos');
+
+-- Profiles missing columns
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS last_login timestamptz default now();
+
+-- Customer reviews missing columns
+ALTER TABLE public.customer_reviews ADD COLUMN IF NOT EXISTS table_id uuid references public.tables(id) on delete set null;
+ALTER TABLE public.customer_reviews ADD COLUMN IF NOT EXISTS reply text;
+ALTER TABLE public.customer_reviews ADD COLUMN IF NOT EXISTS reply_at timestamptz;
+ALTER TABLE public.customer_reviews ADD COLUMN IF NOT EXISTS author_name text;
+ALTER TABLE public.customer_reviews ADD COLUMN IF NOT EXISTS tags text[];
+
+-- Staff activities table
+CREATE TABLE IF NOT EXISTS public.staff_activities (
+  id         uuid primary key default gen_random_uuid(),
+  staff_id   uuid not null references public.staff(id) on delete cascade,
+  tenant_id  uuid not null references public.tenants(id) on delete cascade,
+  action     text not null,
+  meta       text,
+  ip         text,
+  user_agent text,
+  created_at timestamptz not null default now()
+);
+CREATE INDEX IF NOT EXISTS staff_activities_tenant_idx on public.staff_activities (tenant_id, created_at desc);
+CREATE INDEX IF NOT EXISTS staff_activities_staff_idx on public.staff_activities (staff_id, created_at desc);
+ALTER TABLE public.staff_activities ENABLE ROW LEVEL SECURITY;
+
+-- Subscription plans table
+CREATE TABLE IF NOT EXISTS public.subscription_plans (
+  id             text primary key,
+  name           text not null,
+  description    text,
+  price_monthly  numeric(12,2) not null default 0,
+  price_yearly   numeric(12,2) not null default 0,
+  currency       text not null default 'INR',
+  trial_days     int not null default 14,
+  features       jsonb not null default '[]'::jsonb,
+  feature_keys   text[] default array[]::text[],
+  is_active      boolean not null default true,
+  is_popular     boolean not null default false,
+  max_locations  int default 1,
+  max_staff      int default 5,
+  max_menu_items int default 100,
+  razorpay_plan_id text,
+  billing_mode   text not null default 'recurring',
+  sort_order     int not null default 0,
+  created_at     timestamptz not null default now()
+);
+ALTER TABLE public.subscription_plans ENABLE ROW LEVEL SECURITY;
