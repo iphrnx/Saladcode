@@ -186,6 +186,7 @@ create table if not exists public.categories (
   name text not null,
   icon text,
   sort_order integer not null default 0,
+  active boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
