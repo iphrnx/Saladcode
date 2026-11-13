@@ -810,6 +810,32 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
           realtimeDebounce = setTimeout(runDeltaSync, 150)
         }
       )
+      // Instant realtime broadcast events from Edge Functions (ORDER_UPDATED, ORDER_CREATED, ORDER_DELETED)
+      .on('broadcast', { event: 'ORDER_UPDATED' }, (msg: any) => {
+        if (isCancelled) return
+        const ord = msg?.payload?.order
+        if (ord?.id) {
+          addOrUpdateOrder(ord, false, { force: true })
+        } else {
+          void runDeltaSync()
+        }
+      })
+      .on('broadcast', { event: 'ORDER_CREATED' }, (msg: any) => {
+        if (isCancelled) return
+        const ord = msg?.payload?.order
+        if (ord?.id) {
+          addOrUpdateOrder(ord, true)
+        } else {
+          void runDeltaSync()
+        }
+      })
+      .on('broadcast', { event: 'ORDER_DELETED' }, (msg: any) => {
+        if (isCancelled) return
+        const ordId = msg?.payload?.order?.id
+        if (ordId) {
+          removeOrder(ordId)
+        }
+      })
       // A session ending is not an orders-table write, so postgres_changes above
       // never fires for it. The staff function broadcasts it on this same topic
       // instead; without listening, the POS board kept showing a table whose

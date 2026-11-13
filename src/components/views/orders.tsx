@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useApp, type CheckSummary, type Order } from '@/components/app/data-context'
 import { reconcileOrderExpansion, toggleOrderExpansion, type OrderExpansion } from './order-expansion'
 import { cn } from '@/lib/utils'
@@ -261,11 +261,13 @@ export function OrdersView() {
    */
   const [paySitting, setPaySitting] = useState<Sitting | null>(null)
   /** The drawer: the whole sitting, opened from its card or any of its rows. */
-  const [ordersSitting, setOrdersSitting] = useState<Sitting | null>(null)
+  const [ordersSittingKey, setOrdersSittingKey] = useState<string | null>(null)
+  const [fallbackSitting, setFallbackSitting] = useState<Sitting | null>(null)
   /** Which order was pressed, so the drawer can open that one. */
   const [focusOrderId, setFocusOrderId] = useState<string | null>(null)
   /** The single-order drawer opened by pressing an order row. */
-  const [detailOrder, setDetailOrder] = useState<Order | null>(null)
+  const [detailOrderId, setDetailOrderId] = useState<string | null>(null)
+  const [fallbackDetailOrder, setFallbackDetailOrder] = useState<Order | null>(null)
   /**
    * The printable bill.
    *
@@ -473,6 +475,36 @@ export function OrdersView() {
     return out
   }, [orders, checks, tableSessions])
 
+  const ordersSitting = useMemo(() => {
+    if (!ordersSittingKey) return null
+    return sittings.find((s) => s.key === ordersSittingKey) ?? fallbackSitting
+  }, [sittings, ordersSittingKey, fallbackSitting])
+
+  const detailOrder = useMemo(() => {
+    if (!detailOrderId) return null
+    return orders.find((o) => o.id === detailOrderId) ?? fallbackDetailOrder
+  }, [orders, detailOrderId, fallbackDetailOrder])
+
+  const openOrderDetail = useCallback((order: Order | null) => {
+    if (!order) {
+      setDetailOrderId(null)
+      setFallbackDetailOrder(null)
+    } else {
+      setFallbackDetailOrder(order)
+      setDetailOrderId(order.id)
+    }
+  }, [])
+
+  const openSitting = useCallback((sitting: Sitting | null) => {
+    if (!sitting) {
+      setOrdersSittingKey(null)
+      setFallbackSitting(null)
+    } else {
+      setFallbackSitting(sitting)
+      setOrdersSittingKey(sitting.key)
+    }
+  }, [])
+
   /**
    * Which cards the filters leave on screen.
    *
@@ -573,8 +605,12 @@ export function OrdersView() {
       }
       const body = await res.json().catch(() => null)
       const updatedOrder = body?.order ?? (body?.id ? body : null)
-      if (updatedOrder) addOrUpdateOrder(updatedOrder)
-      else refresh()
+      if (updatedOrder) {
+        addOrUpdateOrder(updatedOrder, false, { force: true })
+        if (detailOrderId === order.id) setFallbackDetailOrder(updatedOrder)
+      } else {
+        refresh()
+      }
       toast.success(
         decision === 'accept'
           ? `Order #${order.orderNumber} accepted`
@@ -599,11 +635,16 @@ export function OrdersView() {
     // old `await refresh()` made the cashier watch. The payment fields ride
     // along when this tap is the "Paid & Complete" one, because that dialog is
     // where payment is recorded — the server never assumes it.
-    addOrUpdateOrder({
+    const optimisticUpdatedOrder: Order = {
       ...order,
       status,
+      updatedAt: new Date().toISOString(),
       ...(method ? { paymentMethod: method, paymentStatus: 'PAID' } : {}),
-    })
+    }
+    addOrUpdateOrder(optimisticUpdatedOrder, false, { force: true })
+    if (detailOrderId === order.id) {
+      setFallbackDetailOrder(optimisticUpdatedOrder)
+    }
     try {
       const res = await edgeFetch(`/api/orders/${order.id}`, {
         method: 'PATCH',
@@ -619,7 +660,10 @@ export function OrdersView() {
       await failIfNotOk(res, 'the order')
       const confirmed = await res.json()
       // The authoritative row replaces the optimistic one.
-      addOrUpdateOrder(confirmed)
+      addOrUpdateOrder(confirmed, false, { force: true })
+      if (detailOrderId === order.id) {
+        setFallbackDetailOrder(confirmed)
+      }
       toast.success(`Order #${order.orderNumber} → ${capitalize(status.toLowerCase())}`)
 
       // When an order is completed, end the table session for that table
@@ -653,6 +697,9 @@ export function OrdersView() {
       // Roll back the optimistic move — the card returns to the status the
       // database actually holds, and the next sync keeps it there.
       addOrUpdateOrder(order, false, { force: true })
+      if (detailOrderId === order.id) {
+        setFallbackDetailOrder(order)
+      }
       handleAction(e, 'the order')
     } finally {
       busyRef.current = null
@@ -877,10 +924,10 @@ export function OrdersView() {
                 canEndSession={hasEffectivePermission(perms, 'table-sessions.manage')}
                 ending={endingTable === sitting.tableId}
                 onView={(order) => setViewOrder(order)}
-                onOpenOrder={(order) => setDetailOrder(order)}
+                onOpenOrder={(order) => openOrderDetail(order)}
                 onOpenOrders={(target) => {
                   setFocusOrderId(null)
-                  setOrdersSitting(target)
+                  openSitting(target)
                 }}
                 onCompletePay={(target) => setPaySitting(target)}
                 onBill={(target, autoPrint) =>
@@ -1293,7 +1340,7 @@ export function OrdersView() {
       <OrderDetailDrawer
         order={detailOrder}
         open={detailOrder !== null}
-        onOpenChange={(v) => !v && setDetailOrder(null)}
+        onOpenChange={(v) => !v && openOrderDetail(null)}
         currencySymbol={cs}
         dishImages={dishImages}
         canPrepare={canPrepare}
@@ -1301,16 +1348,17 @@ export function OrdersView() {
         canServe={canServe}
         canAccept={canAcceptHeld}
         accepting={detailOrder ? acceptingId === detailOrder.id : false}
+        busy={detailOrder ? Boolean(busy && busy.startsWith(detailOrder.id)) : false}
         onAccept={() => detailOrder && void decideHeld(detailOrder, 'accept')}
         onReject={() => detailOrder && void decideHeld(detailOrder, 'reject')}
         onUpdate={(next) => detailOrder && void updateStatus(detailOrder, next)}
         onBack={() => {
           const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder?.id))
           const id = detailOrder?.id
-          setDetailOrder(null)
+          openOrderDetail(null)
           if (sitting) {
             setFocusOrderId(id ?? null)
-            setOrdersSitting(sitting)
+            openSitting(sitting)
           }
         }}
       />
@@ -1321,7 +1369,7 @@ export function OrdersView() {
         <SessionOrdersDrawer
           open
           onOpenChange={(v) => {
-            if (!v) setOrdersSitting(null)
+            if (!v) openSitting(null)
           }}
           tableName={ordersSitting.tableName ?? `Order #${ordersSitting.latest.orderNumber}`}
           area={ordersSitting.area}
@@ -1358,7 +1406,7 @@ export function OrdersView() {
           }
           onCompletePay={() => {
             const target = ordersSitting
-            setOrdersSitting(null)
+            openSitting(null)
             if (target.tableId && target.checkId) {
               setPaySitting(target)
             } else {
@@ -1398,7 +1446,7 @@ export function OrdersView() {
           }}
           onSessionDetails={() => {
             const target = ordersSitting
-            setOrdersSitting(null)
+            openSitting(null)
             setBillTable({
               id: target.tableId!,
               name: target.tableName ?? 'Table',
@@ -1461,7 +1509,7 @@ export function OrdersView() {
           const fresh = sittings.find((s) =>
             target.checkId ? s.checkId === target.checkId : s.key === target.key,
           )
-          setOrdersSitting(
+          openSitting(
             fresh ?? { ...target, state: 'Ended', paidOff: true, endedAt: target.endedAt ?? new Date().toISOString() },
           )
         }}

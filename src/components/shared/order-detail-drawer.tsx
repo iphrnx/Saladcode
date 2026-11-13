@@ -28,6 +28,7 @@ export function OrderDetailDrawer({
   canServe = false,
   canAccept = false,
   accepting = false,
+  busy = false,
   onAccept,
   onReject,
   onUpdate,
@@ -44,6 +45,7 @@ export function OrderDetailDrawer({
   canServe?: boolean
   canAccept?: boolean
   accepting?: boolean
+  busy?: boolean
   onAccept?: () => void
   onReject?: () => void
   onUpdate: (status: string) => void
@@ -264,17 +266,18 @@ export function OrderDetailDrawer({
               </button>
               <button
                 onClick={() => onUpdate(nextStep.status)}
-                disabled={!nextStep.allowed}
+                disabled={!nextStep.allowed || busy}
                 title={!nextStep.allowed ? "You don't have permission for this step" : undefined}
                 className={cn(
                   'flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl text-[13.5px] font-semibold transition-colors',
                   nextStep.allowed
                     ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                     : 'bg-secondary text-muted-foreground',
+                  busy && 'opacity-70 cursor-not-allowed',
                 )}
               >
-                <ChefHat className="size-4" />
-                {nextStep.label}
+                {busy ? <Loader2 className="size-4 animate-spin" /> : <ChefHat className="size-4" />}
+                {busy ? 'Updating…' : nextStep.label}
               </button>
             </>
           ) : (
