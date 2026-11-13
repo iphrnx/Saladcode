@@ -1,0 +1,368 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+
+  /* --- Super Admin panel ---------------------------------------------
+     The panel is its own surface, so it carries its own tokens rather
+     than inheriting the app's theme state. They are the restaurant app's
+     palette: the same orange primary, the same warm off-white, the same
+     deep slate for the navigation rail. One place to change it. */
+  --color-admin-accent: var(--admin-accent);
+  --color-admin-accent-hover: var(--admin-accent-hover);
+  --color-admin-accent-soft: var(--admin-accent-soft);
+  --color-admin-accent-ring: var(--admin-accent-ring);
+  --color-admin-surface: var(--admin-surface);
+  --color-admin-bg: var(--admin-bg);
+  --color-admin-elevated: var(--admin-elevated);
+  --color-admin-fg: var(--admin-fg);
+  --color-admin-fg-body: var(--admin-fg-body);
+  --color-admin-muted: var(--admin-muted);
+  --color-admin-faint: var(--admin-faint);
+  --color-admin-faint-2: var(--admin-faint-2);
+  --color-admin-faint-3: var(--admin-faint-3);
+  --color-admin-border: var(--admin-border);
+  --color-admin-border-soft: var(--admin-border-soft);
+  --color-admin-border-strong: var(--admin-border-strong);
+  --color-admin-rail: var(--admin-rail);
+  --color-admin-rail-fg: var(--admin-rail-fg);
+  --color-admin-rail-border: var(--admin-rail-border);
+  --color-admin-rail-hover: var(--admin-rail-hover);
+  --color-admin-rail-active: var(--admin-rail-active);
+}
+
+/* Light theme (default) — warm off-white with coral accent.
+   Also bound to `.light` so a subtree rendered inside the dark app can
+   opt back into light tokens — the diner menu does exactly that, and
+   Radix portals (the cart sheet) render outside its wrapper. */
+:root,
+.light {
+  --radius: 0.875rem;
+  --background: #fafaf7;
+  --foreground: #1a1d29;
+  --card: #ffffff;
+  --card-foreground: #1a1d29;
+  --card-elevated: #f5f5f0;
+  --popover: #ffffff;
+  --popover-foreground: #1a1d29;
+  --primary: #f97316;
+  --primary-hover: #ea580c;
+  --primary-foreground: #ffffff;
+  --secondary: #f0efe9;
+  --secondary-foreground: #1a1d29;
+  --muted: #f0efe9;
+  --muted-foreground: #71778a;
+  --accent: #e8e7e0;
+  --accent-foreground: #1a1d29;
+  --destructive: #ef4444;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --info: #3b82f6;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.12);
+  --input: #f0efe9;
+  --ring: #f97316;
+  --chart-1: #f97316;
+  --chart-2: #22c55e;
+  --chart-3: #f59e0b;
+  --chart-4: #3b82f6;
+  --chart-5: #a855f7;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #71778a;
+  --sidebar-primary: #f97316;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgba(255, 126, 107, 0.1);
+  --sidebar-accent-foreground: #f97316;
+  --sidebar-border: rgba(0, 0, 0, 0.06);
+  --sidebar-ring: #f97316;
+
+  /* Super Admin panel — the restaurant app's palette, pinned so the panel
+     looks the same whatever the app's own theme is doing. */
+  --admin-accent: #f97316;
+  --admin-accent-hover: #ea580c;
+  --admin-accent-soft: rgba(249, 115, 22, 0.10);
+  --admin-accent-ring: rgba(249, 115, 22, 0.28);
+  --admin-surface: #ffffff;
+  --admin-bg: #fafaf7;
+  --admin-elevated: #f0efe9;
+  --admin-fg: #1a1d29;
+  --admin-fg-body: #343846;
+  --admin-muted: #71778a;
+  --admin-faint: #949aa8;
+  --admin-faint-2: #b4b9c4;
+  --admin-faint-3: #e8e9ed;
+  --admin-border: rgba(0, 0, 0, 0.09);
+  --admin-border-soft: rgba(0, 0, 0, 0.06);
+  --admin-border-strong: rgba(0, 0, 0, 0.16);
+  --admin-rail: #11141d;
+  --admin-rail-fg: #9aa3b2;
+  --admin-rail-border: rgba(255, 255, 255, 0.07);
+  --admin-rail-hover: rgba(255, 255, 255, 0.05);
+  --admin-rail-active: rgba(255, 255, 255, 0.08);
+}
+
+/* Re-resolve the inherited colour inside a light subtree.
+   `color` is an inherited property, and `body` resolves it once against the
+   dark tokens (@apply text-foreground). Descendants then inherit that already
+   computed near-white value — re-declaring --foreground alone does nothing for
+   any element that does not set its own colour. That is why the diner menu's
+   light surfaces showed near-white text on white. Declaring `color` here forces
+   the subtree to resolve it against the light tokens above. */
+.light {
+  color: var(--foreground);
+}
+
+/* Dark theme — deep slate with coral accent */
+.dark {
+  --background: #14171f;
+  --foreground: #f4f5f7;
+  --card: #1c2030;
+  --card-foreground: #f4f5f7;
+  --card-elevated: #232838;
+  --popover: #1c2030;
+  --popover-foreground: #f4f5f7;
+  --primary: #f97316;
+  --primary-hover: #ea580c;
+  --primary-foreground: #ffffff;
+  --secondary: #272d3c;
+  --secondary-foreground: #f4f5f7;
+  --muted: #272d3c;
+  --muted-foreground: #9aa3b2;
+  --accent: #2f3543;
+  --accent-foreground: #f4f5f7;
+  --destructive: #ef4444;
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --info: #60a5fa;
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.12);
+  --input: #272d3c;
+  --ring: #f97316;
+  --chart-1: #f97316;
+  --chart-2: #4ade80;
+  --chart-3: #fbbf24;
+  --chart-4: #60a5fa;
+  --chart-5: #c084fc;
+  --sidebar: #11141d;
+  --sidebar-foreground: #9aa3b2;
+  --sidebar-primary: #f97316;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgba(255, 126, 107, 0.12);
+  --sidebar-accent-foreground: #f97316;
+  --sidebar-border: rgba(255, 255, 255, 0.05);
+  --sidebar-ring: #f97316;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  /* Premium heading rendering */
+  h1, h2, h3, h4 {
+    letter-spacing: -0.02em;
+  }
+}
+
+@layer utilities {
+  /* Custom scrollbar — slim, premium with hover */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: rgba(255, 255, 255, 0.12);
+    border-radius: 9999px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background-color: rgba(255, 126, 107, 0.4);
+  }
+
+  /* Glass surfaces — frosted, premium */
+  .glass {
+    background: rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(16px) saturate(180%);
+    -webkit-backdrop-filter: blur(16px) saturate(180%);
+  }
+  .dark .glass {
+    background: rgba(255, 255, 255, 0.04);
+  }
+  :root:not(.dark) .glass {
+    background: rgba(255, 255, 255, 0.7);
+  }
+  .glass-strong {
+    background: rgba(28, 32, 48, 0.85);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+  }
+  .dark .glass-strong {
+    background: rgba(28, 32, 48, 0.85);
+  }
+  :root:not(.dark) .glass-strong {
+    background: rgba(255, 255, 255, 0.9);
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Gradient text — premium coral gradient */
+  .text-gradient-primary {
+    background: linear-gradient(135deg, #f97316 0%, #ff9d8c 50%, #ffb09e 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  /* Premium shadows — layered, soft */
+  .shadow-premium {
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.3),
+      0 4px 12px rgba(0, 0, 0, 0.25),
+      0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+  }
+  .shadow-elevated {
+    box-shadow:
+      0 2px 4px rgba(0, 0, 0, 0.3),
+      0 8px 24px rgba(0, 0, 0, 0.35),
+      0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  }
+  .shadow-glow-primary {
+    box-shadow:
+      0 0 0 1px rgba(255, 126, 107, 0.2),
+      0 4px 16px rgba(255, 126, 107, 0.15);
+  }
+  /* Pulse ring — for live/active indicators */
+  @keyframes pulse-ring {
+    0% { box-shadow: 0 0 0 0 rgba(255, 126, 107, 0.5); }
+    70% { box-shadow: 0 0 0 8px rgba(255, 126, 107, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(255, 126, 107, 0); }
+  }
+  .pulse-ring {
+    animation: pulse-ring 2s infinite;
+  }
+
+  /* Smooth premium transitions */
+  .transition-premium {
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* Hide scrollbar but keep scroll */
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Premium card — subtle gradient border on hover */
+  .card-premium {
+    background: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 100%), var(--card);
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .card-premium:hover {
+    background: linear-gradient(180deg, rgba(255,255,255,0.04) 0%, transparent 100%), var(--card);
+  }
+
+  /*
+   * A POS item card on a phone: a light orange edge, thin and ornamental.
+   *
+   * Scoped by media query rather than by an `md:` utility so the desktop card
+   * keeps exactly the classes it had. Reverting a ring with `md:ring-0` still
+   * leaves its colour in the computed box-shadow at zero width — invisible, but
+   * a difference, and the desktop was not supposed to change at all. Both the
+   * border colour and the faint inner edge are 1px and drawn without affecting
+   * layout, so nothing moves or reflows: only the colour of the edge that was
+   * already there.
+   */
+  @media (max-width: 767px) {
+    .pos-card-edge {
+      border-color: color-mix(in oklab, var(--primary) 30%, transparent);
+      box-shadow: 0 0 0 1px color-mix(in oklab, var(--primary) 8%, transparent);
+    }
+  }
+
+  /* Focus ring — premium */
+  .focus-ring {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--background), 0 0 0 4px rgba(255, 126, 107, 0.4);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * The diner's order tracker: one bounce on a real status change, and a toast
+ * that fades rather than vanishing. Both respect prefers-reduced-motion — the
+ * information is in the toast, not in the movement.
+ * ------------------------------------------------------------------------- */
+@keyframes order-pop {
+  0%   { transform: scale(1); }
+  35%  { transform: scale(1.12); }
+  70%  { transform: scale(0.97); }
+  100% { transform: scale(1); }
+}
+
+@keyframes order-toast {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.order-pop { animation: order-pop 300ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+.order-toast-in { animation: order-toast 200ms ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  .order-pop,
+  .order-toast-in { animation: none; }
+}
