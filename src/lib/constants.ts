@@ -11,8 +11,15 @@ export function formatCurrency(amount: number, symbol = '₹'): string {
   return `${symbol}${amount.toFixed(2)}`
 }
 
-export function timeAgo(date: Date | string): string {
-  const diff = Date.now() - new Date(date).getTime()
+export function timeAgo(date: Date | string | undefined | null): string | null {
+  if (!date) return null
+  const d = new Date(date)
+  const time = d.getTime()
+  if (isNaN(time)) return null
+  const diff = Date.now() - time
+  if (isNaN(diff)) return null
+  if (diff < 0 && diff > -60000) return 'just now'
+  if (diff < 0) return null
   const mins = Math.floor(diff / 60000)
   if (mins < 1) return 'just now'
   if (mins < 60) return `${mins}m ago`

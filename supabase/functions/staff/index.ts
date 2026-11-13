@@ -139,12 +139,14 @@ type AuthResult =
 async function authenticateStaff(tenantId: string, employeeId: string, pin: string, req: Request): Promise<AuthResult> {
   const db = admin();
 
-  const { data: staff } = await db
-    .from("staff")
-    .select("*, role:roles(*)")
-    .eq("tenant_id", tenantId)
-    .eq("employee_id", employeeId.trim())
-    .maybeSingle();
+  let query = db.from("staff").select("*, role:roles(*)").eq("tenant_id", tenantId);
+  const trimmed = employeeId.trim();
+  if (UUID_RE.test(trimmed)) {
+    query = query.or(`employee_id.eq.${trimmed},id.eq.${trimmed}`);
+  } else {
+    query = query.eq("employee_id", trimmed);
+  }
+  const { data: staff } = await query.maybeSingle();
 
   if (!staff) {
     return { ok: false, error: "Employee not found. Please select your name from the list." };
@@ -392,8 +394,8 @@ async function loginGet(req: Request): Promise<Response> {
 
 async function loginPost(req: Request): Promise<Response> {
   const b = await body(req);
-  const tenantId = b.tenantId as string | undefined;
-  const employeeId = b.employeeId as string | undefined;
+  const tenantId = (b.tenantId as string | undefined)?.trim();
+  const employeeId = ((b.employeeId || b.staffId) as string | undefined)?.trim();
   const pin = b.pin as string | undefined;
 
   if (!tenantId || !employeeId || !pin) {

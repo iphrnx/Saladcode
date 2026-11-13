@@ -23,9 +23,16 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 
-function timeAgo(date: string | Date): string {
+function timeAgo(date: string | Date | undefined | null): string | null {
+  if (!date) return null
   const d = new Date(date)
-  const diff = Date.now() - d.getTime()
+  const time = d.getTime()
+  if (isNaN(time)) return null
+  const diff = Date.now() - time
+  if (isNaN(diff)) return null
+  // Small clock skew: if up to 60s in future, display as 'just now'
+  if (diff < 0 && diff > -60000) return 'just now'
+  if (diff < 0) return null
   const mins = Math.floor(diff / 60000)
   if (mins < 1) return 'just now'
   if (mins < 60) return `${mins}m ago`
@@ -331,6 +338,7 @@ export function SecurityView() {
                       canRevoke={canManageSecurity}
                       viewerIsOwner={viewerIsOwnerFlag}
                       onRevoke={() => revokeSession(s.id, s.ids)}
+                      users={users}
                     />
                   ))
                 )}
@@ -428,15 +436,29 @@ function StatCard({ icon, label, value, tint = '#ff7e6b', sub, className }: { ic
 }
 
 function SessionItem({
-  session, revoking, canRevoke, viewerIsOwner: viewerIsOwnerFlag, onRevoke,
+  session, revoking, canRevoke, viewerIsOwner: viewerIsOwnerFlag, onRevoke, users = [],
 }: {
   session: Session
   revoking: boolean
   canRevoke: boolean
   viewerIsOwner: boolean
   onRevoke: () => void
+  users?: { id: string; name?: string; email?: string }[]
 }) {
-  const u = session.user
+  const matchedUser = users.find((item) => item.id === session.userId)
+  const u = session.user ?? matchedUser
+  const emailVal = u?.email?.trim() || (session as any).email?.trim() || ''
+  const emailPrefix = emailVal ? emailVal.split('@')[0] : ''
+  const displayName =
+    u?.name?.trim() ||
+    (session as any).name?.trim() ||
+    (session.kind === 'staff' ? (session.role ? `${session.role} Staff` : 'Staff Member') : (emailPrefix || 'Restaurant Owner'))
+  const displayEmail = emailVal
+  const createdTime = session.createdAt || (session as any).created_at
+  const lastActiveTime = session.lastActive || (session as any).last_active || (session as any).updatedAt || (session as any).updated_at
+  const createdAgo = timeAgo(createdTime)
+  const activeAgo = timeAgo(lastActiveTime)
+  const signInsSince = (session.count ?? 1) > 1 ? timeAgo(session.firstSeen ?? createdTime) : null
   // The label and the button, decided by the same rules the server enforces —
   // see src/lib/session-ui.ts. The current session is never revocable here;
   // an owner session is revocable only by the owner (on another device); a
@@ -452,9 +474,9 @@ function SessionItem({
           <div className="flex items-center gap-2 flex-wrap">
             {/* The person, never the address. A profile with no name still gets
                 a human label rather than a UUID. */}
-            <p className="text-sm font-medium truncate">{u?.name?.trim() || 'Unnamed account'}</p>
-            {session.kind === 'staff' && u?.email && (
-              <span className="text-xs text-muted-foreground">@{u.email}</span>
+            <p className="text-sm font-medium truncate">{displayName}</p>
+            {session.kind === 'staff' && displayEmail && (
+              <span className="text-xs text-muted-foreground">@{displayEmail}</span>
             )}
             {session.current && (
               <Badge variant="secondary" className="text-[10px] h-4 px-1.5 bg-emerald-500/15 text-emerald-400">
@@ -470,9 +492,9 @@ function SessionItem({
           </div>
           <p className="text-xs text-muted-foreground mt-0.5 break-words">
             {[session.browser, session.os, session.device].filter(Boolean).join(' · ') || 'Unknown client'}
-            {(session.count ?? 1) > 1 && (
+            {signInsSince && (
               <span className="text-muted-foreground/80">
-                {' '}· {session.count} sign-ins since {timeAgo(session.firstSeen ?? session.createdAt)}
+                {' '}· {session.count} sign-ins since {signInsSince}
               </span>
             )}
           </p>
@@ -487,13 +509,17 @@ function SessionItem({
                 {session.location}
               </span>
             )}
-            <span className="inline-flex items-center gap-1">
-              <Clock className="h-3 w-3" />
-              Signed in {timeAgo(session.createdAt)}
-            </span>
-            <span>
-              · Active {timeAgo(session.lastActive)}
-            </span>
+            {createdAgo && (
+              <span className="inline-flex items-center gap-1">
+                <Clock className="h-3 w-3" />
+                Signed in {createdAgo}
+              </span>
+            )}
+            {activeAgo && (
+              <span>
+                · Active {activeAgo}
+              </span>
+            )}
           </div>
         </div>
         {right === 'current' && (
@@ -565,7 +591,7 @@ function LogItem({ log }: { log: SecurityLog }) {
               {actor.role}
             </Badge>
           )}
-          <span className="text-[11px] text-muted-foreground ml-auto">{timeAgo(log.createdAt)}</span>
+          <span className="text-[11px] text-muted-foreground ml-auto">{timeAgo(log.createdAt) ?? 'Recently'}</span>
         </div>
         {log.meta && (
           <div className="mt-1.5 flex items-center gap-x-2 gap-y-1 text-xs text-muted-foreground flex-wrap">
