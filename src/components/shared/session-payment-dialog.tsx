@@ -304,8 +304,8 @@ export function SessionPaymentDialog({
             <>
               {/* Header: what this sheet is for, and which table. */}
               <div className="flex items-start gap-3 pr-11">
-                <span className="grid size-11 shrink-0 place-items-center rounded-2xl bg-[#FFF6F0] text-[#EA580C] ring-1 ring-[#FCD7C0] dark:bg-orange-950/40 dark:text-orange-400 dark:ring-orange-800/40 sm:size-12">
-                  <Wallet className="size-5.5 sm:size-6 text-[#EA580C] dark:text-orange-400" />
+                <span className="grid size-11 shrink-0 place-items-center rounded-2xl bg-primary/10 text-primary ring-1 ring-primary/20 sm:size-12">
+                  <Wallet className="size-5.5 sm:size-6 text-primary" />
                 </span>
                 <div className="min-w-0 flex-1">
                   <h2 className="text-[20px] font-extrabold leading-tight tracking-tight text-foreground sm:text-[22px]">
@@ -318,9 +318,9 @@ export function SessionPaymentDialog({
               </div>
 
               {/* The table, and that this is every order on it. */}
-              <div className="mt-3.5 flex items-center gap-2.5 rounded-2xl bg-[#FFF9F5] dark:bg-orange-950/20 px-3.5 py-3 border border-[#FDE5D6] dark:border-orange-900/30">
-                <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-[#FFF1E6] text-[#EA580C] dark:bg-orange-950/50 dark:text-orange-400 border border-orange-200/50">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="size-5.5 text-[#EA580C]">
+              <div className="mt-3.5 flex items-center gap-2.5 rounded-2xl bg-primary/[0.04] px-3.5 py-3 border border-primary/20">
+                <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary border border-primary/20">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="size-5.5 text-primary">
                     <path d="M7 11V7a3 3 0 0 1 3-3h4a3 3 0 0 1 3 3v4" />
                     <rect x="5" y="11" width="14" height="3" rx="1.5" />
                     <path d="M7 14v6" />
@@ -335,7 +335,7 @@ export function SessionPaymentDialog({
                     {tableHint || 'All orders on this table'}
                   </p>
                 </div>
-                <span className="shrink-0 rounded-full bg-[#FDECE0] dark:bg-orange-950/60 px-3 py-1 text-xs font-semibold text-[#EA580C] dark:text-orange-300">
+                <span className="shrink-0 rounded-full bg-primary/10 px-3 py-1 text-xs font-semibold text-primary">
                   Consolidated Bill
                 </span>
               </div>
@@ -344,7 +344,7 @@ export function SessionPaymentDialog({
               <div className="mt-3.5 rounded-2xl border border-border/70 bg-card p-3.5 shadow-xs sm:p-4">
                 <div className="flex items-center justify-between gap-2 border-b border-border/50 pb-2.5">
                   <p className="flex items-center gap-1.5 text-[14.5px] font-bold text-foreground sm:text-[15px]">
-                    <Layers className="size-4 text-[#EA580C] dark:text-orange-400" />
+                    <Layers className="size-4 text-primary" />
                     Bill Summary
                   </p>
                   <span className="shrink-0 text-[11.5px] font-medium text-muted-foreground sm:text-[12px]">
@@ -362,7 +362,7 @@ export function SessionPaymentDialog({
                   )}
                   {!breakup && <Row label="Tax" value={money(totals?.tax ?? 0)} />}
                 </div>
-                <div className="mt-3 flex items-center justify-between rounded-xl bg-[#FDECE0] dark:bg-orange-950/40 px-3.5 py-2.5 border border-[#F5C4A8]/60 dark:border-orange-900/40">
+                <div className="mt-3 flex items-center justify-between rounded-xl bg-primary/10 px-3.5 py-2.5 border border-primary/20">
                   <span className="text-[14.5px] font-bold text-foreground sm:text-[15px]">Total Amount</span>
                   <span className="text-[18px] font-extrabold tabular-nums text-foreground sm:text-[19px]">
                     {money(totals?.outstanding || totals?.total || 0)}
@@ -372,7 +372,7 @@ export function SessionPaymentDialog({
 
               {/* How the money arrives. */}
               <p className="mt-4 flex items-center gap-1.5 text-[14.5px] font-bold text-foreground sm:text-[15px]">
-                <CreditCard className="size-4 text-[#EA580C] dark:text-orange-400" />
+                <CreditCard className="size-4 text-primary" />
                 Select Payment Method
               </p>
               <div className="mt-2.5 grid grid-cols-3 gap-2 sm:gap-2.5">
@@ -388,7 +388,7 @@ export function SessionPaymentDialog({
                       className={cn(
                         'relative flex flex-col items-center justify-center gap-1.5 rounded-2xl border-[1.5px] px-2 py-3.5 transition-all cursor-pointer',
                         active
-                          ? 'border-[#EA580C] bg-[#FFF9F5] dark:bg-orange-950/20 shadow-xs'
+                          ? 'border-primary bg-primary/[0.06] shadow-xs'
                           : 'border-border/80 bg-card hover:border-border hover:bg-secondary/40',
                       )}
                     >
@@ -396,13 +396,13 @@ export function SessionPaymentDialog({
                         className={cn(
                           'absolute right-2.5 top-2.5 grid size-5 place-items-center rounded-full transition-colors',
                           active
-                            ? 'bg-[#EA580C] text-white shadow-xs'
+                            ? 'bg-primary text-primary-foreground shadow-xs'
                             : 'border-[1.5px] border-border/80 bg-transparent',
                         )}
                       >
                         {active && <Check className="size-3" strokeWidth={3.5} />}
                       </span>
-                      <Icon className={cn('size-6 sm:size-7', active ? 'text-[#EA580C]' : 'text-foreground/75')} />
+                      <Icon className={cn('size-6 sm:size-7', active ? 'text-primary' : 'text-foreground/75')} />
                       <span className={cn('text-[13.5px]', active ? 'font-bold text-foreground' : 'font-medium text-foreground')}>{m.label}</span>
                     </button>
                   )
@@ -412,7 +412,7 @@ export function SessionPaymentDialog({
               <Button
                 onClick={() => void pay()}
                 disabled={busy || loading || !totals}
-                className="mt-4 h-12 w-full rounded-2xl bg-[#EA580C] hover:bg-[#EA580C]/90 text-[15px] font-bold text-white shadow-md shadow-orange-500/25 transition-all cursor-pointer flex items-center justify-center gap-2"
+                className="mt-4 h-12 w-full rounded-2xl bg-primary hover:bg-primary/90 text-[15px] font-bold text-primary-foreground shadow-md shadow-primary/25 transition-all cursor-pointer flex items-center justify-center gap-2"
               >
                 {busy ? (
                   <Loader2 className="mr-2 size-5 animate-spin" />
