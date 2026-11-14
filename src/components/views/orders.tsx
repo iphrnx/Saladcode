@@ -373,14 +373,17 @@ export function OrdersView() {
   const sittings = useMemo<Sitting[]>(() => {
     const buckets = new Map<string, Order[]>()
     for (const o of orders) {
-      // Dine-in orders bind to checkId or tableSessionId; fallback to tableId for active dine-in orders
-      const key = o.checkId
-        ? `check:${o.checkId}`
-        : o.tableSessionId
-          ? `session:${o.tableSessionId}`
-          : (o.orderType === 'DINE_IN' && o.tableId)
-            ? `table:${o.tableId}`
-            : `order:${o.id}`
+      // Takeaway and Delivery orders are strictly self-contained and identified exclusively by order:id
+      const isTakeawayOrDelivery = o.orderType === 'TAKEAWAY' || o.orderType === 'DELIVERY'
+      const key = isTakeawayOrDelivery
+        ? `order:${o.id}`
+        : o.checkId
+          ? `check:${o.checkId}`
+          : o.tableSessionId
+            ? `session:${o.tableSessionId}`
+            : (o.orderType === 'DINE_IN' && o.tableId)
+              ? `table:${o.tableId}`
+              : `order:${o.id}`
       const list = buckets.get(key)
       if (list) list.push(o)
       else buckets.set(key, [o])
@@ -2037,7 +2040,8 @@ function SittingCard({
 }) {
   const active = sitting.state === 'Active'
   const isTakeawayOrDelivery = sitting.orderType === 'TAKEAWAY' || sitting.orderType === 'DELIVERY'
-  const canAddToThisOrder = isTakeawayOrDelivery && active && sitting.latest.status !== 'COMPLETED' && sitting.latest.status !== 'CANCELLED' && sitting.latest.paymentStatus !== 'PAID'
+  const isPaid = sitting.latest.paymentStatus?.toUpperCase() === 'PAID'
+  const canAddToThisOrder = isTakeawayOrDelivery && active && sitting.latest.status !== 'COMPLETED' && sitting.latest.status !== 'CANCELLED' && !isPaid
   const started = sessionWhen(sitting.startedAt)
   const hasPayPerm = canComplete && canCollectPay
   const onlyPendingActivation = sitting.orders.every((order) => order.status === 'PENDING_ACTIVATION')

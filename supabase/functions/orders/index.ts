@@ -1383,7 +1383,7 @@ async function recalcOrderTotals(orderId: string, tenantId: string) {
     .eq("tenant_id", tenantId);
 }
 
-// Add items to existing order (Takeaway and Delivery only for Step 1)
+// Add items to existing order (Takeaway and Delivery only)
 async function addItem(req: Request, orderId: string): Promise<Response> {
   const g = await guard(req, { permission: "orders.edit" });
   if (!g.ok) return g.response;
@@ -1398,51 +1398,6 @@ async function addItem(req: Request, orderId: string): Promise<Response> {
 
   const b = await body(req) as any;
   const db = admin();
-
-  // The order must belong to the caller's tenant.
-  const { data: orderRow, error: orderErr } = await db
-    .from("orders")
-    .select("id, status, payment_status, order_type, table_id, check_id, table_session_id")
-    .eq("id", orderId)
-    .eq("tenant_id", tenantId)
-    .maybeSingle();
-
-  if (orderErr) return json(req, { error: orderErr.message }, 500);
-  if (!orderRow) return json(req, { error: "Order not found" }, 404);
-
-  // Safety checks: Step 1 is Takeaway & Delivery only
-  if (orderRow.order_type !== "TAKEAWAY" && orderRow.order_type !== "DELIVERY") {
-    return json(req, { error: "Adding items in Step 1 is restricted to Takeaway and Delivery orders." }, 400);
-  }
-
-  // Safety checks: Never modify completed, cancelled, or paid orders
-  if (orderRow.status === "COMPLETED" || orderRow.status === "CANCELLED") {
-    return json(req, { error: `Cannot add items to ${orderRow.status.toLowerCase()} order.` }, 409);
-  }
-  if (orderRow.payment_status === "PAID") {
-    return json(req, { error: "Cannot add items to an order that is already paid." }, 409);
-  }
-
-  const idemKey = cleanIdempotencyKey(b.idempotencyKey);
-  if (idemKey) {
-    const { data: existingItems } = await db
-      .from("order_items")
-      .select("id")
-      .eq("order_id", orderId)
-      .eq("idempotency_key", idemKey)
-      .limit(1);
-
-    if (existingItems && existingItems.length > 0) {
-      // Idempotent retry: return current full order state
-      const { data: existingOrder } = await db
-        .from("orders")
-        .select(ORDER_SELECT)
-        .eq("id", orderId)
-        .eq("tenant_id", tenantId)
-        .single();
-      return json(req, mapOrder(existingOrder), 200);
-    }
-  }
 
   const rawItems: any[] = Array.isArray(b.items) ? b.items : [b];
   if (rawItems.length === 0 || !rawItems[0].menuItemId) {
@@ -1480,52 +1435,37 @@ async function addItem(req: Request, orderId: string): Promise<Response> {
     });
   }
 
-  // Calculate separate KOT number: COALESCE(MAX(kot_number), 1) + 1
-  const { data: kotData } = await db
-    .from("order_items")
-    .select("kot_number")
-    .eq("order_id", orderId)
-    .order("kot_number", { ascending: false })
-    .limit(1);
+  const idemKey = cleanIdempotencyKey(b.idempotencyKey);
 
-  const currentMaxKot = kotData && kotData.length > 0 ? (kotData[0].kot_number || 1) : 1;
-  const nextKot = currentMaxKot + 1;
+  // Atomic database transaction with row-level lock and separate KOT allocation
+  const { data: txResult, error: txError } = await db.rpc("add_items_to_order_tx", {
+    p_order_id: orderId,
+    p_tenant: tenantId,
+    p_items: validatedLines,
+    p_idempotency_key: idemKey,
+  });
 
-  const rowsToInsert = validatedLines.map((line) => ({
-    order_id: orderId,
-    ...line,
-    kot_number: nextKot,
-    idempotency_key: idemKey,
-    status: "PENDING",
-  }));
-
-  const { data: inserted, error: insertError } = await db
-    .from("order_items")
-    .insert(rowsToInsert)
-    .select();
-
-  if (insertError || !inserted) {
-    return json(req, { error: insertError?.message || "Failed to add items" }, 500);
+  if (txError) {
+    const msg = String(txError.message ?? "");
+    if (msg.includes("ORDER_NOT_FOUND")) {
+      return json(req, { error: "Order not found" }, 404);
+    }
+    if (msg.includes("INVALID_ORDER_TYPE")) {
+      return json(req, { error: "Adding items is restricted to Takeaway and Delivery orders." }, 400);
+    }
+    if (msg.includes("ORDER_LIFECYCLE_CLOSED")) {
+      return json(req, { error: "Cannot add items to a completed or cancelled order." }, 409);
+    }
+    if (msg.includes("ORDER_ALREADY_PAID")) {
+      return json(req, { error: "Cannot add items to an order that is already paid and settled." }, 409);
+    }
+    if (msg.includes("ITEM_UNAVAILABLE")) {
+      return json(req, { error: "One or more items are no longer available." }, 400);
+    }
+    return json(req, { error: txError.message || "Failed to add items" }, 500);
   }
 
-  // Atomically recalculate order totals
-  await recalcOrderTotals(orderId, tenantId);
-
-  // If order was READY or SERVED, newly added items are PENDING, so overall status resets to PENDING for the kitchen
-  if (orderRow.status === "READY" || orderRow.status === "SERVED") {
-    await db
-      .from("orders")
-      .update({ status: "PENDING", updated_at: new Date().toISOString() })
-      .eq("id", orderId)
-      .eq("tenant_id", tenantId);
-  } else {
-    await db
-      .from("orders")
-      .update({ updated_at: new Date().toISOString() })
-      .eq("id", orderId)
-      .eq("tenant_id", tenantId);
-  }
-
+  // Load the full updated order
   const { data: fullOrder, error: fullError } = await db
     .from("orders")
     .select(ORDER_SELECT)
@@ -1539,6 +1479,11 @@ async function addItem(req: Request, orderId: string): Promise<Response> {
 
   const mapped = mapOrder(fullOrder);
 
+  // If this was an idempotent deduplicated replay, return without rebroadcasting
+  if ((txResult as any)?.deduplicated) {
+    return json(req, mapped, 200);
+  }
+
   // Broadcast Realtime events
   await publishOrderEvent({
     type: "ORDER_UPDATED",
@@ -1550,9 +1495,9 @@ async function addItem(req: Request, orderId: string): Promise<Response> {
   await publishToStaff(tenantId, "KOT_ADDED", {
     orderId,
     orderNumber: mapped.orderNumber,
-    kotNumber: nextKot,
+    kotNumber: (txResult as any)?.kot_number,
     orderType: mapped.orderType,
-    itemsCount: inserted.length,
+    itemsCount: validatedLines.length,
   });
 
   return json(req, mapped, 201);
