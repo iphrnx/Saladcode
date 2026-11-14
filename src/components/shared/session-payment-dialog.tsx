@@ -546,9 +546,9 @@ export function SessionPaymentDialog({
                   {/* Soft specular highlight */}
                   <path d="M23.5 40C25 31 31 25.5 38.5 24" stroke="white" strokeOpacity="0.45" strokeWidth="2.4" strokeLinecap="round" />
                   {/* Base tray */}
-                  <rect x="10" y="47" width="64" height="5" rx="2.5" fill="#EA580C" />
+                  <rect x="10" y="47" width="64" height="5" rx="2.5" fill="#f97316" />
                 </svg>
-                <span className="absolute bottom-1 right-1 grid size-7 place-items-center rounded-full bg-[#EA580C] text-white shadow-md shadow-orange-500/35 ring-2 ring-card">
+                <span className="absolute bottom-1 right-1 grid size-7 place-items-center rounded-full bg-primary text-primary-foreground shadow-md shadow-primary/35 ring-2 ring-card">
                   <Check className="size-4" strokeWidth={3.5} />
                 </span>
               </div>
@@ -562,7 +562,7 @@ export function SessionPaymentDialog({
 
               {/* Which table it was, and that it is paid. */}
               <div className="mt-4 flex items-center gap-3 rounded-2xl border border-border/60 bg-card px-3.5 py-3 shadow-[0_1px_3px_rgba(15,23,42,0.04)]">
-                <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-[#FFF1E6] text-[#EA580C] dark:bg-primary/[0.15] dark:text-primary">
+                <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary">
                   <Table2 className="size-5.5" strokeWidth={1.9} />
                 </span>
                 <div className="min-w-0 flex-1">
@@ -592,7 +592,7 @@ export function SessionPaymentDialog({
               <div className="mt-2.5 rounded-2xl border border-border/60 bg-card p-3.5 shadow-[0_1px_3px_rgba(15,23,42,0.04)]">
                 <div className="flex items-center justify-between gap-2">
                   <p className="flex items-center gap-2 text-[15px] font-bold text-foreground sm:text-[15.5px]">
-                    <Layers className="size-4.5 text-[#EA580C] dark:text-primary" />
+                    <Layers className="size-4.5 text-primary" />
                     Bill Summary
                   </p>
                   <span className="shrink-0 text-[12px] font-medium text-muted-foreground sm:text-[12.5px]">
@@ -618,9 +618,9 @@ export function SessionPaymentDialog({
                     </div>
                   )}
                 </div>
-                <div className="mt-2 flex items-center justify-between rounded-xl bg-[#FDECE0] px-3.5 py-2.5 dark:bg-primary/[0.14]">
-                  <span className="text-[15px] font-bold text-[#3B180B] dark:text-foreground sm:text-[16px]">Total Paid</span>
-                  <span className="text-[18px] font-extrabold tabular-nums text-[#3B180B] dark:text-foreground sm:text-[19px]">
+                <div className="mt-2 flex items-center justify-between rounded-xl bg-primary/10 px-3.5 py-2.5">
+                  <span className="text-[15px] font-bold text-foreground sm:text-[16px]">Total Paid</span>
+                  <span className="text-[18px] font-extrabold tabular-nums text-foreground sm:text-[19px]">
                     {paidText}
                   </span>
                 </div>
@@ -638,9 +638,9 @@ export function SessionPaymentDialog({
                 <Button
                   variant="outline"
                   onClick={() => (onViewSession ? onViewSession() : onOpenChange(false))}
-                  className="h-12 gap-2 whitespace-nowrap rounded-2xl border-[#F5B895] bg-[#FFF9F5] px-3 text-[14px] font-semibold text-[#29170D] hover:bg-[#FFF2E8] dark:border-primary/35 dark:bg-primary/[0.06] dark:text-foreground sm:text-[15px]"
+                  className="h-12 gap-2 whitespace-nowrap rounded-2xl border-border bg-card px-3 text-[14px] font-semibold text-foreground hover:bg-secondary sm:text-[15px]"
                 >
-                  <Info className="size-4.5 text-[#EA580C] dark:text-primary" />
+                  <Info className="size-4.5 text-primary" />
                   Session Details
                 </Button>
               </div>
@@ -689,7 +689,7 @@ function fmtPct(n: number) {
 function Fact({ icon: Icon, label, value }: { icon: any; label: string; value: string }) {
   return (
     <div className="flex min-w-0 items-center justify-center gap-2 px-2">
-      <Icon className="size-[18px] shrink-0 text-[#EA580C] dark:text-primary" strokeWidth={2.1} />
+      <Icon className="size-[18px] shrink-0 text-primary" strokeWidth={2.1} />
       <div className="min-w-0">
         <p className="truncate text-[11px] leading-tight text-muted-foreground sm:text-[11.5px]">{label}</p>
         <p className="truncate text-[13.5px] font-bold leading-tight tabular-nums text-foreground sm:text-[14px]">{value}</p>
