@@ -310,7 +310,7 @@ export function OrdersView() {
     (r) => r.toLowerCase() === userRole?.toLowerCase()
   )
   const canEditOrders = hasEffectivePermission(perms, 'orders.edit')
-  const canAddItems = isOwnerManagerOrCashier && canEditOrders
+  const canAddItems = isOwnerManagerOrCashier && (userRole?.toLowerCase() === 'owner' || canEditOrders)
   const canPrepare = hasEffectivePermission(perms, 'orders.prepare')
   const canReady = hasEffectivePermission(perms, 'orders.ready')
   const canServe = hasEffectivePermission(perms, 'orders.serve')
@@ -373,7 +373,14 @@ export function OrdersView() {
   const sittings = useMemo<Sitting[]>(() => {
     const buckets = new Map<string, Order[]>()
     for (const o of orders) {
-      const key = o.tableSessionId ? `session:${o.tableSessionId}` : `order:${o.id}`
+      // Dine-in orders bind to checkId or tableSessionId; fallback to tableId for active dine-in orders
+      const key = o.checkId
+        ? `check:${o.checkId}`
+        : o.tableSessionId
+          ? `session:${o.tableSessionId}`
+          : (o.orderType === 'DINE_IN' && o.tableId)
+            ? `table:${o.tableId}`
+            : `order:${o.id}`
       const list = buckets.get(key)
       if (list) list.push(o)
       else buckets.set(key, [o])
@@ -994,7 +1001,7 @@ export function OrdersView() {
                 canEndSession={hasEffectivePermission(perms, 'table-sessions.manage')}
                 canAddItems={canAddItems}
                 onAddItems={(order) => setAddItemsOrder(order)}
-                ending={endingTable === sitting.tableId}
+                ending={Boolean(sitting.tableId && endingTable === sitting.tableId)}
                 onView={(order) => setViewOrder(order)}
                 onOpenOrder={(order) => openOrderDetail(order)}
                 onOpenOrders={(target) => {
@@ -2291,12 +2298,14 @@ function SittingCard({
             <DropdownMenuItem onClick={() => onOpenOrders(sitting)}>
               <Layers className="mr-2 size-4" /> View orders &amp; bill
             </DropdownMenuItem>
-            <DropdownMenuItem
-              disabled={!canEndSession || !sitting.tableId || !active || ending}
-              onClick={() => onEndSession(sitting)}
-            >
-              <XCircle className="mr-2 size-4" /> {ending ? 'Ending…' : 'End session'}
-            </DropdownMenuItem>
+            {sitting.tableId && (
+              <DropdownMenuItem
+                disabled={!canEndSession || !active || ending}
+                onClick={() => onEndSession(sitting)}
+              >
+                <XCircle className="mr-2 size-4" /> {ending ? 'Ending…' : 'End session'}
+              </DropdownMenuItem>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       </div>

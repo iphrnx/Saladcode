@@ -70,6 +70,7 @@ function mapOrder(row: any) {
     orderNumber: row.order_number,
     tableId: row.table_id,
     tableSessionId: row.table_session_id,
+    checkId: row.check_id,
     orderType: row.order_type,
     status: row.status,
     itemsTotal: row.items_total,
