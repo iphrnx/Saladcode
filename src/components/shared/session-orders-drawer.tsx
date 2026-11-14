@@ -267,15 +267,15 @@ export function SessionOrdersDrawer({
           </div>
 
           {/* Context Card */}
-          <div className="flex items-center justify-between gap-3 rounded-2xl border border-orange-200/80 bg-[#FFF9F5] p-3.5 dark:border-orange-900/40 dark:bg-orange-950/20">
+          <div className="flex items-center justify-between gap-3 rounded-2xl border border-primary/20 bg-primary/[0.04] p-3.5">
             <div className="flex min-w-0 items-center gap-3">
-              <div className="flex size-11 shrink-0 items-center justify-center rounded-xl border border-orange-200/70 bg-[#FFF1E6] text-[#EA580C] dark:border-orange-800/40 dark:bg-orange-900/30 dark:text-orange-400">
+              <div className="flex size-11 shrink-0 items-center justify-center rounded-xl border border-primary/25 bg-primary/10 text-primary">
                 {isTakeaway ? (
                   <ShoppingBag className="size-5" />
                 ) : isDelivery ? (
                   <Truck className="size-5" />
                 ) : (
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="size-5.5 text-[#EA580C]">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="size-5.5 text-primary">
                     <path d="M7 11V7a3 3 0 0 1 3-3h4a3 3 0 0 1 3 3v4" />
                     <rect x="5" y="11" width="14" height="3" rx="1.5" />
                     <path d="M7 14v6" />
@@ -304,7 +304,7 @@ export function SessionOrdersDrawer({
           {/* 3-Cell Timing Strip */}
           <div className="mt-3 grid grid-cols-3 divide-x divide-border/60 rounded-xl border border-border/60 bg-[#FAF9F7] p-2.5 text-center dark:border-border/40 dark:bg-secondary/20">
             <div className="flex items-center justify-center gap-2.5 px-2">
-              <CalendarDays className="size-4.5 text-[#EA580C] shrink-0" strokeWidth={2.2} />
+              <CalendarDays className="size-4.5 text-primary shrink-0" strokeWidth={2.2} />
               <div className="text-left">
                 <p className="text-[11px] sm:text-[11.5px] font-medium text-muted-foreground leading-tight">Started at</p>
                 <p className="text-[13px] sm:text-[14px] font-extrabold tabular-nums text-foreground leading-snug">
@@ -313,7 +313,7 @@ export function SessionOrdersDrawer({
               </div>
             </div>
             <div className="flex items-center justify-center gap-2.5 px-2">
-              <Power className="size-4.5 text-[#EA580C] shrink-0" strokeWidth={2.2} />
+              <Power className="size-4.5 text-primary shrink-0" strokeWidth={2.2} />
               <div className="text-left">
                 <p className="text-[11px] sm:text-[11.5px] font-medium text-muted-foreground leading-tight">Ended at</p>
                 <p className="text-[13px] sm:text-[14px] font-extrabold tabular-nums text-foreground leading-snug">
@@ -322,7 +322,7 @@ export function SessionOrdersDrawer({
               </div>
             </div>
             <div className="flex items-center justify-center gap-2.5 px-2">
-              <Timer className="size-4.5 text-[#EA580C] shrink-0" strokeWidth={2.2} />
+              <Timer className="size-4.5 text-primary shrink-0" strokeWidth={2.2} />
               <div className="text-left">
                 <p className="text-[11px] sm:text-[11.5px] font-medium text-muted-foreground leading-tight">Duration</p>
                 <p className="text-[13px] sm:text-[14px] font-extrabold tabular-nums text-foreground leading-snug">
@@ -341,11 +341,11 @@ export function SessionOrdersDrawer({
               className={cn(
                 'flex items-center justify-center gap-2 rounded-xl py-2 px-2.5 text-[13px] font-bold transition-all cursor-pointer',
                 tab === 'orders'
-                  ? 'bg-[#EA580C] text-white shadow-sm'
+                  ? 'bg-primary text-primary-foreground shadow-sm'
                   : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
               )}
             >
-              <Layers className={cn('size-4 shrink-0', tab === 'orders' ? 'text-white' : 'text-muted-foreground')} />
+              <Layers className={cn('size-4 shrink-0', tab === 'orders' ? 'text-primary-foreground' : 'text-muted-foreground')} />
               <span className="truncate">Orders ({orders.length})</span>
             </button>
             <button
@@ -355,11 +355,11 @@ export function SessionOrdersDrawer({
               className={cn(
                 'flex items-center justify-center gap-2 rounded-xl py-2 px-2.5 text-[13px] font-bold transition-all cursor-pointer',
                 tab === 'bill'
-                  ? 'bg-[#EA580C] text-white shadow-sm'
+                  ? 'bg-primary text-primary-foreground shadow-sm'
                   : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
               )}
             >
-              <FileText className={cn('size-4 shrink-0', tab === 'bill' ? 'text-white' : 'text-muted-foreground')} />
+              <FileText className={cn('size-4 shrink-0', tab === 'bill' ? 'text-primary-foreground' : 'text-muted-foreground')} />
               <span className="truncate">Bill Summary</span>
             </button>
             <button
@@ -369,11 +369,11 @@ export function SessionOrdersDrawer({
               className={cn(
                 'flex items-center justify-center gap-2 rounded-xl py-2 px-2.5 text-[13px] font-bold transition-all cursor-pointer',
                 tab === 'activity'
-                  ? 'bg-[#EA580C] text-white shadow-sm'
+                  ? 'bg-primary text-primary-foreground shadow-sm'
                   : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
               )}
             >
-              <Activity className={cn('size-4 shrink-0', tab === 'activity' ? 'text-white' : 'text-muted-foreground')} />
+              <Activity className={cn('size-4 shrink-0', tab === 'activity' ? 'text-primary-foreground' : 'text-muted-foreground')} />
               <span className="truncate">Activity</span>
             </button>
           </div>
@@ -402,8 +402,8 @@ export function SessionOrdersDrawer({
                       className={cn(
                         'overflow-hidden rounded-xl border transition-colors',
                         expanded
-                          ? 'border-[#EA580C]/40 bg-[#FFF9F5]/40 dark:border-orange-900/50 dark:bg-orange-950/10'
-                          : 'border-border/70 bg-card hover:border-orange-200/70',
+                          ? 'border-primary/40 bg-primary/[0.04]'
+                          : 'border-border/70 bg-card hover:border-primary/30',
                       )}
                     >
                       <button
@@ -419,7 +419,7 @@ export function SessionOrdersDrawer({
                       >
                         <div className="flex items-center justify-between gap-2">
                           <div className="flex items-center gap-2 min-w-0">
-                            <span className="shrink-0 rounded-md bg-[#FFEDD5] px-2 py-0.5 text-[12px] font-extrabold text-[#C2410C] dark:bg-orange-950/60 dark:text-orange-400">
+                            <span className="shrink-0 rounded-md bg-primary/10 px-2 py-0.5 text-[12px] font-extrabold text-primary">
                               #{order.orderNumber}
                             </span>
                             <span className="truncate text-[12.5px] font-medium text-muted-foreground tabular-nums">
@@ -512,10 +512,10 @@ export function SessionOrdersDrawer({
             {tab === 'bill' && (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-1">
                 {/* Left Column: Charges */}
-                <div className="flex flex-col justify-between rounded-2xl border border-orange-200/80 bg-[#FFF9F5] p-3.5 sm:p-4 dark:border-orange-900/40 dark:bg-orange-950/20">
+                <div className="flex flex-col justify-between rounded-2xl border border-primary/20 bg-primary/[0.04] p-3.5 sm:p-4">
                   <div>
                     <div className="flex items-center gap-2 mb-3">
-                      <Layers className="size-4.5 text-[#EA580C] dark:text-orange-400" />
+                      <Layers className="size-4.5 text-primary" />
                       <h4 className="text-[15px] font-bold text-foreground">Charges</h4>
                     </div>
 
@@ -552,11 +552,11 @@ export function SessionOrdersDrawer({
                     </div>
                   </div>
 
-                  <div className="mt-3 flex items-center justify-between rounded-xl bg-[#FFE8DA] px-3.5 py-2.5 dark:bg-orange-900/40">
-                    <span className="text-[14.5px] sm:text-[15px] font-black text-[#7C2D12] dark:text-orange-200">
+                  <div className="mt-3 flex items-center justify-between rounded-xl bg-primary/10 px-3.5 py-2.5">
+                    <span className="text-[14.5px] sm:text-[15px] font-black text-primary">
                       Total Paid
                     </span>
-                    <span className="text-[16.5px] sm:text-[17px] font-black tabular-nums text-[#7C2D12] dark:text-orange-100">
+                    <span className="text-[16.5px] sm:text-[17px] font-black tabular-nums text-foreground">
                       {money(paidAmount)}
                     </span>
                   </div>
@@ -566,7 +566,7 @@ export function SessionOrdersDrawer({
                 <div className="flex flex-col gap-2.5 sm:gap-3">
                   {/* Payment Method */}
                   <div className="flex items-center gap-3 rounded-2xl border border-border/70 bg-card p-3 shadow-xs">
-                    <div className="flex size-10 shrink-0 items-center justify-center rounded-xl border border-orange-200/70 bg-[#FFF1E6] text-[#EA580C] dark:border-orange-800/40 dark:bg-orange-900/30 dark:text-orange-400">
+                    <div className="flex size-10 shrink-0 items-center justify-center rounded-xl border border-primary/25 bg-primary/10 text-primary">
                       <Wallet className="size-5" />
                     </div>
                     <div className="min-w-0">
@@ -579,7 +579,7 @@ export function SessionOrdersDrawer({
 
                   {/* Invoice No. */}
                   <div className="flex items-center gap-3 rounded-2xl border border-border/70 bg-card p-3 shadow-xs">
-                    <div className="flex size-10 shrink-0 items-center justify-center rounded-xl border border-orange-200/70 bg-[#FFF1E6] text-[#EA580C] dark:border-orange-800/40 dark:bg-orange-900/30 dark:text-orange-400">
+                    <div className="flex size-10 shrink-0 items-center justify-center rounded-xl border border-primary/25 bg-primary/10 text-primary">
                       <ReceiptText className="size-5" />
                     </div>
                     <div className="min-w-0">
@@ -592,7 +592,7 @@ export function SessionOrdersDrawer({
 
                   {/* Paid At */}
                   <div className="flex items-center gap-3 rounded-2xl border border-border/70 bg-card p-3 shadow-xs">
-                    <div className="flex size-10 shrink-0 items-center justify-center rounded-xl border border-orange-200/70 bg-[#FFF1E6] text-[#EA580C] dark:border-orange-800/40 dark:bg-orange-900/30 dark:text-orange-400">
+                    <div className="flex size-10 shrink-0 items-center justify-center rounded-xl border border-primary/25 bg-primary/10 text-primary">
                       <CalendarDays className="size-5" />
                     </div>
                     <div className="min-w-0">
@@ -616,7 +616,7 @@ export function SessionOrdersDrawer({
                         {/* Continuous connecting line */}
                         {!isLast && (
                           <div
-                            className="absolute left-4 top-8 -bottom-0.5 w-0.5 -translate-x-1/2 bg-orange-300 dark:bg-orange-800"
+                            className="absolute left-4 top-8 -bottom-0.5 w-0.5 -translate-x-1/2 bg-primary/30"
                             aria-hidden="true"
                           />
                         )}
@@ -628,11 +628,11 @@ export function SessionOrdersDrawer({
                               <Play className="size-3.5 fill-current ml-0.5" />
                             </div>
                           ) : evt.type === 'order_placed' ? (
-                            <div className="flex size-8 items-center justify-center rounded-full border-[1.5px] border-orange-400 bg-orange-50 text-[#EA580C] dark:border-orange-600 dark:bg-orange-950/40 dark:text-orange-400">
+                            <div className="flex size-8 items-center justify-center rounded-full border-[1.5px] border-primary/50 bg-primary/10 text-primary">
                               <Plus className="size-4" strokeWidth={2.4} />
                             </div>
                           ) : evt.type === 'all_served' ? (
-                            <div className="flex size-8 items-center justify-center rounded-full border-[1.5px] border-orange-400 bg-orange-50 text-[#EA580C] dark:border-orange-600 dark:bg-orange-950/40 dark:text-orange-400">
+                            <div className="flex size-8 items-center justify-center rounded-full border-[1.5px] border-primary/50 bg-primary/10 text-primary">
                               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="size-4">
                                 <path d="M18 11a6 6 0 0 0-12 0" />
                                 <path d="M4 14h16" />
@@ -644,7 +644,7 @@ export function SessionOrdersDrawer({
                               <CreditCard className="size-4" strokeWidth={2.2} />
                             </div>
                           ) : (
-                            <div className="flex size-8 items-center justify-center rounded-full border-[1.5px] border-orange-400 bg-orange-50 text-[#EA580C] dark:border-orange-600 dark:bg-orange-950/40 dark:text-orange-400">
+                            <div className="flex size-8 items-center justify-center rounded-full border-[1.5px] border-primary/50 bg-primary/10 text-primary">
                               <Flag className="size-4" strokeWidth={2.2} />
                             </div>
                           )}
@@ -675,27 +675,27 @@ export function SessionOrdersDrawer({
           {/* Bottom Summary Banner (visible on Orders tab) */}
           {tab === 'orders' && (
             orders.length > 1 ? (
-              <div className="mt-3.5 flex items-center justify-between gap-3 rounded-xl border border-[#FED7AA]/70 bg-[#FFF4EC] p-3.5 dark:border-orange-900/40 dark:bg-orange-950/20">
-                <div className="flex items-center gap-2 font-bold text-orange-950 dark:text-orange-100">
-                  <Layers className="size-4.5 text-[#EA580C] dark:text-orange-400 shrink-0" />
+              <div className="mt-3.5 flex items-center justify-between gap-3 rounded-xl border border-primary/20 bg-primary/[0.04] p-3.5">
+                <div className="flex items-center gap-2 font-bold text-foreground">
+                  <Layers className="size-4.5 text-primary shrink-0" />
                   <span className="text-[13px] sm:text-[13.5px]">
                     {orders.length} Order{orders.length === 1 ? '' : 's'} • {totalQty} Item{totalQty === 1 ? '' : 's'}
                   </span>
                 </div>
 
-                <div className="h-5 w-px bg-orange-200/80 dark:bg-orange-800/50" />
+                <div className="h-5 w-px bg-primary/20" />
 
-                <div className="flex items-baseline gap-2 text-orange-950 dark:text-orange-100">
-                  <span className="text-[13px] font-bold text-[#7C2D12] dark:text-orange-200">
+                <div className="flex items-baseline gap-2 text-foreground">
+                  <span className="text-[13px] font-bold text-primary">
                     Total Paid
                   </span>
-                  <span className="text-[17px] sm:text-[18px] font-black text-[#7C2D12] dark:text-orange-100 tabular-nums">
+                  <span className="text-[17px] sm:text-[18px] font-black text-foreground tabular-nums">
                     {money(paidAmount)}
                   </span>
                 </div>
               </div>
             ) : (
-              <div className="mt-3.5 flex items-center justify-between gap-3 rounded-xl border border-[#FED7AA]/70 bg-[#FFF4EC] px-3.5 py-2.5 dark:border-orange-900/40 dark:bg-orange-950/20">
+              <div className="mt-3.5 flex items-center justify-between gap-3 rounded-xl border border-primary/20 bg-primary/[0.04] px-3.5 py-2.5">
                 <div className="flex items-baseline gap-1.5 text-[12.5px] font-bold text-foreground">
                   <span className="text-muted-foreground font-semibold">TOTAL</span>
                   <span className="tabular-nums font-black">{money(orders[0]?.total ?? bill.total)}</span>
@@ -717,17 +717,17 @@ export function SessionOrdersDrawer({
               type="button"
               variant="outline"
               onClick={onPrintBill}
-              className="h-11 rounded-xl border-2 border-orange-200/80 bg-white text-foreground hover:bg-orange-50/50 font-bold text-[13.5px] flex items-center justify-center gap-2 transition-colors cursor-pointer dark:border-orange-800/60 dark:bg-card dark:hover:bg-orange-950/30"
+              className="h-11 rounded-xl border border-border bg-card text-foreground hover:bg-secondary font-bold text-[13.5px] flex items-center justify-center gap-2 transition-colors cursor-pointer"
             >
-              <Printer className="size-4.5 text-[#EA580C] dark:text-orange-400 shrink-0" />
+              <Printer className="size-4.5 text-primary shrink-0" />
               <span>Print Bill</span>
             </Button>
             <Button
               type="button"
               onClick={onDownloadBill}
-              className="h-11 rounded-xl bg-[#EA580C] hover:bg-[#D94E06] text-white font-bold text-[13.5px] flex items-center justify-center gap-2 shadow-sm transition-colors cursor-pointer"
+              className="h-11 rounded-xl bg-primary hover:bg-primary/90 text-primary-foreground font-bold text-[13.5px] flex items-center justify-center gap-2 shadow-sm transition-colors cursor-pointer"
             >
-              <Download className="size-4.5 text-white shrink-0" />
+              <Download className="size-4.5 text-primary-foreground shrink-0" />
               <span>Download Bill (PDF)</span>
             </Button>
           </div>
@@ -742,7 +742,7 @@ function Dish({ src }: { src?: string | null }) {
     return <img src={src} alt="" loading="lazy" className="size-8 shrink-0 rounded-lg object-cover" />
   }
   return (
-    <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-[#FFF1E6] text-[#EA580C] dark:bg-orange-950/60 dark:text-orange-400 border border-orange-200/50">
+    <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary border border-primary/20">
       <Utensils className="size-3.5" />
     </span>
   )
