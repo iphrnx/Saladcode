@@ -141,11 +141,14 @@ async function create(req: Request): Promise<Response> {
     const comment = typeof b.comment === "string" && b.comment.trim()
       ? b.comment.trim().slice(0, 1000)
       : null;
-    const tags = Array.isArray(b.tags)
-      ? b.tags.filter((t: any) => typeof t === "string" && t.trim()).join(", ").slice(0, 200)
+    const tags: string[] = Array.isArray(b.tags)
+      ? b.tags
+          .map((t: any) => (typeof t === "string" ? t.trim() : ""))
+          .filter(Boolean)
+          .slice(0, 10)
       : typeof b.tags === "string" && b.tags.trim()
-      ? b.tags.trim().slice(0, 200)
-      : null;
+      ? [b.tags.trim().slice(0, 50)]
+      : [];
 
     // 5. Insert review
     const { data: review, error: insertErr } = await admin()

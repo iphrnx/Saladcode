@@ -323,6 +323,7 @@ export function OrdersView() {
   // and nothing was charged, so it needs the floor key, not `orders.cancel`.
   const canAcceptHeld = hasEffectivePermission(perms, 'table-sessions.manage')
   const [acceptingId, setAcceptingId] = useState<string | null>(null)
+  const [cancellingId, setCancellingId] = useState<string | null>(null)
   const [paymentMethod, setPaymentMethod] = useState<string>('CASH')
   const [busy, setBusy] = useState<string | null>(null)
   // `busy` is React state, so two clicks in the same tick both read null and
@@ -713,6 +714,37 @@ export function OrdersView() {
       toast.error(describeFailure(err, 'the order').message)
     } finally {
       setAcceptingId(null)
+    }
+  }
+
+  const handleCancelOrder = async (order: Order, reason: string) => {
+    if (cancellingId) return
+    setCancellingId(order.id)
+    try {
+      const res = await edgeFetch(`/api/orders/${order.id}/cancel`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-tenant-id': tenant?.id ?? '',
+        },
+        body: JSON.stringify({ reason }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err?.error || 'Failed to cancel order')
+      }
+      const data = await res.json()
+      const confirmed = data.order || { ...order, status: 'CANCELLED' }
+      addOrUpdateOrder(confirmed, false, { force: true })
+      if (detailOrderId === order.id) {
+        setFallbackDetailOrder(confirmed)
+      }
+      toast.success(`Order #${order.orderNumber} cancelled`)
+    } catch (err: any) {
+      toast.error(err?.message || 'Could not cancel order')
+      throw err
+    } finally {
+      setCancellingId(null)
     }
   }
 
@@ -1470,10 +1502,15 @@ export function OrdersView() {
         canServe={canServe}
         canAccept={canAcceptHeld}
         accepting={detailOrder ? acceptingId === detailOrder.id : false}
+        canCancel={isOwnerManagerOrCashier && (canCancel || canEditOrders)}
+        cancelling={detailOrder ? cancellingId === detailOrder.id : false}
         busy={detailOrder ? Boolean(busy && busy.startsWith(detailOrder.id)) : false}
         onAccept={() => detailOrder && void decideHeld(detailOrder, 'accept')}
         onReject={() => detailOrder && void decideHeld(detailOrder, 'reject')}
         onUpdate={(next) => detailOrder && void updateStatus(detailOrder, next)}
+        onCancel={(reason) => {
+          if (detailOrder) void handleCancelOrder(detailOrder, reason)
+        }}
         onBack={() => {
           const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder?.id))
           const id = detailOrder?.id

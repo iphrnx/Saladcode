@@ -119,7 +119,9 @@ export async function submitEntry(
     const lookupUrl =
       '/api/orders/by-key/' + entry.key + (token ? `?tableSessionToken=${encodeURIComponent(token)}` : '')
     try {
-      const lookup = await fetcher(lookupUrl)
+      const lookup = await fetcher(lookupUrl, {
+        headers: entry.headers ?? {},
+      })
       if (lookup.ok) {
         return { outcome: 'confirmed', order: await lookup.json() }
       }
@@ -175,7 +177,9 @@ export function cleanOrderErrorMessage(raw?: string): string {
     lower.includes('violates') ||
     lower.includes('duplicate key') ||
     lower.includes('foreign key') ||
-    lower.includes('null value in column') ||
+    lower.includes('null value') ||
+    lower.includes('does not exist') ||
+    lower.includes('malformed') ||
     lower.includes('function ') ||
     lower.includes('sql')
   ) {
@@ -258,20 +262,40 @@ export class OrderQueue {
   /**
    * Explicit human discard. Before dropping, reconcile: if the server has the
    * order after all, this is not a discard — it is a confirmation.
+   * If the server confirms 404 (not found) or 401/403, the order is definitely
+   * not created, so we drop it from the queue without re-submitting.
    */
   async dismiss(key: string): Promise<'confirmed' | 'removed' | 'uncertain'> {
     const entries = this.load()
     const entry = entries.find((e) => e.key === key)
     if (!entry) return 'removed'
-    const result = await submitEntry({ ...entry, attempts: Math.max(1, entry.attempts) }, this.fetcher)
-    if (result.outcome === 'confirmed') {
-      this.confirm(key, result.order)
-      return 'confirmed'
+
+    const token = entry.kind === 'diner' ? entry.payload?.tableSessionToken : null
+    const lookupUrl =
+      '/api/orders/by-key/' + entry.key + (token ? `?tableSessionToken=${encodeURIComponent(token)}` : '')
+
+    try {
+      const lookup = await this.fetcher(lookupUrl, {
+        headers: entry.headers ?? {},
+      })
+      if (lookup.ok) {
+        const order = await lookup.json().catch(() => null)
+        this.confirm(key, order)
+        return 'confirmed'
+      }
+      if (lookup.status === 404 || lookup.status === 401 || lookup.status === 403) {
+        // The server definitely does not have this order; dropping is safe.
+        this.save(this.load().filter((e) => e.key !== key))
+        return 'removed'
+      }
+      // If server returned 5xx, drop from local queue since user explicitly dismissed it
+      this.save(this.load().filter((e) => e.key !== key))
+      return 'removed'
+    } catch {
+      // Offline / network failure: respect the user's explicit request to dismiss
+      this.save(this.load().filter((e) => e.key !== key))
+      return 'removed'
     }
-    if (result.outcome === 'uncertain') return 'uncertain'
-    // Rejected by the server → the order does not exist; dropping is safe.
-    this.save(entries.filter((e) => e.key !== key))
-    return 'removed'
   }
 
   private confirm(key: string, order: any) {

@@ -1,9 +1,20 @@
 'use client'
 
-import { Check, ChefHat, FilePenLine, Info, Loader2, Pencil, ReceiptText, Utensils, XCircle } from 'lucide-react'
+import { useState } from 'react'
+import { Check, ChefHat, FilePenLine, Info, Loader2, ReceiptText, Utensils, XCircle } from 'lucide-react'
 import type { Order } from '@/components/app/data-context'
 import { StatusBadge } from '@/components/shared/badges'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { cn } from '@/lib/utils'
 
 /**
@@ -17,6 +28,14 @@ import { cn } from '@/lib/utils'
 
 const STEPS = ['PENDING', 'PREPARING', 'READY', 'SERVED'] as const
 
+const CANCEL_PRESETS = [
+  'Customer changed mind',
+  'Item unavailable',
+  'Placed by mistake',
+  'Duplicate order',
+  'Kitchen delay',
+]
+
 export function OrderDetailDrawer({
   order,
   open,
@@ -28,10 +47,13 @@ export function OrderDetailDrawer({
   canServe = false,
   canAccept = false,
   accepting = false,
+  canCancel = false,
+  cancelling = false,
   busy = false,
   onAccept,
   onReject,
   onUpdate,
+  onCancel,
   onBack,
 }: {
   order: Order | null
@@ -45,13 +67,20 @@ export function OrderDetailDrawer({
   canServe?: boolean
   canAccept?: boolean
   accepting?: boolean
+  canCancel?: boolean
+  cancelling?: boolean
   busy?: boolean
   onAccept?: () => void
   onReject?: () => void
   onUpdate: (status: string) => void
+  onCancel?: (reason: string) => Promise<void> | void
   /** Back arrow — returns to the sitting's other orders. */
   onBack?: () => void
 }) {
+  const [confirmCancelOpen, setConfirmCancelOpen] = useState(false)
+  const [cancelReason, setCancelReason] = useState('')
+  const [selectedPreset, setSelectedPreset] = useState<string | null>(null)
+
   if (!order) return null
   const money = (n: number) =>
     `${currencySymbol}${Number(n ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -257,12 +286,23 @@ export function OrderDetailDrawer({
             /* Kitchen progression — there is a forward step to take */
             <>
               <button
-                disabled
-                title="Editing a placed order is not available yet"
-                className="flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl border border-border bg-card text-[13.5px] font-semibold text-muted-foreground opacity-60"
+                type="button"
+                onClick={() => {
+                  setCancelReason('')
+                  setSelectedPreset(null)
+                  setConfirmCancelOpen(true)
+                }}
+                disabled={!canCancel || cancelling || busy}
+                title={!canCancel ? 'Only Owner, Manager, and Cashier can cancel orders' : undefined}
+                className={cn(
+                  'flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl border border-border bg-card text-[13.5px] font-semibold transition-colors',
+                  canCancel
+                    ? 'text-destructive hover:border-destructive/30 hover:bg-destructive/10'
+                    : 'cursor-not-allowed text-muted-foreground opacity-60',
+                )}
               >
-                <Pencil className="size-4" />
-                Edit Order
+                <XCircle className="size-4" />
+                Cancel Order
               </button>
               <button
                 onClick={() => onUpdate(nextStep.status)}
@@ -280,24 +320,117 @@ export function OrderDetailDrawer({
                 {busy ? 'Updating…' : nextStep.label}
               </button>
             </>
+          ) : !done && !cancelled ? (
+            /* Served state — allow authorized staff to safely cancel if needed */
+            <div className="flex w-full flex-col gap-2">
+              {canCancel && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCancelReason('')
+                    setSelectedPreset(null)
+                    setConfirmCancelOpen(true)
+                  }}
+                  disabled={cancelling || busy}
+                  className="flex h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-destructive/30 bg-destructive/5 text-[13px] font-semibold text-destructive transition-colors hover:bg-destructive/10"
+                >
+                  <XCircle className="size-4" />
+                  Cancel Order
+                </button>
+              )}
+              <div className="flex w-full items-center justify-center gap-2 rounded-xl bg-secondary/60 py-2 text-[12px] text-muted-foreground">
+                <Check className="size-3.5 shrink-0 text-emerald-600" />
+                <span>Order served · Payment handled at table level</span>
+              </div>
+            </div>
           ) : (
-            /* Terminal state — order is Served, Completed, or Cancelled. No action buttons. */
+            /* Finalized state — order is Completed or Cancelled */
             <div className="flex w-full items-center justify-center gap-2 rounded-xl bg-secondary/60 py-2.5 text-[12.5px] text-muted-foreground">
               {cancelled ? (
-                <XCircle className="size-4 shrink-0" />
+                <XCircle className="size-4 shrink-0 text-destructive" />
               ) : (
                 <Check className="size-4 shrink-0 text-emerald-600" />
               )}
               <span>
                 {cancelled
                   ? 'This order was cancelled'
-                  : done
-                    ? 'Order completed · Payment handled at table level'
-                    : 'Order served · Payment handled at table level'}
+                  : 'Order completed · Payment handled at table level'}
               </span>
             </div>
           )}
         </div>
+
+        <AlertDialog open={confirmCancelOpen} onOpenChange={setConfirmCancelOpen}>
+          <AlertDialogContent className="max-w-[420px] rounded-2xl p-5">
+            <AlertDialogHeader className="space-y-1.5">
+              <AlertDialogTitle className="text-[17px] font-bold">
+                Cancel Order #{order.orderNumber}?
+              </AlertDialogTitle>
+              <AlertDialogDescription className="text-[13px] text-muted-foreground">
+                This will cancel the order and its kitchen tickets. It will be excluded from the table&apos;s bill.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+
+            <div className="my-3 space-y-2.5">
+              <label className="text-[12px] font-medium text-foreground">
+                Reason for cancellation:
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {CANCEL_PRESETS.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => {
+                      setSelectedPreset(p)
+                      setCancelReason(p)
+                    }}
+                    className={cn(
+                      'rounded-full border px-2.5 py-1 text-[11.5px] font-medium transition-colors',
+                      selectedPreset === p
+                        ? 'border-primary bg-primary text-primary-foreground'
+                        : 'border-border bg-secondary/60 text-muted-foreground hover:bg-secondary',
+                    )}
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+              <input
+                type="text"
+                placeholder="Or specify custom reason…"
+                value={cancelReason}
+                onChange={(e) => {
+                  setCancelReason(e.target.value)
+                  setSelectedPreset(null)
+                }}
+                maxLength={200}
+                className="w-full rounded-xl border border-border bg-background px-3 py-2 text-[13px] outline-none focus:border-primary"
+              />
+            </div>
+
+            <AlertDialogFooter className="flex-row items-center justify-end gap-2 pt-1">
+              <AlertDialogCancel
+                disabled={cancelling}
+                className="mt-0 rounded-xl text-[13px]"
+              >
+                Keep Order
+              </AlertDialogCancel>
+              <AlertDialogAction
+                disabled={cancelling}
+                onClick={async (e) => {
+                  e.preventDefault()
+                  const finalReason = cancelReason.trim() || selectedPreset || 'Cancelled by staff'
+                  await onCancel?.(finalReason)
+                  setConfirmCancelOpen(false)
+                }}
+                className="rounded-xl bg-destructive text-[13px] text-destructive-foreground hover:bg-destructive/90"
+              >
+                {cancelling ? <Loader2 className="size-4 animate-spin" /> : null}
+                Confirm Cancellation
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </DialogContent>
     </Dialog>
   )

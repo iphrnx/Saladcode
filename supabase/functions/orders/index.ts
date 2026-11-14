@@ -230,6 +230,7 @@ Deno.serve(async (req: Request) => {
         if (segments[0] && segments[1] === "items") return await addItem(req, segments[0]);
         if (segments[0] && segments[1] === "accept") return await acceptHeldOrder(req, segments[0]);
         if (segments[0] && segments[1] === "reject") return await rejectHeldOrder(req, segments[0]);
+        if (segments[0] && segments[1] === "cancel") return await cancelOrder(req, segments[0]);
         return await create(req);
       case "PATCH":
       case "PUT":
@@ -936,6 +937,80 @@ async function rejectHeldOrder(req: Request, id: string): Promise<Response> {
   return json(req, { ok: true, status: "CANCELLED", order });
 }
 
+/**
+ * POST /orders/:id/cancel — atomic production cancellation of one order.
+ *
+ * Scoped strictly to the order: marks order and its items CANCELLED, preserves
+ * history with actor/timestamp/reason, recalculates associated table check
+ * totals atomically, and publishes Realtime to staff and diners.
+ */
+async function cancelOrder(req: Request, id: string): Promise<Response> {
+  const g = await guard(req, { anyOf: ["orders.cancel", "orders.edit"] });
+  if (!g.ok) return g.response;
+
+  const b = (await body(req).catch(() => ({}))) as any;
+  const reason = b?.reason ? String(b.reason).slice(0, 500) : "Cancelled by staff";
+
+  const db = admin();
+  const actor = g.session.subjectId ?? null;
+
+  const { data: result, error: txError } = await db.rpc("cancel_order_tx", {
+    p_tenant: g.session.tenantId,
+    p_order_id: id,
+    p_actor: actor,
+    p_reason: reason,
+  });
+
+  if (txError) {
+    const msg = String(txError.message || "");
+    if (msg.includes("ORDER_NOT_FOUND")) {
+      return json(req, { error: "Order not found." }, 404);
+    }
+    if (msg.includes("ORDER_ALREADY_COMPLETED")) {
+      return json(req, { error: "This order has already been completed and cannot be cancelled." }, 409);
+    }
+    if (msg.includes("ORDER_ALREADY_PAID")) {
+      return json(req, { error: "This order is already paid. Please issue a refund before cancelling." }, 409);
+    }
+    if (msg.includes("CHECK_ALREADY_CLOSED")) {
+      return json(req, { error: "The table check for this order has already been finalized and closed." }, 409);
+    }
+    if (msg.includes("PAYMENT_EXCEEDS_REMAINING_TOTAL:")) {
+      const excess = msg.split("PAYMENT_EXCEEDS_REMAINING_TOTAL:")[1];
+      return json(
+        req,
+        {
+          error: `Cannot cancel this order: payments collected on this check exceed remaining items by ₹${excess}. Please issue a refund first.`,
+          code: "payment_exceeds_remaining",
+        },
+        409,
+      );
+    }
+    console.error("Cancel order error:", txError);
+    return json(req, { error: "Unable to cancel order. Please try again." }, 500);
+  }
+
+  const { data: fresh } = await db
+    .from("orders")
+    .select(ORDER_SELECT)
+    .eq("id", id)
+    .eq("tenant_id", g.session.tenantId)
+    .maybeSingle();
+
+  const order = fresh ? mapOrder(fresh) : null;
+
+  if (order) {
+    await publishOrderEvent({
+      type: "ORDER_UPDATED",
+      tenantId: g.session.tenantId,
+      order,
+      sessionToken: await sessionTokenFor(order),
+    });
+  }
+
+  return json(req, { ok: true, status: "CANCELLED", order, result });
+}
+
 async function update(req: Request, id: string | null): Promise<Response> {
   const g = await guard(req);
   if (!g.ok) return g.response;
@@ -1011,6 +1086,9 @@ async function update(req: Request, id: string | null): Promise<Response> {
     }
     if (!hasEffectivePermission(perms, ORDER_STATUS_KEYS[target])) {
       return refuse(ORDER_STATUS_KEYS[target]);
+    }
+    if (target === "CANCELLED") {
+      return await cancelOrder(req, id);
     }
     // ── Start Preparing on a held order accepts the table first ────────────
     // A held order is one nobody has accepted the table for. The kitchen
