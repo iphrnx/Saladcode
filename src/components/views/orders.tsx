@@ -905,7 +905,7 @@ export function OrdersView() {
         ) : sittingBoard ? (
           <div
             data-sitting-board
-            className="grid grid-cols-1 items-stretch gap-4 sm:grid-cols-2 lg:grid-cols-3 md:gap-5"
+            className="grid grid-cols-1 items-start gap-4 sm:grid-cols-2 lg:grid-cols-3 md:gap-5"
           >
             {filtered.map((sitting) => (
               <SittingCard
@@ -953,7 +953,7 @@ export function OrdersView() {
             ))}
           </div>
         ) : (
-          <div data-order-board className="grid grid-cols-1 gap-3 md:grid-cols-2 md:gap-4 xl:grid-cols-3">
+          <div data-order-board className="grid grid-cols-1 items-start gap-3 md:grid-cols-2 md:gap-4 xl:grid-cols-3">
             {visibleOrders.map((order) => (
               <OrderCard
                 key={order.id}
@@ -1948,7 +1948,7 @@ function SittingCard({
         data-order-card
         data-session-card={sitting.sessionId ?? undefined}
         className={cn(
-          'flex h-full flex-col overflow-hidden rounded-2xl border p-3 sm:p-3.5',
+          'flex min-h-[420px] w-full flex-col overflow-hidden rounded-2xl border p-3 sm:p-3.5',
           'border-border/80 bg-card shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md',
         )}
       >
@@ -2067,10 +2067,10 @@ function SittingCard({
         </div>
 
         {/* Footer Actions: View Bill + Session Details */}
-        <div className="mt-2.5 grid shrink-0 grid-cols-2 gap-2">
+        <div className="mt-auto pt-2.5 grid shrink-0 grid-cols-2 gap-2">
           <Button
             onClick={() => onBill(sitting, false)}
-            className="h-9 gap-1.5 whitespace-nowrap rounded-xl bg-primary px-2 text-xs font-semibold text-primary-foreground shadow-sm shadow-primary/25 hover:bg-primary/90"
+            className="h-10 gap-1.5 whitespace-nowrap rounded-xl bg-primary px-2 text-xs font-semibold text-primary-foreground shadow-sm shadow-primary/25 hover:bg-primary/90"
           >
             <ReceiptText className="size-3.5 shrink-0" />
             View Bill
@@ -2078,7 +2078,7 @@ function SittingCard({
           <Button
             variant="outline"
             onClick={() => onOpenOrders(sitting)}
-            className="h-9 gap-1.5 whitespace-nowrap rounded-xl border border-border bg-card px-2 text-xs font-semibold text-foreground hover:bg-secondary"
+            className="h-10 gap-1.5 whitespace-nowrap rounded-xl border border-border bg-card px-2 text-xs font-semibold text-foreground hover:bg-secondary"
           >
             <Info className="size-3.5 shrink-0 text-muted-foreground" />
             Session Details
@@ -2127,7 +2127,7 @@ function SittingCard({
     <Card
       data-order-card
       data-session-card={sitting.sessionId ?? undefined}
-      className="group relative flex h-full min-w-0 flex-col rounded-2xl border border-border/80 bg-card p-3 sm:p-3.5 shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md"
+      className="group relative flex min-h-[420px] w-full min-w-0 flex-col rounded-2xl border border-border/80 bg-card p-3 sm:p-3.5 shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md"
     >
       <div className="flex items-center gap-2.5 px-0.5 py-0.5">
         <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-secondary text-foreground dark:bg-secondary/80 border border-border/40">
@@ -2193,7 +2193,7 @@ function SittingCard({
         role="region"
         aria-label={`Orders for ${cardName}`}
         tabIndex={0}
-        className="mt-2.5 flex-1 min-h-[5.5rem] max-h-[min(56vh,30rem)] space-y-1.5 overflow-y-auto overscroll-contain px-0.5 py-0.5 scrollbar-thin"
+        className="mt-2.5 flex-1 space-y-1.5 px-0.5 py-0.5"
       >
         {sitting.orders.map((order) => (
           <OrderRow
