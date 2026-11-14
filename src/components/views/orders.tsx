@@ -1667,7 +1667,7 @@ function OrderCard({
     <Card
       data-order-card
       className={cn(
-        'flex flex-col overflow-hidden rounded-2xl border border-border bg-card p-0',
+        'flex min-h-[550px] w-full flex-col overflow-hidden rounded-2xl border border-border bg-card p-0',
         'shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition-[box-shadow,border-color] duration-300',
         isRecent && 'border-primary/40 shadow-[0_0_0_2px_rgba(249,115,22,0.18)]',
       )}
@@ -1948,7 +1948,7 @@ function SittingCard({
         data-order-card
         data-session-card={sitting.sessionId ?? undefined}
         className={cn(
-          'flex min-h-[420px] w-full flex-col overflow-hidden rounded-2xl border p-3 sm:p-3.5',
+          'flex min-h-[550px] w-full flex-col overflow-hidden rounded-2xl border p-3 sm:p-3.5',
           'border-border/80 bg-card shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md',
         )}
       >
@@ -2127,7 +2127,7 @@ function SittingCard({
     <Card
       data-order-card
       data-session-card={sitting.sessionId ?? undefined}
-      className="group relative flex min-h-[420px] w-full min-w-0 flex-col rounded-2xl border border-border/80 bg-card p-3 sm:p-3.5 shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md"
+      className="group relative flex min-h-[550px] w-full min-w-0 flex-col rounded-2xl border border-border/80 bg-card p-3 sm:p-3.5 shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md"
     >
       <div className="flex items-center gap-2.5 px-0.5 py-0.5">
         <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-secondary text-foreground dark:bg-secondary/80 border border-border/40">
