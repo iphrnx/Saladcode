@@ -159,3 +159,4 @@ console.log("\n── 6. Frontend UI Session Grouping & Labeling ──");
 
 console.log(`\nResults: ${pass} passed, ${fail} failed of ${pass + fail} checks.`);
 if (fail > 0) process.exit(1);
+

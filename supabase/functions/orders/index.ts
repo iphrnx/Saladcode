@@ -532,7 +532,8 @@ async function priceAndCommitOnce(
     if (msg.includes("PROMO_REJECTED") || msg.includes("ITEM_UNAVAILABLE")) {
       return { ok: false, error: msg, status: 409, retry: true };
     }
-    return { ok: false, error: txError.message || "Failed to place order", status: 500 };
+    console.error("Order transaction error:", txError);
+    return { ok: false, error: "Unable to place order. Please try again.", status: 500 };
   }
 
   const orderId = (tx as any)?.order_id as string | undefined;
@@ -1469,7 +1470,8 @@ async function addItem(req: Request, orderId: string): Promise<Response> {
     if (msg.includes("ITEM_UNAVAILABLE")) {
       return json(req, { error: "One or more items are no longer available." }, 400);
     }
-    return json(req, { error: txError.message || "Failed to add items" }, 500);
+    console.error("Add items error:", txError);
+    return json(req, { error: "Unable to add items. Please try again." }, 500);
   }
 
   // Load the full updated order

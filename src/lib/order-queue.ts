@@ -148,15 +148,40 @@ export async function submitEntry(
     }
     const err = await res.json().catch(() => ({}))
     if (res.status >= 500) {
-      return { outcome: 'uncertain', error: err?.error || `Server error (${res.status})` }
+      return { outcome: 'uncertain', error: cleanOrderErrorMessage(err?.error) }
     }
     // A real answer from the server: the cart is wrong, the session ended, or
     // the price changed. Retrying the same payload will not fix it — a human
     // needs to see this.
-    return { outcome: 'rejected', error: err?.error || `Rejected (${res.status})` }
+    return { outcome: 'rejected', error: cleanOrderErrorMessage(err?.error || `Rejected (${res.status})`) }
   } catch (e: any) {
     return { outcome: 'uncertain', error: e?.message || 'Network error' }
   }
+}
+
+export function cleanOrderErrorMessage(raw?: string): string {
+  if (!raw) return 'Order could not be sent. Please tap Retry.'
+  const lower = raw.toLowerCase()
+  if (
+    lower.includes('column') ||
+    lower.includes('relation') ||
+    lower.includes('constraint') ||
+    lower.includes('syntax') ||
+    lower.includes('pl/pgsql') ||
+    lower.includes('database') ||
+    lower.includes('p0001') ||
+    lower.includes('server error') ||
+    lower.includes('internal') ||
+    lower.includes('violates') ||
+    lower.includes('duplicate key') ||
+    lower.includes('foreign key') ||
+    lower.includes('null value in column') ||
+    lower.includes('function ') ||
+    lower.includes('sql')
+  ) {
+    return 'Unable to place order. Please tap Retry.'
+  }
+  return raw
 }
 
 /**

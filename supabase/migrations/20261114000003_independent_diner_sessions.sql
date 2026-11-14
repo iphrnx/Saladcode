@@ -262,18 +262,18 @@ begin
   end if;
 
   insert into public.order_items (
-    order_id, menu_item_id, item_name, variant_name, quantity,
-    unit_price, total_price, notes
+    order_id, menu_item_id, name, price, quantity, notes, status, portion_id, portion
   )
   select
     v_order_id,
     (value->>'menu_item_id')::uuid,
     value->>'name',
-    nullif(value->>'variant_name', ''),
-    (value->>'quantity')::integer,
     (value->>'price')::numeric,
-    (value->>'total')::numeric,
-    nullif(value->>'notes', '')
+    (value->>'quantity')::integer,
+    nullif(value->>'notes', ''),
+    'PENDING',
+    nullif(value->>'portion_id', ''),
+    nullif(value->>'portion', '')
   from jsonb_array_elements(p_items);
 
   return jsonb_build_object(
@@ -489,3 +489,4 @@ end $$;
 
 revoke execute on function public.settle_check_on_session_end(uuid, uuid, uuid, uuid) from public, anon, authenticated;
 grant execute on function public.settle_check_on_session_end(uuid, uuid, uuid, uuid) to service_role;
+

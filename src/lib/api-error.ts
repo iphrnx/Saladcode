@@ -172,6 +172,29 @@ function kindForStatus(status: number): ApiFailureKind {
   return 'unknown'
 }
 
+function sanitizeServerMessage(msg: string | undefined): string | undefined {
+  if (!msg) return undefined
+  const lower = msg.toLowerCase()
+  if (
+    lower.includes('column') ||
+    lower.includes('relation') ||
+    lower.includes('constraint') ||
+    lower.includes('syntax') ||
+    lower.includes('pl/pgsql') ||
+    lower.includes('database') ||
+    lower.includes('p0001') ||
+    lower.includes('foreign key') ||
+    lower.includes('violates') ||
+    lower.includes('sqlstate') ||
+    lower.includes('select ') ||
+    lower.includes('insert into') ||
+    lower.includes('update ')
+  ) {
+    return undefined
+  }
+  return msg
+}
+
 /**
  * The sentence for a failure.
  *
@@ -186,6 +209,7 @@ function messageFor(
   serverMessage: string | undefined,
   action: ApiAction,
 ): string {
+  const cleanServerMsg = sanitizeServerMessage(serverMessage)
   const needs = describeRequiredActions(required)
   const saving = action === 'save'
   switch (kind) {
@@ -200,7 +224,7 @@ function messageFor(
     case 'notfound':
       return `${subject} could not be found.`
     case 'conflict':
-      return serverMessage || `${subject} changed while you were working. Reload and try again.`
+      return cleanServerMsg || `${subject} changed while you were working. Reload and try again.`
     case 'ratelimit':
       return 'Too many requests just now. Please wait a moment and try again.'
     case 'server':
@@ -212,7 +236,7 @@ function messageFor(
     case 'timeout':
       return 'The server took too long to respond. Please try again.'
     default:
-      return serverMessage || (saving ? `Could not save ${subject}.` : `Could not load ${subject}.`)
+      return cleanServerMsg || (saving ? `Could not save ${subject}.` : `Could not load ${subject}.`)
   }
 }
 

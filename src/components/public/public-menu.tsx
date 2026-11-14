@@ -27,7 +27,7 @@ import {
 import { cn } from '@/lib/utils'
 import { createClient } from '@/lib/supabase/client'
 import { edgeFetch, edgeUrl } from '@/lib/edge'
-import { orderQueue, startOrderQueue, type QueueEntry } from '@/lib/order-queue'
+import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
 import { keyName, readStored, removeStored, writeStored } from '@/lib/storage-keys'
 import { DinerOrderTracker } from '@/components/public/diner-order-tracker'
 import {
@@ -1625,7 +1625,7 @@ export function PublicMenu() {
                   className="flex items-center gap-2 rounded-full bg-white shadow-lg px-4 py-2.5 text-xs"
                 >
                   <span className="flex-1 font-semibold text-destructive">
-                    {e.lastError || 'Order could not be sent'}
+                    {cleanOrderErrorMessage(e.lastError)}
                   </span>
                   <button
                     className="rounded-full px-2.5 py-1 font-semibold text-white"
@@ -1838,7 +1838,7 @@ export function PublicMenu() {
                                 className="flex items-center gap-2 rounded-lg border border-destructive/30 px-3 py-2 text-xs"
                               >
                                 <span className="flex-1 font-medium text-destructive">
-                                  {e.lastError || 'Order could not be sent'}
+                                  {cleanOrderErrorMessage(e.lastError)}
                                 </span>
                                 <button
                                   className="rounded-full px-2.5 py-1 font-semibold text-white"
