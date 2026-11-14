@@ -685,14 +685,20 @@ async function create(req: Request): Promise<Response> {
 
     if (b.tableId) {
       tableId = b.tableId;
-      const { data: activeSession } = await db
-        .from("table_sessions")
-        .select("id")
-        .eq("tenant_id", tenantId)
-        .eq("table_id", tableId)
-        .eq("status", "ACTIVE")
-        .maybeSingle();
-      if (activeSession) tableSessionId = activeSession.id;
+      if (b.tableSessionId) {
+        tableSessionId = String(b.tableSessionId);
+      } else {
+        const { data: activeSession } = await db
+          .from("table_sessions")
+          .select("id")
+          .eq("tenant_id", tenantId)
+          .eq("table_id", tableId)
+          .eq("status", "ACTIVE")
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (activeSession) tableSessionId = activeSession.id;
+      }
     }
 
     // Verify servedById if provided
@@ -1280,6 +1286,7 @@ async function update(req: Request, id: string | null): Promise<Response> {
         p_tenant: order.tenantId,
         p_table: order.tableId,
         p_actor: null,
+        p_session: order.tableSessionId ?? null,
       });
     } catch (e) {
       console.error("Failed to end table session on order completion:", e);

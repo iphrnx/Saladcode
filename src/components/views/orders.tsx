@@ -197,6 +197,8 @@ type Sitting = {
   allServed: boolean
   /** The sitting's bill is settled: nothing left to collect. */
   paidOff: boolean
+  /** Label for concurrent diner sessions on the same table (e.g. Diner 1, Diner 2). */
+  sessionLabel?: string | null
 }
 
 /**
@@ -285,7 +287,7 @@ export function OrdersView() {
     table: { name: string; seats: number; area: string } | null
     autoPrint: boolean
   } | null>(null)
-  const [endingTable, setEndingTable] = useState<string | null>(null)
+  const [endingSession, setEndingSession] = useState<string | null>(null)
   /**
    * The clock the durations read.
    *
@@ -377,10 +379,10 @@ export function OrdersView() {
       const isTakeawayOrDelivery = o.orderType === 'TAKEAWAY' || o.orderType === 'DELIVERY'
       const key = isTakeawayOrDelivery
         ? `order:${o.id}`
-        : o.checkId
-          ? `check:${o.checkId}`
-          : o.tableSessionId
-            ? `session:${o.tableSessionId}`
+        : o.tableSessionId
+          ? `session:${o.tableSessionId}`
+          : o.checkId
+            ? `check:${o.checkId}`
             : (o.orderType === 'DINE_IN' && o.tableId)
               ? `table:${o.tableId}`
               : `order:${o.id}`
@@ -491,6 +493,26 @@ export function OrdersView() {
         paidOff: check?.status === 'PAID',
       })
     }
+
+    // Label concurrent sessions on the same table (e.g. Diner 1, Diner 2)
+    const tableSittingCounts = new Map<string, number>()
+    for (const s of out) {
+      if (s.tableId) {
+        tableSittingCounts.set(s.tableId, (tableSittingCounts.get(s.tableId) ?? 0) + 1)
+      }
+    }
+
+    const tableSessionIndices = new Map<string, number>()
+    const multiSittingTables = out
+      .filter((s) => s.tableId && (tableSittingCounts.get(s.tableId) ?? 0) > 1)
+      .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
+
+    for (const s of multiSittingTables) {
+      const idx = (tableSessionIndices.get(s.tableId!) ?? 0) + 1
+      tableSessionIndices.set(s.tableId!, idx)
+      s.sessionLabel = s.latest.customerName ? `Diner: ${s.latest.customerName}` : `Diner ${idx}`
+    }
+
     return out
   }, [orders, checks, tableSessions])
 
@@ -806,9 +828,9 @@ export function OrdersView() {
    * ending by table alone would close the other party's sitting too.
    */
   const endSitting = async (sitting: Sitting, force = false) => {
-    if (!sitting.tableId || endingTable) return
-    const target = sitting.tableId
-    setEndingTable(target)
+    if (!sitting.tableId || endingSession) return
+    const targetKey = sitting.sessionId ?? sitting.tableId
+    setEndingSession(targetKey)
     try {
       const res = await edgeFetch('/api/table-session/end', {
         method: 'POST',
@@ -849,7 +871,7 @@ export function OrdersView() {
     } catch (e) {
       handleAction(e, 'the table session')
     } finally {
-      setEndingTable(null)
+      setEndingSession(null)
     }
   }
 
@@ -1004,7 +1026,7 @@ export function OrdersView() {
                 canEndSession={hasEffectivePermission(perms, 'table-sessions.manage')}
                 canAddItems={canAddItems}
                 onAddItems={(order) => setAddItemsOrder(order)}
-                ending={Boolean(sitting.tableId && endingTable === sitting.tableId)}
+                ending={Boolean(sitting.tableId && endingSession && (sitting.sessionId ? endingSession === sitting.sessionId : endingSession === sitting.tableId))}
                 onView={(order) => setViewOrder(order)}
                 onOpenOrder={(order) => openOrderDetail(order)}
                 onOpenOrders={(target) => {
@@ -2240,7 +2262,9 @@ function SittingCard({
     : billTotal === null || billPaid === null
       ? null
       : Math.max(0, billTotal - billPaid)
-  const cardName = sitting.tableName ?? `Order #${sitting.latest.orderNumber}`
+  const cardName = sitting.tableName
+    ? (sitting.sessionLabel ? `${sitting.tableName} · ${sitting.sessionLabel}` : sitting.tableName)
+    : `Order #${sitting.latest.orderNumber}`
   const sessionStats = [
     { icon: ClipboardCheck, label: `${validOrders.length} Order${validOrders.length === 1 ? '' : 's'}` },
     { icon: Layers, label: `${sitting.qtyCount} Item${sitting.qtyCount === 1 ? '' : 's'}` },

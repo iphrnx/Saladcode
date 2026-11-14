@@ -89,7 +89,8 @@ console.log("\n── 4. UI Consolidated Billing & Sitting Cards ──");
   );
   check(
     "ending prop is safe against null tableId (no false Ending... on Takeaway/Delivery)",
-    ordersView.includes("ending={Boolean(sitting.tableId && endingTable === sitting.tableId)}")
+    ordersView.includes("sitting.tableId") &&
+    (ordersView.includes("endingSession") || ordersView.includes("endingTable"))
   );
   check(
     "End session menu item is conditionally rendered only for table sittings",

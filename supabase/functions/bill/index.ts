@@ -87,6 +87,22 @@ async function checkForTenant(
     return await loadCheck(tenantId, named);
   }
 
+  // A session-scoped check takes precedence over table-level resolution
+  // so each diner session at the same table has its own independent bill
+  if (sessionId) {
+    const { data: sessionCheck } = await db
+      .from("table_checks")
+      .select("*")
+      .eq("tenant_id", tenantId)
+      .eq("session_id", sessionId)
+      .order("opened_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (sessionCheck) {
+      return await loadCheck(tenantId, sessionCheck);
+    }
+  }
+
   let table = tableId;
   if (!table && sessionId) {
     const { data: session } = await db
@@ -390,6 +406,7 @@ async function recordPayment(req: Request): Promise<Response> {
     g.session.tenantId,
     b.sessionId ? String(b.sessionId) : null,
     b.tableId ? String(b.tableId) : null,
+    b.checkId ? String(b.checkId) : null,
   );
   if (!data) return json(req, { error: "No open bill for that table." }, 404);
 
@@ -473,20 +490,38 @@ async function broadcastCheck(tenantId: string, checkId: string, reason: string)
 
   const { data: check } = await admin()
     .from("table_checks")
-    .select("table_id")
+    .select("table_id, session_id")
     .eq("id", checkId)
     .eq("tenant_id", tenantId)
     .maybeSingle();
   if (!check) return;
 
-  const { data: sessions } = await admin()
-    .from("table_sessions")
-    .select("token")
-    .eq("table_id", check.table_id)
-    .eq("tenant_id", tenantId)
-    .eq("status", "ACTIVE");
-  for (const s of sessions ?? []) {
-    publishToDiner(s.token, "CHECK_UPDATED", { checkId, reason });
+  if (check.session_id) {
+    const { data: s } = await admin()
+      .from("table_sessions")
+      .select("token")
+      .eq("id", check.session_id)
+      .maybeSingle();
+    if (s?.token) {
+      publishToDiner(s.token, "CHECK_UPDATED", { checkId, reason });
+      if (reason === "FINALISED") {
+        publishToDiner(s.token, "SESSION_ENDED", {
+          tableId: check.table_id,
+          sessionId: check.session_id,
+          status: "ENDED",
+        });
+      }
+    }
+  } else {
+    const { data: sessions } = await admin()
+      .from("table_sessions")
+      .select("token")
+      .eq("table_id", check.table_id)
+      .eq("tenant_id", tenantId)
+      .eq("status", "ACTIVE");
+    for (const s of sessions ?? []) {
+      publishToDiner(s.token, "CHECK_UPDATED", { checkId, reason });
+    }
   }
 }
 
@@ -543,6 +578,7 @@ async function finalize(req: Request): Promise<Response> {
     g.session.tenantId,
     b.sessionId ? String(b.sessionId) : null,
     b.tableId ? String(b.tableId) : null,
+    b.checkId ? String(b.checkId) : null,
   );
   if (!data) return json(req, { error: "No open bill for that table." }, 404);
 

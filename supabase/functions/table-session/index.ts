@@ -844,10 +844,11 @@ async function endSession(req: Request): Promise<Response> {
       p_tenant: tenantId,
       p_table: tableId,
       p_actor: g.session.kind === "owner" ? g.session.subjectId : null,
+      p_session: sessionId ?? null,
     });
     settlement = data;
     if ((data as any)?.action === "finalized") {
-      await publishToStaff(tenantId, "CHECK_UPDATED", { tableId, reason: "FINALISED" });
+      await publishToStaff(tenantId, "CHECK_UPDATED", { tableId, sessionId, reason: "FINALISED" });
     }
   }
 
