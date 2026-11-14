@@ -99,7 +99,7 @@ type MenuItem = {
   category?: { id: string; name: string; icon?: string | null } | null
 }
 
-type CartItem = {
+export type CartItem = {
   menuItemId: string
   name: string
   portionId?: string | null
@@ -111,7 +111,7 @@ type CartItem = {
   prepTime?: number
 }
 
-const sameCartLine = (
+export const sameCartLine = (
   c: CartItem,
   menuItemId: string,
   portion?: string | null,
@@ -162,7 +162,7 @@ const FACEBOOK_BG = 'bg-[#1877F2]'
 const YOUTUBE_BG = 'bg-[#FF0000]'
 
 // ---------- Helpers ----------
-function formatPrice(amount: number, symbol: string) {
+export function formatPrice(amount: number, symbol: string) {
   return `${symbol}${amount.toFixed(2)}`
 }
 
@@ -1907,7 +1907,7 @@ export function PublicMenu() {
 }
 
 // ---------- Sub-components ----------
-function CategoryPill({
+export function CategoryPill({
   active,
   onClick,
   icon,
@@ -1935,7 +1935,7 @@ function CategoryPill({
   )
 }
 
-function MenuItemCard({
+export function MenuItemCard({
   item,
   currency,
   inCartQty,
@@ -2139,7 +2139,7 @@ function MenuItemCard({
   )
 }
 
-function CartLine({
+export function CartLine({
   item,
   currency,
   onAdd,

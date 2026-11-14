@@ -90,6 +90,7 @@ export interface OrderItem {
   quantity: number
   notes: string | null
   status: string
+  kotNumber?: number
 }
 
 export interface Order {

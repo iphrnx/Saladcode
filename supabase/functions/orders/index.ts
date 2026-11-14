@@ -57,6 +57,7 @@ function mapOrderItem(row: any) {
     quantity: row.quantity,
     notes: row.notes,
     status: row.status,
+    kotNumber: row.kot_number ?? 1,
   };
 }
 
@@ -1089,7 +1090,29 @@ async function update(req: Request, id: string | null): Promise<Response> {
       }
     }
 
-    if (target !== current.status) {
+    if (b.kotNumber) {
+      await db
+        .from("order_items")
+        .update({ status: target })
+        .eq("order_id", id)
+        .eq("kot_number", Number(b.kotNumber));
+
+      const { data: allItems } = await db
+        .from("order_items")
+        .select("status")
+        .eq("order_id", id);
+
+      const statuses = (allItems ?? []).map((i) => i.status);
+      let aggregate = target;
+      if (statuses.includes("PENDING")) aggregate = "PENDING";
+      else if (statuses.includes("PREPARING")) aggregate = "PREPARING";
+      else if (statuses.includes("READY")) aggregate = "READY";
+      else if (statuses.length > 0 && statuses.every((s) => s === "SERVED")) aggregate = "SERVED";
+      else if (statuses.length > 0 && statuses.every((s) => s === "COMPLETED")) aggregate = "COMPLETED";
+
+      data.status = aggregate;
+      data.updated_at = new Date().toISOString();
+    } else if (target !== current.status) {
       if (!(NEXT[current.status] ?? []).includes(target)) {
         return json(
           req,
@@ -1101,6 +1124,10 @@ async function update(req: Request, id: string | null): Promise<Response> {
         );
       }
       data.status = target;
+      await db
+        .from("order_items")
+        .update({ status: target })
+        .eq("order_id", id);
       if (target === "CANCELLED") {
         // Auditable cancellation — recorded only when the transition is real:
         // the order row stays (status CANCELLED) and the actor is logged, so
@@ -1355,58 +1382,179 @@ async function recalcOrderTotals(orderId: string, tenantId: string) {
     .eq("tenant_id", tenantId);
 }
 
-// Add item to existing order
+// Add items to existing order (Takeaway and Delivery only for Step 1)
 async function addItem(req: Request, orderId: string): Promise<Response> {
   const g = await guard(req, { permission: "orders.edit" });
   if (!g.ok) return g.response;
   const tenantId = g.session.tenantId;
+
+  // RBAC enforcement: Accessible only to Owner, Manager, Cashier
+  const callerRole = g.session.kind === "owner" ? "Owner" : (g.session.role ?? "");
+  const allowedRoles = ["owner", "manager", "cashier"];
+  if (!allowedRoles.includes(callerRole.toLowerCase())) {
+    return json(req, { error: "Forbidden: Only Owner, Manager, and Cashier can add items to orders." }, 403);
+  }
+
   const b = await body(req) as any;
   const db = admin();
 
   // The order must belong to the caller's tenant.
-  const { data: orderRow } = await db
+  const { data: orderRow, error: orderErr } = await db
     .from("orders")
-    .select("id")
+    .select("id, status, payment_status, order_type, table_id, check_id, table_session_id")
     .eq("id", orderId)
     .eq("tenant_id", tenantId)
     .maybeSingle();
+
+  if (orderErr) return json(req, { error: orderErr.message }, 500);
   if (!orderRow) return json(req, { error: "Order not found" }, 404);
 
-  const { data: mi, error: miError } = await db
+  // Safety checks: Step 1 is Takeaway & Delivery only
+  if (orderRow.order_type !== "TAKEAWAY" && orderRow.order_type !== "DELIVERY") {
+    return json(req, { error: "Adding items in Step 1 is restricted to Takeaway and Delivery orders." }, 400);
+  }
+
+  // Safety checks: Never modify completed, cancelled, or paid orders
+  if (orderRow.status === "COMPLETED" || orderRow.status === "CANCELLED") {
+    return json(req, { error: `Cannot add items to ${orderRow.status.toLowerCase()} order.` }, 409);
+  }
+  if (orderRow.payment_status === "PAID") {
+    return json(req, { error: "Cannot add items to an order that is already paid." }, 409);
+  }
+
+  const idemKey = cleanIdempotencyKey(b.idempotencyKey);
+  if (idemKey) {
+    const { data: existingItems } = await db
+      .from("order_items")
+      .select("id")
+      .eq("order_id", orderId)
+      .eq("idempotency_key", idemKey)
+      .limit(1);
+
+    if (existingItems && existingItems.length > 0) {
+      // Idempotent retry: return current full order state
+      const { data: existingOrder } = await db
+        .from("orders")
+        .select(ORDER_SELECT)
+        .eq("id", orderId)
+        .eq("tenant_id", tenantId)
+        .single();
+      return json(req, mapOrder(existingOrder), 200);
+    }
+  }
+
+  const rawItems: any[] = Array.isArray(b.items) ? b.items : [b];
+  if (rawItems.length === 0 || !rawItems[0].menuItemId) {
+    return json(req, { error: "At least one valid menu item is required." }, 400);
+  }
+
+  const itemIds = [...new Set(rawItems.map((i) => i.menuItemId).filter(Boolean))];
+  const { data: menuItems, error: miError } = await db
     .from("menu_items")
-    .select("id, name, price, portions")
-    .eq("id", b.menuItemId)
-    .eq("tenant_id", tenantId) // tenant scoping — see header
-    .maybeSingle();
+    .select("id, name, price, portions, available")
+    .in("id", itemIds)
+    .eq("tenant_id", tenantId);
 
   if (miError) return json(req, { error: miError.message }, 500);
-  if (!mi) return json(req, { error: "Menu item not found" }, 404);
+  const miMap = new Map((menuItems ?? []).map((m) => [m.id, m]));
 
-  const unit = resolveOrderUnitPrice(mi, b.portion, b.portionId);
-  if (!unit.ok) return json(req, { error: unit.error }, 400);
+  const validatedLines: any[] = [];
+  for (const raw of rawItems) {
+    const mi = miMap.get(raw.menuItemId);
+    if (!mi) return json(req, { error: `Menu item not found: ${raw.menuItemId}` }, 404);
+    if (!mi.available) return json(req, { error: `Menu item "${mi.name}" is currently unavailable.` }, 400);
 
-  const { data: item, error: itemError } = await db
-    .from("order_items")
-    .insert({
-      order_id: orderId,
+    const unit = resolveOrderUnitPrice(mi, raw.portion, raw.portionId);
+    if (!unit.ok) return json(req, { error: unit.error }, 400);
+
+    const qty = Math.max(1, Math.floor(Number(raw.quantity) || 1));
+    validatedLines.push({
       menu_item_id: mi.id,
       name: mi.name,
       portion_id: unit.portionId,
       portion: unit.portion,
       price: unit.price,
-      quantity: Math.max(1, Number(b.quantity) || 1),
-      notes: b.notes || null,
-      status: "PENDING",
-    })
-    .select()
-    .single();
-
-  if (itemError || !item) {
-    return json(req, { error: itemError?.message || "Failed to add item" }, 500);
+      quantity: qty,
+      notes: (raw.notes ? String(raw.notes).trim() : null) || null,
+    });
   }
 
+  // Calculate separate KOT number: COALESCE(MAX(kot_number), 1) + 1
+  const { data: kotData } = await db
+    .from("order_items")
+    .select("kot_number")
+    .eq("order_id", orderId)
+    .order("kot_number", { ascending: false })
+    .limit(1);
+
+  const currentMaxKot = kotData && kotData.length > 0 ? (kotData[0].kot_number || 1) : 1;
+  const nextKot = currentMaxKot + 1;
+
+  const rowsToInsert = validatedLines.map((line) => ({
+    order_id: orderId,
+    ...line,
+    kot_number: nextKot,
+    idempotency_key: idemKey,
+    status: "PENDING",
+  }));
+
+  const { data: inserted, error: insertError } = await db
+    .from("order_items")
+    .insert(rowsToInsert)
+    .select();
+
+  if (insertError || !inserted) {
+    return json(req, { error: insertError?.message || "Failed to add items" }, 500);
+  }
+
+  // Atomically recalculate order totals
   await recalcOrderTotals(orderId, tenantId);
-  return json(req, mapOrderItem(item), 201);
+
+  // If order was READY or SERVED, newly added items are PENDING, so overall status resets to PENDING for the kitchen
+  if (orderRow.status === "READY" || orderRow.status === "SERVED") {
+    await db
+      .from("orders")
+      .update({ status: "PENDING", updated_at: new Date().toISOString() })
+      .eq("id", orderId)
+      .eq("tenant_id", tenantId);
+  } else {
+    await db
+      .from("orders")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("id", orderId)
+      .eq("tenant_id", tenantId);
+  }
+
+  const { data: fullOrder, error: fullError } = await db
+    .from("orders")
+    .select(ORDER_SELECT)
+    .eq("id", orderId)
+    .eq("tenant_id", tenantId)
+    .single();
+
+  if (fullError || !fullOrder) {
+    return json(req, { error: "Failed to reload updated order" }, 500);
+  }
+
+  const mapped = mapOrder(fullOrder);
+
+  // Broadcast Realtime events
+  await publishOrderEvent({
+    type: "ORDER_UPDATED",
+    tenantId,
+    order: mapped,
+    sessionToken: await sessionTokenFor(mapped),
+  });
+
+  await publishToStaff(tenantId, "KOT_ADDED", {
+    orderId,
+    orderNumber: mapped.orderNumber,
+    kotNumber: nextKot,
+    orderType: mapped.orderType,
+    itemsCount: inserted.length,
+  });
+
+  return json(req, mapped, 201);
 }
 
 // Update item quantity / remove

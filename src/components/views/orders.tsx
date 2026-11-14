@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
-import { useApp, type CheckSummary, type Order } from '@/components/app/data-context'
+import { useApp, type CheckSummary, type Order, type OrderItem } from '@/components/app/data-context'
 import { reconcileOrderExpansion, toggleOrderExpansion, type OrderExpansion } from './order-expansion'
 import { cn } from '@/lib/utils'
 import { useT } from '@/lib/i18n'
@@ -10,6 +10,7 @@ import { SessionPaymentDialog } from '@/components/shared/session-payment-dialog
 import { SessionOrdersDrawer } from '@/components/shared/session-orders-drawer'
 import { OrderDetailDrawer } from '@/components/shared/order-detail-drawer'
 import { BillDialog } from '@/components/shared/bill-dialog'
+import { AddItemsModal } from '@/components/shared/add-items-modal'
 import { edgeFetch } from '@/lib/edge'
 import { describeFailure, failIfNotOk } from '@/lib/api-error'
 import { useAccessDenied } from '@/lib/use-access-denied'
@@ -70,6 +71,7 @@ import {
   Coins,
   Printer,
   MoreHorizontal,
+  PlusCircle,
   Info,
   ClipboardCheck,
   ConciergeBell,
@@ -250,6 +252,7 @@ export function OrdersView() {
   const [search, setSearch] = useState('')
   const [payOrder, setPayOrder] = useState<Order | null>(null)
   const [viewOrder, setViewOrder] = useState<Order | null>(null)
+  const [addItemsOrder, setAddItemsOrder] = useState<Order | null>(null)
   // The bill action opens the TABLE's check, not the single order: a sitting
   // can be several orders and one payment, and the card is about the table.
   const [billTable, setBillTable] = useState<{ id: string; name: string; checkId: string | null } | null>(null)
@@ -302,6 +305,12 @@ export function OrdersView() {
   // honoured here exactly as the server honours it, so a pre-migration custom
   // role keeps every button it had.
   const perms = data?.permissions ?? []
+  const userRole = data?.currentStaff ? data.currentStaff.role : (data?.currentUser?.role ?? 'Owner')
+  const isOwnerManagerOrCashier = ['Owner', 'Manager', 'Cashier'].some(
+    (r) => r.toLowerCase() === userRole?.toLowerCase()
+  )
+  const canEditOrders = hasEffectivePermission(perms, 'orders.edit')
+  const canAddItems = isOwnerManagerOrCashier && canEditOrders
   const canPrepare = hasEffectivePermission(perms, 'orders.prepare')
   const canReady = hasEffectivePermission(perms, 'orders.ready')
   const canServe = hasEffectivePermission(perms, 'orders.serve')
@@ -557,23 +566,75 @@ export function OrdersView() {
    */
   const sittingBoard = canComplete || canCollectPay
 
-  /** Per-order filtering, for the per-order board. Same rules as before. */
-  const visibleOrders = useMemo(() => {
+  interface KotTicket {
+    key: string
+    order: Order
+    kotNumber?: number
+    items?: OrderItem[]
+    status?: string
+    total?: number
+    isMultiKot: boolean
+  }
+
+  /** Per-ticket filtering, for the kitchen/waiter pass board with KOT separation. */
+  const visibleTickets = useMemo(() => {
     const q = search.trim().toLowerCase()
-    return orders
-      .filter((o) => {
+    const tickets: KotTicket[] = []
+
+    for (const o of orders) {
+      if (typeFilter !== 'all' && o.orderType !== typeFilter) continue
+      if (q) {
+        const matchNum = String(o.orderNumber).includes(q)
+        const matchCust = (o.customerName || '').toLowerCase().includes(q)
+        const matchItem = o.items.some((i) => i.name.toLowerCase().includes(q))
+        if (!matchNum && !matchCust && !matchItem) continue
+      }
+
+      // Group items by kotNumber
+      const kotMap = new Map<number, OrderItem[]>()
+      for (const item of o.items) {
+        const kot = item.kotNumber ?? 1
+        const list = kotMap.get(kot) ?? []
+        list.push(item)
+        kotMap.set(kot, list)
+      }
+
+      if (kotMap.size <= 1) {
         const viewStatus = o.status === 'PENDING_ACTIVATION' ? 'PENDING' : o.status
-        if (statusFilter !== 'all' && viewStatus !== statusFilter) return false
-        if (typeFilter !== 'all' && o.orderType !== typeFilter) return false
-        if (q) {
-          const match =
-            String(o.orderNumber).includes(q) ||
-            (o.customerName || '').toLowerCase().includes(q)
-          if (!match) return false
+        if (statusFilter !== 'all' && viewStatus !== statusFilter) continue
+        tickets.push({
+          key: o.id,
+          order: o,
+          isMultiKot: false,
+        })
+      } else {
+        const sortedKots = Array.from(kotMap.keys()).sort((a, b) => a - b)
+        for (const kot of sortedKots) {
+          const items = kotMap.get(kot)!
+          let ticketStatus = o.status
+          if (items.some((i) => i.status === 'PENDING')) ticketStatus = 'PENDING'
+          else if (items.some((i) => i.status === 'PREPARING')) ticketStatus = 'PREPARING'
+          else if (items.some((i) => i.status === 'READY')) ticketStatus = 'READY'
+          else if (items.length > 0 && items.every((i) => i.status === 'SERVED')) ticketStatus = 'SERVED'
+
+          const viewStatus = ticketStatus === 'PENDING_ACTIVATION' ? 'PENDING' : ticketStatus
+          if (statusFilter !== 'all' && viewStatus !== statusFilter) continue
+
+          const kotTotal = items.reduce((s, it) => s + it.price * it.quantity, 0)
+          tickets.push({
+            key: `${o.id}-kot-${kot}`,
+            order: o,
+            kotNumber: kot,
+            items,
+            status: ticketStatus,
+            total: kotTotal,
+            isMultiKot: true,
+          })
         }
-        return true
-      })
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      }
+    }
+
+    return tickets.sort((a, b) => new Date(b.order.createdAt).getTime() - new Date(a.order.createdAt).getTime())
   }, [orders, statusFilter, typeFilter, search])
 
   // (scrollRef is the whole-view scroll container, declared above)
@@ -623,13 +684,14 @@ export function OrdersView() {
     }
   }
 
-  const updateStatus = async (order: Order, status: string, method?: string) => {
+  const updateStatus = async (order: Order, status: string, method?: string, kotNumber?: number) => {
     // One transition at a time per screen — a second tap while the first is in
     // flight would race the server's status machine.
+    const busyKey = order.id + (kotNumber ? `-kot-${kotNumber}` : '') + status
     if (busy) return
     if (busyRef.current) return
-    busyRef.current = order.id + status
-    setBusy(order.id + status)
+    busyRef.current = busyKey
+    setBusy(busyKey)
     // Optimistic: the card moves now and the button stops spinning as soon as
     // the server confirms — not after a whole-app reload, which is what the
     // old `await refresh()` made the cashier watch. The payment fields ride
@@ -637,7 +699,10 @@ export function OrdersView() {
     // where payment is recorded — the server never assumes it.
     const optimisticUpdatedOrder: Order = {
       ...order,
-      status,
+      status: kotNumber ? order.status : status,
+      items: order.items.map((it) =>
+        !kotNumber || it.kotNumber === kotNumber ? { ...it, status } : it
+      ),
       updatedAt: new Date().toISOString(),
       ...(method ? { paymentMethod: method, paymentStatus: 'PAID' } : {}),
     }
@@ -654,6 +719,7 @@ export function OrdersView() {
         },
         body: JSON.stringify({
           status,
+          ...(kotNumber ? { kotNumber } : {}),
           ...(method ? { paymentMethod: method, paymentStatus: 'PAID' } : {}),
         }),
       })
@@ -664,7 +730,11 @@ export function OrdersView() {
       if (detailOrderId === order.id) {
         setFallbackDetailOrder(confirmed)
       }
-      toast.success(`Order #${order.orderNumber} → ${capitalize(status.toLowerCase())}`)
+      toast.success(
+        kotNumber
+          ? `Order #${order.orderNumber} (KOT ${kotNumber}) → ${capitalize(status.toLowerCase())}`
+          : `Order #${order.orderNumber} → ${capitalize(status.toLowerCase())}`
+      )
 
       // When an order is completed, end the table session for that table
       if (status === 'COMPLETED' && order.tableId) {
@@ -896,7 +966,7 @@ export function OrdersView() {
           cards, two on a tablet, one on a phone; the breakpoints are the widths
           a card can hold its own contents at, not round numbers. */}
       <div data-orders-list className="px-3.5 md:px-6 pt-3 md:pt-4">
-        {(sittingBoard ? filtered.length : visibleOrders.length) === 0 ? (
+        {(sittingBoard ? filtered.length : visibleTickets.length) === 0 ? (
           <EmptyState
             icon={Inbox}
             title={t('orders.noOrders')}
@@ -922,6 +992,8 @@ export function OrdersView() {
                 canComplete={canComplete}
                 canCollectPay={canCollectPay}
                 canEndSession={hasEffectivePermission(perms, 'table-sessions.manage')}
+                canAddItems={canAddItems}
+                onAddItems={(order) => setAddItemsOrder(order)}
                 ending={endingTable === sitting.tableId}
                 onView={(order) => setViewOrder(order)}
                 onOpenOrder={(order) => openOrderDetail(order)}
@@ -954,22 +1026,26 @@ export function OrdersView() {
           </div>
         ) : (
           <div data-order-board className="grid grid-cols-1 items-start gap-3 md:grid-cols-2 md:gap-4 xl:grid-cols-3">
-            {visibleOrders.map((order) => (
+            {visibleTickets.map((ticket) => (
               <OrderCard
-                key={order.id}
-                order={order}
+                key={ticket.key}
+                order={ticket.order}
+                kotNumber={ticket.isMultiKot ? ticket.kotNumber : undefined}
+                itemsOverride={ticket.isMultiKot ? ticket.items : undefined}
+                statusOverride={ticket.isMultiKot ? ticket.status : undefined}
+                totalOverride={ticket.isMultiKot ? ticket.total : undefined}
                 currencySymbol={cs}
-                onView={() => setViewOrder(order)}
+                onView={() => setViewOrder(ticket.order)}
                 onViewBill={() =>
-                  order.tableId
+                  ticket.order.tableId
                     ? setBillTable({
-                        id: order.tableId,
-                        name: order.table?.name ?? 'Table',
-                        checkId: order.checkId ?? null,
+                        id: ticket.order.tableId,
+                        name: ticket.order.table?.name ?? 'Table',
+                        checkId: ticket.order.checkId ?? null,
                       })
                     : setBillDoc({
-                        checkId: order.checkId ?? null,
-                        orderId: order.id,
+                        checkId: ticket.order.checkId ?? null,
+                        orderId: ticket.order.id,
                         table: null,
                         autoPrint: false,
                       })
@@ -980,16 +1056,16 @@ export function OrdersView() {
                 canComplete={canComplete}
                 canCollectPay={canCollectPay}
                 canCancel={canCancel}
-                busy={busy === order.id + (actionForStatus(order.status)?.nextStatus || '')}
-                onUpdate={(next) => void updateStatus(order, next)}
+                busy={busy === ticket.order.id + (ticket.isMultiKot ? `-kot-${ticket.kotNumber}` : '') + (actionForStatus(ticket.status ?? ticket.order.status)?.nextStatus || '')}
+                onUpdate={(next) => void updateStatus(ticket.order, next, undefined, ticket.isMultiKot ? ticket.kotNumber : undefined)}
                 onPay={() => {
-                  setPayOrder(order)
+                  setPayOrder(ticket.order)
                   setPaymentMethod('CASH')
                 }}
                 canAccept={canAcceptHeld}
-                accepting={acceptingId === order.id}
-                onAccept={() => void decideHeld(order, 'accept')}
-                onReject={() => void decideHeld(order, 'reject')}
+                accepting={acceptingId === ticket.order.id}
+                onAccept={() => void decideHeld(ticket.order, 'accept')}
+                onReject={() => void decideHeld(ticket.order, 'reject')}
               />
             ))}
           </div>
@@ -1337,6 +1413,20 @@ export function OrdersView() {
         canCollect={canCollectPay}
       />
 
+      {/* Add Items Modal (Takeaway & Delivery only) */}
+      <AddItemsModal
+        open={Boolean(addItemsOrder)}
+        onOpenChange={(open) => !open && setAddItemsOrder(null)}
+        order={addItemsOrder}
+        currencySymbol={cs}
+        menuItems={data?.menuItems ?? []}
+        categories={data?.categories ?? []}
+        tenantId={tenant.id}
+        onSuccess={(updatedOrder) => {
+          addOrUpdateOrder(updatedOrder, false, { force: true })
+        }}
+      />
+
       <OrderDetailDrawer
         order={detailOrder}
         open={detailOrder !== null}
@@ -1600,6 +1690,10 @@ function cellEdge(index: number): string {
  */
 function OrderCard({
   order,
+  kotNumber,
+  itemsOverride,
+  statusOverride,
+  totalOverride,
   currencySymbol,
   onView,
   onViewBill,
@@ -1618,6 +1712,10 @@ function OrderCard({
   onReject,
 }: {
   order: Order
+  kotNumber?: number
+  itemsOverride?: OrderItem[]
+  statusOverride?: string
+  totalOverride?: number
   currencySymbol: string
   onView: () => void
   onViewBill: () => void
@@ -1636,7 +1734,10 @@ function OrderCard({
   onReject: () => void
 }) {
   const t = useT()
-  const action = actionForStatus(order.status)
+  const displayStatus = statusOverride ?? order.status
+  const displayItems = itemsOverride ?? order.items
+  const displayTotal = totalOverride ?? order.total
+  const action = actionForStatus(displayStatus)
   const next = action?.nextStatus
   const keyPerms: Record<string, boolean> = {
     'orders.prepare': canPrepare,
@@ -1650,8 +1751,8 @@ function OrderCard({
       : next
         ? (keyPerms[ORDER_STATUS_KEYS[next]] ?? false)
         : false
-  const canCancelOrder = canCancel && !['COMPLETED', 'CANCELLED'].includes(order.status)
-  const billReady = order.status === 'COMPLETED'
+  const canCancelOrder = canCancel && !['COMPLETED', 'CANCELLED'].includes(displayStatus)
+  const billReady = displayStatus === 'COMPLETED'
 
   const where =
     order.orderType === 'DINE_IN'
@@ -1660,8 +1761,8 @@ function OrderCard({
         ? 'Takeaway'
         : 'Delivery'
   const who = order.customerName || order.customerPhone || null
-  const accent = ORDER_STATUS[order.status as keyof typeof ORDER_STATUS]?.color ?? '#94a3b8'
-  const isRecent = order.status === 'PENDING' && Date.now() - new Date(order.createdAt).getTime() < 60000
+  const accent = ORDER_STATUS[displayStatus as keyof typeof ORDER_STATUS]?.color ?? '#94a3b8'
+  const isRecent = displayStatus === 'PENDING' && Date.now() - new Date(order.createdAt).getTime() < 60000
 
   return (
     <Card
@@ -1676,7 +1777,14 @@ function OrderCard({
       <div className="flex items-start justify-between gap-2 p-3.5 pb-2.5">
         <div className="flex min-w-0 items-center gap-2">
           <span aria-hidden className="h-6 w-[3px] shrink-0 rounded-full" style={{ backgroundColor: accent }} />
-          <span className="truncate text-[15px] font-bold tracking-tight">#{order.orderNumber}</span>
+          <span className="truncate text-[15px] font-bold tracking-tight">
+            #{order.orderNumber}
+            {kotNumber && (
+              <span className="ml-1 rounded-md bg-secondary px-1.5 py-0.5 text-xs font-semibold text-muted-foreground">
+                KOT {kotNumber}
+              </span>
+            )}
+          </span>
           {isRecent && (
             <span className="shrink-0 rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-bold text-primary-foreground">
               NEW
@@ -1684,7 +1792,7 @@ function OrderCard({
           )}
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
-          <StatusBadge status={order.status} />
+          <StatusBadge status={displayStatus} />
           <OrderTypeBadge type={order.orderType} />
         </div>
       </div>
@@ -1707,7 +1815,7 @@ function OrderCard({
       {/* Every line, always. A cook reads the whole ticket; a waiter carries the
           whole tray. Nothing here is collapsed, capped or scrolled. */}
       <div className="space-y-1.5 px-3.5 py-3">
-        {order.items.map((it) => (
+        {displayItems.map((it) => (
           <div key={it.id} className="flex items-baseline justify-between gap-3 text-[13px]">
             <span className="min-w-0">
               <span className="font-semibold text-muted-foreground">{it.quantity}× </span>
@@ -1729,7 +1837,7 @@ function OrderCard({
             </span>
           </div>
         ))}
-        {order.items.length === 0 && <p className="text-xs text-muted-foreground">No items</p>}
+        {displayItems.length === 0 && <p className="text-xs text-muted-foreground">No items</p>}
         {order.notes && (
           <p className="pt-0.5 text-[11.5px] italic text-muted-foreground">“{order.notes}”</p>
         )}
@@ -1746,7 +1854,7 @@ function OrderCard({
             </span>
             <span className="text-[17px] font-bold tabular-nums">
               {currencySymbol}
-              {order.total.toFixed(2)}
+              {displayTotal.toFixed(2)}
             </span>
           </div>
           <PaymentPill status={order.paymentStatus} method={order.paymentMethod} />
@@ -1889,6 +1997,7 @@ function SittingCard({
   canComplete,
   canCollectPay,
   canEndSession,
+  canAddItems,
   ending,
   onView,
   onOpenOrders,
@@ -1897,6 +2006,7 @@ function SittingCard({
   onBill,
   onEndSession,
   onPay,
+  onAddItems,
 }: {
   sitting: Sitting
   check?: CheckSummary
@@ -1907,6 +2017,7 @@ function SittingCard({
   canComplete: boolean
   canCollectPay: boolean
   canEndSession: boolean
+  canAddItems?: boolean
   ending: boolean
   onView: (order: Order) => void
   onOpenOrders: (sitting: Sitting) => void
@@ -1915,8 +2026,11 @@ function SittingCard({
   onBill: (sitting: Sitting, autoPrint: boolean) => void
   onEndSession: (sitting: Sitting) => void
   onPay: (order: Order) => void
+  onAddItems?: (order: Order) => void
 }) {
   const active = sitting.state === 'Active'
+  const isTakeawayOrDelivery = sitting.orderType === 'TAKEAWAY' || sitting.orderType === 'DELIVERY'
+  const canAddToThisOrder = isTakeawayOrDelivery && active && sitting.latest.status !== 'COMPLETED' && sitting.latest.status !== 'CANCELLED' && sitting.latest.paymentStatus !== 'PAID'
   const started = sessionWhen(sitting.startedAt)
   const hasPayPerm = canComplete && canCollectPay
   const onlyPendingActivation = sitting.orders.every((order) => order.status === 'PENDING_ACTIVATION')
@@ -2160,6 +2274,14 @@ function SittingCard({
             <DropdownMenuItem onClick={() => onView(sitting.latest)}>
               <Eye className="mr-2 size-4" /> Open latest order
             </DropdownMenuItem>
+            {canAddItems && isTakeawayOrDelivery && (
+              <DropdownMenuItem
+                disabled={!canAddToThisOrder}
+                onClick={() => onAddItems?.(sitting.latest)}
+              >
+                <PlusCircle className="mr-2 size-4" /> Add Items
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem onClick={() => onBill(sitting, false)} disabled={awaiting} aria-label={`View bill for ${cardName}`}>
               <FileText className="mr-2 size-4" /> Bill
             </DropdownMenuItem>
@@ -2407,8 +2529,8 @@ function OrderRow({ order, currencySymbol, dishImages, expanded, onToggle, onOpe
                     <DishThumb src={dishImages[item.menuItemId]} />
                     <div className="min-w-0 [overflow-wrap:anywhere]">
                       <p className="leading-tight font-bold">{item.name}</p>
-                      {(item.portion || item.notes) && (
-                        <p className="mt-0.5 text-[11px] leading-tight text-muted-foreground">{[item.portion, item.notes].filter(Boolean).join(' · ')}</p>
+                      {(item.portion || item.notes || (item.kotNumber && item.kotNumber > 1)) && (
+                        <p className="mt-0.5 text-[11px] leading-tight text-muted-foreground">{[item.portion, item.kotNumber && item.kotNumber > 1 ? `KOT ${item.kotNumber}` : null, item.notes].filter(Boolean).join(' · ')}</p>
                       )}
                     </div>
                     <span className="font-semibold tabular-nums">×{item.quantity}</span>
