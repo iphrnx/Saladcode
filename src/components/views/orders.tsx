@@ -41,6 +41,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { StatusBadge, OrderTypeBadge } from '@/components/shared/badges'
+import { formatOrderRelativeTime, msUntilMidnight, safeTimeZone } from '@/lib/order-time'
 import {
   Search,
   Clock,
@@ -124,24 +125,17 @@ const PAYMENT_METHODS = [
  * it. Anything older than yesterday gets its date; today and yesterday are
  * named, which is what the person scanning the list is actually asking.
  */
-function orderWhen(iso: string, opts: { weekday?: boolean } = {}): string {
-  const d = new Date(iso)
-  const startOfToday = new Date()
-  startOfToday.setHours(0, 0, 0, 0)
-  const startOfYesterday = new Date(startOfToday)
-  startOfYesterday.setDate(startOfYesterday.getDate() - 1)
-
-  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  if (d >= startOfToday) return `Today · ${time}`
-  if (d >= startOfYesterday) return `Yesterday · ${time}`
-
-  const date = d.toLocaleDateString(
-    [],
-    opts.weekday
-      ? { weekday: 'short', day: 'numeric', month: 'short' }
-      : { day: 'numeric', month: 'short' },
-  )
-  return `${date} · ${time}`
+/**
+ * Authoritative relative date and time label for orders:
+ * - Today: "Today, 02:23 PM"
+ * - Yesterday: "Yesterday, 02:23 PM"
+ * - Older: "13 Nov 2026, 02:23 PM"
+ */
+function orderWhen(
+  iso: string,
+  opts: { weekday?: boolean; timeZone?: string; now?: number } = {},
+): string {
+  return formatOrderRelativeTime(iso, opts.timeZone, opts.now)
 }
 
 /** One sitting — every order a table wrote before it got up. */
@@ -289,16 +283,32 @@ export function OrdersView() {
   } | null>(null)
   const [endingSession, setEndingSession] = useState<string | null>(null)
   /**
-   * The clock the durations read.
+   * The clock the durations and relative date labels read.
    *
-   * One timer for the whole board, once a minute — not one per card, and not a
-   * re-fetch: the sitting's start never changes, only the distance to now.
+   * One timer for the whole board, every 30s plus an exact midnight trigger
+   * in the restaurant's declared timezone — no re-fetch needed: relative dates
+   * (Today -> Yesterday -> DD MMM YYYY) update automatically at midnight without reloading.
    */
+  const restaurantTimeZone = safeTimeZone(data?.settings?.timezone)
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 30_000)
-    return () => clearInterval(timer)
-  }, [])
+
+    let midnightTimeout: ReturnType<typeof setTimeout> | null = null
+    const scheduleMidnight = () => {
+      const ms = msUntilMidnight(restaurantTimeZone, Date.now())
+      midnightTimeout = setTimeout(() => {
+        setNow(Date.now())
+        scheduleMidnight()
+      }, ms)
+    }
+    scheduleMidnight()
+
+    return () => {
+      clearInterval(timer)
+      if (midnightTimeout) clearTimeout(midnightTimeout)
+    }
+  }, [restaurantTimeZone])
 
   // Order actions are granular now — each status transition has its own key,
   // plus payments and cancellation. The server enforces the same rule
@@ -1052,6 +1062,7 @@ export function OrdersView() {
                   checkServing.get(sitting.checkId)?.orderCount === checks[sitting.checkId]?.orderCount
                 )}
                 dishImages={dishImages}
+                timeZone={restaurantTimeZone}
                 now={now}
                 canComplete={canComplete}
                 canCollectPay={canCollectPay}
@@ -1540,6 +1551,7 @@ export function OrdersView() {
           orders={ordersSitting.orders}
           currencySymbol={cs}
           dishImages={dishImages}
+          timeZone={restaurantTimeZone}
           bill={{
             subtotal: ordersSitting.subtotal,
             tax: ordersSitting.tax,
@@ -2063,6 +2075,7 @@ function SittingCard({
   checkCanSettle,
   currencySymbol,
   dishImages,
+  timeZone = 'Asia/Kolkata',
   now,
   canComplete,
   canCollectPay,
@@ -2083,6 +2096,7 @@ function SittingCard({
   checkCanSettle: boolean
   currencySymbol: string
   dishImages: Record<string, string>
+  timeZone?: string
   now: number
   canComplete: boolean
   canCollectPay: boolean
@@ -2398,6 +2412,8 @@ function SittingCard({
             order={order}
             currencySymbol={currencySymbol}
             dishImages={dishImages}
+            timeZone={timeZone}
+            now={now}
             expanded={currentExpansion.openId === order.id}
             onToggle={() => setExpansion(toggleOrderExpansion(currentExpansion, order.id))}
             onOpen={() => onOpenOrder(order)}
@@ -2495,10 +2511,21 @@ function DishThumb({ src }: { src?: string }) {
   )
 }
 
-function OrderRow({ order, currencySymbol, dishImages, expanded, onToggle, onOpen }: {
+function OrderRow({
+  order,
+  currencySymbol,
+  dishImages,
+  timeZone = 'Asia/Kolkata',
+  now = Date.now(),
+  expanded,
+  onToggle,
+  onOpen,
+}: {
   order: Order
   currencySymbol: string
   dishImages: Record<string, string>
+  timeZone?: string
+  now?: number
   expanded: boolean
   onToggle: () => void
   onOpen: () => void
@@ -2543,8 +2570,10 @@ function OrderRow({ order, currencySymbol, dishImages, expanded, onToggle, onOpe
             )}
           />
           <span className="shrink-0 text-sm leading-none font-extrabold tabular-nums min-[360px]:text-base">#{order.orderNumber}</span>
-          <time dateTime={order.createdAt} title={orderWhen(order.createdAt)} className="flex shrink-0 items-center gap-1 border-l border-border pl-1.5 text-[10px] text-muted-foreground min-[360px]:text-[11px]">
-            <Clock aria-hidden className="hidden size-3 min-[360px]:block" /> {timeOf(order.createdAt)}
+          <span aria-hidden className="shrink-0 text-muted-foreground/60 text-[11px] select-none">·</span>
+          <time dateTime={order.createdAt} title={orderWhen(order.createdAt, { timeZone, now })} className="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground min-[360px]:text-[11px] whitespace-nowrap">
+            <Clock aria-hidden className="hidden size-3 min-[360px]:block shrink-0" />
+            <span>{formatOrderRelativeTime(order.createdAt, timeZone, now)}</span>
           </time>
           <span className={cn(
             'ml-auto flex min-w-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] leading-tight font-bold min-[360px]:px-2 min-[360px]:text-[11px]',

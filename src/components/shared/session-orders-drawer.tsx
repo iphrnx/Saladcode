@@ -28,6 +28,7 @@ import type { Order } from '@/components/app/data-context'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
+import { formatOrderRelativeTime } from '@/lib/order-time'
 
 type Tab = 'orders' | 'bill' | 'activity'
 
@@ -50,6 +51,7 @@ export function SessionOrdersDrawer({
   orders,
   currencySymbol = '₹',
   dishImages,
+  timeZone = 'Asia/Kolkata',
   bill,
   activity,
   focusOrderId = null,
@@ -73,6 +75,7 @@ export function SessionOrdersDrawer({
   orders: Order[]
   currencySymbol?: string
   dishImages: Record<string, string>
+  timeZone?: string
   bill: {
     subtotal: number
     tax: number
@@ -423,7 +426,7 @@ export function SessionOrdersDrawer({
                               #{order.orderNumber}
                             </span>
                             <span className="truncate text-[12.5px] font-medium text-muted-foreground tabular-nums">
-                              {formatTime(order.createdAt)}
+                              {formatOrderRelativeTime(order.createdAt, timeZone)}
                             </span>
                           </div>
 
