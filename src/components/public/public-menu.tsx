@@ -1044,6 +1044,10 @@ export function PublicMenu() {
       } catch {}
     }
 
+    // Refresh diner order tracker immediately
+    setOrdersRefreshKey((k) => k + 1)
+    setCartOpen(true)
+
     // Broadcast immediately across browser tabs/windows
     try {
       if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
@@ -1599,63 +1603,6 @@ export function PublicMenu() {
           </footer>
         </main>
 
-        {/* ===== Floating queue status ===== */}
-        {/* The cart sheet is the full queue UI, but it can only be opened
-            with items in the in-memory cart. After a reload mid-checkout the
-            cart is empty and the pending entry would be invisible — so the
-            status also lives here, pinned to the viewport. */}
-        {!cartOpen && (() => {
-          const busy = queueEntries.some((e) => e.state === 'pending' || e.state === 'submitting')
-          const failed = queueEntries.filter((e) => e.state === 'failed')
-          if (!busy && failed.length === 0) return null
-          return (
-            <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 w-[min(92vw,26rem)] space-y-1.5">
-              {busy && (
-                <div className="flex items-center gap-2 rounded-full text-white shadow-lg px-4 py-2.5 text-xs font-medium"
-                  style={{ background: INK }}>
-                  <Loader2 className="size-3.5 animate-spin" />
-                  {offline
-                    ? 'No connection — your order is saved and will be sent automatically'
-                    : 'Sending your order…'}
-                </div>
-              )}
-              {failed.map((e) => (
-                <div
-                  key={e.key}
-                  className="flex items-center gap-2 rounded-full bg-white shadow-lg px-4 py-2.5 text-xs"
-                >
-                  <span className="flex-1 font-semibold text-destructive">
-                    {cleanOrderErrorMessage(e.lastError)}
-                  </span>
-                  <button
-                    className="rounded-full px-2.5 py-1 font-semibold text-white"
-                    style={{ background: CORAL }}
-                    onClick={() =>
-                      orderQueue(sessionTenantId ?? '', sessionToken ?? '', {}).retry(e.key)
-                    }
-                  >
-                    Retry
-                  </button>
-                  <button
-                    className="rounded-full px-2.5 py-1 font-semibold text-muted-foreground border border-border"
-                    onClick={() =>
-                      orderQueue(sessionTenantId ?? '', sessionToken ?? '', {})
-                        .dismiss(e.key)
-                        .then((r) => {
-                          if (r === 'confirmed') toast.success('Order actually went through')
-                          else if (r === 'uncertain')
-                            toast.error('Still no answer — kept the order pending')
-                        })
-                    }
-                  >
-                    Dismiss
-                  </button>
-                </div>
-              ))}
-            </div>
-          )
-        })()}
-
         {/* ===== Floating cart button ===== */}
         {cart.length > 0 && !cartOpen && (
           <button
@@ -1818,73 +1765,62 @@ export function PublicMenu() {
                     )}
                   </div>
                   {(() => {
-                    const busy = queueEntries.some((e) => e.state === 'pending' || e.state === 'submitting')
-                    const failed = queueEntries.filter((e) => e.state === 'failed')
+                    const activeEntry = queueEntries.find((e) => e.state === 'pending' || e.state === 'submitting')
+                    const busy = Boolean(activeEntry)
+                    const isRetrying = Boolean(activeEntry && activeEntry.attempts > 0)
+                    const failedEntry = queueEntries.find((e) => e.state === 'failed')
+
                     return (
-                      <>
-                        {(busy || failed.length > 0) && (
-                          <div className="space-y-1.5 mb-2">
-                            {busy && (
-                              <div className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
-                                <Loader2 className="size-3.5 animate-spin" />
-                                {offline
-                                  ? 'No connection — your order is saved and will be sent automatically'
-                                  : 'Sending your order…'}
-                              </div>
-                            )}
-                            {failed.map((e) => (
-                              <div
-                                key={e.key}
-                                className="flex items-center gap-2 rounded-lg border border-destructive/30 px-3 py-2 text-xs"
-                              >
-                                <span className="flex-1 font-medium text-destructive">
-                                  {cleanOrderErrorMessage(e.lastError)}
-                                </span>
-                                <button
-                                  className="rounded-full px-2.5 py-1 font-semibold text-white"
-                                  style={{ background: CORAL }}
-                                  onClick={() =>
-                                    orderQueue(sessionTenantId ?? '', sessionToken ?? '', {}).retry(e.key)
-                                  }
-                                >
-                                  Retry
-                                </button>
-                                <button
-                                  className="rounded-full border border-border px-2.5 py-1 text-muted-foreground"
-                                  onClick={() => {
-                                    void orderQueue(sessionTenantId ?? '', sessionToken ?? '', {})
-                                      .dismiss(e.key)
-                                      .then((r) => {
-                                        if (r === 'confirmed') toast.success('Order actually went through')
-                                        else if (r === 'uncertain')
-                                          toast.error('Still no answer — kept the order pending')
-                                      })
-                                  }}
-                                >
-                                  Dismiss
-                                </button>
-                              </div>
-                            ))}
-                          </div>
+                      <div className="space-y-2">
+                        {isRetrying && (
+                          <p className="text-center text-xs text-amber-600 dark:text-amber-400 py-1 font-medium">
+                            Order pending, retrying automatically…
+                          </p>
                         )}
-                        <Button
-                          onClick={placeOrder}
-                          disabled={busy || cart.length === 0}
-                          className="w-full h-12 text-white text-base font-semibold rounded-2xl"
-                          style={{ background: CORAL }}
-                        >
-                          {busy ? (
-                            <>
-                              <Loader2 className="size-4 animate-spin" />
-                              Placing order…
-                            </>
-                          ) : (
-                            <>
-                              Place Order · {formatPrice(grandTotal, currency)}
-                            </>
-                          )}
-                        </Button>
-                      </>
+                        {failedEntry ? (
+                          <div className="rounded-2xl border border-destructive/20 bg-destructive/5 p-3.5 text-xs space-y-2.5">
+                            <p className="font-semibold text-destructive">
+                              {cleanOrderErrorMessage(failedEntry.lastError)}
+                            </p>
+                            <div className="flex items-center gap-2">
+                              <Button
+                                onClick={() =>
+                                  orderQueue(sessionTenantId ?? '', sessionToken ?? '', {}).retry(failedEntry.key)
+                                }
+                                className="h-10 flex-1 rounded-xl text-white font-semibold shadow-sm"
+                                style={{ background: CORAL }}
+                              >
+                                Retry Now
+                              </Button>
+                              <Button
+                                variant="outline"
+                                onClick={() => {
+                                  void orderQueue(sessionTenantId ?? '', sessionToken ?? '', {}).dismiss(failedEntry.key)
+                                }}
+                                className="h-10 px-3.5 rounded-xl text-muted-foreground border-border hover:bg-muted"
+                              >
+                                Dismiss
+                              </Button>
+                            </div>
+                          </div>
+                        ) : (
+                          <Button
+                            onClick={placeOrder}
+                            disabled={busy || cart.length === 0}
+                            className="w-full h-12 text-white text-base font-semibold rounded-2xl shadow-sm transition active:scale-[0.99]"
+                            style={{ background: CORAL }}
+                          >
+                            {busy ? (
+                              <>
+                                <Loader2 className="size-4 animate-spin" />
+                                Placing order…
+                              </>
+                            ) : (
+                              <>Place Order · {formatPrice(grandTotal, currency)}</>
+                            )}
+                          </Button>
+                        )}
+                      </div>
                     )
                   })()}
                 </div>

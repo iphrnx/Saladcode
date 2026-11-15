@@ -269,7 +269,11 @@ async function getByKey(req: Request, key: string): Promise<Response> {
     return json(req, mapOrder(data));
   }
 
-  const token = new URL(req.url).searchParams.get("tableSessionToken") ?? "";
+  const token =
+    new URL(req.url).searchParams.get("tableSessionToken") ||
+    new URL(req.url).searchParams.get("sessionToken") ||
+    req.headers.get("x-session-token") ||
+    "";
   const session = await validateDinerSession(token);
   if (!session.ok) return json(req, { error: session.error }, session.status);
   const { data, error } = await db

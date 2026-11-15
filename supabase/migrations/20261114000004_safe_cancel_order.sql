@@ -160,3 +160,4 @@ $$;
 
 revoke execute on function public.cancel_order_tx(uuid, uuid, uuid, text) from public, anon, authenticated;
 grant execute on function public.cancel_order_tx(uuid, uuid, uuid, text) to service_role;
+
