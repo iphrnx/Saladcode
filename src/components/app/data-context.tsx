@@ -735,6 +735,9 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
             addOrUpdateOrder(event.data.order, event.data.type === 'ORDER_CREATED')
           } else if (event.data.type === 'ORDER_DELETED' && event.data.order?.id) {
             removeOrder(event.data.order.id)
+          } else if (event.data.type === 'CHECK_UPDATED' || event.data.type === 'SESSION_ENDED' || event.data.type === 'CHECK_SETTLED') {
+            setSessionRevision((n) => n + 1)
+            void runDeltaSync()
           }
         }
       }
@@ -844,6 +847,12 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       .on('broadcast', { event: 'SESSION_ENDED' }, () => {
         if (isCancelled) return
         setSessionRevision((n) => n + 1)
+        void runDeltaSync()
+      })
+      .on('broadcast', { event: 'CHECK_UPDATED' }, () => {
+        if (isCancelled) return
+        setSessionRevision((n) => n + 1)
+        void runDeltaSync()
       })
       // A table asking to be accepted, and a table that just was. Both change
       // the floor board, and neither is an orders-table write — so the

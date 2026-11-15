@@ -32,6 +32,10 @@ Deno.serve(async (req: Request) => {
     // The consolidated check lives beside the single-order bill. Same function
     // because they are the same subject — money owed for food — and splitting
     // them would mean two places that must agree about tax and totalling.
+    if (segments[0] === "settle-cash") {
+      if (req.method !== "POST") return json(req, { error: "Method not allowed" }, 405);
+      return await settleCash(req);
+    }
     if (segments[0] === "check") {
       if (req.method !== "GET") return json(req, { error: "Method not allowed" }, 405);
       return await getCheck(req);
@@ -444,8 +448,14 @@ async function recordPayment(req: Request): Promise<Response> {
         409,
       );
     }
-    if (message.includes("CHECK_PAID")) return json(req, { error: "This bill is already settled." }, 409);
+    if (message.includes("CHECK_PAID")) {
+      return json(req, { ok: true, already: true, deduplicated: true, message: "This bill is already settled." }, 200);
+    }
     return json(req, { error: message || "Could not record the payment." }, 500);
+  }
+
+  if ((result as any)?.already) {
+    return json(req, { ok: true, already: true, deduplicated: true, ...(result as any) }, 200);
   }
 
   await auditMoney(req, g.session, "CHECK_PAYMENT", g.session.tenantId, `${amount} ${method} on check ${data.check.id}`);
@@ -618,6 +628,86 @@ async function finalize(req: Request): Promise<Response> {
   );
   await broadcastCheck(g.session.tenantId, data.check.id, "FINALISED");
   return json(req, result);
+}
+
+/**
+ * Atomic Cash settlement for a check:
+ * 1. Takes cash for remaining due (if any)
+ * 2. Settles the check
+ * 3. Allocates sequential invoice
+ * 4. Completes all paid check orders
+ * 5. Ends ONLY that session
+ * 6. Broadcasts CHECK_UPDATED and SESSION_ENDED in Realtime
+ * 7. Idempotently returns existing invoice if already settled
+ */
+async function settleCash(req: Request): Promise<Response> {
+  const g = await guard(req, { anyOf: ["payments.collect", "orders.complete"] });
+  if (!g.ok) return g.response;
+
+  const b = await req.json().catch(() => ({} as any));
+  const data = await checkForTenant(
+    g.session.tenantId,
+    b.sessionId ? String(b.sessionId) : null,
+    b.tableId ? String(b.tableId) : null,
+    b.checkId ? String(b.checkId) : null,
+  );
+  if (!data) return json(req, { error: "No open bill for that table." }, 404);
+
+  const { data: result, error } = await admin().rpc("settle_check_cash_tx", {
+    p_tenant: g.session.tenantId,
+    p_check: data.check.id,
+    p_actor: g.session.kind === "owner" ? g.session.subjectId : null,
+    p_idempotency_key: b.idempotencyKey ? String(b.idempotencyKey) : null,
+    p_note: b.note ? String(b.note).slice(0, 200) : null,
+  });
+
+  if (error) {
+    const message = String(error.message ?? "");
+    if (message.includes("ORDERS_OPEN:")) {
+      return json(
+        req,
+        { error: "Something is still being prepared on this table.", code: "orders_open" },
+        409,
+      );
+    }
+    if (message.includes("NOTHING_TO_BILL")) return json(req, { error: "There is nothing to bill." }, 409);
+    return json(req, { error: message || "Could not settle the bill." }, 500);
+  }
+
+  const tid = g.session.tenantId;
+  const chkId = data.check.id;
+  const tblId = data.check.table_id;
+  const sessId = data.check.session_id ?? (result as any)?.endedSessionId ?? null;
+  const invNum = (result as any)?.invoiceNumber ?? "";
+
+  await auditMoney(
+    req,
+    g.session,
+    "CHECK_SETTLED_CASH",
+    tid,
+    `check ${chkId} settled in cash, invoice ${invNum}`,
+  );
+
+  // Broadcast to Staff (Owner, Manager, Cashier dashboards)
+  await publishToStaff(tid, "CHECK_UPDATED", {
+    tableId: tblId,
+    checkId: chkId,
+    sessionId: sessId,
+    reason: "FINALISED",
+    invoiceNumber: invNum,
+  });
+  if (sessId) {
+    await publishToStaff(tid, "SESSION_UPDATED", {
+      tableId: tblId,
+      sessionId: sessId,
+      status: "ENDED",
+    });
+  }
+
+  // Broadcast to Diner
+  await broadcastCheck(tid, chkId, "FINALISED");
+
+  return json(req, result, 200);
 }
 
 async function get(req: Request, orderId: string | null): Promise<Response> {

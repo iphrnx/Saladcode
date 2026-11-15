@@ -48,6 +48,7 @@ type Totals = {
 export function SessionPaymentDialog({
   tableId,
   checkId,
+  sessionId,
   tableName,
   tableHint,
   currencySymbol = '₹',
@@ -60,6 +61,7 @@ export function SessionPaymentDialog({
 }: {
   tableId: string | null
   checkId: string | null
+  sessionId?: string | null
   tableName: string | null
   /** "Main Hall · 4 Seats · Dine In" — the sitting's own description. */
   tableHint?: string
@@ -102,14 +104,15 @@ export function SessionPaymentDialog({
   const keyRef = useRef<string>('')
 
   const load = useCallback(async () => {
-    if (!tableId && !checkId) return
+    if (!tableId && !checkId && !sessionId) return
     setLoading(true)
     try {
-      const res = await edgeFetch(
-        checkId
-          ? `/api/bill/check?checkId=${encodeURIComponent(checkId)}`
-          : `/api/bill/check?tableId=${encodeURIComponent(tableId!)}`,
-      )
+      const q = new URLSearchParams()
+      if (checkId) q.set('checkId', checkId)
+      else if (sessionId) q.set('sessionId', sessionId)
+      else if (tableId) q.set('tableId', tableId)
+
+      const res = await edgeFetch(`/api/bill/check?${q.toString()}`)
       if (!res.ok) return
       const body = await res.json()
       const live = (body?.orders ?? []).filter((o: any) => o.status !== 'CANCELLED')
@@ -149,15 +152,27 @@ export function SessionPaymentDialog({
         total: Number(body?.totals?.total ?? 0),
         outstanding: Number(body?.totals?.outstanding ?? 0),
       })
-      setInvoiceNumber(body?.invoiceNumber ?? null)
+      const invNum = body?.invoiceNumber ?? body?.check?.invoice_number ?? null
+      setInvoiceNumber(invNum)
       setBillOpenedAt(body?.openedAt ? new Date(body.openedAt) : null)
       setBillClosedAt(body?.closedAt ? new Date(body.closedAt) : null)
+
+      // If check is already settled (status === 'PAID'), transition directly to 'done'
+      if (
+        body?.status === 'PAID' ||
+        body?.check?.status === 'PAID' ||
+        (invNum && Number(body?.totals?.outstanding ?? 0) === 0 && Number(body?.totals?.total ?? 0) > 0)
+      ) {
+        setPaidAt(body?.closedAt ? new Date(body.closedAt) : new Date())
+        setStage('done')
+        onPaid?.()
+      }
     } catch {
       /* the button below reports anything that matters */
     } finally {
       setLoading(false)
     }
-  }, [tableId, checkId, tableHint])
+  }, [tableId, checkId, sessionId, tableHint, onPaid])
 
   useEffect(() => {
     if (!open) {
@@ -173,57 +188,123 @@ export function SessionPaymentDialog({
   /**
    * Take the money and close the bill.
    *
-   * Two calls, in this order: record the payment for what is owed, then settle.
-   * If either refuses, the dialog goes to the failed face with the server's own
-   * words — never a generic "something went wrong".
+   * For Cash: Atomic single-flight PostgreSQL transaction via /api/bill/settle-cash.
+   * For already-settled checks (Due = ₹0): Returns existing settlement and invoice idempotently.
    */
   const pay = async () => {
     if (!totals || busy) return
     setBusy(true)
     setError(null)
     try {
-      /*
-       * Only what is actually owed. Falling back to the total when the balance
-       * was zero charged a table twice — the sheet said success and the ledger
-       * held a second payment. Nothing outstanding means nothing to collect.
-       */
-      const amount = totals.outstanding
-      if (!(amount > 0)) {
-        setError('This bill has already been settled.')
-        setFailedAt(new Date())
-        setStage('failed')
+      // 1. If check is already settled (Due = 0 and has total > 0 or invoice):
+      // Idempotently return the existing settlement and invoice without throwing an error
+      if (totals.outstanding <= 0 && (invoiceNumber || totals.total > 0)) {
+        const settleRes = await edgeFetch('/api/bill/settle-cash', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            tableId,
+            checkId,
+            sessionId,
+            idempotencyKey: keyRef.current,
+          }),
+        })
+        if (settleRes.ok) {
+          const settled = await settleRes.json().catch(() => null)
+          setInvoiceNumber(
+            settled?.invoiceNumber ?? settled?.check?.invoiceNumber ?? invoiceNumber ?? null,
+          )
+          const settledAt = settled?.closedAt ? new Date(settled.closedAt) : new Date()
+          setPaidAt(settledAt)
+          setBillClosedAt(settledAt)
+          setStage('done')
+          onPaid?.()
+          try {
+            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+              const bc = new BroadcastChannel('the_salad_orders_sync')
+              bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, reason: 'FINALISED' })
+              bc.close()
+            }
+          } catch {}
+          void load()
+          return
+        }
+      }
+
+      // 2. Production Cash payment: execute atomic single-transaction settlement
+      if (method === 'CASH') {
+        const cashRes = await edgeFetch('/api/bill/settle-cash', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            tableId,
+            checkId,
+            sessionId,
+            idempotencyKey: keyRef.current,
+          }),
+        })
+
+        if (!cashRes.ok) {
+          const body = await cashRes.json().catch(() => null)
+          const raw = String(body?.error ?? '')
+          setError(raw || 'The cash payment could not be recorded.')
+          setFailedAt(new Date())
+          setStage('failed')
+          return
+        }
+
+        const settled = await cashRes.json().catch(() => null)
+        const invNum = settled?.invoiceNumber ?? settled?.check?.invoiceNumber ?? null
+        setInvoiceNumber(invNum)
+        const settledAt = settled?.closedAt ? new Date(settled.closedAt) : new Date()
+        setPaidAt(settledAt)
+        setBillClosedAt(settledAt)
+        setStage('done')
+        onPaid?.()
+        try {
+          if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+            const bc = new BroadcastChannel('the_salad_orders_sync')
+            bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, reason: 'FINALISED' })
+            bc.close()
+          }
+        } catch {}
+        void load()
         return
       }
-      const payRes = await edgeFetch('/api/bill/payment', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          tableId,
-          checkId,
-          amount,
-          method,
-          idempotencyKey: keyRef.current,
-        }),
-      })
-      if (!payRes.ok) {
-        const body = await payRes.json().catch(() => null)
-        // The server's overpayment sentence is written for a human at a till;
-        // anything that reads like "already settled" is said plainly instead.
-        const raw = String(body?.error ?? '')
-        setError(
-          /still due on this table|already settled/i.test(raw)
-            ? 'This bill was settled a moment ago. Nothing more is owed on it.'
-            : raw || 'The payment could not be recorded.',
-        )
-        setFailedAt(new Date())
-        setStage('failed')
-        return
+
+      // 3. Multi-tender fallback for UPI / Card
+      const amount = totals.outstanding
+      if (amount > 0) {
+        const payRes = await edgeFetch('/api/bill/payment', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            tableId,
+            checkId,
+            sessionId,
+            amount,
+            method,
+            idempotencyKey: keyRef.current,
+          }),
+        })
+        if (!payRes.ok) {
+          const body = await payRes.json().catch(() => null)
+          const raw = String(body?.error ?? '')
+          setError(
+            /still due on this table|already settled/i.test(raw)
+              ? 'This bill was settled a moment ago. Nothing more is owed on it.'
+              : raw || 'The payment could not be recorded.',
+          )
+          setFailedAt(new Date())
+          setStage('failed')
+          return
+        }
       }
 
       const settleRes = await edgeFetch('/api/bill/finalize', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ tableId, checkId }),
+        body: JSON.stringify({ tableId, checkId, sessionId }),
       })
       if (!settleRes.ok) {
         const body = await settleRes.json().catch(() => null)
@@ -237,16 +318,18 @@ export function SessionPaymentDialog({
       setInvoiceNumber(
         settled?.invoiceNumber ?? settled?.check?.invoiceNumber ?? settled?.invoice?.number ?? null,
       )
-      const settledAt = new Date()
+      const settledAt = settled?.closedAt ? new Date(settled.closedAt) : new Date()
       setPaidAt(settledAt)
-      // The moment of settlement, stated by the server a breath later, is what
-      // the closing screen shows. This is only the fallback until it arrives.
       setBillClosedAt(settledAt)
       setStage('done')
       onPaid?.()
-      // Re-read the check so the closing screen quotes the invoice number, the
-      // closed_at and the totals the server actually stored — not what this
-      // sheet asked for a moment ago.
+      try {
+        if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+          const bc = new BroadcastChannel('the_salad_orders_sync')
+          bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, reason: 'FINALISED' })
+          bc.close()
+        }
+      } catch {}
       void load()
     } catch (e) {
       setError(describeFailure(e, 'the payment').message)
@@ -554,11 +637,26 @@ export function SessionPaymentDialog({
               </div>
 
               <h2 className="mt-1.5 text-center text-[25px] font-extrabold leading-tight tracking-tight text-foreground sm:text-[27px]">
-                Session Ended
+                Payment Successful
               </h2>
               <p className="mt-1 text-center text-[13px] leading-snug text-muted-foreground sm:text-[13.5px]">
                 {tableName ?? 'This sitting'} has been closed and settled.
               </p>
+
+              {/* Invoice & Status Banner */}
+              {invoiceNumber && (
+                <div className="mt-3.5 flex items-center justify-between rounded-2xl border border-emerald-300/80 bg-emerald-50/80 px-4 py-2.5 dark:border-emerald-800 dark:bg-emerald-950/40">
+                  <div className="flex items-center gap-2">
+                    <ReceiptText className="size-4.5 text-emerald-700 dark:text-emerald-400" />
+                    <span className="text-xs font-bold text-emerald-800 dark:text-emerald-300 uppercase tracking-wider">
+                      Invoice Number
+                    </span>
+                  </div>
+                  <span className="font-mono text-sm font-extrabold text-emerald-900 dark:text-emerald-200">
+                    {invoiceNumber}
+                  </span>
+                </div>
+              )}
 
               {/* Which table it was, and that it is paid. */}
               <div className="mt-4 flex items-center gap-3 rounded-2xl border border-border/60 bg-card px-3.5 py-3 shadow-[0_1px_3px_rgba(15,23,42,0.04)]">

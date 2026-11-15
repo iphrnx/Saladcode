@@ -1626,6 +1626,7 @@ export function OrdersView() {
       <SessionPaymentDialog
         tableId={paySitting?.tableId ?? null}
         checkId={paySitting?.checkId ?? null}
+        sessionId={paySitting?.sessionId ?? null}
         tableName={paySitting?.tableName ?? null}
         tableHint={
           paySitting
