@@ -2389,7 +2389,7 @@ function SittingCard({
         role="region"
         aria-label={`Orders for ${cardName}`}
         tabIndex={0}
-        className="mt-2.5 flex-1 space-y-1.5 px-0.5 py-0.5"
+        className="mt-2.5 flex-1 space-y-1.5 px-0.5 py-0.5 max-h-[min(56vh,30rem)] overflow-y-auto"
       >
         {sitting.orders.map((order) => (
           <OrderRow

@@ -172,16 +172,16 @@ async function runTests() {
 
     q.enqueue('diner', { tableSessionToken: 'token-test', items: [] }, 1)
 
-    // Run process cycles advancing clock each time
-    for (let i = 0; i < 7; i++) {
-      fakeNow += 20_000
+    // Run process cycles advancing clock each time past backoff
+    for (let i = 0; i < 15; i++) {
+      fakeNow += 40_000
       await q.process()
     }
 
     const entries = q.load()
     assert.strictEqual(entries.length, 1)
     assert.strictEqual(entries[0].state, 'failed', 'Order must transition to "failed" after bounded attempts')
-    assert.strictEqual(entries[0].attempts >= 5, true, 'Retries must be bounded (<= 5)')
+    assert.strictEqual(entries[0].attempts >= 12, true, 'Retries must be bounded (<= 12)')
     console.log(`  ✔ Bounded after ${entries[0].attempts} attempts; transitioned cleanly to "failed"`)
   }
 
@@ -208,12 +208,21 @@ async function runTests() {
     })
 
     let reconciledKey: string | null = null
-    const reconcilingFetcher = (async (url: string) => {
+    const reconcilingFetcher = (async (url: string, init?: any) => {
       if (url.includes('/api/orders/by-key/')) {
         reconciledKey = url.split('/by-key/')[1].split('?')[0]
         return {
           ok: true,
           status: 200,
+          json: async () => ({ id: 'order-recovered', orderNumber: 101, total: 200 }),
+        } as any
+      }
+      if (url === '/api/orders') {
+        const body = JSON.parse(init.body)
+        reconciledKey = body.idempotencyKey
+        return {
+          ok: true,
+          status: 201,
           json: async () => ({ id: 'order-recovered', orderNumber: 101, total: 200 }),
         } as any
       }

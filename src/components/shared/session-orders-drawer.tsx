@@ -267,7 +267,7 @@ export function SessionOrdersDrawer({
           </div>
 
           {/* Context Card */}
-          <div className="flex items-center justify-between gap-3 rounded-2xl border border-primary/20 bg-primary/[0.04] p-3.5">
+          <div className="flex items-center justify-between gap-3 rounded-2xl border border-orange-200/80 bg-[#FFF9F5] p-3.5 dark:border-primary/20 dark:bg-primary/[0.04]">
             <div className="flex min-w-0 items-center gap-3">
               <div className="flex size-11 shrink-0 items-center justify-center rounded-xl border border-primary/25 bg-primary/10 text-primary">
                 {isTakeaway ? (
@@ -341,11 +341,11 @@ export function SessionOrdersDrawer({
               className={cn(
                 'flex items-center justify-center gap-2 rounded-xl py-2 px-2.5 text-[13px] font-bold transition-all cursor-pointer',
                 tab === 'orders'
-                  ? 'bg-primary text-primary-foreground shadow-sm'
+                  ? 'bg-[#EA580C] text-white shadow-sm'
                   : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
               )}
             >
-              <Layers className={cn('size-4 shrink-0', tab === 'orders' ? 'text-primary-foreground' : 'text-muted-foreground')} />
+              <Layers className={cn('size-4 shrink-0', tab === 'orders' ? 'text-white' : 'text-muted-foreground')} />
               <span className="truncate">Orders ({orders.length})</span>
             </button>
             <button
@@ -355,11 +355,11 @@ export function SessionOrdersDrawer({
               className={cn(
                 'flex items-center justify-center gap-2 rounded-xl py-2 px-2.5 text-[13px] font-bold transition-all cursor-pointer',
                 tab === 'bill'
-                  ? 'bg-primary text-primary-foreground shadow-sm'
+                  ? 'bg-[#EA580C] text-white shadow-sm'
                   : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
               )}
             >
-              <FileText className={cn('size-4 shrink-0', tab === 'bill' ? 'text-primary-foreground' : 'text-muted-foreground')} />
+              <FileText className={cn('size-4 shrink-0', tab === 'bill' ? 'text-white' : 'text-muted-foreground')} />
               <span className="truncate">Bill Summary</span>
             </button>
             <button
@@ -369,7 +369,7 @@ export function SessionOrdersDrawer({
               className={cn(
                 'flex items-center justify-center gap-2 rounded-xl py-2 px-2.5 text-[13px] font-bold transition-all cursor-pointer',
                 tab === 'activity'
-                  ? 'bg-primary text-primary-foreground shadow-sm'
+                  ? 'bg-[#EA580C] text-white shadow-sm'
                   : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
               )}
             >

@@ -73,8 +73,8 @@ export interface StorageLike {
 }
 
 const BACKOFF_BASE_MS = 1_000
-const BACKOFF_CAP_MS = 15_000
-const MAX_ATTEMPTS = 5
+const BACKOFF_CAP_MS = 30_000
+const MAX_ATTEMPTS = 12
 const CLAIM_STALE_MS = 15_000
 
 /** Backoff with ±25% jitter — retries must not arrive in lockstep. */
@@ -227,7 +227,7 @@ export class OrderQueue {
       // should be normalized to 'pending' so callers/UI don't see an abandoned claim
       return parsed.map((e: QueueEntry) => {
         if (e.state === 'submitting') {
-          if (!this.processing && (!e.claimAt || now - e.claimAt > CLAIM_STALE_MS)) {
+          if (!this.processing && (e.claimAt == null || now - e.claimAt > CLAIM_STALE_MS)) {
             return { ...e, state: 'pending', claimId: null, claimAt: null }
           }
         }
@@ -271,14 +271,14 @@ export class OrderQueue {
     return entry
   }
 
-  /** Human retry of a failed entry: reset the clock, keep the key, and reconcile first. */
+  /** Human retry of a failed entry: reset the clock, keep the key. */
   retry(key: string) {
     const entries = this.load().map((e) =>
       e.key === key
         ? {
             ...e,
             state: 'pending' as const,
-            attempts: Math.max(1, e.attempts),
+            attempts: 0,
             nextAttemptAt: this.now(),
             lastError: undefined,
             claimId: null,
@@ -319,13 +319,12 @@ export class OrderQueue {
         this.save(this.load().filter((e) => e.key !== key))
         return 'removed'
       }
-      // If server returned 5xx, drop from local queue since user explicitly dismissed it
-      this.save(this.load().filter((e) => e.key !== key))
-      return 'removed'
+      // 5xx means the server is unstable — we still cannot be sure the order committed.
+      return 'uncertain'
     } catch {
-      // Offline / network failure: respect the user's explicit request to dismiss
-      this.save(this.load().filter((e) => e.key !== key))
-      return 'removed'
+      // Offline / network failure: we cannot verify whether the server committed the order.
+      // Keep it pending and report uncertain.
+      return 'uncertain'
     }
   }
 
@@ -350,9 +349,9 @@ export class OrderQueue {
         const entries = this.load()
         const due = entries.find(
           (e) =>
-            (e.state === 'pending' || (e.state === 'submitting' && (!e.claimAt || now - e.claimAt > CLAIM_STALE_MS))) &&
+            (e.state === 'pending' || (e.state === 'submitting' && (e.claimAt == null || now - e.claimAt > CLAIM_STALE_MS))) &&
             e.nextAttemptAt <= now &&
-            (!e.claimId || !e.claimAt || now - e.claimAt > CLAIM_STALE_MS),
+            (!e.claimId || e.claimAt == null || now - e.claimAt > CLAIM_STALE_MS),
         )
         if (!due) return
 
@@ -373,7 +372,8 @@ export class OrderQueue {
             e.key === due.key &&
             e.claimId &&
             e.claimId !== claimId &&
-            now - (e.claimAt || 0) <= CLAIM_STALE_MS,
+            e.claimAt != null &&
+            now - e.claimAt <= CLAIM_STALE_MS,
         )
         if (stolen) continue
 

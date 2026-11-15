@@ -28,7 +28,8 @@ check(
 );
 check(
   "OrderCard onViewBill falls back to setBillDoc when tableId is null",
-  src.includes("orderId: order.id,\n                        table: null,"),
+  src.includes("orderId: ticket.order.id,\n                        table: null,") ||
+    src.includes("orderId: order.id,\n                        table: null,"),
 );
 
 // 2. Inline Accept / Reject for PENDING_ACTIVATION
