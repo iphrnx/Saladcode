@@ -149,7 +149,7 @@ async function validateTableSession(params: {
   // The one rule that can end a session without the restaurant asking.
   //
   // A diner who scans the QR, never orders, and whose page has been gone for
-  // thirty minutes is releasing the table back to the floor. The definition
+  // fifteen minutes is releasing the table back to the floor. The definition
   // lives in the database (`session_is_abandoned`), and the sweep uses the same
   // one, so the board and this route cannot disagree about it.
   //
@@ -160,7 +160,7 @@ async function validateTableSession(params: {
   // This has to be asked before the heartbeat below is written: refreshing
   // `last_seen_at` first would make every session look busy, including the one
   // being tested.
-  if (now - lastSeen > 30 * 60_000) {
+  if (now - lastSeen > 15 * 60_000) {
     const { data: abandoned } = await admin().rpc("session_is_abandoned", { p_session_id: row.id });
     if (abandoned === true) {
       await admin()
@@ -637,23 +637,46 @@ async function active(req: Request): Promise<Response> {
     };
   });
 
-  // The running bill for each table, so the floor card can show what is owed
-  // rather than only how many orders there are.
+  // The running bill for each table and individual session, so cards show
+  // what is owed accurately, including multiple independent diner sessions at one table.
   const tableIds = [...new Set(sessions.map((s) => s.tableId))];
-  const checkByTable: Record<string, { total: number; paid: number; outstanding: number; status: string }> = {};
+  const sessionIds = sessions.map((s) => s.id);
+  const checkBySession: Record<string, { id: string; total: number; paid: number; outstanding: number; status: string }> = {};
+  const checkByTable: Record<string, { id: string; total: number; paid: number; outstanding: number; status: string }> = {};
+
   if (tableIds.length) {
-    const { data: checks } = await admin()
+    let checkQuery = admin()
       .from("table_checks")
-      .select("table_id, status, total, paid_total, opened_at")
-      .eq("tenant_id", tenantId)
-      .in("table_id", tableIds)
-      .order("opened_at", { ascending: false });
+      .select("id, table_id, session_id, anchor_session_id, status, total, paid_total, opened_at")
+      .eq("tenant_id", tenantId);
+
+    if (sessionIds.length) {
+      checkQuery = checkQuery.or(`table_id.in.(${tableIds.join(",")}),session_id.in.(${sessionIds.join(",")})`);
+    } else {
+      checkQuery = checkQuery.in("table_id", tableIds);
+    }
+
+    const { data: checks } = await checkQuery.order("opened_at", { ascending: false });
+
     for (const c of checks ?? []) {
-      if (checkByTable[c.table_id]) continue; // newest wins
       const total = Number(c.total ?? 0);
       const paid = Number(c.paid_total ?? 0);
-      checkByTable[c.table_id] = { total, paid, outstanding: Math.max(0, total - paid), status: c.status };
+      const entry = { id: c.id, total, paid, outstanding: Math.max(0, total - paid), status: c.status };
+      if (c.session_id && !checkBySession[c.session_id]) {
+        checkBySession[c.session_id] = entry;
+      }
+      if (c.anchor_session_id && !checkBySession[c.anchor_session_id]) {
+        checkBySession[c.anchor_session_id] = entry;
+      }
+      if (!checkByTable[c.table_id]) {
+        checkByTable[c.table_id] = entry;
+      }
     }
+  }
+
+  // Attach session-level checks to each session row
+  for (const s of sessions) {
+    (s as any).check = (s.id && checkBySession[s.id]) || checkByTable[s.tableId] || null;
   }
 
   const byTable: Record<string, { id: string; tableId: string; table: any; sessions: any[] }> = {};
@@ -677,7 +700,7 @@ async function active(req: Request): Promise<Response> {
   // ledger, which are the truth while the sitting is live.
   const { data: owing } = await admin()
     .from("table_checks")
-    .select("id, table_id, status, opened_at, unsettled_at, table:tables(name, area)")
+    .select("id, table_id, session_id, status, opened_at, unsettled_at, table:tables(name, area)")
     .eq("tenant_id", tenantId)
     .in("status", ["OPEN", "UNSETTLED"])
     .order("opened_at", { ascending: false })
@@ -719,6 +742,7 @@ async function active(req: Request): Promise<Response> {
       return {
         checkId: c.id,
         tableId: c.table_id,
+        sessionId: c.session_id ?? null,
         tableName: t?.name ?? "Table",
         area: t?.area ?? "",
         status: c.status,

@@ -452,6 +452,124 @@ export function DashboardView() {
     )
   }, [sessions, pendingBills, tables])
 
+  /**
+   * Compact, fixed-size active session cards.
+   *
+   * Displays all active floor sittings dynamically with table number,
+   * sitting/session identifier (when multi-diner independent sessions exist),
+   * total due, paid amount, and status via realtime without duplicates.
+   */
+  const activeSessionCards = useMemo(() => {
+    interface SessionCardItem {
+      id: string
+      tableId: string
+      tableName: string
+      area?: string
+      sessionNumber?: number | null
+      total: number
+      paid: number
+      outstanding: number
+      statusTone: 'amber' | 'emerald' | 'rose' | 'slate'
+      statusLabel: string
+    }
+
+    const cards: SessionCardItem[] = []
+    const seenCheckIds = new Set<string>()
+    const seenSessionIds = new Set<string>()
+
+    // 1. Live sessions from the active floor groups
+    for (const group of sessions) {
+      const live = (group.sessions || []).filter((s: any) => s.status === 'ACTIVE')
+      const totalLiveAtTable = live.length
+      const groupCheck = group.check
+
+      live.forEach((s: any, idx: number) => {
+        seenSessionIds.add(s.id)
+        if (s.check?.id) seenCheckIds.add(s.check.id)
+        if (groupCheck?.id) seenCheckIds.add(groupCheck.id)
+
+        // Totals for this specific session or the table check
+        let total = 0
+        let paid = 0
+        let outstanding = 0
+
+        const orders = s.order_rows || []
+        const activeOrders = orders.filter((o: any) => o.status !== 'CANCELLED' && o.status !== 'PENDING_ACTIVATION')
+        const ordersTotal = activeOrders.reduce((sum: number, o: any) => sum + Number(o.total || 0), 0)
+
+        if (s.check) {
+          total = Number(s.check.total || 0)
+          paid = Number(s.check.paid_total || s.check.paid || 0)
+          outstanding = Math.max(0, total - paid)
+        } else if (groupCheck && totalLiveAtTable === 1) {
+          total = Number(groupCheck.total || 0)
+          paid = Number(groupCheck.paid || 0)
+          outstanding = Number(groupCheck.outstanding || 0)
+        } else {
+          total = ordersTotal
+          paid = 0
+          outstanding = ordersTotal
+        }
+
+        // Status derivation
+        let statusLabel = 'active'
+        let statusTone: 'amber' | 'emerald' | 'rose' | 'slate' = 'emerald'
+
+        if (s.activationStatus === 'PENDING') {
+          statusLabel = 'pending'
+          statusTone = 'amber'
+        } else if (outstanding > 0) {
+          statusLabel = groupCheck?.status === 'UNSETTLED' ? 'closed · due' : 'open'
+          statusTone = 'amber'
+        } else if (total > 0 && outstanding === 0) {
+          statusLabel = 'paid'
+          statusTone = 'emerald'
+        } else {
+          statusLabel = 'active'
+          statusTone = 'slate'
+        }
+
+        cards.push({
+          id: `sess-${s.id}`,
+          tableId: group.tableId,
+          tableName: group.table?.name || 'Table',
+          area: group.table?.area,
+          sessionNumber: totalLiveAtTable > 1 ? idx + 1 : null,
+          total: +total.toFixed(2),
+          paid: +paid.toFixed(2),
+          outstanding: +outstanding.toFixed(2),
+          statusTone,
+          statusLabel,
+        })
+      })
+    }
+
+    // 2. Pending bills that don't have an active session (e.g. sitting ended unpaid)
+    for (const b of pendingBills) {
+      if (b.checkId && seenCheckIds.has(b.checkId)) continue
+      if (b.sessionId && seenSessionIds.has(b.sessionId)) continue
+      const alreadyRepresented = cards.some(
+        (c) => c.tableId === b.tableId && Math.abs(c.outstanding - Number(b.outstanding)) < 0.01
+      )
+      if (alreadyRepresented) continue
+
+      cards.push({
+        id: `bill-${b.checkId || b.tableId}`,
+        tableId: b.tableId,
+        tableName: b.tableName || 'Table',
+        area: b.area,
+        sessionNumber: null,
+        total: +Number(b.total || 0).toFixed(2),
+        paid: +Number(b.paid || 0).toFixed(2),
+        outstanding: +Number(b.outstanding || 0).toFixed(2),
+        statusTone: 'amber',
+        statusLabel: b.status === 'UNSETTLED' ? 'closed · due' : 'open',
+      })
+    }
+
+    return cards
+  }, [sessions, pendingBills])
+
   const endSession = async (tableId: string, tableName?: string, force = false, sessionId?: string) => {
     setEndingTable(sessionId ? `${tableId}:${sessionId}` : tableId)
     try {
@@ -503,44 +621,6 @@ export function DashboardView() {
       setEndingTable(null)
     }
   }
-
-/**
- * The state a table card is in, as three words.
- *
- * Same anatomy for all three — a dot and a label — so the row of cards reads
- * as one set. Pending is the only one in the accent colour, because it is the
- * only one asking for something.
- */
-type FloorState = 'idle' | 'waiting' | 'active' | 'payment-due' | 'closed'
-
-const STATE_COPY: Record<FloorState, { label: string; style: string }> = {
-  idle: { label: 'Idle', style: 'bg-secondary text-muted-foreground' },
-  waiting: { label: 'Waiting', style: 'bg-amber-500/15 text-amber-700 dark:text-amber-300' },
-  active: { label: 'Active', style: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400' },
-  'payment-due': { label: 'Payment Due', style: 'bg-[#f97316]/15 text-[#c2410c] dark:text-[#fdba74]' },
-  closed: { label: 'Closed', style: 'bg-secondary text-muted-foreground' },
-}
-
-function SessionStateBadge({ state }: { state: FloorState }) {
-  const copy = STATE_COPY[state] ?? STATE_COPY.idle
-  return (
-    <span className={cn('inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium', copy.style)}>
-      <span className="size-1.5 rounded-full bg-current" />
-      {copy.label}
-    </span>
-  )
-}
-
-  /** How long a table has been open — the oldest session is the stale one. */
-  const sessionAge = (group: any) => {
-    const times = (group.sessions || []).map((s: any) => new Date(s.createdAt).getTime()).filter(Boolean)
-    if (!times.length) return ''
-    const mins = Math.max(0, Math.round((Date.now() - Math.min(...times)) / 60000))
-    if (mins < 60) return `${mins} min`
-    return `${Math.floor(mins / 60)}h ${mins % 60}m`
-  }
-
-
 
   // per-category counts for the pills
   const catCount = (catId: string) =>
@@ -775,282 +855,75 @@ function SessionStateBadge({ state }: { state: FloorState }) {
             )}
           </div>
 
-          {/* Bills still owed, including sittings that already ended.
-              A table that closes unpaid used to disappear from this screen and
-              take its balance with it. */}
-          {pendingBills.length > 0 && canCollect && (
-            <div className="mt-8">
-              <div className="mb-3 flex items-center gap-2">
-                <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-                  Awaiting payment
-                </h3>
-                <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400">
-                  {pendingBills.length}
-                </span>
-              </div>
-              <div className="flex gap-3 overflow-x-auto scrollbar-thin pb-2">
-                {pendingBills.map((b) => (
-                  <button
-                    key={b.checkId}
-                    type="button"
-                    onClick={() => setBillTable({ id: b.tableId, name: b.tableName, checkId: b.checkId })}
-                    data-pending-bill
-                    className="w-56 shrink-0 rounded-2xl border border-amber-500/40 bg-card p-3.5 text-left transition-colors hover:border-amber-500/70"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <p className="truncate font-semibold">{b.tableName}</p>
-                      <span className="shrink-0 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
-                        {b.status === 'UNSETTLED' ? 'closed · due' : 'open'}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-[11px] text-muted-foreground">
-                      {b.area ? `${b.area} · ` : ''}{tenant.currencySymbol}
-                      {Number(b.outstanding).toLocaleString('en-IN')} due
-                    </p>
-                    <p className="mt-0.5 text-[10.5px] text-muted-foreground">
-                      {tenant.currencySymbol}{Number(b.paid).toLocaleString('en-IN')} of{' '}
-                      {tenant.currencySymbol}{Number(b.total).toLocaleString('en-IN')} paid
-                    </p>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Open table sessions */}
+          {/* Active Sessions: Compact, fixed-size, non-expandable, non-clickable cards */}
           <div className="mt-8">
             <div className="mb-3 flex items-center gap-2">
-              <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
-                {tr('pos.sessions')}
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                Active Sessions
               </h3>
-              {sessions.length > 0 && (
+              {activeSessionCards.length > 0 && (
                 <span className="rounded-full bg-primary/15 px-2 py-0.5 text-[11px] font-medium text-primary">
-                  {sessions.length}
+                  {activeSessionCards.length}
                 </span>
               )}
             </div>
 
-            {sessions.length === 0 ? (
+            {activeSessionCards.length === 0 ? (
               <p className="text-xs text-muted-foreground">
                 {tr('pos.noSessions')}
               </p>
             ) : (
               <div className="flex gap-3 overflow-x-auto scrollbar-thin pb-2">
-                {floor.map((group) => {
-                  const liveSessions = group.liveSessions
-                  const pending = group.pendingSession
-                  const state = group.state as 'idle' | 'waiting' | 'active' | 'payment-due' | 'closed'
-                  const orderCount = group.orderCount
-                  const heldCount = group.heldCount
-                  const label = group.label
-
-                  return (
-                    <div
-                      key={group.tableId}
-                      data-session-state={state}
-                      className={cn(
-                        'flex w-64 shrink-0 flex-col rounded-2xl border bg-card p-4',
-                        state === 'waiting'
-                          ? 'border-amber-500/40'
-                          : state === 'payment-due'
-                            ? 'border-[#f97316]/45'
-                            : state === 'closed'
-                              ? 'border-border/70 opacity-70'
-                              : state === 'idle'
-                                ? 'border-border/60 border-dashed'
-                                : 'border-border',
-                      )}
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <p className="truncate font-semibold">{label}</p>
-                          <p className="truncate text-[11px] text-muted-foreground">
-                            {group.table?.area}
-                            {group.table?.seats ? ` · ${group.table.seats} seats` : ''}
-                          </p>
-                        </div>
-                        <SessionStateBadge state={state} />
-                      </div>
-
-                      {/* The running bill, when there is one. A card that
-                          only counts orders hides the number the cashier
-                          actually needs. */}
-                      {group.check && group.check.total > 0 && (
-                        <p className="mt-1.5 text-[11px] text-muted-foreground">
-                          <span className="font-medium text-foreground">
-                            {tenant.currencySymbol}
-                            {Number(group.check.total).toLocaleString('en-IN')}
-                          </span>
-                          {group.check.outstanding > 0
-                            ? ` due · ${tenant.currencySymbol}${Number(group.check.paid).toLocaleString('en-IN')} paid`
-                            : ' · settled'}
-                        </p>
-                      )}
-
-                      <div className="mt-2.5 flex items-center gap-3 text-[11px] text-muted-foreground">
-                        <span className="inline-flex items-center gap-1">
-                          <Clock className="size-3" />
-                          {state === 'closed' ? 'closed' : sessionAge(group)}
-                        </span>
-                        <span className="inline-flex items-center gap-1">
-                          <Receipt className="size-3" />
-                          {orderCount === 0
-                            ? heldCount > 0
-                              ? `${heldCount} held`
-                              : tr('pos.noOrderYet')
-                            : `${orderCount} order${orderCount === 1 ? '' : 's'}`}
-                        </span>
-                      </div>
-
-                      {liveSessions.length > 1 && (
-                        <div className="mt-2.5 rounded-xl border border-amber-500/30 bg-amber-500/5 p-2 space-y-1.5">
-                          <div className="flex items-center justify-between text-[10.5px] font-semibold text-amber-600 dark:text-amber-400">
-                            <span>{liveSessions.length} Active Sittings</span>
-                            <span className="text-[10px] text-muted-foreground font-normal">Independent bills</span>
-                          </div>
-                          <div className="space-y-1">
-                            {liveSessions.map((s: any, idx: number) => {
-                              const isSelected = selectedTableId === group.tableId && selectedSessionId === s.id
-                              const isEndingThis = endingTable === `${group.tableId}:${s.id}` || endingTable === group.tableId
-                              return (
-                                <div
-                                  key={s.id}
-                                  className={cn(
-                                    'flex items-center justify-between rounded-lg px-2 py-1 text-[11px] transition-colors',
-                                    isSelected
-                                      ? 'bg-primary text-white font-medium'
-                                      : 'bg-secondary/70 hover:bg-secondary text-foreground',
-                                  )}
-                                >
-                                  <span className="truncate">
-                                    Sitting #{idx + 1} ({s._count?.orders ?? 0} ord)
-                                  </span>
-                                  <div className="flex items-center gap-1">
-                                    <Button
-                                      size="sm"
-                                      variant={isSelected ? 'secondary' : 'outline'}
-                                      className="h-5 px-1.5 text-[10px]"
-                                      onClick={() => {
-                                        setSelectedTableId(group.tableId)
-                                        setSelectedSessionId(s.id)
-                                        setCartOpen(true)
-                                      }}
-                                    >
-                                      {isSelected ? 'Selected' : 'Select'}
-                                    </Button>
-                                    <Button
-                                      size="sm"
-                                      variant="ghost"
-                                      className="h-5 px-1.5 text-[10px] text-destructive hover:bg-destructive/10 hover:text-destructive"
-                                      disabled={isEndingThis || !canEndSessions}
-                                      onClick={() => endSession(group.tableId, `${label} (Sitting #${idx + 1})`, false, s.id)}
-                                      title="End this sitting only"
-                                    >
-                                      {isEndingThis ? '…' : 'End'}
-                                    </Button>
-                                  </div>
-                                </div>
-                              )
-                            })}
-                          </div>
-                        </div>
-                      )}
-
-                      {pending && (
-                        <div className="mt-2.5 rounded-xl border border-amber-500/25 bg-amber-50/70 p-2.5 dark:bg-amber-500/10">
-                          <p className="text-[11px] font-semibold text-amber-900 dark:text-amber-200">
-                            Awaiting Acceptance
-                          </p>
-                          <p className="mt-0.5 text-[10.5px] leading-snug text-amber-800/90 dark:text-amber-300/80">
-                            Their order is saved and held — not in the kitchen yet.
-                          </p>
-                          <div className="mt-2 flex gap-1.5">
-                            <Button
-                              size="sm"
-                              className="h-7 flex-1 bg-[#f97316] px-2 text-[11.5px] font-semibold text-white hover:bg-[#ea580c]"
-                              onClick={() => activateTable(pending.id, true, label)}
-                              disabled={!canEndSessions || activatingSession === pending.id}
-                            >
-                              {activatingSession === pending.id ? (
-                                <Loader2 className="mr-1 size-3.5 animate-spin" />
-                              ) : (
-                                <Check className="mr-1 size-3.5" />
-                              )}
-                              Accept
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-7 flex-1 px-2 text-[11.5px]"
-                              onClick={() => activateTable(pending.id, false, label)}
-                              disabled={!canEndSessions || activatingSession === pending.id}
-                            >
-                              Reject
-                            </Button>
-                          </div>
-                        </div>
-                      )}
-
-                      {(state === 'active' || state === 'payment-due' || state === 'closed') && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className={cn(
-                            'mb-1.5 h-8 w-full text-xs',
-                            state === 'payment-due' && 'border-[#f97316]/45 bg-[#f97316]/5 text-[#c2410c] hover:bg-[#f97316]/10 dark:text-[#fdba74]',
-                          )}
-                          onClick={() => setBillTable({
-                            id: group.tableId,
-                            name: label,
-                            checkId: selectedTableId === group.tableId && selectedSessionId
-                              ? liveSessions.find((s: any) => s.id === selectedSessionId)?.check?.id
-                              : undefined,
-                          })}
-                          disabled={!canEndSessions}
-                        >
-                          <Receipt className="mr-1.5 size-3.5" />
-                          Table bill
-                        </Button>
-                      )}
-
-                      {(() => {
-                        const isMulti = liveSessions.length > 1
-                        const activeSessionId = selectedTableId === group.tableId && selectedSessionId
-                          ? selectedSessionId
-                          : isMulti
-                            ? undefined
-                            : liveSessions[0]?.id
-                        const targetLabel = isMulti && activeSessionId
-                          ? `${label} (Sitting #${liveSessions.findIndex((s: any) => s.id === activeSessionId) + 1})`
-                          : label
-                        const isEnding = endingTable === group.tableId || (activeSessionId && endingTable === `${group.tableId}:${activeSessionId}`)
-
-                        return (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => endSession(group.tableId, targetLabel, false, activeSessionId)}
-                            disabled={Boolean(isEnding) || !canEndSessions || state === 'closed' || state === 'idle'}
-                            title={!canEndSessions ? 'You do not have permission to manage the floor' : undefined}
-                            className="mt-auto h-8 w-full text-xs"
-                          >
-                            <LogOut className="mr-1.5 size-3.5" />
-                            {isEnding
-                              ? 'Ending…'
-                              : isMulti
-                                ? activeSessionId
-                                  ? 'End Selected Sitting'
-                                  : 'End All Sittings'
-                                : tr('pos.endSession')}
-                          </Button>
-                        )
-                      })()}
+                {activeSessionCards.map((card) => (
+                  <div
+                    key={card.id}
+                    data-active-session-card
+                    className={cn(
+                      'w-56 shrink-0 rounded-2xl border bg-card p-3.5 text-left select-none transition-colors',
+                      card.statusTone === 'amber'
+                        ? 'border-amber-500/40 dark:border-amber-500/30'
+                        : card.statusTone === 'emerald'
+                          ? 'border-emerald-500/30 dark:border-emerald-500/20'
+                          : 'border-border/80'
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="truncate font-semibold text-foreground">
+                        {card.tableName}
+                        {card.sessionNumber ? ` · Sitting #${card.sessionNumber}` : ''}
+                      </p>
+                      <span
+                        className={cn(
+                          'shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium',
+                          card.statusTone === 'amber'
+                            ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
+                            : card.statusTone === 'emerald'
+                              ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
+                              : 'bg-secondary text-muted-foreground'
+                        )}
+                      >
+                        {card.statusLabel}
+                      </span>
                     </div>
-                  )
-                })}
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      {card.area ? `${card.area} · ` : ''}
+                      <span className={cn(card.outstanding > 0 ? 'font-medium text-foreground' : '')}>
+                        {tenant.currencySymbol}
+                        {Number(card.outstanding).toLocaleString('en-IN')} due
+                      </span>
+                    </p>
+                    <p className="mt-0.5 text-[10.5px] text-muted-foreground">
+                      {tenant.currencySymbol}
+                      {Number(card.paid).toLocaleString('en-IN')} of{' '}
+                      {tenant.currencySymbol}
+                      {Number(card.total).toLocaleString('en-IN')} paid
+                    </p>
+                  </div>
+                ))}
               </div>
             )}
           </div>
+
         </div>
       </div>
 
