@@ -1,6 +1,6 @@
 'use client'
 
-import { createContext, useContext, useCallback, useState, useEffect, useRef, ReactNode } from 'react'
+import { createContext, useContext, useCallback, useMemo, useState, useEffect, useRef, ReactNode } from 'react'
 import { edgeFetch, onForbidden } from '@/lib/edge'
 import { describeFailure, failIfNotOk, type ApiFailure } from '@/lib/api-error'
 import { hasPermission } from '@/lib/permissions'
@@ -262,7 +262,13 @@ export interface SubscriptionState {
   trialDaysRemaining: number | null
   currentPeriodEnd: string | null
   cancelAtPeriodEnd: boolean
-  limits: { locations: number | null; staff: number | null; menuItems: number | null }
+  limits: {
+    locations: number | null
+    staff: number | null
+    menuItems: number | null
+    tables?: number | null
+    qrCodes?: number | null
+  }
   features: string[]
   priceMonthly: number
   /** The annual price, 0 when the plan is not sold yearly. */
@@ -360,7 +366,7 @@ function orderChimeContext(): AudioContext | null {
  * handler, is what makes the context run when an order arrives later — including
  * one that arrives from a diner's phone while nobody is touching the till.
  */
-export function primeOrderChime() {
+function primeOrderChime() {
   const ctx = orderChimeContext()
   if (ctx && ctx.state === 'suspended') void ctx.resume().catch(() => {})
 }
@@ -395,7 +401,7 @@ function ringChime(ctx: AudioContext) {
   osc2.stop(now + 0.6)
 }
 
-export function playOrderChime() {
+function playOrderChime() {
   try {
     const ctx = orderChimeContext()
     if (!ctx) return
@@ -497,6 +503,19 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     for (const o of data.orders) knownOrderIds.current.add(o.id)
   }, [data])
   const recentNotifiedIds = useRef<Set<string>>(new Set())
+  const dataRef = useRef<AppData | null>(null)
+  useEffect(() => {
+    dataRef.current = data
+  }, [data])
+
+  const isSoundAlertsEnabled = useCallback(() => {
+    const pref = dataRef.current?.settings?.pref_sound_alerts
+    if (pref === 'false') return false
+    if (typeof window !== 'undefined' && window.localStorage.getItem('the-salad-activation-sound') === 'off') {
+      return false
+    }
+    return true
+  }, [])
   /**
    * Ids we have already been told about.
    *
@@ -515,6 +534,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   // The overlap is harmless: orders the client already knows are skipped before
   // anything is announced.
   const lastSyncTimeRef = useRef<string>(new Date(Date.now() - 60_000).toISOString())
+  const isSyncingRef = useRef(false)
 
   const refresh = useCallback(async () => {
     try {
@@ -535,6 +555,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       const json = await res.json()
       setData(json)
       if (json.tableSessions) setTableSessions(json.tableSessions)
+      if (json.checks) setChecks((prev) => ({ ...prev, ...json.checks }))
       lastSyncTimeRef.current = new Date().toISOString()
     } catch (e) {
       setError(describeFailure(e, 'your restaurant'))
@@ -633,12 +654,19 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         nextOrders = [order, ...prev.orders]
       }
 
-      // Update table status if dine-in
+      // Update table status if dine-in based on whether any active order remains on the table
       let nextTables = prev.tables
       if (order.tableId) {
+        const hasActiveOrders = nextOrders.some(
+          (o) =>
+            o.tableId === order.tableId &&
+            o.status !== 'COMPLETED' &&
+            o.status !== 'CANCELLED' &&
+            o.status !== 'REJECTED'
+        )
         nextTables = prev.tables.map((t) =>
           t.id === order.tableId
-            ? { ...t, currentStatus: order.status === 'COMPLETED' ? 'AVAILABLE' : 'OCCUPIED' }
+            ? { ...t, currentStatus: hasActiveOrders ? 'OCCUPIED' : 'AVAILABLE' }
             : t
         )
       }
@@ -660,7 +688,9 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       recentNotifiedIds.current.add(order.id)
       setTimeout(() => recentNotifiedIds.current.delete(order.id), 60000)
 
-      playOrderChime()
+      if (isSoundAlertsEnabled()) {
+        playOrderChime()
+      }
       const tableName = order.table?.name || 'Table'
       const cs = order.total ? '₹' : ''
       toast.success(`🔔 New Order #${order.orderNumber} (${tableName})`, {
@@ -735,7 +765,28 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
             addOrUpdateOrder(event.data.order, event.data.type === 'ORDER_CREATED')
           } else if (event.data.type === 'ORDER_DELETED' && event.data.order?.id) {
             removeOrder(event.data.order.id)
-          } else if (event.data.type === 'CHECK_UPDATED' || event.data.type === 'SESSION_ENDED' || event.data.type === 'CHECK_SETTLED') {
+          } else if (event.data.type === 'CHECK_UPDATED' || event.data.type === 'SESSION_ENDED' || event.data.type === 'SESSION_UPDATED' || event.data.type === 'CHECK_SETTLED') {
+            if (event.data.sessionId && (event.data.type === 'SESSION_ENDED' || event.data.type === 'SESSION_UPDATED')) {
+              setTableSessions((prev) => ({
+                ...prev,
+                [event.data.sessionId]: {
+                  ...(prev[event.data.sessionId] ?? { id: event.data.sessionId, tableId: event.data.tableId, startedAt: new Date().toISOString() }),
+                  status: 'ENDED',
+                  endedAt: event.data.endedAt ?? new Date().toISOString(),
+                },
+              }))
+            }
+            if (event.data.checkId) {
+              setChecks((prev) => ({
+                ...prev,
+                [event.data.checkId]: {
+                  ...(prev[event.data.checkId] ?? { orderCount: 1, subtotal: 0, tax: 0, total: 0, paid: 0, outstanding: 0 }),
+                  status: 'PAID',
+                  outstanding: 0,
+                  invoiceNumber: event.data.invoiceNumber ?? prev[event.data.checkId]?.invoiceNumber ?? null,
+                },
+              }))
+            }
             setSessionRevision((n) => n + 1)
             void runDeltaSync()
           }
@@ -745,9 +796,15 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       // ignore
     }
 
-    // 3. Fallback Periodic Delta Sync (every 4 seconds) to guarantee no missed orders
+    // 3. Adaptive Periodic Delta Sync with Request Deduplication & Visibility Awareness
+    let isRealtimeHealthy = false
+    let syncTimer: NodeJS.Timeout | null = null
+    const recentBroadcastOrderIds = new Map<string, number>()
+
     const runDeltaSync = async () => {
-      if (isCancelled || !canReadOrders) return
+      if (isCancelled || !canReadOrders || isSyncingRef.current) return
+      if (typeof document !== 'undefined' && document.hidden) return
+      isSyncingRef.current = true
       try {
         const since = lastSyncTimeRef.current
         const res = await edgeFetch(`/api/orders/sync?tenantId=${encodeURIComponent(activeTenantId)}&since=${encodeURIComponent(since)}`)
@@ -758,20 +815,55 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
               addOrUpdateOrder(ord, true)
             }
           }
-          // The authoritative figures per table check, so a session header and
-          // its bill can never disagree.
-          if (json.checks) setChecks(json.checks)
-          // The sittings: start, status and end. Merged, not replaced — the
-          // poll returns the sittings that are open or recent, and a card for
-          // an older closed one keeps the row it already had.
-          if (json.tableSessions) {
-            setTableSessions((prev) => ({ ...prev, ...json.tableSessions }))
+          // The authoritative figures per table check, merged so previously loaded checks are never evicted.
+          // Referential equality is preserved when checks have not changed, preventing re-render churn.
+          if (json.checks && Object.keys(json.checks).length > 0) {
+            setChecks((prev) => {
+              let changed = false
+              for (const [k, v] of Object.entries(json.checks)) {
+                const p = prev[k]
+                const cur = v as any
+                if (
+                  !p ||
+                  p.status !== cur.status ||
+                  p.total !== cur.total ||
+                  p.paid !== cur.paid ||
+                  p.outstanding !== cur.outstanding ||
+                  p.invoiceNumber !== cur.invoiceNumber
+                ) {
+                  changed = true
+                  break
+                }
+              }
+              return changed ? { ...prev, ...json.checks } : prev
+            })
+          }
+          // The sittings: start, status and end. Referential equality preserved if unchanged.
+          if (json.tableSessions && Object.keys(json.tableSessions).length > 0) {
+            setTableSessions((prev) => {
+              let changed = false
+              for (const [k, v] of Object.entries(json.tableSessions)) {
+                const p = prev[k]
+                const cur = v as any
+                if (!p || p.status !== cur.status || p.endedAt !== cur.endedAt || p.tableId !== cur.tableId) {
+                  changed = true
+                  break
+                }
+              }
+              return changed ? { ...prev, ...json.tableSessions } : prev
+            })
           }
           // The server's aggregate owns the counters — see addOrUpdateOrder.
           if (json.summary) {
-            setData((prev) =>
-              prev ? { ...prev, summary: { ...prev.summary, ...json.summary } } : prev,
-            )
+            setData((prev) => {
+              if (!prev) return prev
+              const s = prev.summary
+              const n = json.summary
+              if (s && s.revenue === n.revenue && s.ordersToday === n.ordersToday && s.activeOrders === n.activeOrders) {
+                return prev
+              }
+              return { ...prev, summary: { ...prev.summary, ...json.summary } }
+            })
           }
           if (json.serverTime) {
             lastSyncTimeRef.current = json.serverTime
@@ -779,7 +871,20 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         }
       } catch {
         // ignore network hiccups
+      } finally {
+        isSyncingRef.current = false
       }
+    }
+
+    const scheduleNextSync = () => {
+      if (isCancelled) return
+      // When Realtime is healthy, poll every 15s purely as a reconciliation safety net.
+      // When Realtime is disconnected / reconnecting, poll every 5s for rapid recovery.
+      const intervalMs = isRealtimeHealthy ? 15000 : 5000
+      syncTimer = setTimeout(async () => {
+        await runDeltaSync()
+        scheduleNextSync()
+      }, intervalMs)
     }
 
     // 2. Supabase Realtime
@@ -810,6 +915,15 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
             removeOrder(payload.old.id)
             return
           }
+          // If the order was already authoritatively applied via instant broadcast within the last 2s,
+          // skip triggering a duplicate delta sync run for this CDC event.
+          const changedId = payload?.new?.id
+          if (changedId && recentBroadcastOrderIds.has(changedId)) {
+            const ts = recentBroadcastOrderIds.get(changedId)!
+            if (Date.now() - ts < 2500) {
+              return
+            }
+          }
           if (realtimeDebounce) clearTimeout(realtimeDebounce)
           realtimeDebounce = setTimeout(runDeltaSync, 150)
         }
@@ -819,6 +933,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         if (isCancelled) return
         const ord = msg?.payload?.order
         if (ord?.id) {
+          recentBroadcastOrderIds.set(ord.id, Date.now())
           addOrUpdateOrder(ord, false, { force: true })
         } else {
           void runDeltaSync()
@@ -828,6 +943,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         if (isCancelled) return
         const ord = msg?.payload?.order
         if (ord?.id) {
+          recentBroadcastOrderIds.set(ord.id, Date.now())
           addOrUpdateOrder(ord, true)
         } else {
           void runDeltaSync()
@@ -844,13 +960,53 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       // never fires for it. The staff function broadcasts it on this same topic
       // instead; without listening, the POS board kept showing a table whose
       // diner had already closed the menu until the page was reloaded.
-      .on('broadcast', { event: 'SESSION_ENDED' }, () => {
+      .on('broadcast', { event: 'SESSION_ENDED' }, (msg: any) => {
         if (isCancelled) return
+        const sessId = msg?.payload?.sessionId
+        if (sessId) {
+          setTableSessions((prev) => ({
+            ...prev,
+            [sessId]: {
+              ...(prev[sessId] ?? { id: sessId, tableId: msg?.payload?.tableId, startedAt: new Date().toISOString() }),
+              status: 'ENDED',
+              endedAt: msg?.payload?.endedAt ?? new Date().toISOString(),
+            },
+          }))
+        }
         setSessionRevision((n) => n + 1)
         void runDeltaSync()
       })
-      .on('broadcast', { event: 'CHECK_UPDATED' }, () => {
+      .on('broadcast', { event: 'SESSION_UPDATED' }, (msg: any) => {
         if (isCancelled) return
+        const sessId = msg?.payload?.sessionId
+        const st = msg?.payload?.status
+        if (sessId && st === 'ENDED') {
+          setTableSessions((prev) => ({
+            ...prev,
+            [sessId]: {
+              ...(prev[sessId] ?? { id: sessId, tableId: msg?.payload?.tableId, startedAt: new Date().toISOString() }),
+              status: 'ENDED',
+              endedAt: msg?.payload?.endedAt ?? new Date().toISOString(),
+            },
+          }))
+        }
+        setSessionRevision((n) => n + 1)
+        void runDeltaSync()
+      })
+      .on('broadcast', { event: 'CHECK_UPDATED' }, (msg: any) => {
+        if (isCancelled) return
+        const chkId = msg?.payload?.checkId
+        if (chkId && (msg?.payload?.reason === 'FINALISED' || msg?.payload?.status === 'PAID')) {
+          setChecks((prev) => ({
+            ...prev,
+            [chkId]: {
+              ...(prev[chkId] ?? { orderCount: 1, subtotal: 0, tax: 0, total: 0, paid: 0, outstanding: 0 }),
+              status: 'PAID',
+              outstanding: 0,
+              invoiceNumber: msg?.payload?.invoiceNumber ?? prev[chkId]?.invoiceNumber ?? null,
+            },
+          }))
+        }
         setSessionRevision((n) => n + 1)
         void runDeltaSync()
       })
@@ -862,12 +1018,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         setSessionRevision((n) => n + 1)
         // Optional by design: a browser that has never been interacted with
         // cannot play audio, and this is a nudge, not a requirement.
-        if (typeof window !== 'undefined') {
+        if (typeof window !== 'undefined' && isSoundAlertsEnabled()) {
           try {
-            if (window.localStorage.getItem('the-salad-activation-sound') !== 'off') playOrderChime()
-          } catch {
             playOrderChime()
-          }
+          } catch {}
         }
         void msg
       })
@@ -881,20 +1035,40 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         // order list rather than waiting for the next poll — the poll is a
         // safety net, not the plan.
         if (isCancelled) return
+        isRealtimeHealthy = status === 'SUBSCRIBED'
         if (status === 'SUBSCRIBED') {
           setSessionRevision((n) => n + 1)
           void runDeltaSync()
         }
       })
 
-    pollTimer = setInterval(runDeltaSync, 4000)
+    scheduleNextSync()
+
+    // Immediate reconciliation when user returns to tab or comes back online
+    const onVisibilityOrOnline = () => {
+      if (typeof document !== 'undefined' && !document.hidden) {
+        void runDeltaSync()
+      }
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibilityOrOnline)
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', onVisibilityOrOnline)
+    }
 
     return () => {
       isCancelled = true
       if (bc) bc.close()
       if (realtimeDebounce) clearTimeout(realtimeDebounce)
       void supabase.removeChannel(channel)
-      if (pollTimer) clearInterval(pollTimer)
+      if (syncTimer) clearTimeout(syncTimer)
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibilityOrOnline)
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', onVisibilityOrOnline)
+      }
     }
   }, [tenantId, data?.tenant?.id, canUseRealtime, canReadOrders, addOrUpdateOrder, removeOrder])
 
@@ -902,8 +1076,36 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     setTenantIdState(id)
   }, [])
 
+  const contextValue = useMemo(() => ({
+    data,
+    loading,
+    error,
+    tenantId,
+    setTenantId,
+    refresh,
+    addOrUpdateOrder,
+    removeOrder,
+    applySecurity,
+    sessionRevision,
+    checks,
+    tableSessions,
+  }), [
+    data,
+    loading,
+    error,
+    tenantId,
+    setTenantId,
+    refresh,
+    addOrUpdateOrder,
+    removeOrder,
+    applySecurity,
+    sessionRevision,
+    checks,
+    tableSessions,
+  ])
+
   return (
-    <AppContext.Provider value={{ data, loading, error, tenantId, setTenantId, refresh, addOrUpdateOrder, removeOrder, applySecurity, sessionRevision, checks, tableSessions }}>
+    <AppContext.Provider value={contextValue}>
       {children}
     </AppContext.Provider>
   )

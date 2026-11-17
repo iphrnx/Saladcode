@@ -159,6 +159,54 @@ async function loadCheck(tenantId: string, open: any) {
   const settingsMap: Record<string, string> = {};
   for (const row of settings ?? []) settingsMap[row.key] = row.value;
 
+  // Resolve table information:
+  // 1. check.table_id directly
+  // 2. check.session_id -> table_sessions(table_id)
+  // 3. check's orders -> order.table_id or order.table_session_id -> table_sessions(table_id)
+  let resolvedTableId = open.table_id ?? null;
+  if (!resolvedTableId && open.session_id) {
+    const { data: sess } = await db
+      .from("table_sessions")
+      .select("table_id")
+      .eq("id", open.session_id)
+      .eq("tenant_id", tenantId)
+      .maybeSingle();
+    resolvedTableId = sess?.table_id ?? null;
+  }
+  if (!resolvedTableId && orders && orders.length > 0) {
+    for (const ord of orders) {
+      if (ord.table_id) {
+        resolvedTableId = ord.table_id;
+        break;
+      }
+      if (ord.table_session_id) {
+        const { data: sess } = await db
+          .from("table_sessions")
+          .select("table_id")
+          .eq("id", ord.table_session_id)
+          .eq("tenant_id", tenantId)
+          .maybeSingle();
+        if (sess?.table_id) {
+          resolvedTableId = sess.table_id;
+          break;
+        }
+      }
+    }
+  }
+
+  let tableRecord: { id: string; name: string; seats: number; area: string } | null = null;
+  if (resolvedTableId) {
+    const { data: t } = await db
+      .from("tables")
+      .select("id, name, seats, area")
+      .eq("id", resolvedTableId)
+      .eq("tenant_id", tenantId)
+      .maybeSingle();
+    if (t) {
+      tableRecord = t;
+    }
+  }
+
   return {
     check: open,
     orders: orders ?? [],
@@ -166,6 +214,7 @@ async function loadCheck(tenantId: string, open: any) {
     gstin: settingsMap.gstin || null,
     fssai: settingsMap.fssai || null,
     tenant,
+    table: tableRecord,
   };
 }
 
@@ -183,6 +232,8 @@ function dinerDocument(
   payments: any[],
   gstin: string | null,
   tenant: any,
+  table: { name: string; seats?: number; area?: string } | null = null,
+  fssai: string | null = null,
 ) {
   const total = +orders.reduce((s: number, o: any) => s + Number(o.total), 0).toFixed(2);
   const tax = +orders.reduce((s: number, o: any) => s + Number(o.tax), 0).toFixed(2);
@@ -201,6 +252,8 @@ function dinerDocument(
     .toFixed(2);
 
   const taxRate = Number(tenant?.tax_rate ?? 0);
+  const cgstAmount = +(tax / 2).toFixed(2);
+  const sgstAmount = +(tax - cgstAmount).toFixed(2);
 
   const items = orders.flatMap((o: any) =>
     (o.items ?? []).map((it: any) => ({
@@ -227,7 +280,7 @@ function dinerDocument(
       currency: tenant?.currency ?? "INR",
       currencySymbol: tenant?.currency_symbol ?? "₹",
       gstin,
-      fssai: null,
+      fssai: fssai ?? null,
     },
     billNumber: check.invoice_number ?? `TABLE-${String(check.id).slice(0, 6).toUpperCase()}`,
     orderNumber: orders.length === 1 ? orders[0].order_number : null,
@@ -253,8 +306,10 @@ function dinerDocument(
     })),
     invoiceDate: check.invoice_date ?? check.opened_at,
     completedAt: check.closed_at,
-    table: { name: "", seats: 0, area: "" },
-    orderType: "DINE_IN",
+    table: table && table.name?.trim()
+      ? { name: table.name.trim(), seats: Number(table.seats ?? 0), area: table.area?.trim() ?? "" }
+      : null,
+    orderType: orders[0]?.order_type ?? (table ? "DINE_IN" : "TAKEAWAY"),
     // No customer identity on a shared table bill.
     customerName: null,
     customerPhone: null,
@@ -268,8 +323,8 @@ function dinerDocument(
       rate: taxRate,
       cgstRate: taxRate / 2,
       sgstRate: taxRate / 2,
-      cgstAmount: +(tax / 2).toFixed(2),
-      sgstAmount: +(tax / 2).toFixed(2),
+      cgstAmount,
+      sgstAmount,
       totalTax: tax,
     },
     serviceCharge,
@@ -345,13 +400,18 @@ async function getCheck(req: Request): Promise<Response> {
     .toFixed(2);
 
   if (url.searchParams.get("format") === "document") {
-    return json(req, dinerDocument(check, live, payments, gstin, data.tenant));
+    return json(req, dinerDocument(check, live, payments, gstin, data.tenant, data.table, data.fssai));
   }
 
   return json(req, {
     checkId: check.id,
     status: check.status,
-    tableId: check.table_id,
+    tableId: check.table_id ?? data.table?.id ?? null,
+    tableName: data.table?.name ?? null,
+    tableArea: data.table?.area ?? null,
+    table: data.table && data.table.name?.trim()
+      ? { name: data.table.name.trim(), seats: Number(data.table.seats ?? 0), area: data.table.area?.trim() ?? "" }
+      : null,
     openedAt: check.opened_at,
     closedAt: check.closed_at,
     invoiceNumber: check.invoice_number,
@@ -434,7 +494,7 @@ async function recordPayment(req: Request): Promise<Response> {
     p_amount: amount,
     p_method: method,
     p_idempotency_key: b.idempotencyKey ? String(b.idempotencyKey) : null,
-    p_actor: g.session.kind === "owner" ? g.session.subjectId : null,
+    p_actor: g.session.subjectId ?? null,
     p_note: b.note ? String(b.note).slice(0, 200) : null,
   });
 
@@ -507,6 +567,18 @@ async function broadcastCheck(tenantId: string, checkId: string, reason: string)
   if (!check) return;
 
   if (check.session_id) {
+    if (reason === "FINALISED") {
+      await publishToStaff(tenantId, "SESSION_ENDED", {
+        tableId: check.table_id,
+        sessionId: check.session_id,
+        status: "ENDED",
+      });
+      await publishToStaff(tenantId, "SESSION_UPDATED", {
+        tableId: check.table_id,
+        sessionId: check.session_id,
+        status: "ENDED",
+      });
+    }
     const { data: s } = await admin()
       .from("table_sessions")
       .select("token")
@@ -595,7 +667,7 @@ async function finalize(req: Request): Promise<Response> {
   const { data: result, error } = await admin().rpc("finalize_table_check", {
     p_tenant: g.session.tenantId,
     p_check: data.check.id,
-    p_actor: g.session.kind === "owner" ? g.session.subjectId : null,
+    p_actor: g.session.subjectId ?? null,
   });
 
   if (error) {
@@ -656,7 +728,7 @@ async function settleCash(req: Request): Promise<Response> {
   const { data: result, error } = await admin().rpc("settle_check_cash_tx", {
     p_tenant: g.session.tenantId,
     p_check: data.check.id,
-    p_actor: g.session.kind === "owner" ? g.session.subjectId : null,
+    p_actor: g.session.subjectId ?? null,
     p_idempotency_key: b.idempotencyKey ? String(b.idempotencyKey) : null,
     p_note: b.note ? String(b.note).slice(0, 200) : null,
   });
@@ -680,13 +752,7 @@ async function settleCash(req: Request): Promise<Response> {
   const sessId = data.check.session_id ?? (result as any)?.endedSessionId ?? null;
   const invNum = (result as any)?.invoiceNumber ?? "";
 
-  await auditMoney(
-    req,
-    g.session,
-    "CHECK_SETTLED_CASH",
-    tid,
-    `check ${chkId} settled in cash, invoice ${invNum}`,
-  );
+  // settle_check_cash_tx atomic transaction already records CHECK_SETTLED_CASH in security_logs with total and invoice.
 
   // Broadcast to Staff (Owner, Manager, Cashier dashboards)
   await publishToStaff(tid, "CHECK_UPDATED", {
@@ -697,10 +763,19 @@ async function settleCash(req: Request): Promise<Response> {
     invoiceNumber: invNum,
   });
   if (sessId) {
+    await publishToStaff(tid, "SESSION_ENDED", {
+      tableId: tblId,
+      sessionId: sessId,
+      status: "ENDED",
+      endedAt: new Date().toISOString(),
+      invoiceNumber: invNum,
+    });
     await publishToStaff(tid, "SESSION_UPDATED", {
       tableId: tblId,
       sessionId: sessId,
       status: "ENDED",
+      endedAt: new Date().toISOString(),
+      invoiceNumber: invNum,
     });
   }
 
@@ -751,7 +826,28 @@ async function get(req: Request, orderId: string | null): Promise<Response> {
   }
 
   const tenant = Array.isArray(order.tenant) ? order.tenant[0] : order.tenant;
-  const table = Array.isArray(order.table) ? order.table[0] : order.table;
+  let table = Array.isArray(order.table) ? order.table[0] : order.table;
+
+  // If table wasn't directly joined on order, trace via table_session_id or check_id
+  if (!table && order.table_session_id) {
+    const { data: sess } = await db
+      .from("table_sessions")
+      .select("table:tables(*)")
+      .eq("id", order.table_session_id)
+      .eq("tenant_id", tenant.id)
+      .maybeSingle();
+    table = Array.isArray(sess?.table) ? sess.table[0] : sess?.table;
+  }
+  if (!table && order.check_id) {
+    const { data: chk } = await db
+      .from("table_checks")
+      .select("table:tables(*)")
+      .eq("id", order.check_id)
+      .eq("tenant_id", tenant.id)
+      .maybeSingle();
+    table = Array.isArray(chk?.table) ? chk.table[0] : chk?.table;
+  }
+
   const servedBy = Array.isArray(order.servedBy) ? order.servedBy[0] : order.servedBy;
   const items = Array.isArray(order.items) ? order.items : [];
 
@@ -796,7 +892,9 @@ async function get(req: Request, orderId: string | null): Promise<Response> {
     invoiceDate: order.created_at,
     completedAt: order.completed_at,
     // Table/session info
-    table: table ? { name: table.name, seats: table.seats, area: table.area } : null,
+    table: table && table.name?.trim()
+      ? { name: table.name.trim(), seats: Number(table.seats ?? 0), area: table.area?.trim() ?? "" }
+      : null,
     orderType: order.order_type,
     customerName: order.customer_name,
     customerPhone: order.customer_phone,
@@ -829,7 +927,7 @@ async function get(req: Request, orderId: string | null): Promise<Response> {
     grandTotal: order.total,
     // Payment
     paymentMethod: order.payment_method,
-    paymentStatus: order.payment_status,
+    paymentStatus: order.payment_status ? String(order.payment_status).toUpperCase() : "UNPAID",
     orderStatus: order.status,
     // Footer terms
     terms: [

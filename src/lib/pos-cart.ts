@@ -26,6 +26,7 @@ export interface PosCartSnapshot {
   cart: CartItem[]
   orderType: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
   selectedTableId: string | null
+  selectedSessionId?: string | null
   promoCode: string
   savedAt: number
 }

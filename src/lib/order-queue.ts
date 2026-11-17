@@ -176,6 +176,18 @@ export async function submitEntry(
 export function cleanOrderErrorMessage(raw?: string): string {
   if (!raw) return 'Order could not be sent. Please tap Retry.'
   const lower = raw.toLowerCase()
+  if (lower.includes('401') || lower.includes('unauthorized') || lower.includes('session expired')) {
+    return 'Session expired. Please sign in or re-scan table QR to submit.'
+  }
+  if (lower.includes('session_ended') || lower.includes('session ended') || lower.includes('table session ended') || lower.includes('session closed')) {
+    return 'This table session has ended. Please scan the QR code again to start a new sitting.'
+  }
+  if (lower.includes('403') || lower.includes('forbidden')) {
+    return 'You do not have permission to place this order.'
+  }
+  if (lower.includes('item_unavailable') || lower.includes('unavailable')) {
+    return 'One or more items in your cart are currently unavailable. Please review your cart.'
+  }
   if (
     lower.includes('column') ||
     lower.includes('relation') ||

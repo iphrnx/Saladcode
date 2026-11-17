@@ -123,7 +123,12 @@ function buildPrintHtml(bill: BillData): string {
     [isMultiOrder ? 'Order Nos' : 'Order No', orderNoLabel],
     ['Date', new Date(bill.invoiceDate).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })],
   ]
-  if (bill.table) meta.push(['Table', bill.table.area ? `${bill.table.name} · ${bill.table.area}` : bill.table.name])
+  if (bill.table && bill.table.name?.trim()) {
+    const tableLabel = bill.table.area?.trim()
+      ? `${bill.table.name.trim()} · ${bill.table.area.trim()}`
+      : bill.table.name.trim()
+    meta.push(['Table', tableLabel])
+  }
   meta.push(['Type', orderTypeLabel])
   if (bill.customerName) meta.push(['Customer', bill.customerName])
   if (bill.customerPhone) meta.push(['Phone', bill.customerPhone])
@@ -291,10 +296,28 @@ function buildPrintHtml(bill: BillData): string {
 </body></html>`
 }
 
-function parseBillPayload(doc: any, tableHint?: { name: string; seats: number; area: string } | null): BillData | null {
+function parseBillPayload(doc: any, tableHint?: { name: string; seats?: number; area?: string } | null): BillData | null {
   if (!doc) return null
+
+  const resolvedTable = (doc.table && doc.table.name?.trim())
+    ? {
+        name: doc.table.name.trim(),
+        seats: Number(doc.table.seats ?? 0),
+        area: doc.table.area?.trim() ?? '',
+      }
+    : (tableHint && tableHint.name?.trim())
+      ? {
+          name: tableHint.name.trim(),
+          seats: Number(tableHint.seats ?? 0),
+          area: tableHint.area?.trim() ?? '',
+        }
+      : null
+
   if (doc.restaurant) {
-    return tableHint && !doc.table ? { ...doc, table: tableHint } : doc
+    return {
+      ...doc,
+      table: resolvedTable,
+    }
   }
   const tenant = doc.tenant || {}
   const orders = Array.isArray(doc.orders) && doc.orders.length > 0
@@ -326,37 +349,37 @@ function parseBillPayload(doc: any, tableHint?: { name: string; seats: number; a
   const grandTotal = chk?.total ?? doc.totals?.total ?? +activeOrders.reduce((s: number, o: any) => s + Number(o.total || 0), 0).toFixed(2)
   const paid = chk?.paid ?? doc.totals?.paid ?? (primary?.paymentStatus === 'PAID' ? grandTotal : 0)
 
-  const taxRate = Number(tenant.taxRate ?? 5)
-  const cgstRate = taxRate / 2
-  const sgstRate = taxRate / 2
-  const cgstAmount = +(tax / 2).toFixed(2)
-  const sgstAmount = +(tax - cgstAmount).toFixed(2)
+  const taxRate = Number(doc.taxBreakup?.rate ?? tenant.taxRate ?? 8)
+  const cgstRate = Number(doc.taxBreakup?.cgstRate ?? (taxRate / 2))
+  const sgstRate = Number(doc.taxBreakup?.sgstRate ?? (taxRate / 2))
+  const cgstAmount = Number(doc.taxBreakup?.cgstAmount ?? +(tax / 2).toFixed(2))
+  const sgstAmount = Number(doc.taxBreakup?.sgstAmount ?? +(tax - cgstAmount).toFixed(2))
 
   const billNumber = chk?.invoiceNumber ?? doc.invoiceNumber ?? `BILL-${String(primary?.orderNumber || '000001').padStart(6, '0')}`
 
   return {
     restaurant: {
-      name: tenant.name || 'The Salad Bistro',
-      tagline: tenant.tagline || 'Artisanal Bowls & Greens',
+      name: tenant.name || doc.restaurantName || 'Restaurant',
+      tagline: tenant.tagline || null,
       logo: tenant.logo || null,
-      address: tenant.address || 'Connaught Place, New Delhi, India',
-      phone: tenant.phone || '+91 98765 43210',
-      email: tenant.email || 'hello@thesalad.in',
+      address: tenant.address || doc.address || null,
+      phone: tenant.phone || doc.phone || null,
+      email: tenant.email || doc.email || null,
       currency: tenant.currency || 'INR',
       currencySymbol: tenant.currencySymbol || '₹',
-      gstin: tenant.gstin || doc.gstin || '07AABCT2345K1Z8',
-      fssai: tenant.fssai || doc.fssai || '13324001000123',
+      gstin: tenant.gstin || doc.gstin || null,
+      fssai: tenant.fssai || doc.fssai || null,
     },
     billNumber,
     orderNumber: primary?.orderNumber ?? 1001,
     orderNumbers: activeOrders.map((o: any) => o.orderNumber),
     invoiceDate: chk?.invoiceDate ?? primary?.createdAt ?? new Date().toISOString(),
     completedAt: chk?.closedAt ?? primary?.completedAt ?? null,
-    table: tableHint ?? (primary?.table ? { name: primary.table.name, seats: primary.table.seats, area: primary.table.area } : null),
+    table: resolvedTable ?? (primary?.table && primary.table.name?.trim() ? { name: primary.table.name.trim(), seats: Number(primary.table.seats ?? 0), area: primary.table.area?.trim() ?? '' } : null),
     orderType: primary?.orderType || 'DINE_IN',
     customerName: primary?.customerName || null,
     customerPhone: primary?.customerPhone || null,
-    servedBy: 'Aarav Mehta',
+    servedBy: doc.servedBy || primary?.servedBy || primary?.serverName || primary?.staffName || null,
     items,
     subtotal,
     discount,
@@ -612,7 +635,15 @@ export function BillDialog({
                 </span>
               </div>
               <div className="flex justify-between"><span className="text-gray-500">Date</span><span>{fmtDate(bill.invoiceDate)}</span></div>
-              {bill.table && <div className="flex justify-between"><span className="text-gray-500">Table</span><span>{bill.table.name} ({bill.table.area})</span></div>}
+              {bill.table && bill.table.name?.trim() && (
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Table</span>
+                  <span>
+                    {bill.table.name.trim()}
+                    {bill.table.area?.trim() ? ` (${bill.table.area.trim()})` : ''}
+                  </span>
+                </div>
+              )}
               <div className="flex justify-between"><span className="text-gray-500">Type</span><span>{bill.orderType === 'DINE_IN' ? 'Dine In' : bill.orderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'}</span></div>
               {bill.customerName && <div className="flex justify-between"><span className="text-gray-500">Customer</span><span>{bill.customerName}</span></div>}
               {bill.servedBy && <div className="flex justify-between"><span className="text-gray-500">Served by</span><span>{bill.servedBy}</span></div>}

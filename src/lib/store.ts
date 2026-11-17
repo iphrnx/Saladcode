@@ -34,10 +34,6 @@ const sameLine = (
   normalizePortionKey(c.portion, c.portionId) === normalizePortionKey(portion, portionId)
 
 interface AppState {
-  // tenant context
-  tenantId: string | null
-  setTenantId: (id: string) => void
-
   // current view (for the single-page dashboard)
   view: ViewKey
   setView: (v: ViewKey) => void
@@ -67,6 +63,7 @@ interface AppState {
     cart: CartItem[]
     orderType?: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
     selectedTableId?: string | null
+    selectedSessionId?: string | null
     promoCode?: string
   }) => void
   /**
@@ -77,11 +74,13 @@ interface AppState {
     lines: Array<{ menuItemId: string; portion?: string | null; portionId?: string | null; quantity: number }>,
   ) => void
 
-  // POS order type & table
+  // POS order type & table / session
   orderType: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
   setOrderType: (t: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY') => void
   selectedTableId: string | null
   setSelectedTableId: (id: string | null) => void
+  selectedSessionId: string | null
+  setSelectedSessionId: (id: string | null) => void
 
   // promo
   promoCode: string
@@ -93,9 +92,6 @@ interface AppState {
 }
 
 export const useStore = create<AppState>((set) => ({
-  tenantId: null,
-  setTenantId: (id) => set({ tenantId: id }),
-
   view: 'dashboard',
   setView: (v) => set({ view: v }),
 
@@ -141,6 +137,7 @@ export const useStore = create<AppState>((set) => ({
             cart: snapshot.cart,
             ...(snapshot.orderType ? { orderType: snapshot.orderType } : {}),
             ...(snapshot.selectedTableId !== undefined ? { selectedTableId: snapshot.selectedTableId } : {}),
+            ...(snapshot.selectedSessionId !== undefined ? { selectedSessionId: snapshot.selectedSessionId } : {}),
             ...(snapshot.promoCode !== undefined ? { promoCode: snapshot.promoCode } : {}),
           },
     ),
@@ -163,7 +160,13 @@ export const useStore = create<AppState>((set) => ({
   orderType: 'DINE_IN',
   setOrderType: (t) => set({ orderType: t }),
   selectedTableId: null,
-  setSelectedTableId: (id) => set({ selectedTableId: id }),
+  setSelectedTableId: (id) =>
+    set((s) => ({
+      selectedTableId: id,
+      selectedSessionId: s.selectedTableId === id ? s.selectedSessionId : null,
+    })),
+  selectedSessionId: null,
+  setSelectedSessionId: (id) => set({ selectedSessionId: id }),
 
   promoCode: '',
   setPromoCode: (c) => set({ promoCode: c }),

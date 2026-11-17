@@ -110,8 +110,8 @@ async function create(req: Request): Promise<Response> {
 
   // An empty body used to fall through to the insert and surface the database
   // constraint as a 500; the caller should hear that the fields are missing.
-  if (!String(b.name ?? "").trim() || !b.date || !b.time) {
-    return json(req, { error: "Name, date and time are required" }, 400);
+  if (!String(b.name ?? "").trim() || !String(b.phone ?? "").trim() || !b.date || !b.time) {
+    return json(req, { error: "Name, phone, date and time are required" }, 400);
   }
 
   const { data, error } = await admin()
@@ -135,6 +135,15 @@ async function create(req: Request): Promise<Response> {
   return json(req, mapReservation(data), 201);
 }
 
+const RESERVATION_NEXT: Record<string, string[]> = {
+  PENDING: ["CONFIRMED", "CANCELLED"],
+  CONFIRMED: ["SEATED", "CANCELLED", "NO_SHOW"],
+  SEATED: ["COMPLETED"],
+  CANCELLED: [],
+  NO_SHOW: [],
+  COMPLETED: [],
+};
+
 async function update(req: Request, id: string | null): Promise<Response> {
   const g = await guard(req, { anyOf: ["tables.manage", "orders.create"] });
   if (!g.ok) return g.response;
@@ -142,8 +151,35 @@ async function update(req: Request, id: string | null): Promise<Response> {
   const tenantId = g.session.tenantId;
   const b = await body(req);
 
+  const { data: current, error: fetchErr } = await admin()
+    .from("reservations")
+    .select("id, status, table_id")
+    .eq("id", id)
+    .eq("tenant_id", tenantId)
+    .maybeSingle();
+
+  if (fetchErr) return json(req, { error: fetchErr.message }, 500);
+  if (!current) return json(req, { error: "Reservation not found" }, 404);
+
   const data: Record<string, unknown> = {};
-  if (b.status !== undefined) data.status = b.status;
+  if (b.status !== undefined) {
+    const target = String(b.status).toUpperCase();
+    const allowed = RESERVATION_NEXT[current.status] ?? [];
+    if (target !== current.status && !allowed.includes(target)) {
+      return json(
+        req,
+        {
+          error: `Reservation is ${current.status}; it cannot transition to ${target}.`,
+          currentStatus: current.status,
+        },
+        409,
+      );
+    }
+    if (target === "SEATED" && !b.tableId && !current.table_id) {
+      return json(req, { error: "A table must be assigned before seating a reservation." }, 400);
+    }
+    data.status = target;
+  }
   if (b.tableId !== undefined) data.table_id = b.tableId;
 
   const { data: reservation, error } = await admin()

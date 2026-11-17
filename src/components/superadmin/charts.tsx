@@ -5,8 +5,6 @@ import {
   BarChart,
   CartesianGrid,
   Cell,
-  Line,
-  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -72,56 +70,6 @@ export function TrendChart({
         />
         <Bar dataKey={valueKey} fill="url(#adminBar)" radius={[4, 4, 0, 0]} maxBarSize={28} />
       </BarChart>
-    </ResponsiveContainer>
-  )
-}
-
-/** A smooth line, for a metric that is better read as a shape. */
-export function LineTrend({
-  data,
-  dataKey,
-  label,
-  color = '#f97316',
-  height = 200,
-}: {
-  data: any[]
-  dataKey: string
-  label: string
-  color?: string
-  height?: number
-}) {
-  if (!data.length) {
-    return (
-      <div
-        className="grid place-items-center rounded-xl border border-dashed border-admin-border text-[13px] text-admin-faint"
-        style={{ height }}
-      >
-        No data yet
-      </div>
-    )
-  }
-
-  return (
-    <ResponsiveContainer width="100%" height={height}>
-      <LineChart data={data} margin={{ top: 6, right: 8, left: -20, bottom: 0 }}>
-        <CartesianGrid vertical={false} stroke="#f0efe9" />
-        <XAxis dataKey="date" {...AXIS} tickFormatter={(v: string) => v.slice(5)} interval="preserveStartEnd" />
-        <YAxis {...AXIS} width={48} />
-        <Tooltip
-          cursor={{ stroke: '#d7d9df', strokeDasharray: '4 4' }}
-          contentStyle={TOOLTIP_STYLE}
-          labelStyle={{ color: '#343846', fontWeight: 600, marginBottom: 2 }}
-        />
-        <Line
-          type="monotone"
-          dataKey={dataKey}
-          name={label}
-          stroke={color}
-          strokeWidth={2.5}
-          dot={false}
-          activeDot={{ r: 4, strokeWidth: 0 }}
-        />
-      </LineChart>
     </ResponsiveContainer>
   )
 }

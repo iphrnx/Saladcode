@@ -67,12 +67,18 @@ async function handler(
   const contentType = res.headers.get('content-type') ?? 'application/json'
   const payload = await res.text()
 
+  const responseHeaders: Record<string, string> = {
+    'content-type': contentType,
+    'cache-control': 'no-store',
+  }
+  const contentDisposition = res.headers.get('content-disposition')
+  if (contentDisposition) {
+    responseHeaders['content-disposition'] = contentDisposition
+  }
+
   return new NextResponse(payload, {
     status: res.status,
-    headers: {
-      'content-type': contentType,
-      'cache-control': 'no-store',
-    },
+    headers: responseHeaders,
   })
 }
 

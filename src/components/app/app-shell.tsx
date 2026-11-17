@@ -2,25 +2,28 @@
 
 import { useEffect, useRef } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
+import dynamic from 'next/dynamic'
 import { AppDataProvider, useApp } from './data-context'
 import { Sidebar, MobileMoreSheet } from './sidebar'
 import { Header } from './header'
 import { useStore } from '@/lib/store'
 import { initTheme } from '@/lib/theme'
 import { DashboardView } from '@/components/views/dashboard'
-import { OrdersView } from '@/components/views/orders'
-import { AnalyticsView } from '@/components/views/analytics'
-import { MenuView } from '@/components/views/menu'
-import { QrView } from '@/components/views/qr'
-import { PromosView } from '@/components/views/promos'
-import { RolesView } from '@/components/views/roles'
-import { SecurityView } from '@/components/views/security'
-import { SettingsView } from '@/components/views/settings'
-import { OnboardingFlow } from '@/components/onboarding/onboarding-flow'
 import { TrialBanner } from '@/components/app/trial-banner'
 import { canView, firstAllowedView } from '@/lib/permissions'
 import { AccessDeniedForView } from '@/components/shared/access-denied'
 import { AccessDenied } from '@/components/shared/access-denied'
+
+// Code-split heavy views to keep initial interactive bundle lightweight
+const OrdersView = dynamic(() => import('@/components/views/orders').then((m) => m.OrdersView))
+const AnalyticsView = dynamic(() => import('@/components/views/analytics').then((m) => m.AnalyticsView))
+const MenuView = dynamic(() => import('@/components/views/menu').then((m) => m.MenuView))
+const QrView = dynamic(() => import('@/components/views/qr').then((m) => m.QrView))
+const PromosView = dynamic(() => import('@/components/views/promos').then((m) => m.PromosView))
+const RolesView = dynamic(() => import('@/components/views/roles').then((m) => m.RolesView))
+const SecurityView = dynamic(() => import('@/components/views/security').then((m) => m.SecurityView))
+const SettingsView = dynamic(() => import('@/components/views/settings').then((m) => m.SettingsView))
+const OnboardingFlow = dynamic(() => import('@/components/onboarding/onboarding-flow').then((m) => m.OnboardingFlow))
 
 function ShellLoading() {
   return (
@@ -113,6 +116,16 @@ function ShellContent() {
   useEffect(() => {
     initTheme()
   }, [])
+
+  // Synchronize runtime preferences (compact mode & language) to the document root
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    const isCompact = data?.settings?.pref_compact_mode === 'true'
+    document.documentElement.setAttribute('data-compact', isCompact ? 'true' : 'false')
+
+    const lang = data?.settings?.pref_language || 'en'
+    document.documentElement.setAttribute('lang', lang)
+  }, [data?.settings?.pref_compact_mode, data?.settings?.pref_language])
 
   // No tenant in DB — send to onboarding wizard
   useEffect(() => {

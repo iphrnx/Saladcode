@@ -1,7 +1,7 @@
 'use client'
 
-import { useMemo, useState, useEffect, useCallback } from 'react'
-import { useApp } from '@/components/app/data-context'
+import { useMemo, useState, useEffect, useCallback, useRef } from 'react'
+import { useApp, type AppData } from '@/components/app/data-context'
 import { useStore } from '@/lib/store'
 import { cn } from '@/lib/utils'
 import { useScrollCollapse } from '@/lib/use-scroll-collapse'
@@ -37,10 +37,11 @@ import {
   Settings, Store, SlidersHorizontal, CreditCard, AlertTriangle, Save, Building2, MapPin, Phone, Mail, Globe, Clock, Trash2, Check, Sparkles, User, Palette, Bell, Lock, KeyRound, Smartphone, Moon, Sun, Languages, ShieldCheck, ChevronDown, FileText, Star, ExternalLink, RefreshCw, MessageSquare, Send, Loader2, ChevronRight, Instagram, Facebook, Youtube,
   CheckCircle2, XCircle, Receipt, Clock as ClockIcon,
   Printer, RotateCcw, FileDown,
-  ArrowLeft, CalendarClock, History, Wallet,
+  ArrowLeft, CalendarClock, History, Wallet, Calendar,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { LANGUAGES } from '@/lib/i18n'
+import { DATE_FORMAT_OPTIONS, type DateFormatPattern } from '@/lib/date-format'
 import {
   type BillingInterval,
   annualSavings,
@@ -581,8 +582,8 @@ export function SettingsView() {
   })
 
   // Operations form state
-  const [taxRate, setTaxRate] = useState(0)
-  const [serviceCharge, setServiceCharge] = useState(0)
+  const [taxRate, setTaxRate] = useState<string>('0')
+  const [serviceCharge, setServiceCharge] = useState<string>('0')
   const [openingHours, setOpeningHours] = useState('')
   const [timezone, setTimezone] = useState('UTC')
   const [opToggles, setOpToggles] = useState<Record<string, boolean>>({})
@@ -599,6 +600,7 @@ export function SettingsView() {
   const [prefs, setPrefs] = useState({
     theme: 'dark',
     language: 'en',
+    dateFormat: 'DD/MM/YYYY' as DateFormatPattern,
     emailAlerts: true,
     pushAlerts: true,
     soundAlerts: false,
@@ -676,10 +678,9 @@ export function SettingsView() {
   const [cancelScheduledFor, setCancelScheduledFor] = useState<ScheduledChange | null>(null)
   const [cancellingScheduled, setCancellingScheduled] = useState(false)
 
-  // Initialize from data
-  useEffect(() => {
-    if (!data) return
-    const t = data.tenant
+  // Dedicated initializer: cleanly sets all form fields from app data
+  const initForm = useCallback((d: AppData) => {
+    const t = d.tenant
     setTenantForm({
       name: t.name || '',
       tagline: t.tagline || '',
@@ -689,39 +690,58 @@ export function SettingsView() {
       currency: t.currency || 'INR',
       currencySymbol: t.currencySymbol || '$',
       logo: t.logo || '',
-      gstin: data.settings.gstin || '',
-      fssai: data.settings.fssai || '',
-      instagram: data.settings.instagram || '',
-      facebook: data.settings.facebook || '',
-      youtube: data.settings.youtube || '',
-      menuTheme: normaliseMenuTheme(data.settings.menu_theme),
+      gstin: d.settings.gstin || '',
+      fssai: d.settings.fssai || '',
+      instagram: d.settings.instagram || '',
+      facebook: d.settings.facebook || '',
+      youtube: d.settings.youtube || '',
+      menuTheme: normaliseMenuTheme(d.settings.menu_theme),
     })
-    setTaxRate(t.taxRate ?? 0)
-    setServiceCharge(t.serviceCharge ?? 0)
-    setOpeningHours(data.settings.opening_hours || 'Mon–Fri 9:00 AM – 10:00 PM')
-    setTimezone(data.settings.timezone || 'Asia/Kolkata')
+    setTaxRate(t.taxRate != null ? String(Number(t.taxRate)) : '0')
+    setServiceCharge(t.serviceCharge != null ? String(Number(t.serviceCharge)) : '0')
+    setOpeningHours(d.settings.opening_hours || 'Mon–Fri 9:00 AM – 10:00 PM')
+    setTimezone(d.settings.timezone || 'Asia/Kolkata')
     const toggles: Record<string, boolean> = {}
-    for (const t of OPS_TOGGLES) {
-      toggles[t.key] = data.settings[t.key] === 'true'
+    for (const tog of OPS_TOGGLES) {
+      toggles[tog.key] = d.settings[tog.key] === 'true'
     }
     setOpToggles(toggles)
     // Review collection is on unless the owner has explicitly turned it off.
-    setReviewsEnabled(data.settings.reviews_enabled !== 'false')
+    setReviewsEnabled(d.settings.reviews_enabled !== 'false')
     // profile
-    const u = data.currentUser
+    const u = d.currentUser
     setProfileForm({ name: u.name || '', email: u.email || '', phone: u.phone || '', avatar: u.avatar || '' })
     // prefs
     setPrefs({
-      theme: data.settings.pref_theme || 'dark',
-      language: data.settings.pref_language || 'en',
-      emailAlerts: data.settings.pref_email_alerts !== 'false',
-      pushAlerts: data.settings.pref_push_alerts !== 'false',
-      soundAlerts: data.settings.pref_sound_alerts === 'true',
-      dailyDigest: data.settings.pref_daily_digest !== 'false',
-      defaultOrderType: data.settings.pref_default_order_type || 'DINE_IN',
-      compactMode: data.settings.pref_compact_mode === 'true',
+      theme: d.settings.pref_theme || 'dark',
+      language: d.settings.pref_language || 'en',
+      dateFormat: (d.settings.pref_date_format as DateFormatPattern) || 'DD/MM/YYYY',
+      emailAlerts: d.settings.pref_email_alerts !== 'false',
+      pushAlerts: d.settings.pref_push_alerts !== 'false',
+      soundAlerts: d.settings.pref_sound_alerts === 'true',
+      dailyDigest: d.settings.pref_daily_digest !== 'false',
+      defaultOrderType: d.settings.pref_default_order_type || 'DINE_IN',
+      compactMode: d.settings.pref_compact_mode === 'true',
     })
-  }, [data])
+  }, [])
+
+  // Ref tracking to protect unsaved user edits from being overwritten by background polling / realtime
+  const initializedTenantIdRef = useRef<string | null>(null)
+  const dirtyRef = useRef(false)
+
+  // Initialize from data: runs on initial load, tenant switch, or when server data updates IF form is not dirty
+  useEffect(() => {
+    if (!data) return
+    if (initializedTenantIdRef.current !== data.tenant.id) {
+      initializedTenantIdRef.current = data.tenant.id
+      initForm(data)
+      return
+    }
+    // Only re-sync from server data if there are no unsaved user edits
+    if (!dirtyRef.current) {
+      initForm(data)
+    }
+  }, [data?.tenant, data?.settings, data?.currentUser, initForm])
 
   const headers = useMemo(() => ({
     'x-tenant-id': data?.tenant.id ?? '',
@@ -745,17 +765,22 @@ export function SettingsView() {
     if (tenantForm.instagram !== (data.settings.instagram || '')) return true
     if (tenantForm.facebook !== (data.settings.facebook || '')) return true
     if (tenantForm.youtube !== (data.settings.youtube || '')) return true
-    if (taxRate !== (t.taxRate ?? 0)) return true
-    if (serviceCharge !== (t.serviceCharge ?? 0)) return true
+
+    const savedTaxRateStr = t.taxRate != null ? String(Number(t.taxRate)) : '0'
+    const savedServiceChargeStr = t.serviceCharge != null ? String(Number(t.serviceCharge)) : '0'
+    if (taxRate !== savedTaxRateStr) return true
+    if (serviceCharge !== savedServiceChargeStr) return true
+
     if (openingHours !== (data.settings.opening_hours || 'Mon–Fri 9:00 AM – 10:00 PM')) return true
     if (timezone !== (data.settings.timezone || 'Asia/Kolkata')) return true
-    for (const t of OPS_TOGGLES) {
-      if (opToggles[t.key] !== (data.settings[t.key] === 'true')) return true
+    for (const tog of OPS_TOGGLES) {
+      if (opToggles[tog.key] !== (data.settings[tog.key] === 'true')) return true
     }
     // Preferences are part of the same save, so they must be able to raise it.
     // Each comparison mirrors the default used when loading them above.
     if (prefs.theme !== (data.settings.pref_theme || 'dark')) return true
     if (prefs.language !== (data.settings.pref_language || 'en')) return true
+    if (prefs.dateFormat !== (data.settings.pref_date_format || 'DD/MM/YYYY')) return true
     if (prefs.emailAlerts !== (data.settings.pref_email_alerts !== 'false')) return true
     if (prefs.pushAlerts !== (data.settings.pref_push_alerts !== 'false')) return true
     if (prefs.soundAlerts !== (data.settings.pref_sound_alerts === 'true')) return true
@@ -765,6 +790,10 @@ export function SettingsView() {
     return false
   }, [data, tenantForm, taxRate, serviceCharge, openingHours, timezone, opToggles, prefs])
 
+  useEffect(() => {
+    dirtyRef.current = dirty
+  }, [dirty])
+
   const tenantId = data?.tenant?.id ?? ''
 
   const save = async () => {
@@ -773,6 +802,11 @@ export function SettingsView() {
     if (saving || !dirty || !data?.tenant) return
     setSaving(true)
     try {
+      const parsedTaxRate = taxRate.trim() === '' ? 0 : parseFloat(taxRate)
+      const parsedServiceCharge = serviceCharge.trim() === '' ? 0 : parseFloat(serviceCharge)
+      const validTaxRate = isNaN(parsedTaxRate) ? 0 : Math.max(0, Math.min(100, parsedTaxRate))
+      const validServiceCharge = isNaN(parsedServiceCharge) ? 0 : Math.max(0, Math.min(100, parsedServiceCharge))
+
       const t = data.tenant
       const body: any = {
         tenant: {
@@ -784,8 +818,8 @@ export function SettingsView() {
           currency: tenantForm.currency,
           currencySymbol: tenantForm.currencySymbol,
           logo: tenantForm.logo,
-          taxRate,
-          serviceCharge,
+          taxRate: validTaxRate,
+          serviceCharge: validServiceCharge,
         },
         settings: {
           opening_hours: openingHours,
@@ -801,6 +835,7 @@ export function SettingsView() {
           // reset to its default on reload no matter what was chosen.
           pref_theme: prefs.theme,
           pref_language: prefs.language,
+          pref_date_format: prefs.dateFormat,
           pref_email_alerts: String(prefs.emailAlerts),
           pref_push_alerts: String(prefs.pushAlerts),
           pref_sound_alerts: String(prefs.soundAlerts),
@@ -819,6 +854,13 @@ export function SettingsView() {
       const payload = await res.json().catch(() => null)
       if (payload?.error) throw new Error(payload.error)
       toast.success('Settings saved')
+      if (typeof window !== 'undefined') {
+        try {
+          window.localStorage.setItem('the-salad-activation-sound', prefs.soundAlerts ? 'on' : 'off')
+        } catch {}
+      }
+      setTaxRate(String(validTaxRate))
+      setServiceCharge(String(validServiceCharge))
       // Re-read them, so the form matches what the database now holds and the
       // Save button stops offering a save that has already happened.
       await refresh()
@@ -1568,44 +1610,7 @@ export function SettingsView() {
   // Discard changes
   const discard = () => {
     if (!data) return
-    const t = data.tenant
-    setTenantForm({
-      name: t.name || '',
-      tagline: t.tagline || '',
-      email: t.email || '',
-      phone: t.phone || '',
-      address: t.address || '',
-      currency: t.currency || 'INR',
-      currencySymbol: t.currencySymbol || '$',
-      logo: t.logo || '',
-      gstin: data.settings.gstin || '',
-      fssai: data.settings.fssai || '',
-      instagram: data.settings.instagram || '',
-      facebook: data.settings.facebook || '',
-      youtube: data.settings.youtube || '',
-      menuTheme: normaliseMenuTheme(data.settings.menu_theme),
-    })
-    setTaxRate(t.taxRate ?? 0)
-    setServiceCharge(t.serviceCharge ?? 0)
-    setOpeningHours(data.settings.opening_hours || 'Mon–Fri 9:00 AM – 10:00 PM')
-    setTimezone(data.settings.timezone || 'Asia/Kolkata')
-    const toggles: Record<string, boolean> = {}
-    for (const t of OPS_TOGGLES) {
-      toggles[t.key] = data.settings[t.key] === 'true'
-    }
-    setOpToggles(toggles)
-    const u = data.currentUser
-    setProfileForm({ name: u.name || '', email: u.email || '', phone: u.phone || '', avatar: u.avatar || '' })
-    setPrefs({
-      theme: data.settings.pref_theme || 'dark',
-      language: data.settings.pref_language || 'en',
-      emailAlerts: data.settings.pref_email_alerts !== 'false',
-      pushAlerts: data.settings.pref_push_alerts !== 'false',
-      soundAlerts: data.settings.pref_sound_alerts === 'true',
-      dailyDigest: data.settings.pref_daily_digest !== 'false',
-      defaultOrderType: data.settings.pref_default_order_type || 'DINE_IN',
-      compactMode: data.settings.pref_compact_mode === 'true',
-    })
+    initForm(data)
   }
 
   const onCurrencyChange = (code: string) => {
@@ -1672,9 +1677,21 @@ export function SettingsView() {
         headers,
       })
       await failIfNotOk(res, 'the restaurant', { action: 'save' })
-      toast.success('Restaurant deleted')
+      toast.success('Restaurant deleted. Redirecting...')
       setDeleteOpen(false)
       setDeleteConfirm('')
+
+      // Clear cached tenant and session data to prevent landing on a stale 404
+      if (typeof window !== 'undefined') {
+        try {
+          window.localStorage.removeItem('the-salad-active-tenant')
+          window.localStorage.removeItem('the-salad-cart')
+          window.localStorage.removeItem('the-salad-table-tokens')
+          window.localStorage.removeItem('the-salad-activation-sound')
+          window.sessionStorage.clear()
+        } catch {}
+        window.location.href = '/login?deleted=true'
+      }
     } catch (err) {
       handleAction(err, 'the restaurant')
     }
@@ -1923,6 +1940,23 @@ export function SettingsView() {
                       <SelectContent>
                         {LANGUAGES.map((l) => (
                           <SelectItem key={l.value} value={l.value}>{l.label}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-secondary/30 p-4">
+                    <div className="flex items-center gap-3">
+                      <Calendar className="h-4 w-4 text-primary shrink-0" />
+                      <div>
+                        <p className="text-sm font-medium">Date Format</p>
+                        <p className="text-xs text-muted-foreground">Format for dates across orders & invoices</p>
+                      </div>
+                    </div>
+                    <Select value={prefs.dateFormat} onValueChange={(v) => setPrefs(p => ({ ...p, dateFormat: v as DateFormatPattern }))}>
+                      <SelectTrigger className="bg-secondary/50 border-border w-36 shrink-0"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {DATE_FORMAT_OPTIONS.map((f) => (
+                          <SelectItem key={f.value} value={f.value}>{f.label}</SelectItem>
                         ))}
                       </SelectContent>
                     </Select>
@@ -2193,7 +2227,7 @@ export function SettingsView() {
                         min="0"
                         max="100"
                         value={taxRate}
-                        onChange={(e) => setTaxRate(parseFloat(e.target.value) || 0)}
+                        onChange={(e) => setTaxRate(e.target.value)}
                         className="bg-secondary/50 border-border"
                       />
                     </Field>
@@ -2204,7 +2238,7 @@ export function SettingsView() {
                         min="0"
                         max="100"
                         value={serviceCharge}
-                        onChange={(e) => setServiceCharge(parseFloat(e.target.value) || 0)}
+                        onChange={(e) => setServiceCharge(e.target.value)}
                         className="bg-secondary/50 border-border"
                       />
                     </Field>

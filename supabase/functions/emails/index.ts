@@ -3,7 +3,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { admin } from "../_shared/db.ts";
 import { json, preflight } from "../_shared/http.ts";
 import { dispatchPending, emailConfig, emailConfigured, validateEmailConfig } from "../_shared/email.ts";
-import { queueReminders } from "../_shared/reminders.ts";
+import { queueReminders, queueDailyDigests } from "../_shared/reminders.ts";
 import { razorpayConfig } from "../_shared/razorpay.ts";
 
 /**
@@ -94,14 +94,15 @@ Deno.serve(async (req: Request) => {
     if (route === "daily") {
       const db = admin();
       const reminders = await queueReminders(db);
+      const digests = await queueDailyDigests(db);
       const result = await dispatchPending(db, 50);
       // Record the run so "did the scheduler fire today?" is a fact on the
       // dashboard rather than something to be inferred from email timestamps.
       await db.from("super_admin_audit_logs").insert({
         action: "email.daily_run",
-        details: { queued: reminders.queued, kinds: reminders.kinds, ...result },
+        details: { queued: reminders.queued + digests.queued, kinds: reminders.kinds, digestsQueued: digests.queued, ...result },
       });
-      return json(req, { ok: true, queued: reminders.queued, kinds: reminders.kinds, ...result, razorpay: razorpayConfig().keyId ? "configured" : "missing" });
+      return json(req, { ok: true, queued: reminders.queued + digests.queued, kinds: reminders.kinds, digestsQueued: digests.queued, ...result, razorpay: razorpayConfig().keyId ? "configured" : "missing" });
     }
 
     if (route === "dispatch") {

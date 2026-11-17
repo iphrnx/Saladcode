@@ -386,6 +386,39 @@ export function renderEmail(event: EmailEvent): Rendered {
         text: `Your The Salad account has been deleted\n\n${restaurant} and its data have been permanently removed (${fmtDate(p.deletedAt)}).\n\nIf you did not request this, contact ${emailConfig().support}.`,
       };
 
+    case "daily_digest":
+      return {
+        subject: `Daily Digest: ${restaurant} — ${p.ordersCount ?? 0} orders · ₹${(p.revenue ?? 0).toFixed(2)}`,
+        html: frame({
+          heading: "Daily Sales Summary",
+          intro: `Here is the performance summary for <strong>${restaurant}</strong> over the last 24 hours.`,
+          rows: [
+            ["Total Orders", String(p.ordersCount ?? 0)],
+            ["Total Revenue", `₹${(p.revenue ?? 0).toFixed(2)}`],
+            ["Date", fmtDate(p.date)],
+          ],
+          cta: { label: "View Analytics", href: site ? `${site}/?view=analytics` : "" },
+          footnote: "You receive this daily report because Daily Digest is enabled in your restaurant settings.",
+        }),
+        text: `Daily Sales Summary for ${restaurant}\n\nOrders: ${p.ordersCount ?? 0}\nRevenue: ₹${(p.revenue ?? 0).toFixed(2)}\n\nView details: ${site}/?view=analytics`,
+      };
+
+    case "order_alert":
+      return {
+        subject: `New Order #${p.orderNumber} at ${restaurant}`,
+        html: frame({
+          heading: `New Order #${p.orderNumber}`,
+          intro: `A new order has been received at <strong>${restaurant}</strong> for table/customer <strong>${p.tableName || p.customerName || "Takeaway"}</strong>.`,
+          rows: [
+            ["Order #", `#${p.orderNumber}`],
+            ["Total Amount", `₹${(p.total ?? 0).toFixed(2)}`],
+            ["Type", String(p.orderType ?? "DINE_IN")],
+          ],
+          cta: { label: "Open Orders", href: site ? `${site}/?view=orders` : "" },
+        }),
+        text: `New Order #${p.orderNumber} at ${restaurant}\nTotal: ₹${(p.total ?? 0).toFixed(2)}\n\nManage orders: ${site}/?view=orders`,
+      };
+
     default:
       return {
         subject: event.planName ? `${plan} — The Salad` : "The Salad",
@@ -415,6 +448,19 @@ export async function queueEmail(db: SupabaseClient, event: EmailEvent): Promise
   if (!event.recipient || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(event.recipient)) {
     console.error("email: not queuing an event with no usable recipient", event.eventType);
     return null;
+  }
+
+  // If this is an order alert, respect tenant pref_email_alerts preference
+  if (event.eventType === "order_alert" && event.tenantId) {
+    const { data: settingRow } = await db
+      .from("settings")
+      .select("value")
+      .eq("tenant_id", event.tenantId)
+      .eq("key", "pref_email_alerts")
+      .maybeSingle();
+    if (settingRow && settingRow.value === "false") {
+      return null;
+    }
   }
   const rendered = renderEmail(event);
   const { data, error } = await db

@@ -5,6 +5,7 @@ import { useApp, type CheckSummary, type Order, type OrderItem } from '@/compone
 import { reconcileOrderExpansion, toggleOrderExpansion, type OrderExpansion } from './order-expansion'
 import { cn } from '@/lib/utils'
 import { useT } from '@/lib/i18n'
+import { formatDateWithPattern, type DateFormatPattern } from '@/lib/date-format'
 import { TableCheckDialog } from '@/components/shared/table-check-dialog'
 import { SessionPaymentDialog } from '@/components/shared/session-payment-dialog'
 import { SessionOrdersDrawer } from '@/components/shared/session-orders-drawer'
@@ -448,31 +449,61 @@ export function OrdersView() {
       const due = !check || sharedBill
         ? +Math.max(0, total - paid).toFixed(2)
         : Math.max(0, check.outstanding)
+      const allOrdersCompleted = rows.every((o) => ['COMPLETED', 'CANCELLED'].includes(o.status))
+      const allOrdersPaid = rows.every((o) => o.paymentStatus === 'PAID')
+      const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber) || Boolean((latest as any).invoiceNumber)
+
       // A sitting with a row is Active or Ended because the server says so. One
       // without a row (an order written before sessions existed, or a takeaway)
       // is open while any of its orders is, which is all that can be said.
       // Sittings in PENDING (e.g. awaiting activation) are active, not ended.
       const state: 'Active' | 'Ended' = sitting
-        ? (sitting.status !== 'ENDED' && !sitting.endedAt) ? 'Active' : 'Ended'
-        : rows.some((o) => !['COMPLETED', 'CANCELLED'].includes(o.status))
-          ? 'Active'
-          : 'Ended'
+        ? (sitting.status === 'ENDED' || Boolean(sitting.endedAt) || (isSettledCheck && allOrdersCompleted))
+          ? 'Ended'
+          : 'Active'
+        : allOrdersCompleted
+          ? 'Ended'
+          : 'Active'
       // When it ended. The server's `ended_at` is the truth; without it the last
       // order's own timestamps are the closest honest answer, and a live sitting
       // has no end at all. Without this an ended card kept counting up.
       const endedAt = sitting?.endedAt
         ?? (state === 'Ended'
-          ? latest.completedAt ?? latest.updatedAt ?? latest.createdAt
+          ? (check as any)?.closedAt ?? latest.completedAt ?? latest.updatedAt ?? latest.createdAt
           : null)
+
+      const tableFromRows = rows.find((o) => o.table?.name)?.table
+      const resolvedTableId = latest.tableId
+        ?? rows.find((o) => o.tableId)?.tableId
+        ?? sitting?.tableId
+        ?? (checkId && checks[checkId] ? (checks[checkId] as any).tableId : null)
+        ?? null
+      const tableFromData = resolvedTableId
+        ? (data?.tables ?? []).find((t) => t.id === resolvedTableId)
+        : null
+
+      const resolvedTableName = latest.table?.name
+        ?? tableFromRows?.name
+        ?? tableFromData?.name
+        ?? null
+      const resolvedArea = latest.table?.area
+        ?? tableFromRows?.area
+        ?? tableFromData?.area
+        ?? null
+      const resolvedSeats = latest.table?.seats
+        ?? tableFromRows?.seats
+        ?? tableFromData?.seats
+        ?? null
+
       out.push({
         key,
         sessionId,
         orders: rows,
         latest,
-        tableId: latest.tableId ?? null,
-        tableName: latest.table?.name ?? null,
-        area: latest.table?.area ?? null,
-        seats: latest.table?.seats ?? null,
+        tableId: resolvedTableId,
+        tableName: resolvedTableName,
+        area: resolvedArea,
+        seats: resolvedSeats,
         orderType: latest.orderType,
         startedAt: sitting?.startedAt ?? rows[0].createdAt,
         endedAt,
@@ -501,21 +532,26 @@ export function OrdersView() {
         allServed: rows.every((o) =>
           ['SERVED', 'COMPLETED', 'CANCELLED'].includes(o.status),
         ),
-        paidOff: check?.status === 'PAID',
+        paidOff: Boolean(
+          check?.status === 'PAID'
+          || Boolean(check?.invoiceNumber)
+          || (allOrdersPaid && allOrdersCompleted)
+          || (latest.paymentStatus === 'PAID' && !checkId)
+        ),
       })
     }
 
-    // Label concurrent sessions on the same table (e.g. Diner 1, Diner 2)
+    // Label concurrent active sessions on the same table (e.g. Diner 1, Diner 2)
     const tableSittingCounts = new Map<string, number>()
     for (const s of out) {
-      if (s.tableId) {
+      if (s.tableId && s.state === 'Active') {
         tableSittingCounts.set(s.tableId, (tableSittingCounts.get(s.tableId) ?? 0) + 1)
       }
     }
 
     const tableSessionIndices = new Map<string, number>()
     const multiSittingTables = out
-      .filter((s) => s.tableId && (tableSittingCounts.get(s.tableId) ?? 0) > 1)
+      .filter((s) => s.tableId && s.state === 'Active' && (tableSittingCounts.get(s.tableId) ?? 0) > 1)
       .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
 
     for (const s of multiSittingTables) {
@@ -525,7 +561,7 @@ export function OrdersView() {
     }
 
     return out
-  }, [orders, checks, tableSessions])
+  }, [orders, checks, tableSessions, data?.tables])
 
   const ordersSitting = useMemo(() => {
     if (!ordersSittingKey) return null
@@ -809,34 +845,6 @@ export function OrdersView() {
           ? `Order #${order.orderNumber} (KOT ${kotNumber}) → ${capitalize(status.toLowerCase())}`
           : `Order #${order.orderNumber} → ${capitalize(status.toLowerCase())}`
       )
-
-      // When an order is completed, end the table session for that table
-      if (status === 'COMPLETED' && order.tableId) {
-        // 1. Broadcast immediately across browser tabs for zero-delay instant session end
-        try {
-          if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-            const bc = new BroadcastChannel('the_salad_orders_sync')
-            bc.postMessage({
-              type: 'SESSION_ENDED',
-              tenantId: tenant.id,
-              tableId: order.tableId,
-              orderId: order.id,
-              status: 'COMPLETED',
-              timestamp: new Date().toISOString(),
-            })
-            bc.close()
-          }
-        } catch {}
-
-        // 2. The backend already ended it. Marking an order COMPLETED ends the
-        //    table's session inside the orders function, in that same request,
-        //    and publishes the same SESSION_ENDED event — so the extra call to
-        //    /api/table-session/end that used to sit here was doing nothing the
-        //    server had not already done. It is gone, which also means the
-        //    kitchen no longer needs permission to end a table session: the
-        //    broadcast above is for the other tabs on this browser, and the
-        //    server's event covers the rest.
-      }
     } catch (e) {
       // Roll back the optimistic move — the card returns to the status the
       // database actually holds, and the next sync keeps it there.
@@ -900,13 +908,19 @@ export function OrdersView() {
         setBillDoc({
           checkId: sitting.checkId,
           orderId: sitting.latest.id,
-          table: sitting.tableId
+          table: sitting.tableName
             ? {
-                name: sitting.tableName ?? 'Table',
+                name: sitting.tableName,
                 seats: sitting.seats ?? 0,
                 area: sitting.area ?? '',
               }
-            : null,
+            : sitting.tableId
+              ? {
+                  name: 'Table',
+                  seats: sitting.seats ?? 0,
+                  area: sitting.area ?? '',
+                }
+              : null,
           autoPrint: true,
         })
       }
@@ -1081,13 +1095,19 @@ export function OrdersView() {
                   setBillDoc({
                     checkId: target.checkId,
                     orderId: target.latest.id,
-                    table: target.tableId
+                    table: target.tableName
                       ? {
-                          name: target.tableName ?? 'Table',
+                          name: target.tableName,
                           seats: target.seats ?? 0,
                           area: target.area ?? '',
                         }
-                      : null,
+                      : target.tableId
+                        ? {
+                            name: 'Table',
+                            seats: target.seats ?? 0,
+                            area: target.area ?? '',
+                          }
+                        : null,
                     autoPrint,
                   })
                 }
@@ -1111,20 +1131,27 @@ export function OrdersView() {
                 totalOverride={ticket.isMultiKot ? ticket.total : undefined}
                 currencySymbol={cs}
                 onView={() => setViewOrder(ticket.order)}
-                onViewBill={() =>
-                  ticket.order.tableId
+                onViewBill={() => {
+                  const ordTable = ticket.order.table ?? (ticket.order.tableId ? (data?.tables ?? []).find((t) => t.id === ticket.order.tableId) : null)
+                  return ticket.order.tableId
                     ? setBillTable({
                         id: ticket.order.tableId,
-                        name: ticket.order.table?.name ?? 'Table',
+                        name: ordTable?.name ?? 'Table',
                         checkId: ticket.order.checkId ?? null,
                       })
                     : setBillDoc({
                         checkId: ticket.order.checkId ?? null,
                         orderId: ticket.order.id,
-                        table: null,
+                        table: ordTable?.name
+                          ? {
+                              name: ordTable.name,
+                              seats: ordTable.seats ?? 0,
+                              area: ordTable.area ?? '',
+                            }
+                          : null,
                         autoPrint: false,
                       })
-                }
+                }}
                 canPrepare={canPrepare}
                 canReady={canReady}
                 canServe={canServe}
@@ -1563,8 +1590,7 @@ export function OrdersView() {
             awaiting: ordersSitting.awaiting,
           }}
           invoiceNumber={
-            (ordersSitting.checkId ? checks[ordersSitting.checkId]?.invoiceNumber : null) ||
-            `INV-${String(ordersSitting.latest.orderNumber).padStart(6, '0')}`
+            ordersSitting.checkId ? (checks[ordersSitting.checkId]?.invoiceNumber || null) : null
           }
           paymentMethod={ordersSitting.latest.paymentMethod || 'Cash'}
           paidAt={ordersSitting.endedAt || ordersSitting.latest.completedAt || ordersSitting.latest.createdAt}
@@ -1590,13 +1616,19 @@ export function OrdersView() {
             setBillDoc({
               checkId: target.checkId,
               orderId: target.latest.id,
-              table: target.tableId
+              table: target.tableName
                 ? {
-                    name: target.tableName ?? 'Table',
+                    name: target.tableName,
                     seats: target.seats ?? 0,
                     area: target.area ?? '',
                   }
-                : null,
+                : target.tableId
+                  ? {
+                      name: 'Table',
+                      seats: target.seats ?? 0,
+                      area: target.area ?? '',
+                    }
+                  : null,
               autoPrint: true,
             })
           }}
@@ -1605,13 +1637,19 @@ export function OrdersView() {
             setBillDoc({
               checkId: target.checkId,
               orderId: target.latest.id,
-              table: target.tableId
+              table: target.tableName
                 ? {
-                    name: target.tableName ?? 'Table',
+                    name: target.tableName,
                     seats: target.seats ?? 0,
                     area: target.area ?? '',
                   }
-                : null,
+                : target.tableId
+                  ? {
+                      name: 'Table',
+                      seats: target.seats ?? 0,
+                      area: target.area ?? '',
+                    }
+                  : null,
               autoPrint: false,
             })
           }}
@@ -1659,13 +1697,19 @@ export function OrdersView() {
           setBillDoc({
             checkId: target.checkId,
             orderId: target.latest.id,
-            table: target.tableId
+            table: target.tableName
               ? {
-                  name: target.tableName ?? 'Table',
+                  name: target.tableName,
                   seats: target.seats ?? 0,
                   area: target.area ?? '',
                 }
-              : null,
+              : target.tableId
+                ? {
+                    name: 'Table',
+                    seats: target.seats ?? 0,
+                    area: target.area ?? '',
+                  }
+                : null,
             autoPrint: false,
           })
         }}
@@ -1727,7 +1771,7 @@ function timeOf(iso: string): string {
  * Whole, that sentence is 123px wide and the cell is 95–116px — it was being
  * clipped at both breakpoints. Time alone fits anywhere.
  */
-function sessionWhen(iso: string): { day: string; time: string } {
+function sessionWhen(iso: string, dateFormat?: DateFormatPattern): { day: string; time: string } {
   const d = new Date(iso)
   if (isNaN(d.getTime())) return { day: '', time: '—' }
   const startOfToday = new Date()
@@ -1737,7 +1781,7 @@ function sessionWhen(iso: string): { day: string; time: string } {
   const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   if (d >= startOfToday) return { day: 'Today', time }
   if (d >= startOfYesterday) return { day: 'Yesterday', time }
-  return { day: d.toLocaleDateString([], { day: 'numeric', month: 'short' }), time }
+  return { day: formatDateWithPattern(iso, dateFormat || 'DD/MM/YYYY'), time }
 }
 
 /**
@@ -2116,12 +2160,22 @@ function SittingCard({
   const isTakeawayOrDelivery = sitting.orderType === 'TAKEAWAY' || sitting.orderType === 'DELIVERY'
   const isPaid = sitting.latest.paymentStatus?.toUpperCase() === 'PAID'
   const canAddToThisOrder = isTakeawayOrDelivery && active && sitting.latest.status !== 'COMPLETED' && sitting.latest.status !== 'CANCELLED' && !isPaid
-  const started = sessionWhen(sitting.startedAt)
+  const { data } = useApp()
+  const dateFormat = (data?.settings?.pref_date_format as DateFormatPattern) || 'DD/MM/YYYY'
+  const started = sessionWhen(sitting.startedAt, dateFormat)
   const hasPayPerm = canComplete && canCollectPay
   const onlyPendingActivation = sitting.orders.every((order) => order.status === 'PENDING_ACTIVATION')
   const hasBill = check ? check.orderCount > 0 : !sitting.awaiting
   const awaiting = !hasBill
-  const paidOff = sitting.checkId ? sitting.paidOff : sitting.latest.paymentStatus === 'PAID'
+  const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber) || Boolean((sitting.latest as any).invoiceNumber)
+  const allOrdersCompleted = sitting.orders.every((order) => ['COMPLETED', 'CANCELLED'].includes(order.status))
+  const allOrdersPaid = sitting.orders.every((order) => order.paymentStatus === 'PAID')
+  const paidOff = Boolean(
+    sitting.paidOff
+    || isSettledCheck
+    || (allOrdersPaid && allOrdersCompleted)
+    || sitting.latest.paymentStatus === 'PAID'
+  )
   const canPay = active && hasPayPerm && sitting.allServed && checkCanSettle &&
     !paidOff && hasBill && Boolean(
       (sitting.tableId && sitting.checkId) || (!sitting.checkId && sitting.latest.status !== 'COMPLETED'),
@@ -2140,7 +2194,11 @@ function SittingCard({
           .filter(Boolean)
           .join(' · ')
       : ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType
-    const endedTime = sitting.endedAt ? timeOf(sitting.endedAt) : '—'
+    const endedTime = sitting.endedAt
+      ? timeOf(sitting.endedAt)
+      : (check as any)?.closedAt
+        ? timeOf((check as any).closedAt)
+        : '—'
 
     return (
       <Card

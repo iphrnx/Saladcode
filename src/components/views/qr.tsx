@@ -96,6 +96,11 @@ export function QrView() {
   // permission, and a role can hold one without the other — so the controls that
   // write to `/api/tables` are the ones that have to ask.
   const canManageTables = hasPermission(data?.permissions, 'tables.manage')
+  const qrLimit =
+    data?.subscription?.limits?.tables ??
+    data?.subscription?.limits?.qrCodes ??
+    (data?.subscription?.planId === 'pro' ? 100 : 50)
+  const isAtLimit = items.length >= qrLimit
 
   // fetch all QR codes for tenant
   const loadQr = useCallback(async () => {
@@ -124,6 +129,12 @@ export function QrView() {
   }, [loadQr, tables])
 
   const handleOpenCreate = () => {
+    if (isAtLimit) {
+      toast.error(
+        `Plan limit reached: your ${data?.subscription?.planName || 'current'} plan includes up to ${qrLimit} QR codes. Upgrade to Pro to add more.`
+      )
+      return
+    }
     setCreateForm({
       name: `Table ${items.length + 1}`,
       area: 'Main Hall',
@@ -135,6 +146,12 @@ export function QrView() {
   const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!createForm.name.trim()) return
+    if (isAtLimit) {
+      toast.error(
+        `Plan limit reached: your ${data?.subscription?.planName || 'current'} plan includes up to ${qrLimit} QR codes. Upgrade to Pro to add more.`
+      )
+      return
+    }
     setSaving(true)
     try {
       const res = await edgeFetch('/api/tables', {
@@ -379,8 +396,11 @@ export function QrView() {
                 QR Codes
               </h1>
               {!loading && (
-                <Badge variant="secondary" className="font-semibold">
-                  {items.length} {items.length === 1 ? 'table' : 'tables'}
+                <Badge
+                  variant={isAtLimit ? 'destructive' : 'secondary'}
+                  className="font-semibold"
+                >
+                  {items.length} / {qrLimit} QR codes
                 </Badge>
               )}
             </div>
@@ -522,6 +542,11 @@ export function QrView() {
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={handleCreateSubmit} className="space-y-4 py-2">
+            {isAtLimit && (
+              <div className="rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
+                You have reached the maximum of {qrLimit} QR codes allowed on your {data?.subscription?.planName || 'current'} plan. Upgrade to Pro for up to 100 QR codes.
+              </div>
+            )}
             <div className="space-y-1.5">
               <Label htmlFor="create-name" className="text-xs font-medium">Table Name *</Label>
               <Input
@@ -562,7 +587,7 @@ export function QrView() {
               <Button type="button" variant="ghost" onClick={() => setCreateOpen(false)}>
                 Cancel
               </Button>
-              <Button type="submit" disabled={saving || !createForm.name.trim()} className="bg-primary text-white">
+              <Button type="submit" disabled={saving || isAtLimit || !createForm.name.trim()} className="bg-primary text-white">
                 {saving ? <><Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> Creating…</> : 'Generate QR Code'}
               </Button>
             </DialogFooter>

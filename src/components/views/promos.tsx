@@ -3,6 +3,7 @@
 import { useMemo, useState } from 'react'
 import { useApp, type PromoCode } from '@/components/app/data-context'
 import { cn } from '@/lib/utils'
+import { formatDateWithPattern, type DateFormatPattern } from '@/lib/date-format'
 import { useScrollCollapse } from '@/lib/use-scroll-collapse'
 import { edgeFetch } from '@/lib/edge'
 import { failIfNotOk } from '@/lib/api-error'
@@ -96,6 +97,7 @@ export function PromosView() {
   const promos = data?.promos ?? []
   const tenant = data?.tenant
   const currency = tenant?.currencySymbol ?? '$'
+  const dateFormat = (data?.settings?.pref_date_format as DateFormatPattern) || 'DD/MM/YYYY'
   // The `promos` function guards every write on `promos.manage`; the buttons
   // that reach those writes are gated on the same key so a custom role without
   // it is not offered an action the server will refuse.
@@ -350,6 +352,7 @@ export function PromosView() {
                 key={p.id}
                 promo={p}
                 currency={currency}
+                dateFormat={dateFormat}
                 toggling={togglingId === p.id}
                 canManage={canManage}
                 onCopy={() => copyCode(p.code)}
@@ -440,7 +443,7 @@ export function PromosView() {
                     className="h-10 w-full justify-start gap-2 bg-secondary/50 border-0 font-normal"
                   >
                     <CalendarIcon className="h-4 w-4 opacity-70 shrink-0" />
-                    {form.validTo ? formatDate(form.validTo) : 'No expiry'}
+                    {form.validTo ? formatDate(form.validTo, dateFormat) : 'No expiry'}
                   </Button>
                 </PopoverTrigger>
                 <PopoverContent align="start" className="w-auto p-0">
@@ -587,9 +590,9 @@ function isExpired(p: PromoCode): boolean {
   return new Date(p.validTo).getTime() < Date.now()
 }
 
-function formatDate(iso: string | null): string {
+function formatDate(iso: string | null, pattern: DateFormatPattern = 'DD/MM/YYYY'): string {
   if (!iso) return '—'
-  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+  return formatDateWithPattern(iso, pattern)
 }
 
 /** Local calendar date as the 'YYYY-MM-DD' string the API expects. */
@@ -639,6 +642,7 @@ function StatChip({
 function PromoCard({
   promo,
   currency,
+  dateFormat = 'DD/MM/YYYY',
   toggling,
   canManage,
   onCopy,
@@ -648,6 +652,7 @@ function PromoCard({
 }: {
   promo: PromoCode
   currency: string
+  dateFormat?: DateFormatPattern
   toggling: boolean
   canManage: boolean
   onCopy: () => void
@@ -738,7 +743,7 @@ function PromoCard({
       <div className="mt-3 flex items-start gap-2 text-xs text-muted-foreground flex-wrap">
         <CalendarClock className="h-3.5 w-3.5 shrink-0 mt-0.5" />
         <span className="min-w-0">
-          {formatDate(promo.validFrom)} → {formatDate(promo.validTo)}
+          {formatDate(promo.validFrom, dateFormat)} → {formatDate(promo.validTo, dateFormat)}
         </span>
       </div>
 

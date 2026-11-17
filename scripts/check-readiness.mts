@@ -1,10 +1,14 @@
 /** What is configured, and what is still missing. */
 import { createClient } from "@supabase/supabase-js";
 
-const SB = "https://ygibmdkrslquamwflshb.supabase.co";
-const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpcJMiOiJzdXBhYmFzZSIsInJlZiI6InlnaWJtZGtyc2xxdWFtd2Zsc2hiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA5MTg0NTUsImV4cCI6MjEwNjQ5NDQ1NX0.6zGsI3raxhRsi2cwt0eaEae1Vmh_C6qmVM2PVZs4uQw";
+const SB = process.env.NEXT_PUBLIC_SUPABASE_URL;
+if (!SB) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL environment variable.");
+const ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+if (!ANON) throw new Error("Missing NEXT_PUBLIC_SUPABASE_ANON_KEY environment variable.");
+const SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SERVICE) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY environment variable.");
 
-const admin = createClient(SB, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } });
+const admin = createClient(SB, SERVICE, { auth: { persistSession: false } });
 const { data: link } = await admin.auth.admin.generateLink({ type: "magiclink", email: "phrnx@icloud.com" });
 const c = createClient(SB, ANON, { auth: { persistSession: false } });
 const { data } = await c.auth.verifyOtp({ token_hash: link!.properties.hashed_token, type: "magiclink" });

@@ -11,8 +11,14 @@
 import { createClient } from "@supabase/supabase-js";
 import { randomBytes, scryptSync } from "node:crypto";
 
-const SB = "https://ygibmdkrslquamwflshb.supabase.co";
-const SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const SB = process.env.NEXT_PUBLIC_SUPABASE_URL;
+if (!SB) {
+  throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL environment variable.");
+}
+const SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SERVICE) {
+  throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY environment variable.");
+}
 const admin = createClient(SB, SERVICE, { auth: { persistSession: false } });
 
 let pass = 0, fail = 0;

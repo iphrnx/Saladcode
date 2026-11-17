@@ -35,19 +35,32 @@ await admin.from("profiles").insert({ id: user.id, tenant_id: tenant.id, name: u
 // Roles, staff and staff sessions are owner-only writes through RLS, and this
 // client is not the owner, so the fixture is created by the database owner.
 // Everything under test then goes through the real HTTP endpoints.
-import { execFileSync } from "node:child_process";
-const sqlq = (query: string) => {
-  const out = execFileSync("letta", ["mcp", "call", "mcp__supaletta__execute_sql", "--args",
-    JSON.stringify({ project_id: "ygibmdkrslquamwflshb", query })], { encoding: "utf8", maxBuffer: 1 << 20 });
-  return out;
-};
 const staffToken = `teststaff${stamp}`;
-sqlq(`insert into roles (tenant_id, name, description, is_system, permissions) values ('${tenant.id}','Manager','test',false,'security.view,security.manage,settings.manage');
-insert into staff (tenant_id, name, employee_id, role_id, active, pin_hash, pin_salt)
-  select '${tenant.id}', 'Ravi Staff', 'R${stamp}', id, true, 'test', 'test' from roles where tenant_id='${tenant.id}' and name='Manager';
-insert into staff_sessions (staff_id, token, ip, user_agent)
-  select id, '${staffToken}', '203.0.113.9', 'Mozilla/5.0 (iPhone) Safari' from staff where tenant_id='${tenant.id}' and name='Ravi Staff';`);
-const staff = { id: "" };
+const { data: roleData } = await admin.from("roles").insert({
+  tenant_id: tenant.id,
+  name: "Manager",
+  description: "test",
+  is_system: false,
+  permissions: "security.view,security.manage,settings.manage"
+}).select("id").single();
+
+const { data: staffData } = await admin.from("staff").insert({
+  tenant_id: tenant.id,
+  name: "Ravi Staff",
+  employee_id: `R${stamp}`,
+  role_id: roleData!.id,
+  active: true,
+  pin_hash: "test",
+  pin_salt: "test"
+}).select("id").single();
+
+await admin.from("staff_sessions").insert({
+  staff_id: staffData!.id,
+  token: staffToken,
+  ip: "203.0.113.9",
+  user_agent: "Mozilla/5.0 (iPhone) Safari"
+});
+const staff = { id: staffData!.id };
 
 const { data: link } = await admin.auth.admin.generateLink({ type: "magiclink", email });
 const otp = await admin.auth.verifyOtp({ token_hash: (link as any).properties.hashed_token, type: "magiclink" });

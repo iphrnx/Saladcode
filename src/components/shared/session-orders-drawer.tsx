@@ -219,7 +219,7 @@ export function SessionOrdersDrawer({
   // 4. Payment Completed
   if (state === 'Ended' || bill.paid > 0 || bill.due <= 0) {
     const payMethodStr = formatPaymentMethod(paymentMethod || orders[0]?.paymentMethod)
-    const invStr = formatInvoiceNumber(invoiceNumber, orders[0]?.orderNumber)
+    const invStr = formatInvoiceNumber(invoiceNumber)
     timelineEvents.push({
       id: 'payment-completed',
       title: 'Payment Completed',
@@ -588,7 +588,7 @@ export function SessionOrdersDrawer({
                     <div className="min-w-0">
                       <p className="text-[11.5px] font-medium text-muted-foreground">Invoice No.</p>
                       <p className="truncate text-[14px] font-bold text-foreground">
-                        {formatInvoiceNumber(invoiceNumber, orders[0]?.orderNumber)}
+                        {formatInvoiceNumber(invoiceNumber)}
                       </p>
                     </div>
                   </div>
@@ -779,10 +779,9 @@ function formatPaymentMethod(m?: string | null): string {
   return m
 }
 
-function formatInvoiceNumber(inv?: string | null, orderNum?: number): string {
+function formatInvoiceNumber(inv?: string | null): string {
   if (inv && inv.trim()) return inv
-  if (orderNum) return `INV-${String(orderNum).padStart(6, '0')}`
-  return 'INV-000123'
+  return 'Pending settlement'
 }
 
 function calculateDuration(startIso?: string | null, endIso?: string | null): string {

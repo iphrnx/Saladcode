@@ -148,3 +148,71 @@ export async function queueReminders(db: SupabaseClient): Promise<{ queued: numb
   return { queued, kinds };
 }
 
+/**
+ * Queue the daily summary for restaurants that have pref_daily_digest enabled.
+ * Aggregates orders and sales in the previous 24h window.
+ */
+export async function queueDailyDigests(db: SupabaseClient): Promise<{ queued: number }> {
+  const { data: tenants } = await db
+    .from("tenants")
+    .select("id, name, email")
+    .limit(2000);
+
+  let queued = 0;
+  const yesterday = new Date(Date.now() - DAY_MS).toISOString();
+  const dateStr = new Date().toISOString().slice(0, 10);
+
+  for (const t of (tenants ?? []) as any[]) {
+    // Check if daily digest is turned off in settings (default true)
+    const { data: prefRow } = await db
+      .from("settings")
+      .select("value")
+      .eq("tenant_id", t.id)
+      .eq("key", "pref_daily_digest")
+      .maybeSingle();
+
+    if (prefRow?.value === "false") continue;
+
+    // Aggregate orders in the last 24h
+    const { data: orders } = await db
+      .from("orders")
+      .select("id, total_amount, status")
+      .eq("tenant_id", t.id)
+      .gte("created_at", yesterday)
+      .neq("status", "CANCELLED");
+
+    const ordersCount = orders?.length ?? 0;
+    const revenue = (orders ?? []).reduce((acc: number, o: any) => acc + (Number(o.total_amount) || 0), 0);
+
+    const { data: owner } = await db
+      .from("profiles")
+      .select("name, email")
+      .eq("tenant_id", t.id)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    const recipient = (owner as any)?.email ?? t.email ?? null;
+    if (!recipient) continue;
+
+    const id = await queueEmail(db, {
+      eventKey: `daily_digest:${t.id}:${dateStr}`,
+      eventType: "daily_digest",
+      tenantId: t.id,
+      recipient,
+      recipientName: (owner as any)?.name ?? null,
+      restaurantName: t.name,
+      currency: "INR",
+      payload: {
+        ordersCount,
+        revenue,
+        date: dateStr,
+      },
+    } as any);
+
+    if (id) queued++;
+  }
+
+  return { queued };
+}
+

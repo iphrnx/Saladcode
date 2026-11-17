@@ -534,6 +534,7 @@ export function PublicMenu() {
   // other table's orders. The topic now carries this session's token, which
   // only this browser holds, and the server addresses events to it alone.
   // Subscribing needs the token; the diner's row-level access is the token.
+  const isRealtimeConnectedRef = useRef(false)
   useEffect(() => {
     if (!sessionToken) return
     const supabase = createClient()
@@ -550,8 +551,22 @@ export function PublicMenu() {
           setBillRefreshKey((k) => k + 1)
         }
       })
-      .subscribe()
+      .on('broadcast', { event: 'CHECK_UPDATED' }, () => {
+        setOrdersRefreshKey((k) => k + 1)
+        setBillRefreshKey((k) => k + 1)
+      })
+      .on('broadcast', { event: 'SESSION_ENDED' }, () => {
+        lockDinerSession(setSessionState)
+        setCartOpen(false)
+      })
+      .on('broadcast', { event: 'TABLE_ACTIVATED' }, () => {
+        setActivation('ACTIVE')
+      })
+      .subscribe((status: string) => {
+        isRealtimeConnectedRef.current = status === 'SUBSCRIBED'
+      })
     return () => {
+      isRealtimeConnectedRef.current = false
       void supabase.removeChannel(channel)
     }
   }, [sessionToken, sessionId])
@@ -817,8 +832,9 @@ export function PublicMenu() {
     setCart([])
   }
 
-  // ===== Instant Session End Listeners (BroadcastChannel + SSE + Heartbeat) =====
+  // ===== Instant Session End Listeners (BroadcastChannel + Realtime + Adaptive Heartbeat) =====
   // When restaurant staff marks an order COMPLETED, the customer menu ends instantly without any delay.
+  const isValidatingSessionRef = useRef(false)
   useEffect(() => {
     if (sessionState !== 'active') return
 
@@ -838,20 +854,15 @@ export function PublicMenu() {
         ) {
           lockDinerSession(setSessionState)
           setCartOpen(false)
-        } else if (
-          msg.type === 'ORDER_UPDATED' &&
-          msg.order?.status === 'COMPLETED' &&
-          (!msg.order?.tableId || !targetTableId || msg.order.tableId === targetTableId)
-        ) {
-          lockDinerSession(setSessionState)
-          setCartOpen(false)
         }
       }
     }
 
-    // 2. Fast Heartbeat Poll (1.5s fallback safety net)
-    const interval = setInterval(async () => {
-      if (!sessionToken) return
+    // 2. Adaptive Heartbeat & Session Validation (Realtime-first fallback)
+    const validateSession = async () => {
+      if (!sessionToken || isValidatingSessionRef.current) return
+      if (typeof document !== 'undefined' && document.hidden) return
+      isValidatingSessionRef.current = true
       try {
         const tId = targetTenantId || ''
         const tblId = targetTableId || ''
@@ -862,16 +873,6 @@ export function PublicMenu() {
           { headers: { 'x-session-token': sessionToken } }
         )
         if (!res.ok) {
-          // 401 and 403 are the server refusing this session: it was ended, it
-          // does not exist, or it is for another table. That is what puts the
-          // diner on the ended screen, with the bill and the review prompt —
-          // and it only happens because the restaurant ended the session.
-          //
-          // Anything else is a failure of the request, not a fact about the
-          // session: a 500, a gateway error, or the client giving up after its
-          // own deadline. Those used to end the session on screen too, so a
-          // blip showed the diner a closed table with a bill on it. They are
-          // ignored now, and the next beat a second and a half later retries.
           if (res.status === 401 || res.status === 403) {
             const failed = await res.json().catch(() => null)
             setSessionHasOrder(Boolean(failed?.hasOrder))
@@ -889,7 +890,6 @@ export function PublicMenu() {
           setCartOpen(false)
           return
         }
-        // The floor accepted the table: the held order is with the kitchen.
         const next = (data.activationStatus ?? data.session?.activationStatus ?? 'ACTIVE') as typeof activation
         setActivation((prev) => {
           if (prev === 'PENDING' && next === 'ACTIVE') {
@@ -898,14 +898,54 @@ export function PublicMenu() {
           }
           return next
         })
-      } catch {}
-    }, 1500)
+      } catch {
+        // network blips are ignored; adaptive schedule will retry
+      } finally {
+        isValidatingSessionRef.current = false
+      }
+    }
+
+    let timer: NodeJS.Timeout | null = null
+    let isCancelled = false
+
+    const scheduleNext = () => {
+      if (isCancelled) return
+      // When awaiting host acceptance, poll every 5s so diner isn't delayed.
+      // When active and Realtime channel is healthy, 30s heartbeat is plenty.
+      // When Realtime is disconnected/reconnecting, fallback to 10s.
+      const delay = activation === 'PENDING' ? 5000 : (isRealtimeConnectedRef.current ? 30000 : 10000)
+      timer = setTimeout(async () => {
+        await validateSession()
+        scheduleNext()
+      }, delay)
+    }
+
+    scheduleNext()
+
+    const onVisibleOrOnline = () => {
+      if (typeof document !== 'undefined' && !document.hidden) {
+        void validateSession()
+      }
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibleOrOnline)
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', onVisibleOrOnline)
+    }
 
     return () => {
+      isCancelled = true
       if (bc) bc.close()
-      clearInterval(interval)
+      if (timer) clearTimeout(timer)
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibleOrOnline)
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', onVisibleOrOnline)
+      }
     }
-  }, [sessionState, sessionToken, sessionTenantId, sessionTableId, tenant?.id, table?.id])
+  }, [sessionState, sessionToken, sessionTenantId, sessionTableId, tenant?.id, table?.id, activation])
 
 
   // ----- "The page is going away" beacon — a goodbye, not a verdict -----
@@ -941,9 +981,11 @@ export function PublicMenu() {
 
   const cartCount = cart.reduce((s, c) => s + c.quantity, 0)
   const itemsTotal = cart.reduce((s, c) => s + c.price * c.quantity, 0)
-  const tax = +(itemsTotal * taxRate).toFixed(2)
+  const discount = 0
+  const taxableAmount = Math.max(0, itemsTotal - discount)
+  const tax = +(taxableAmount * taxRate).toFixed(2)
   const service = +(itemsTotal * serviceRate).toFixed(2)
-  const grandTotal = +(itemsTotal + tax + service).toFixed(2)
+  const grandTotal = +(taxableAmount + tax + service).toFixed(2)
 
   const estimatedPrep = useMemo(() => {
     if (cart.length === 0) return 0

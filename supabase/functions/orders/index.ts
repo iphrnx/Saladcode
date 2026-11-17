@@ -84,7 +84,7 @@ function mapOrder(row: any) {
     customerPhone: row.customer_phone,
     notes: row.notes,
     paymentMethod: row.payment_method,
-    paymentStatus: row.payment_status,
+    paymentStatus: row.payment_status ? String(row.payment_status).toUpperCase() : "UNPAID",
     servedById: row.served_by_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -201,6 +201,7 @@ async function validateDinerSession(
 }
 
 async function endTableSession(tenantId: string, tableId?: string, sessionId?: string) {
+  if (!sessionId && !tableId) return;
   let query = admin()
     .from("table_sessions")
     .update({ status: "ENDED", ended_at: new Date().toISOString() })
@@ -537,6 +538,32 @@ async function priceAndCommitOnce(
     if (msg.includes("PROMO_REJECTED") || msg.includes("ITEM_UNAVAILABLE")) {
       return { ok: false, error: msg, status: 409, retry: true };
     }
+    // Concurrency defense (Fix C1): if an idempotency key conflict occurred,
+    // look up the existing order and return it as deduplicated.
+    if (idempotencyKey && (msg.includes("orders_idempotency_key_idx") || msg.includes("unique constraint"))) {
+      const { data: existing } = await db
+        .from("orders")
+        .select("id")
+        .eq("idempotency_key", idempotencyKey)
+        .eq("tenant_id", tenantId)
+        .maybeSingle();
+      if (existing?.id) {
+        const { data: existingRow } = await db
+          .from("orders")
+          .select(ORDER_SELECT)
+          .eq("id", existing.id)
+          .eq("tenant_id", tenantId)
+          .single();
+        if (existingRow) {
+          return {
+            ok: true,
+            order: mapOrder(existingRow),
+            promoApplied: false,
+            deduplicated: true,
+          };
+        }
+      }
+    }
     console.error("Order transaction error:", txError);
     return { ok: false, error: "Unable to place order. Please try again.", status: 500 };
   }
@@ -693,17 +720,39 @@ async function create(req: Request): Promise<Response> {
       tableId = b.tableId;
       if (b.tableSessionId) {
         tableSessionId = String(b.tableSessionId);
+        // Verify requested session exists on this table and is active
+        const { data: requestedSession } = await db
+          .from("table_sessions")
+          .select("id, status")
+          .eq("tenant_id", tenantId)
+          .eq("table_id", tableId)
+          .eq("id", tableSessionId)
+          .maybeSingle();
+        if (!requestedSession || requestedSession.status !== "ACTIVE") {
+          return json(req, {
+            error: "Selected diner session is not active or not found on this table. Please refresh and select an active sitting.",
+            code: "SESSION_INACTIVE",
+          }, 400);
+        }
       } else {
-        const { data: activeSession } = await db
+        // Safe resolution when no session was explicitly specified:
+        // If multiple active diner sittings exist on this table, reject ambiguous placement
+        // to prevent cross-diner billing corruption.
+        const { data: activeSessions } = await db
           .from("table_sessions")
           .select("id")
           .eq("tenant_id", tenantId)
           .eq("table_id", tableId)
-          .eq("status", "ACTIVE")
-          .order("created_at", { ascending: false })
-          .limit(1)
-          .maybeSingle();
-        if (activeSession) tableSessionId = activeSession.id;
+          .eq("status", "ACTIVE");
+        if (activeSessions && activeSessions.length > 1) {
+          return json(req, {
+            error: "This table has multiple active diner sessions. Please select the specific sitting/check before placing an order.",
+            code: "AMBIGUOUS_TABLE_SESSION",
+          }, 400);
+        }
+        if (activeSessions && activeSessions.length === 1) {
+          tableSessionId = activeSessions[0].id;
+        }
       }
     }
 
@@ -912,6 +961,29 @@ async function rejectHeldOrder(req: Request, id: string): Promise<Response> {
 
   if (error) return json(req, { error: error.message }, 500);
 
+  // If this session has no other active or pending orders, mark session ended & rejected
+  if (current.table_session_id) {
+    const { count: remainingOrders } = await db
+      .from("orders")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", g.session.tenantId)
+      .eq("table_session_id", current.table_session_id)
+      .neq("id", id)
+      .not("status", "in", "(CANCELLED,REJECTED)");
+
+    if (!remainingOrders) {
+      await db
+        .from("table_sessions")
+        .update({
+          status: "ENDED",
+          activation_status: "REJECTED",
+          ended_at: new Date().toISOString(),
+        })
+        .eq("id", current.table_session_id)
+        .eq("tenant_id", g.session.tenantId);
+    }
+  }
+
   await db.from("security_logs").insert({
     tenant_id: g.session.tenantId,
     user_id: g.session.kind === "owner" ? g.session.subjectId : null,
@@ -1073,6 +1145,7 @@ async function update(req: Request, id: string | null): Promise<Response> {
    * retry of the move the order already made is a no-op, not an error.
    */
   const NEXT: Record<string, string[]> = {
+    PENDING_ACTIVATION: ["PENDING", "PREPARING", "CANCELLED"],
     PENDING: ["PREPARING", "CANCELLED"],
     PREPARING: ["READY", "CANCELLED"],
     READY: ["SERVED", "CANCELLED"],
@@ -1088,11 +1161,73 @@ async function update(req: Request, id: string | null): Promise<Response> {
     if (!ORDER_STATUSES.includes(target)) {
       return json(req, { error: `Unknown order status ${target}.` }, 400);
     }
-    if (!hasEffectivePermission(perms, ORDER_STATUS_KEYS[target])) {
+    if (target !== "PENDING" && !hasEffectivePermission(perms, ORDER_STATUS_KEYS[target])) {
       return refuse(ORDER_STATUS_KEYS[target]);
+    }
+    if (target === "PENDING" && !hasEffectivePermission(perms, "table-sessions.manage") && !hasEffectivePermission(perms, "orders.edit")) {
+      return refuse("table-sessions.manage");
     }
     if (target === "CANCELLED") {
       return await cancelOrder(req, id);
+    }
+    if (target === "PENDING" && current.status === "PENDING_ACTIVATION") {
+      const sessionId = (current as any).table_session_id;
+      if (!sessionId) {
+        const { error: promoteError } = await db
+          .from("orders")
+          .update({ status: "PENDING", updated_at: new Date().toISOString() })
+          .eq("id", id)
+          .eq("tenant_id", g.session.tenantId)
+          .eq("status", "PENDING_ACTIVATION");
+        if (promoteError) return json(req, { error: promoteError.message }, 500);
+
+        const { data: promoted } = await db
+          .from("orders")
+          .select(ORDER_SELECT)
+          .eq("id", id)
+          .eq("tenant_id", g.session.tenantId)
+          .maybeSingle();
+        if (promoted) current = promoted;
+      } else {
+        const { error: activateError } = await admin().rpc("approve_table_activation", {
+          p_tenant: g.session.tenantId,
+          p_session: sessionId,
+          p_actor: g.session.kind === "owner" ? g.session.subjectId : null,
+        });
+
+        if (activateError) {
+          const message = String(activateError.message ?? "");
+          if (message.includes("ITEMS_UNAVAILABLE:")) {
+            return json(
+              req,
+              { error: `These dishes are no longer available: ${message.split("ITEMS_UNAVAILABLE:")[1]}`, code: "items_unavailable" },
+              409,
+            );
+          }
+          if (message.includes("SESSION_")) {
+            return json(req, { error: "That table session has already ended.", code: "session_ended" }, 409);
+          }
+          return json(req, { error: message || "Could not accept the table." }, 500);
+        }
+
+        const { data: fresh, error: freshError } = await db
+          .from("orders")
+          .select(ORDER_SELECT)
+          .eq("id", id)
+          .eq("tenant_id", g.session.tenantId)
+          .maybeSingle();
+        if (freshError) return json(req, { error: freshError.message }, 500);
+        if (fresh) current = fresh;
+
+        for (const sibling of (await releasedSiblings(g.session.tenantId, sessionId))) {
+          await publishOrderEvent({
+            type: "ORDER_UPDATED",
+            tenantId: g.session.tenantId,
+            order: sibling,
+            sessionToken: await sessionTokenFor(sibling),
+          });
+        }
+      }
     }
     // ── Start Preparing on a held order accepts the table first ────────────
     // A held order is one nobody has accepted the table for. The kitchen
@@ -1214,10 +1349,9 @@ async function update(req: Request, id: string | null): Promise<Response> {
         );
       }
       data.status = target;
-      await db
-        .from("order_items")
-        .update({ status: target })
-        .eq("order_id", id);
+      // Note: order_items.status is synchronized atomically by trg_sync_order_items_status
+      // in PostgreSQL when orders.status commits, preventing partial commits if orders update
+      // encounters an optimistic concurrency conflict (Fix C4).
       if (target === "CANCELLED") {
         // Auditable cancellation — recorded only when the transition is real:
         // the order row stays (status CANCELLED) and the actor is logged, so
@@ -1243,8 +1377,9 @@ async function update(req: Request, id: string | null): Promise<Response> {
   if (b.paymentMethod) data.payment_method = b.paymentMethod;
   if (b.paymentStatus) {
     const target = String(b.paymentStatus).toUpperCase();
+    const currentPayment = String(current.payment_status ?? "UNPAID").toUpperCase();
     if (target === "PAID") {
-      if (current.payment_status !== "PAID") {
+      if (currentPayment !== "PAID") {
         // Recording a payment requires saying how it was paid — otherwise the
         // bill can never show a method, and the books cannot be reconciled.
         const method = b.paymentMethod || current.payment_method;
@@ -1256,7 +1391,7 @@ async function update(req: Request, id: string | null): Promise<Response> {
       }
       // Already PAID → idempotent no-op (a double-tap on Pay is safe).
     } else if (target === "UNPAID") {
-      if (current.payment_status === "PAID") {
+      if (currentPayment === "PAID") {
         // Money never un-flows through a status write; a refund is a ledger
         // event, not a flag flip.
         return json(
@@ -1435,7 +1570,7 @@ async function recalcOrderTotals(orderId: string, tenantId: string) {
 
   const { data: order } = await db
     .from("orders")
-    .select("tenant_id, discount")
+    .select("tenant_id, discount, check_id")
     .eq("id", orderId)
     .eq("tenant_id", tenantId)
     .maybeSingle();
@@ -1456,21 +1591,53 @@ async function recalcOrderTotals(orderId: string, tenantId: string) {
 
   const taxRate = (tenant?.tax_rate ?? 8) / 100;
   const serviceRate = (tenant?.service_charge ?? 0) / 100;
-  const discount = order.discount || 0;
-  const tax = +((itemsTotal - discount) * taxRate).toFixed(2);
+  const rawDiscount = order.discount || 0;
+  const discount = Math.min(rawDiscount, itemsTotal);
+  const taxable = Math.max(0, itemsTotal - discount);
+  const tax = +(taxable * taxRate).toFixed(2);
   const serviceCharge = +(itemsTotal * serviceRate).toFixed(2);
-  const total = +(itemsTotal - discount + tax + serviceCharge).toFixed(2);
+  const total = +(taxable + tax + serviceCharge).toFixed(2);
 
   await db
     .from("orders")
     .update({
       items_total: +itemsTotal.toFixed(2),
+      discount: +discount.toFixed(2),
       tax,
       service_charge: serviceCharge,
       total,
     })
     .eq("id", orderId)
     .eq("tenant_id", tenantId);
+
+  if (order.check_id) {
+    const { data: checkOrders } = await db
+      .from("orders")
+      .select("items_total, discount, tax, service_charge, total")
+      .eq("check_id", order.check_id)
+      .neq("status", "CANCELLED");
+
+    if (checkOrders) {
+      const cSubtotal = checkOrders.reduce((s, o) => s + (o.items_total || 0), 0);
+      const cDiscount = checkOrders.reduce((s, o) => s + (o.discount || 0), 0);
+      const cTax = checkOrders.reduce((s, o) => s + (o.tax || 0), 0);
+      const cServiceCharge = checkOrders.reduce((s, o) => s + (o.service_charge || 0), 0);
+      const cTotal = checkOrders.reduce((s, o) => s + (o.total || 0), 0);
+
+      await db
+        .from("table_checks")
+        .update({
+          subtotal: +cSubtotal.toFixed(2),
+          discount: +cDiscount.toFixed(2),
+          tax: +cTax.toFixed(2),
+          service_charge: +cServiceCharge.toFixed(2),
+          total: +cTotal.toFixed(2),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", order.check_id)
+        .eq("tenant_id", tenantId);
+    }
+  }
 }
 
 // Add items to existing order (Takeaway and Delivery only)
@@ -1480,7 +1647,7 @@ async function addItem(req: Request, orderId: string): Promise<Response> {
   const tenantId = g.session.tenantId;
 
   // RBAC enforcement: Accessible only to Owner, Manager, Cashier
-  const callerRole = g.session.kind === "owner" ? "Owner" : (g.session.role ?? "");
+  const callerRole = g.session.kind === "owner" ? "Owner" : (g.session.roleName ?? "");
   const allowedRoles = ["owner", "manager", "cashier"];
   if (!allowedRoles.includes(callerRole.toLowerCase())) {
     return json(req, { error: "Forbidden: Only Owner, Manager, and Cashier can add items to orders." }, 403);
@@ -1659,13 +1826,32 @@ async function sync(req: Request): Promise<Response> {
     }
   }
 
-  // The summary is one aggregate row, not the newest 200 orders reduced in JS.
-  // The old shape stopped counting at 200 orders — a busy day silently froze
-  // "orders today" and "active orders" — and pulled 200 rows every four
-  // seconds for three numbers (migration 0060).
-  const [{ data: changedOrders }, { data: summaryRow, error: summaryError }] = await Promise.all([
+  const openCheckSince = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const recentSittings = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  // Phase 1: Parallelize the 4 foundational read queries:
+  // 1. changed orders
+  // 2. summary RPC
+  // 3. open checks discovery
+  // 4. recent/active table sessions
+  const [
+    { data: changedOrders },
+    { data: summaryRow, error: summaryError },
+    { data: openChecks },
+    { data: sittingRows },
+  ] = await Promise.all([
     changedQuery,
     db.rpc("tenant_order_summary", { p_tenant: tenantId }),
+    db
+      .from("table_checks")
+      .select("id")
+      .eq("tenant_id", tenantId)
+      .or(`status.in.(OPEN,UNSETTLED),opened_at.gte.${openCheckSince}`),
+    db
+      .from("table_sessions")
+      .select("id, table_id, status, created_at, ended_at")
+      .eq("tenant_id", tenantId)
+      .or(`status.eq.ACTIVE,created_at.gte.${recentSittings}`),
   ]);
 
   // If the aggregate fails, fail the poll: the client keeps the last summary it
@@ -1675,100 +1861,11 @@ async function sync(req: Request): Promise<Response> {
   const orders = (changedOrders || []).map(mapOrder);
 
   // The authoritative figures for each table check these orders belong to.
-  // `table_checks.total` is only written at finalisation, so an open bill has
-  // to be summed from its orders and its ledger — the same truth the bill
-  // dialog reads, so the Orders header and the bill cannot disagree.
-  // Which checks to price.
-  //
-  // Not only the ones behind this poll's changed orders: the board groups by
-  // sitting and shows a bill on every card, so a sitting whose orders have not
-  // changed still needs its totals. Reading every bill that is still open (or
-  // was touched in the last day) costs one small query and stops the cards
-  // falling back to a local sum.
-  const openCheckSince = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const { data: openChecks } = await db
-    .from("table_checks")
-    .select("id")
-    .eq("tenant_id", tenantId)
-    .or(`status.in.(OPEN,UNSETTLED),opened_at.gte.${openCheckSince}`);
   const checkIds = [...new Set([
     ...(changedOrders ?? []).map((o: any) => o.check_id).filter(Boolean),
     ...(openChecks ?? []).map((c: any) => c.id),
   ])] as string[];
-  const checks: Record<string, {
-    orderCount: number;
-    /** Before tax: the items, less discount. What the food cost. */
-    subtotal: number;
-    tax: number;
-    total: number;
-    paid: number;
-    outstanding: number;
-    status: string;
-    invoiceNumber: string | null;
-  }> = {};
-  if (checkIds.length) {
-    const [{ data: checkRows }, { data: checkOrders }, { data: checkPayments }] = await Promise.all([
-      db.from("table_checks").select("id, status, invoice_number").in("id", checkIds).eq("tenant_id", tenantId),
-      db.from("orders").select("check_id, total, items_total, discount, tax").in("check_id", checkIds)
-        .eq("tenant_id", tenantId).not("status", "in", "(CANCELLED,PENDING_ACTIVATION)"),
-      db.from("check_payments").select("check_id, amount").in("check_id", checkIds)
-        .eq("tenant_id", tenantId).eq("status", "SUCCEEDED"),
-    ]);
-    for (const c of checkRows ?? []) {
-      checks[c.id] = {
-        orderCount: 0, subtotal: 0, tax: 0, total: 0, paid: 0, outstanding: 0,
-        status: c.status, invoiceNumber: c.invoice_number ?? null,
-      };
-    }
-    for (const o of checkOrders ?? []) {
-      const c = checks[(o as any).check_id];
-      if (!c) continue;
-      // Pre-tax is the food: item prices, less any discount. Service charge and
-      // tax are added on top of it, so it is never the same number as the total
-      // and must not be labelled as one.
-      c.orderCount += 1;
-      c.subtotal += Number((o as any).items_total ?? 0) - Number((o as any).discount ?? 0);
-      c.tax += Number((o as any).tax ?? 0);
-      c.total += Number((o as any).total ?? 0);
-    }
-    for (const p of checkPayments ?? []) {
-      const c = checks[(p as any).check_id];
-      if (c) c.paid += Number((p as any).amount ?? 0);
-    }
-    for (const c of Object.values(checks)) {
-      c.subtotal = +c.subtotal.toFixed(2);
-      c.tax = +c.tax.toFixed(2);
-      c.total = +c.total.toFixed(2);
-      c.paid = +c.paid.toFixed(2);
-      c.outstanding = +Math.max(0, c.total - c.paid).toFixed(2);
-    }
-  }
 
-  const summary = (summaryRow ?? {}) as { revenue?: number; ordersToday?: number; activeOrders?: number };
-  const revenue = Number(summary.revenue ?? 0);
-  const ordersToday = Number(summary.ordersToday ?? 0);
-  const activeOrders = Number(summary.activeOrders ?? 0);
-
-  // The sittings themselves.
-  //
-  // An order carries `table_session_id`, but nothing about the sitting it
-  // belongs to — so a screen grouping by session could say what was ordered
-  // and nothing about when the table sat down, how long it has been there, or
-  // whether it is still open. Reading those three facts from the row that owns
-  // them is the only honest way to show them; deriving them from order
-  // timestamps would call a table that is still open "closed" the moment its
-  // last order is completed.
-  //
-  // Read-only, and deliberately separate from the `since` cursor: a session
-  // ending writes no order, so a changed-orders poll would never report it.
-  // Active sittings are always returned, plus anything that opened recently
-  // enough to still be on the board.
-  const recentSittings = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const { data: sittingRows } = await db
-    .from("table_sessions")
-    .select("id, table_id, status, created_at, ended_at")
-    .eq("tenant_id", tenantId)
-    .or(`status.eq.ACTIVE,created_at.gte.${recentSittings}`);
   const tableSessions: Record<string, {
     id: string;
     tableId: string;
@@ -1785,6 +1882,105 @@ async function sync(req: Request): Promise<Response> {
       endedAt: row.ended_at ?? null,
     };
   }
+
+  // Ensure every session referenced by changedOrders is included
+  const missingSessionIds = [...new Set(
+    (changedOrders ?? []).map((o: any) => o.table_session_id).filter((id: string | null) => Boolean(id) && !tableSessions[id!])
+  )] as string[];
+
+  // Phase 2: Parallelize check settlement aggregation & missing session lookups
+  const [
+    checkRowsResult,
+    checkOrdersResult,
+    checkPaymentsResult,
+    missingSessionsResult,
+  ] = await Promise.all([
+    checkIds.length
+      ? db.from("table_checks").select("id, status, invoice_number, closed_at, subtotal, tax, total, paid_total").in("id", checkIds).eq("tenant_id", tenantId)
+      : Promise.resolve({ data: [] }),
+    checkIds.length
+      ? db.from("orders").select("check_id, total, items_total, discount, tax").in("check_id", checkIds)
+        .eq("tenant_id", tenantId).not("status", "in", "(CANCELLED,PENDING_ACTIVATION)")
+      : Promise.resolve({ data: [] }),
+    checkIds.length
+      ? db.from("check_payments").select("check_id, amount").in("check_id", checkIds)
+        .eq("tenant_id", tenantId).eq("status", "SUCCEEDED")
+      : Promise.resolve({ data: [] }),
+    missingSessionIds.length
+      ? db.from("table_sessions").select("id, table_id, status, created_at, ended_at").in("id", missingSessionIds)
+      : Promise.resolve({ data: [] }),
+  ]);
+
+  const checks: Record<string, {
+    orderCount: number;
+    /** Before tax: the items, less discount. What the food cost. */
+    subtotal: number;
+    tax: number;
+    total: number;
+    paid: number;
+    outstanding: number;
+    status: string;
+    invoiceNumber: string | null;
+    closedAt: string | null;
+  }> = {};
+
+  if (checkIds.length) {
+    const checkRows = (checkRowsResult as any).data ?? [];
+    const checkOrders = (checkOrdersResult as any).data ?? [];
+    const checkPayments = (checkPaymentsResult as any).data ?? [];
+
+    for (const c of checkRows) {
+      checks[c.id] = {
+        orderCount: 0,
+        subtotal: Number(c.subtotal ?? 0),
+        tax: Number(c.tax ?? 0),
+        total: Number(c.total ?? 0),
+        paid: Number(c.paid_total ?? 0),
+        outstanding: 0,
+        status: c.status,
+        invoiceNumber: c.invoice_number ?? null,
+        closedAt: c.closed_at ?? null,
+      };
+    }
+    for (const o of checkOrders) {
+      const c = checks[(o as any).check_id];
+      if (!c) continue;
+      c.orderCount += 1;
+      if (c.status !== "PAID") {
+        c.subtotal += Number((o as any).items_total ?? 0) - Number((o as any).discount ?? 0);
+        c.tax += Number((o as any).tax ?? 0);
+        c.total += Number((o as any).total ?? 0);
+      }
+    }
+    for (const p of checkPayments) {
+      const c = checks[(p as any).check_id];
+      if (c && c.status !== "PAID") {
+        c.paid += Number((p as any).amount ?? 0);
+      }
+    }
+    for (const c of Object.values(checks)) {
+      c.subtotal = +c.subtotal.toFixed(2);
+      c.tax = +c.tax.toFixed(2);
+      c.total = +c.total.toFixed(2);
+      c.paid = +c.paid.toFixed(2);
+      c.outstanding = +Math.max(0, c.total - c.paid).toFixed(2);
+    }
+  }
+
+  for (const row of ((missingSessionsResult as any).data ?? []) as any[]) {
+    tableSessions[row.id] = {
+      id: row.id,
+      tableId: row.table_id,
+      status: row.status,
+      startedAt: row.created_at,
+      endedAt: row.ended_at ?? null,
+    };
+  }
+
+  const summary = (summaryRow ?? {}) as { revenue?: number; ordersToday?: number; activeOrders?: number };
+  const revenue = Number(summary.revenue ?? 0);
+  const ordersToday = Number(summary.ordersToday ?? 0);
+  const activeOrders = Number(summary.activeOrders ?? 0);
 
   return json(req, {
     orders,

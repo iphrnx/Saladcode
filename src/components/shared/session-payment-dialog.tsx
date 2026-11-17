@@ -21,7 +21,7 @@ import { cn } from '@/lib/utils'
  * returned, and the invoice number shown is the one the server issued.
  */
 
-export function UpiLogo({ className }: { className?: string }) {
+function UpiLogo({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 24 24" fill="none" className={cn('size-6 sm:size-7', className)} aria-hidden="true">
       <path d="M12 3.5L5 19.5H10.5L14.5 9L12 3.5Z" fill="#EA580C" />
@@ -199,14 +199,13 @@ export function SessionPaymentDialog({
       // 1. If check is already settled (Due = 0 and has total > 0 or invoice):
       // Idempotently return the existing settlement and invoice without throwing an error
       if (totals.outstanding <= 0 && (invoiceNumber || totals.total > 0)) {
-        const settleRes = await edgeFetch('/api/bill/settle-cash', {
+        const settleRes = await edgeFetch('/api/bill/finalize', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
             tableId,
             checkId,
             sessionId,
-            idempotencyKey: keyRef.current,
           }),
         })
         if (settleRes.ok) {
@@ -222,7 +221,11 @@ export function SessionPaymentDialog({
           try {
             if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
               const bc = new BroadcastChannel('the_salad_orders_sync')
-              bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, reason: 'FINALISED' })
+              const inv = settled?.invoiceNumber ?? settled?.check?.invoiceNumber ?? invoiceNumber ?? null
+              bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, status: 'PAID', invoiceNumber: inv, reason: 'FINALISED' })
+              if (sessionId) {
+                bc.postMessage({ type: 'SESSION_ENDED', checkId, tableId, sessionId, status: 'ENDED', endedAt: settledAt.toISOString(), invoiceNumber: inv })
+              }
               bc.close()
             }
           } catch {}
@@ -264,7 +267,10 @@ export function SessionPaymentDialog({
         try {
           if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
             const bc = new BroadcastChannel('the_salad_orders_sync')
-            bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, reason: 'FINALISED' })
+            bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, status: 'PAID', invoiceNumber: invNum, reason: 'FINALISED' })
+            if (sessionId) {
+              bc.postMessage({ type: 'SESSION_ENDED', checkId, tableId, sessionId, status: 'ENDED', endedAt: settledAt.toISOString(), invoiceNumber: invNum })
+            }
             bc.close()
           }
         } catch {}
@@ -299,6 +305,17 @@ export function SessionPaymentDialog({
           setStage('failed')
           return
         }
+
+        // Payment recorded successfully: update totals state immediately so subsequent retries
+        // (if finalize fails or is interrupted) do not re-attempt payment or cause OVERPAYMENT errors.
+        setTotals((prev) =>
+          prev
+            ? {
+                ...prev,
+                outstanding: 0,
+              }
+            : prev,
+        )
       }
 
       const settleRes = await edgeFetch('/api/bill/finalize', {
@@ -326,7 +343,11 @@ export function SessionPaymentDialog({
       try {
         if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
           const bc = new BroadcastChannel('the_salad_orders_sync')
-          bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, reason: 'FINALISED' })
+          const inv = settled?.invoiceNumber ?? settled?.check?.invoiceNumber ?? settled?.invoice?.number ?? null
+          bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, status: 'PAID', invoiceNumber: inv, reason: 'FINALISED' })
+          if (sessionId) {
+            bc.postMessage({ type: 'SESSION_ENDED', checkId, tableId, sessionId, status: 'ENDED', endedAt: settledAt.toISOString(), invoiceNumber: inv })
+          }
           bc.close()
         }
       } catch {}
@@ -574,7 +595,11 @@ export function SessionPaymentDialog({
               <Button
                 onClick={() => {
                   setStage('pay')
-                  keyRef.current = crypto.randomUUID()
+                  // Only regenerate key if money is still outstanding.
+                  // If payment already succeeded and only finalize failed, keep key and proceed directly to finalize.
+                  if ((totals?.outstanding ?? 0) > 0) {
+                    keyRef.current = crypto.randomUUID()
+                  }
                   void pay()
                 }}
                 disabled={busy}

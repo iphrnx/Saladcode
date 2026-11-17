@@ -1,17 +1,12 @@
 import { supabaseAdmin } from '@/lib/supabase/admin'
 
 /**
- * Table Session access system — BACKEND source of truth.
+ * @deprecated Legacy direct Next.js database adapter.
  *
- * A customer may only view the menu / place orders while holding an ACTIVE
- * session. A session is created when they scan a valid table QR code. Every
- * protected request re-validates against the database — never against
- * localStorage or a client-supplied tableId.
- *
- * Guarantees:
- *  - The menu URL alone is not sufficient to order.
- *  - tableId / tenantId from the frontend are never trusted without a DB check.
- *  - An ENDED session is rejected immediately.
+ * PRODUCTION AUTHORITATIVE ENDPOINT: Supabase Edge Function `table-session`
+ * (`supabase/functions/table-session/index.ts`). All diner QR validation,
+ * activation, and floor sessions are routed through `/api/table-session/*`.
+ * This module is preserved for legacy server script compatibility and type sharing.
  */
 
 export interface ValidatedSession {
@@ -195,6 +190,10 @@ export async function endTableSession(params: {
   tableId?: string
 }): Promise<{ ok: true; ended: number } | { ok: false; error: string; status: number }> {
   const { tenantId, sessionId, tableId } = params
+
+  if (!sessionId && !tableId) {
+    return { ok: false, error: 'sessionId or tableId is required to end a table session.', status: 400 }
+  }
 
   let query = supabaseAdmin()
     .from('table_sessions')

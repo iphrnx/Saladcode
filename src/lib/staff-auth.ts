@@ -2,17 +2,13 @@ import { supabaseAdmin } from '@/lib/supabase/admin'
 import { randomBytes, scryptSync, timingSafeEqual } from 'crypto'
 
 /**
- * Staff Authentication System
+ * @deprecated Legacy direct Next.js staff auth adapter.
  *
- * Completely separate from owner login (which uses Supabase Auth).
- * Staff authenticate with employeeId + 4-digit PIN.
- *
- * Security:
- *  - PINs are hashed with scrypt + per-staff salt (never plaintext)
- *  - Rate limiting: 5 failed attempts → 15 min lockout
- *  - Staff sessions use their own cookie (the-salad-staff-session), never shared
- *    with owner sessions
- *  - All staff actions are logged to staff_activities
+ * PRODUCTION AUTHORITATIVE ENDPOINT: Supabase Edge Function `staff`
+ * (`supabase/functions/staff/index.ts`) backed by atomic SQL RPC
+ * `record_staff_login_attempt`. All staff PIN logins, session validation,
+ * and lockouts are managed by the Edge Function and staff session cookies.
+ * This module is preserved for legacy server script compatibility and type sharing.
  */
 
 const MAX_FAILED_ATTEMPTS = 5
@@ -87,16 +83,33 @@ export async function authenticateStaff(
 
   const valid = verifyPin(pin, staff.pin_hash, staff.pin_salt)
   if (!valid) {
-    const attempts = (staff.failed_attempts || 0) + 1
-    const shouldLock = attempts >= MAX_FAILED_ATTEMPTS
-    const lockedUntil = shouldLock
+    const { data: rpcRes, error: rpcErr } = await admin.rpc("record_staff_login_attempt" as any, {
+      p_tenant: tenantId,
+      p_staff_id: staff.id,
+      p_success: false,
+      p_max_attempts: MAX_FAILED_ATTEMPTS,
+      p_lockout_mins: LOCKOUT_MINUTES,
+    })
+
+    let attempts = (staff.failed_attempts || 0) + 1
+    let shouldLock = attempts >= MAX_FAILED_ATTEMPTS
+    let lockedUntil: string | null = shouldLock
       ? new Date(Date.now() + LOCKOUT_MINUTES * 60000).toISOString()
       : null
 
-    await admin
-      .from('staff')
-      .update({ failed_attempts: attempts, locked_until: lockedUntil })
-      .eq('id', staff.id)
+    if (!rpcErr && rpcRes) {
+      const res = rpcRes as any
+      if (res.locked) {
+        shouldLock = true
+        lockedUntil = res.locked_until
+      }
+      attempts = res.attempts ?? attempts
+    } else {
+      await admin
+        .from('staff')
+        .update({ failed_attempts: attempts, locked_until: lockedUntil })
+        .eq('id', staff.id)
+    }
 
     await admin.from('staff_activities').insert({
       staff_id: staff.id,
@@ -114,14 +127,22 @@ export async function authenticateStaff(
     }
     return {
       ok: false,
-      error: `Incorrect PIN. ${MAX_FAILED_ATTEMPTS - attempts} attempt(s) remaining.`,
+      error: `Incorrect PIN. ${Math.max(0, MAX_FAILED_ATTEMPTS - attempts)} attempt(s) remaining.`,
     }
   }
 
-  await admin
-    .from('staff')
-    .update({ failed_attempts: 0, locked_until: null, last_login: new Date().toISOString() })
-    .eq('id', staff.id)
+  const { error: resetErr } = await admin.rpc("record_staff_login_attempt" as any, {
+    p_tenant: tenantId,
+    p_staff_id: staff.id,
+    p_success: true,
+  })
+
+  if (resetErr) {
+    await admin
+      .from('staff')
+      .update({ failed_attempts: 0, locked_until: null, last_login: new Date().toISOString() })
+      .eq('id', staff.id)
+  }
 
   const { data: session } = await admin
     .from('staff_sessions')

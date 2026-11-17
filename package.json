@@ -88,6 +88,8 @@
     "test:table-activation": "tsx scripts/test-table-activation-offline.mts",
     "test:table-checks": "tsx scripts/test-table-checks-offline.mts",
     "test:security-hardening": "tsx scripts/test-security-hardening-offline.mts",
+    "test:core-invariants": "tsx --env-file=.env.local scripts/test-core-invariants.mts",
+    "test:resilience": "tsx scripts/test-resilience-recovery.mts",
     "smoke": "tsx scripts/smoke-preflight.mts",
     "test:realtime-live": "tsx scripts/test-realtime-live.mts",
     "test:roles-live": "tsx scripts/test-roles-live.mts"
@@ -117,7 +119,7 @@
     "framer-motion": "^12.23.2",
     "heic-decode": "^2.1.0",
     "lucide-react": "^0.525.0",
-    "next": "16.4.3",
+    "next": "^16.4.6",
     "react": "^19.0.0",
     "react-day-picker": "^9.8.0",
     "react-dom": "^19.0.0",

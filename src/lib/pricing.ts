@@ -9,12 +9,6 @@
 
 export type BillingInterval = 'monthly' | 'annual'
 
-export const INTERVALS: BillingInterval[] = ['monthly', 'annual']
-
-export function intervalLabel(interval: BillingInterval): string {
-  return interval === 'annual' ? 'Annual' : 'Monthly'
-}
-
 /** The per-period amount. Falls back to the monthly price if a plan has no
  * annual price, so a card never renders ₹0. */
 export function priceFor(

@@ -25,7 +25,7 @@ const OUT = process.env.OUT ?? "/root/downloads/view.png";
 const WIDTH = Number(process.env.WIDTH ?? 390);
 const HEIGHT = Number(process.env.HEIGHT ?? 844);
 const EMAIL = process.env.EMAIL ?? "phrnx@icloud.com";
-const REF = "ygibmdkrslquamwflshb";
+const REF = new URL(SB).hostname.split(".")[0];
 
 const admin = createClient(SB, SERVICE, { auth: { persistSession: false } });
 const { data: link } = await admin.auth.admin.generateLink({ type: "magiclink", email: EMAIL });

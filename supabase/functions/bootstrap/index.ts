@@ -146,7 +146,7 @@ Deno.serve(async (req: Request) => {
         .from("table_sessions")
         .select("id, table_id, status, created_at, ended_at")
         .eq("tenant_id", tenantId)
-        .or(`status.eq.ACTIVE,created_at.gte.${new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()}`),
+        .or(`status.eq.ACTIVE,created_at.gte.${new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()}`),
     ]);
 
     if (usersRes.error) return json(req, { error: usersRes.error.message }, 500);
@@ -250,6 +250,98 @@ Deno.serve(async (req: Request) => {
         startedAt: row.created_at,
         endedAt: row.ended_at ?? null,
       };
+    }
+
+    // Ensure every session referenced by bootstrap orders is included
+    const missingSessionIds = [...new Set(
+      (ordersRes.data ?? []).map((o: any) => o.table_session_id).filter((id: string | null) => Boolean(id) && !tableSessions[id!])
+    )] as string[];
+    if (missingSessionIds.length > 0) {
+      const { data: missingRows } = await db
+        .from("table_sessions")
+        .select("id, table_id, status, created_at, ended_at")
+        .in("id", missingSessionIds);
+      for (const row of missingRows ?? []) {
+        tableSessions[row.id] = {
+          id: row.id,
+          tableId: row.table_id,
+          status: row.status,
+          startedAt: row.created_at,
+          endedAt: row.ended_at ?? null,
+        };
+      }
+    }
+
+    // Resolve checks for all bootstrap orders and open/recent checks (7 days)
+    const recentCheckSince = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const { data: openChecks } = await db
+      .from("table_checks")
+      .select("id")
+      .eq("tenant_id", tenantId)
+      .or(`status.in.(OPEN,UNSETTLED),opened_at.gte.${recentCheckSince}`);
+
+    const bootstrapCheckIds = [...new Set([
+      ...(ordersRes.data ?? []).map((o: any) => o.check_id).filter(Boolean),
+      ...(openChecks ?? []).map((c: any) => c.id),
+    ])] as string[];
+
+    const checks: Record<string, {
+      orderCount: number;
+      subtotal: number;
+      tax: number;
+      total: number;
+      paid: number;
+      outstanding: number;
+      status: string;
+      invoiceNumber: string | null;
+      closedAt: string | null;
+    }> = {};
+
+    if (bootstrapCheckIds.length) {
+      const [{ data: checkRows }, { data: checkOrders }, { data: checkPayments }] = await Promise.all([
+        db.from("table_checks").select("id, status, invoice_number, closed_at, subtotal, tax, total, paid_total").in("id", bootstrapCheckIds).eq("tenant_id", tenantId),
+        db.from("orders").select("check_id, total, items_total, discount, tax").in("check_id", bootstrapCheckIds)
+          .eq("tenant_id", tenantId).not("status", "in", "(CANCELLED,PENDING_ACTIVATION)"),
+        db.from("check_payments").select("check_id, amount").in("check_id", bootstrapCheckIds)
+          .eq("tenant_id", tenantId).eq("status", "SUCCEEDED"),
+      ]);
+
+      for (const c of checkRows ?? []) {
+        checks[c.id] = {
+          orderCount: 0,
+          subtotal: Number(c.subtotal ?? 0),
+          tax: Number(c.tax ?? 0),
+          total: Number(c.total ?? 0),
+          paid: Number(c.paid_total ?? 0),
+          outstanding: 0,
+          status: c.status,
+          invoiceNumber: c.invoice_number ?? null,
+          closedAt: c.closed_at ?? null,
+        };
+      }
+      for (const o of checkOrders ?? []) {
+        const c = checks[(o as any).check_id];
+        if (!c) continue;
+        c.orderCount += 1;
+        if (c.status !== "PAID") {
+          c.subtotal += Number((o as any).items_total ?? 0) - Number((o as any).discount ?? 0);
+          c.tax += Number((o as any).tax ?? 0);
+          c.total += Number((o as any).total ?? 0);
+        }
+      }
+      for (const p of checkPayments ?? []) {
+        const c = checks[(p as any).check_id];
+        if (c && c.status !== "PAID") {
+          c.paid += Number((p as any).amount ?? 0);
+        }
+      }
+      for (const c of Object.values(checks)) {
+        c.subtotal = +c.subtotal.toFixed(2);
+        c.tax = +c.tax.toFixed(2);
+        c.total = +c.total.toFixed(2);
+        c.paid = +c.paid.toFixed(2);
+        c.outstanding = +Math.max(0, c.total - c.paid).toFixed(2);
+      }
     }
 
 
@@ -358,6 +450,7 @@ Deno.serve(async (req: Request) => {
       tables,
       orders,
       tableSessions,
+      checks,
       reservations,
       promos,
       sessions,

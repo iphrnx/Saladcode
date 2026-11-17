@@ -453,6 +453,7 @@ const FALLBACK_PLANS: MarketingPlan[] = [
     priceYearly: 9990,
     currency: 'INR',
     features: [
+      '50 QR codes maximum',
       'AI menu scanning with instant extraction',
       'QR ordering',
       'Kitchen display',
@@ -472,6 +473,7 @@ const FALLBACK_PLANS: MarketingPlan[] = [
     priceYearly: 24990,
     currency: 'INR',
     features: [
+      '100 QR codes maximum',
       'AI menu scanning with instant extraction',
       'QR ordering',
       'Kitchen display',
@@ -665,7 +667,7 @@ const FAQS = [
   },
   {
     q: 'Does it work for a small café or a single outlet?',
-    a: 'Yes. The Starter plan covers one location with up to 100 menu items and 5 staff members — most cafés and single outlets, end to end.',
+    a: 'Yes. The Starter plan covers one location with up to 50 QR codes, 100 menu items and 5 staff members — most cafés and single outlets, end to end.',
   },
   {
     q: 'Can I control what each staff member sees?',

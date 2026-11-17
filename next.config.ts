@@ -69,6 +69,9 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   // Don't advertise the framework.
   poweredByHeader: false,
+  experimental: {
+    agentUpgrade: "security",
+  },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }]
   },

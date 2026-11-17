@@ -6,7 +6,7 @@ import { Card } from '@/components/ui/card'
 import { useT } from '@/lib/i18n'
 import { useApp } from '@/components/app/data-context'
 import { describeRequired, type ApiFailure } from '@/lib/api-error'
-import { canView, VIEW_PERMISSIONS, firstAllowedView } from '@/lib/permissions'
+import { VIEW_PERMISSIONS, firstAllowedView } from '@/lib/permissions'
 import type { ViewKey } from '@/lib/store'
 
 /**
@@ -138,9 +138,4 @@ export function AccessDeniedForView({ view }: { view: ViewKey }) {
       }}
     />
   )
-}
-
-/** Whether this role may open this view at all. */
-export function mayOpenView(permissions: string[] | undefined, view: ViewKey): boolean {
-  return canView(permissions, view)
 }

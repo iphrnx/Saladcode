@@ -21,7 +21,7 @@ import { json, preflight } from "../_shared/http.ts";
  */
 
 const PLAN_COLUMNS =
-  "id, name, description, price_monthly, price_yearly, currency, features, trial_days, max_locations, max_staff, max_menu_items, is_popular, sort_order";
+  "id, name, description, price_monthly, price_yearly, currency, features, trial_days, max_locations, max_staff, max_menu_items, max_tables, is_popular, sort_order";
 
 Deno.serve(async (req: Request) => {
   const pf = preflight(req);
@@ -52,6 +52,8 @@ Deno.serve(async (req: Request) => {
         locations: p.max_locations ?? null,
         staff: p.max_staff ?? null,
         menuItems: p.max_menu_items ?? null,
+        tables: p.max_tables ?? (p.id === "pro" ? 100 : 50),
+        qrCodes: p.max_tables ?? (p.id === "pro" ? 100 : 50),
       },
       popular: Boolean(p.is_popular),
     }));

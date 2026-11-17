@@ -65,7 +65,8 @@ try {
   // base64url cookie — set it exactly the way its own storage would.
   const { stringToBase64URL } = await import("@supabase/ssr/dist/main/utils/base64url.js");
   const { createChunks } = await import("@supabase/ssr/dist/main/utils/chunker.js");
-  const key = "sb-ygibmdkrslquamwflshb-auth-token";
+  const ref = new URL(process.env.NEXT_PUBLIC_SUPABASE_URL || "https://jeuixphibaasbxgaexfg.supabase.co").hostname.split(".")[0];
+  const key = `sb-${ref}-auth-token`;
   const encoded = "base64-" + stringToBase64URL(JSON.stringify(s));
   const chunks = createChunks(key, encoded);
   await send("Network.enable", {}, sessionId);

@@ -100,6 +100,11 @@ Deno.serve(async (req: Request) => {
     return json(req, { ok: true, duplicate: true });
   }
 
+  if (gate === "in_progress") {
+    console.log("razorpay webhook: event currently being processed by another worker", eventId, eventType);
+    return json(req, { ok: true, in_progress: true });
+  }
+
   if (gate === "stale") {
     console.log("razorpay webhook: stale delivery, not applied", eventId, eventType);
     return json(req, { ok: true, stale: true });
@@ -109,7 +114,12 @@ Deno.serve(async (req: Request) => {
     const result = await handleEvent(event, eventType, eventId);
     await db
       .from("subscription_webhook_events")
-      .update({ processed_at: new Date().toISOString(), result: result.summary })
+      .update({
+        status: "processed",
+        processed_at: new Date().toISOString(),
+        result: result.summary,
+        last_error: null,
+      })
       .eq("event_id", eventId);
     return json(req, { ok: true, ...result });
   } catch (e) {
@@ -117,10 +127,14 @@ Deno.serve(async (req: Request) => {
     console.error("razorpay webhook: handling failed", eventId, message);
     await db
       .from("subscription_webhook_events")
-      .update({ result: `error: ${message}` })
+      .update({
+        status: "failed",
+        last_error: message,
+        result: `error: ${message}`,
+      })
       .eq("event_id", eventId);
-    // A 500 makes Razorpay retry, which is what we want for a genuine
-    // failure. The idempotency gate means the retry is safe.
+    // A 500 makes Razorpay retry. The apply_subscription_event gate allows retries when status is 'failed',
+    // ensuring transient failures are safely retried rather than dropped as duplicates (Fix C5).
     return json(req, { error: message }, 500);
   }
 });

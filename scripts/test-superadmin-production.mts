@@ -7,10 +7,11 @@
  * data. If any link is broken, this fails.
  */
 const URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+if (!URL) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL environment variable.");
 const ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 const SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const SITE = process.env.SITE_URL ?? "https://www.thesalad.in";
-const REF = "ygibmdkrslquamwflshb";
+const REF = new URL(URL).hostname.split(".")[0];
 
 let failures = 0;
 let checks = 0;

@@ -1,5 +1,5 @@
 import type { ViewKey } from '@/lib/store'
-import { expandPermissions, RESERVED_ROLE_NAMES } from '@/lib/constants'
+import { expandPermissions, RESERVED_ROLE_NAMES, hasEffectivePermission } from '@/lib/constants'
 
 /**
  * What each dashboard module needs.
@@ -53,9 +53,9 @@ export function canView(permissions: string[] | undefined, view: ViewKey): boole
 /**
  * Whether a set of permissions holds one key.
  *
- * The same rule `canView` uses, for the write keys — so a screen can ask about
- * `menu.manage` in exactly the way it asks about `menu.view`, and the two
- * answers cannot drift apart.
+ * Evaluates effective permissions including implications (e.g. *.manage implies
+ * *.view) and umbrella aliases (e.g. orders.manage covers operational actions),
+ * mirroring the Edge Function server authorization gate.
  *
  * No permission list means an owner: bootstrap sends every key for an owner,
  * and anything older that sends none is not a restricted staff member.
@@ -66,7 +66,7 @@ export function hasPermission(
 ): boolean {
   if (!permissions || permissions.length === 0) return true
   if (!permission) return false
-  return permissions.includes(permission)
+  return hasEffectivePermission(permissions, permission)
 }
 
 /** The first module this role may open — where a restricted login should land. */

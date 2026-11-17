@@ -31,6 +31,8 @@ export type PlanLimits = {
   locations: number | null;
   staff: number | null;
   menuItems: number | null;
+  tables: number | null;
+  qrCodes?: number | null;
 };
 
 export type EffectivePlan = {
@@ -98,6 +100,7 @@ type PlanRow = {
   max_locations: number | null;
   max_staff: number | null;
   max_menu_items: number | null;
+  max_tables: number | null;
   razorpay_plan_id: string | null;
   billing_mode: "recurring" | "onetime";
   /** Machine-readable entitlements. The authority for `hasFeature`. */
@@ -108,7 +111,7 @@ async function planRow(id: string): Promise<PlanRow | null> {
   const { data } = await admin()
     .from("subscription_plans")
     .select(
-      "id, name, price_monthly, price_yearly, currency, trial_days, features, feature_keys, is_active, is_popular, max_locations, max_staff, max_menu_items, razorpay_plan_id, billing_mode",
+      "id, name, price_monthly, price_yearly, currency, trial_days, features, feature_keys, is_active, is_popular, max_locations, max_staff, max_menu_items, max_tables, razorpay_plan_id, billing_mode",
     )
     .eq("id", id)
     .maybeSingle();
@@ -119,7 +122,7 @@ async function activePlans(): Promise<PlanRow[]> {
   const { data } = await admin()
     .from("subscription_plans")
     .select(
-      "id, name, price_monthly, price_yearly, currency, trial_days, features, feature_keys, is_active, max_locations, max_staff, max_menu_items, razorpay_plan_id, billing_mode",
+      "id, name, price_monthly, price_yearly, currency, trial_days, features, feature_keys, is_active, max_locations, max_staff, max_menu_items, max_tables, razorpay_plan_id, billing_mode",
     )
     .eq("is_active", true)
     .order("sort_order", { ascending: true });
@@ -309,6 +312,8 @@ export async function resolvePlan(tenantId: string): Promise<EffectivePlan> {
       locations: chosen?.max_locations ?? null,
       staff: chosen?.max_staff ?? null,
       menuItems: chosen?.max_menu_items ?? null,
+      tables: chosen?.max_tables ?? (chosen?.id === "pro" ? 100 : 50),
+      qrCodes: chosen?.max_tables ?? (chosen?.id === "pro" ? 100 : 50),
     },
     features: Array.isArray(chosen?.features) ? chosen!.features : [],
     featureKeys: Array.isArray(chosen?.feature_keys) ? chosen!.feature_keys : [],
@@ -338,6 +343,8 @@ export async function planCatalogue() {
       locations: p.max_locations,
       staff: p.max_staff,
       menuItems: p.max_menu_items,
+      tables: p.max_tables ?? (p.id === "pro" ? 100 : 50),
+      qrCodes: p.max_tables ?? (p.id === "pro" ? 100 : 50),
     },
     popular: Boolean(p.is_popular),
     razorpayPlanId: p.razorpay_plan_id,
@@ -354,14 +361,23 @@ export async function planCatalogue() {
  */
 export function checkLimit(
   plan: EffectivePlan,
-  kind: "locations" | "staff" | "menuItems",
+  kind: "locations" | "staff" | "menuItems" | "tables" | "qrCodes",
   currentCount: number,
 ): { ok: true } | { ok: false; error: string; limit: number } {
-  const limit = plan.limits[kind];
+  const limit =
+    (kind === "qrCodes" ? plan.limits.tables : plan.limits[kind]) ??
+    (kind === "tables" || kind === "qrCodes" ? (plan.planId === "pro" ? 100 : 50) : null);
   if (limit === null || limit === undefined) return { ok: true };
   if (currentCount < limit) return { ok: true };
 
-  const noun = kind === "staff" ? "staff members" : kind === "menuItems" ? "menu items" : "locations";
+  const noun =
+    kind === "staff"
+      ? "staff members"
+      : kind === "menuItems"
+        ? "menu items"
+        : kind === "tables" || kind === "qrCodes"
+          ? "QR codes"
+          : "locations";
   return {
     ok: false,
     limit,
@@ -426,30 +442,35 @@ export function checkFeature(
  * which is what the helper this replaced got wrong: it logged the failure and
  * returned `{ ok: true }`.
  */
-function limitForPlan(plan: EffectivePlan, kind: "staff" | "menuItems"): number {
+function limitForPlan(plan: EffectivePlan, kind: "staff" | "menuItems" | "tables"): number {
   // `null` in the catalogue means no limit. The database still does the
   // counting, so "no limit" is a ceiling it will never reach rather than a
   // second code path that skips the check: one writer, one rule.
-  const limit = plan.limits[kind];
+  const limit = kind === "tables" ? (plan.limits.tables ?? (plan.planId === "pro" ? 100 : 50)) : plan.limits[kind];
   return limit === null || limit === undefined ? 2_147_483_647 : limit;
 }
 
 export async function enforceWriteLimit(
   tenantId: string,
-  kind: "staff" | "menuItems",
+  kind: "staff" | "menuItems" | "tables",
   row: Record<string, unknown>,
 ): Promise<
   | { ok: true; row: any; limit: number }
   | { ok: false; reason: "limit"; error: string; limit: number }
   | { ok: false; reason: "unavailable"; retryable: true; status: 503; error: string }
-  | { ok: false; reason: "write"; error: string; status: 500 }
+  | { ok: false; reason: "write"; error: string; status: number }
 > {
   const plan = await resolvePlan(tenantId);
   const limit = limitForPlan(plan, kind);
 
-  const fn = kind === "staff" ? "create_staff_within_limit" : "create_menu_item_within_limit";
+  const fn =
+    kind === "staff"
+      ? "create_staff_within_limit"
+      : kind === "menuItems"
+        ? "create_menu_item_within_limit"
+        : "create_table_within_limit";
   const args: Record<string, unknown> = { p_tenant_id: tenantId, p_limit: limit };
-  args[kind === "staff" ? "p_staff" : "p_item"] = row;
+  args[kind === "staff" ? "p_staff" : kind === "menuItems" ? "p_item" : "p_table"] = row;
 
   const { data, error } = await admin().rpc(fn, args);
 
@@ -466,18 +487,28 @@ export async function enforceWriteLimit(
   }
 
   const result = data as any;
-  if (result && result.ok === false && result.reason === "limit") {
-    const cap = Number(result.limit ?? limit);
-    const noun = kind === "staff" ? "staff members" : "menu items";
-    return {
-      ok: false,
-      reason: "limit",
-      limit: cap,
-      error: `Your ${plan.planName} plan includes up to ${cap} ${noun}. Upgrade your plan to add more.`,
-    };
+  if (result && result.ok === false) {
+    if (result.reason === "limit") {
+      const cap = Number(result.limit ?? limit);
+      const noun = kind === "staff" ? "staff members" : kind === "menuItems" ? "menu items" : "QR codes";
+      return {
+        ok: false,
+        reason: "limit",
+        limit: cap,
+        error: `Your ${plan.planName} plan includes up to ${cap} ${noun}. Upgrade your plan to add more.`,
+      };
+    }
+    if (result.reason === "duplicate") {
+      return {
+        ok: false,
+        reason: "write",
+        error: result.error ?? "A table with that name already exists",
+        status: 409,
+      };
+    }
   }
 
-  const written = kind === "staff" ? result?.staff : result?.item;
+  const written = kind === "staff" ? result?.staff : kind === "menuItems" ? result?.item : result?.table;
   if (!result?.ok || !written?.id) {
     console.error("plans: the write returned nothing usable", kind, String(JSON.stringify(result)).slice(0, 200));
     return limitCheckFailure({ error: undefined });

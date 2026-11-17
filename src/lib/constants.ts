@@ -37,6 +37,7 @@ export function json(data: unknown, status = 200) {
 }
 
 export const ORDER_STATUS = {
+  PENDING_ACTIVATION: { label: 'Held', color: '#8b5cf6', step: -0.5 },
   PENDING: { label: 'Pending', color: '#d97706', step: 0 },
   PREPARING: { label: 'Preparing', color: '#2563eb', step: 1 },
   READY: { label: 'Ready', color: '#16a34a', step: 2 },

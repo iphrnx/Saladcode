@@ -258,7 +258,7 @@ begin
        and tenant_id = v_tenant and active
        and (usage_limit = 0 or used_count < usage_limit)
        and valid_from <= now()
-       and (valid_until is null or valid_until >= now());
+       and (valid_to is null or valid_to >= now());
   end if;
 
   insert into public.order_items (

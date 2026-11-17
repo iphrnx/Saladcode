@@ -168,16 +168,32 @@ async function authenticateStaff(tenantId: string, employeeId: string, pin: stri
 
   const valid = verifyPin(pin, staff.pin_hash, staff.pin_salt);
   if (!valid) {
-    const attempts = (staff.failed_attempts || 0) + 1;
-    const shouldLock = attempts >= MAX_FAILED_ATTEMPTS;
-    const lockedUntil = shouldLock
+    const { data: rpcRes, error: rpcErr } = await db.rpc("record_staff_login_attempt", {
+      p_tenant: tenantId,
+      p_staff_id: staff.id,
+      p_success: false,
+      p_max_attempts: MAX_FAILED_ATTEMPTS,
+      p_lockout_mins: LOCKOUT_MINUTES,
+    });
+
+    let attempts = (staff.failed_attempts || 0) + 1;
+    let shouldLock = attempts >= MAX_FAILED_ATTEMPTS;
+    let lockedUntil: string | null = shouldLock
       ? new Date(Date.now() + LOCKOUT_MINUTES * 60000).toISOString()
       : null;
 
-    await db
-      .from("staff")
-      .update({ failed_attempts: attempts, locked_until: lockedUntil })
-      .eq("id", staff.id);
+    if (!rpcErr && rpcRes) {
+      if (rpcRes.locked) {
+        shouldLock = true;
+        lockedUntil = rpcRes.locked_until;
+      }
+      attempts = rpcRes.attempts ?? attempts;
+    } else {
+      await db
+        .from("staff")
+        .update({ failed_attempts: attempts, locked_until: lockedUntil })
+        .eq("id", staff.id);
+    }
 
     await db.from("staff_activities").insert({
       staff_id: staff.id,
@@ -195,14 +211,22 @@ async function authenticateStaff(tenantId: string, employeeId: string, pin: stri
     }
     return {
       ok: false,
-      error: `Incorrect PIN. ${MAX_FAILED_ATTEMPTS - attempts} attempt(s) remaining.`,
+      error: `Incorrect PIN. ${Math.max(0, MAX_FAILED_ATTEMPTS - attempts)} attempt(s) remaining.`,
     };
   }
 
-  await db
-    .from("staff")
-    .update({ failed_attempts: 0, locked_until: null, last_login: new Date().toISOString() })
-    .eq("id", staff.id);
+  const { error: resetErr } = await db.rpc("record_staff_login_attempt", {
+    p_tenant: tenantId,
+    p_staff_id: staff.id,
+    p_success: true,
+  });
+
+  if (resetErr) {
+    await db
+      .from("staff")
+      .update({ failed_attempts: 0, locked_until: null, last_login: new Date().toISOString() })
+      .eq("id", staff.id);
+  }
 
   // Record the client the session was created from so the owner's Security
   // dashboard can show staff sessions with browser / OS / device / IP, like

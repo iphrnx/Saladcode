@@ -10,7 +10,7 @@ export type OrderExpansion = {
   manuallyClosedId: string | null
 }
 
-export function orderExpansionMode(orders: readonly OrderIdentity[]): ExpansionMode {
+function orderExpansionMode(orders: readonly OrderIdentity[]): ExpansionMode {
   const valid = orders.filter((order) => order.status !== 'CANCELLED')
   return valid.length === 1 ? { kind: 'single', id: valid[0].id } : { kind: 'multiple' }
 }

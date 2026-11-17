@@ -39,7 +39,7 @@ type Detail = {
 }
 
 const STATUSES = ['trial', 'active', 'past_due', 'cancelled', 'expired']
-const PLANS = ['basic', 'pro', 'enterprise']
+const PLANS = ['starter', 'pro']
 
 export default function RestaurantDetail({
   params,

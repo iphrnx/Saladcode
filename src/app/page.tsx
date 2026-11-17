@@ -2,17 +2,19 @@
 
 import { Suspense, useEffect, useState } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
+import dynamic from 'next/dynamic'
 import { edgeFetch, staffFetch } from '@/lib/edge'
-import { AppShell } from '@/components/app/app-shell'
-import { PublicMenu } from '@/components/public/public-menu'
-import { LandingPage } from '@/components/landing/landing-page'
-import { OnboardingFlow } from '@/components/onboarding/onboarding-flow'
-import { LoginPage } from '@/components/auth/login-page'
-import { StaffLoginPage } from '@/components/staff/staff-login'
-import { StaffDashboard } from '@/components/staff/staff-dashboard'
-import { ResetPasswordView } from '@/components/auth/reset-password'
 import { MagicLinkForwarder } from '@/components/auth/magic-link-forwarder'
-import { ConfirmEmailView } from '@/components/auth/confirm-email'
+
+const AppShell = dynamic(() => import('@/components/app/app-shell').then((m) => m.AppShell))
+const PublicMenu = dynamic(() => import('@/components/public/public-menu').then((m) => m.PublicMenu))
+const LandingPage = dynamic(() => import('@/components/landing/landing-page').then((m) => m.LandingPage))
+const OnboardingFlow = dynamic(() => import('@/components/onboarding/onboarding-flow').then((m) => m.OnboardingFlow))
+const LoginPage = dynamic(() => import('@/components/auth/login-page').then((m) => m.LoginPage))
+const StaffLoginPage = dynamic(() => import('@/components/staff/staff-login').then((m) => m.StaffLoginPage))
+const StaffDashboard = dynamic(() => import('@/components/staff/staff-dashboard').then((m) => m.StaffDashboard))
+const ResetPasswordView = dynamic(() => import('@/components/auth/reset-password').then((m) => m.ResetPasswordView))
+const ConfirmEmailView = dynamic(() => import('@/components/auth/confirm-email').then((m) => m.ConfirmEmailView))
 
 // Views that require a logged-in owner session
 const PROTECTED_VIEWS = ['onboarding', 'dashboard', '']

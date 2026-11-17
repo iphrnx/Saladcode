@@ -27,7 +27,8 @@ try {
   const { targetId } = await send("Target.createTarget", { url: `${SITE}/?view=login` });
   const { sessionId: sid } = await send("Target.attachToTarget", { targetId, flatten: true });
   await send("Runtime.enable", {}, sid); await send("Page.enable", {}, sid); await sleep(3000);
-  await send("Runtime.evaluate", { expression: `(() => { const key="sb-ygibmdkrslquamwflshb-auth-token"; const s=${JSON.stringify({ access_token: sess.access_token, refresh_token: sess.refresh_token, token_type: "bearer", expires_in: 3600, expires_at: Math.floor(Date.now()/1000)+3600, user: sess.user })}; document.cookie = key+"="+encodeURIComponent("base64-"+btoa(JSON.stringify(s)).replace(/=+$/,""))+"; path=/; SameSite=Lax"; return 1; })()`, returnByValue: true }, sid);
+  const ref = new URL(SITE_SUPABASE).hostname.split(".")[0];
+  await send("Runtime.evaluate", { expression: `(() => { const key="sb-${ref}-auth-token"; const s=${JSON.stringify({ access_token: sess.access_token, refresh_token: sess.refresh_token, token_type: "bearer", expires_in: 3600, expires_at: Math.floor(Date.now()/1000)+3600, user: sess.user })}; document.cookie = key+"="+encodeURIComponent("base64-"+btoa(JSON.stringify(s)).replace(/=+$/,""))+"; path=/; SameSite=Lax"; return 1; })()`, returnByValue: true }, sid);
   await send("Page.navigate", { url: `${SITE}/?view=settings` }, sid); await sleep(14000);
   await clickText(sid, "[role=tab]", "Billing"); await sleep(4000);
   await clickText(sid, "[role=tab]", "Annually"); await sleep(2500);

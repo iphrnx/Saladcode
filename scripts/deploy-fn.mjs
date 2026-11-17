@@ -14,7 +14,8 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const PROJECT_ID = process.env.SUPABASE_PROJECT_ID ?? "ygibmdkrslquamwflshb";
+const PROJECT_ID = process.env.SUPABASE_PROJECT_ID ?? 
+  (process.env.NEXT_PUBLIC_SUPABASE_URL ? new URL(process.env.NEXT_PUBLIC_SUPABASE_URL).hostname.split(".")[0] : "jeuixphibaasbxgaexfg");
 const ROOT = "supabase/functions";
 
 const name = process.argv[2];

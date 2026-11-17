@@ -2,6 +2,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { guard } from "../_shared/auth.ts";
 import { admin } from "../_shared/db.ts";
+import { enforceWriteLimit } from "../_shared/plans.ts";
 import { toCamel, embedCount } from "../_shared/case.ts";
 import { body, json, preflight, subPath } from "../_shared/http.ts";
 
@@ -64,12 +65,12 @@ async function list(req: Request): Promise<Response> {
 
   if (error) return json(req, { error: error.message }, 500);
 
-  // Which tables currently have food on them?
+  // Which tables currently have food or active orders on them?
   const { data: activeOrders } = await db
     .from("orders")
     .select("table_id, status")
     .eq("tenant_id", tenantId)
-    .in("status", ["PENDING", "PREPARING", "READY", "SERVED"]);
+    .in("status", ["PENDING_ACTIVATION", "PENDING", "PREPARING", "READY", "SERVED"]);
 
   const tableStatus: Record<string, string> = {};
   for (const o of activeOrders ?? []) {
@@ -100,27 +101,25 @@ async function create(req: Request): Promise<Response> {
   const b = await body(req) as any;
   if (!String(b.name ?? "").trim()) return json(req, { error: "Table name is required" }, 400);
 
-  const { data, error } = await admin()
-    .from("tables")
-    .insert({
-      tenant_id: tenantId,
-      name: String(b.name).trim(),
-      seats: Number(b.seats) || 4,
-      area: b.area ? String(b.area).trim() || "Main Hall" : "Main Hall",
-      active: b.active !== false,
-      // Unguessable: this token is the only thing protecting a table's session.
-      qr_token: tableToken(),
-    })
-    .select("*")
-    .single();
+  // The plan's limit is checked and the row written in one transaction, so two
+  // requests cannot both take the last slot. A limit that cannot be checked
+  // writes nothing and asks the caller to retry.
+  const written = await enforceWriteLimit(tenantId, "tables", {
+    name: String(b.name).trim(),
+    seats: Number(b.seats) || 4,
+    area: b.area ? String(b.area).trim() || "Main Hall" : "Main Hall",
+    active: b.active !== false,
+    // Unguessable: this token is the only thing protecting a table's session.
+    qr_token: tableToken(),
+  });
 
-  if (error) {
-    if (error.code === "23505") {
-      return json(req, { error: "A table with that name already exists" }, 409);
-    }
-    return json(req, { error: error.message }, 500);
+  if (!written.ok) {
+    if (written.reason === "limit") return json(req, { error: written.error, limit: written.limit }, 402);
+    if (written.reason === "write") return json(req, { error: written.error }, written.status);
+    return json(req, { error: written.error, retryable: true }, written.status);
   }
-  return json(req, toCamel(data), 201);
+
+  return json(req, toCamel(written.row), 201);
 }
 
 async function update(req: Request, id: string | null): Promise<Response> {
@@ -154,7 +153,40 @@ async function remove(req: Request, id: string | null): Promise<Response> {
   if (!g.ok) return g.response;
   if (!id) return json(req, { error: "id is required" }, 400);
 
-  const { error } = await admin()
+  const db = admin();
+
+  // Guard against deleting tables with active orders
+  const { count: activeOrders } = await db
+    .from("orders")
+    .select("id", { count: "exact", head: true })
+    .eq("tenant_id", g.session.tenantId)
+    .eq("table_id", id)
+    .not("status", "in", "(COMPLETED,CANCELLED)");
+
+  if (activeOrders && activeOrders > 0) {
+    return json(
+      req,
+      { error: "Cannot delete table with active orders. Complete or cancel them first." },
+      409,
+    );
+  }
+
+  // Guard against deleting tables with historical checks (preserves audit integrity)
+  const { count: existingChecks } = await db
+    .from("table_checks")
+    .select("id", { count: "exact", head: true })
+    .eq("tenant_id", g.session.tenantId)
+    .eq("table_id", id);
+
+  if (existingChecks && existingChecks > 0) {
+    return json(
+      req,
+      { error: "Cannot delete table with sales history. Deactivate it instead to preserve financial records." },
+      409,
+    );
+  }
+
+  const { error } = await db
     .from("tables")
     .delete()
     .eq("id", id)

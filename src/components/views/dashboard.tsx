@@ -28,7 +28,7 @@ export function DashboardView() {
   const tr = useT()
   const { data, refresh, sessionRevision } = useApp()
   const { denied, handleLoad, handleAction } = useAccessDenied()
-  const { cart, addToCart, updateCartQty, removeFromCart, setCartNotes, clearCart, hydrateCart, subtractCartLines, orderType, setOrderType, selectedTableId, setSelectedTableId, promoCode, setPromoCode } = useStore()
+  const { cart, addToCart, updateCartQty, removeFromCart, setCartNotes, clearCart, hydrateCart, subtractCartLines, orderType, setOrderType, selectedTableId, setSelectedTableId, selectedSessionId, setSelectedSessionId, promoCode, setPromoCode } = useStore()
   const [activeCat, setActiveCat] = useState<string>('all')
   const [search, setSearch] = useState('')
   const [lastOrder, setLastOrder] = useState<any>(null)
@@ -42,6 +42,18 @@ export function DashboardView() {
   // Mirrors "a checkout is in flight" synchronously — see submitOrder.
   const submittingRef = useRef(false)
   const [offline, setOffline] = useState(false)
+
+  // Synchronize configured default order type when starting a new session or loading settings
+  const defaultOrderType = data?.settings?.pref_default_order_type as 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY' | undefined
+  const defaultOrderTypeAppliedRef = useRef(false)
+  useEffect(() => {
+    if (!defaultOrderTypeAppliedRef.current && defaultOrderType && ['DINE_IN', 'TAKEAWAY', 'DELIVERY'].includes(defaultOrderType)) {
+      if (cart.length === 0) {
+        setOrderType(defaultOrderType)
+        defaultOrderTypeAppliedRef.current = true
+      }
+    }
+  }, [defaultOrderType, cart.length, setOrderType])
 
   // scroll-collapse effect: when the menu is scrolled, the restaurant header
   // (name/tagline/stats) collapses to give the category pills + cards more room
@@ -147,11 +159,12 @@ export function DashboardView() {
       cart,
       orderType,
       selectedTableId,
+      selectedSessionId,
       promoCode,
     })
     if (cart.length === 0) clearPosCart(tenantId, userId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cart, orderType, selectedTableId, promoCode, tenantId, userId])
+  }, [cart, orderType, selectedTableId, selectedSessionId, promoCode, tenantId, userId])
 
   const queueBusy = queueEntries.some((e) => e.state === 'pending' || e.state === 'submitting')
   const failedEntries = queueEntries.filter((e) => e.state === 'failed')
@@ -272,7 +285,7 @@ export function DashboardView() {
   /** The session whose accept/decline request is in flight. */
   const [activatingSession, setActivatingSession] = useState<string | null>(null)
   /** The table whose consolidated bill is open. */
-  const [billTable, setBillTable] = useState<{ id: string; name: string } | null>(null)
+  const [billTable, setBillTable] = useState<{ id: string; name: string; checkId?: string | null } | null>(null)
 
   // A repeating poll: only the first load may take over the screen. After that,
   // a failure leaves the previous list in place rather than blanking a page
@@ -439,13 +452,17 @@ export function DashboardView() {
     )
   }, [sessions, pendingBills, tables])
 
-  const endSession = async (tableId: string, tableName?: string, force = false) => {
-    setEndingTable(tableId)
+  const endSession = async (tableId: string, tableName?: string, force = false, sessionId?: string) => {
+    setEndingTable(sessionId ? `${tableId}:${sessionId}` : tableId)
     try {
       const res = await edgeFetch('/api/table-session/end', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-tenant-id': tenant?.id ?? '' },
-        body: JSON.stringify({ tableId, force }),
+        body: JSON.stringify({
+          tableId,
+          ...(sessionId ? { sessionId } : {}),
+          force,
+        }),
       })
       if (res.status === 409) {
         // The server refuses to close a table with open or unpaid orders. The
@@ -457,7 +474,7 @@ export function DashboardView() {
             duration: 8000,
             action: {
               label: 'Close anyway',
-              onClick: () => void endSession(tableId, tableName, true),
+              onClick: () => void endSession(tableId, tableName, true, sessionId),
             },
           })
           return
@@ -472,7 +489,13 @@ export function DashboardView() {
           : 'The diner must scan the QR code again to order.',
       })
       // The prompt the cashier needs, at the moment they need it.
-      if (stillOwed && canCollect) setBillTable({ id: tableId, name: tableName ?? 'Table' })
+      if (stillOwed && canCollect) {
+        setBillTable({
+          id: tableId,
+          name: tableName ?? 'Table',
+          checkId: body?.settlement?.checkId,
+        })
+      }
       await loadSessions()
     } catch (err) {
       handleAction(err, 'the table session')
@@ -534,9 +557,26 @@ function SessionStateBadge({ state }: { state: FloorState }) {
       toast.error('Cart is empty')
       return
     }
-    if (orderType === 'DINE_IN' && !selectedTableId) {
-      toast.error('Please select a table')
-      return
+    const floorTable = selectedTableId ? floor.find((f: any) => f.tableId === selectedTableId) : null
+    let activeSessionId: string | null = null
+
+    if (orderType === 'DINE_IN') {
+      if (!selectedTableId) {
+        toast.error('Please select a table')
+        return
+      }
+      const liveSessions = floorTable?.liveSessions || []
+      if (liveSessions.length > 1) {
+        if (!selectedSessionId || !liveSessions.some((s: any) => s.id === selectedSessionId)) {
+          toast.error('This table has multiple active diner sessions. Please select which sitting/bill to add this order to.')
+          return
+        }
+        activeSessionId = selectedSessionId
+      } else if (liveSessions.length === 1) {
+        activeSessionId = liveSessions[0].id
+      } else if (floorTable?.check?.sessionId) {
+        activeSessionId = floorTable.check.sessionId
+      }
     }
     if (orderType !== 'DINE_IN' && !customerName.trim()) {
       toast.error('Please enter customer name')
@@ -561,6 +601,7 @@ function SessionStateBadge({ state }: { state: FloorState }) {
       'pos',
       {
         tableId: orderType === 'DINE_IN' ? selectedTableId : null,
+        tableSessionId: orderType === 'DINE_IN' ? (activeSessionId || undefined) : undefined,
         orderType,
         items,
         promoCode: promoCode || undefined,
@@ -752,7 +793,7 @@ function SessionStateBadge({ state }: { state: FloorState }) {
                   <button
                     key={b.checkId}
                     type="button"
-                    onClick={() => setBillTable({ id: b.tableId, name: b.tableName })}
+                    onClick={() => setBillTable({ id: b.tableId, name: b.tableName, checkId: b.checkId })}
                     data-pending-bill
                     className="w-56 shrink-0 rounded-2xl border border-amber-500/40 bg-card p-3.5 text-left transition-colors hover:border-amber-500/70"
                   >
@@ -861,6 +902,60 @@ function SessionStateBadge({ state }: { state: FloorState }) {
                         </span>
                       </div>
 
+                      {liveSessions.length > 1 && (
+                        <div className="mt-2.5 rounded-xl border border-amber-500/30 bg-amber-500/5 p-2 space-y-1.5">
+                          <div className="flex items-center justify-between text-[10.5px] font-semibold text-amber-600 dark:text-amber-400">
+                            <span>{liveSessions.length} Active Sittings</span>
+                            <span className="text-[10px] text-muted-foreground font-normal">Independent bills</span>
+                          </div>
+                          <div className="space-y-1">
+                            {liveSessions.map((s: any, idx: number) => {
+                              const isSelected = selectedTableId === group.tableId && selectedSessionId === s.id
+                              const isEndingThis = endingTable === `${group.tableId}:${s.id}` || endingTable === group.tableId
+                              return (
+                                <div
+                                  key={s.id}
+                                  className={cn(
+                                    'flex items-center justify-between rounded-lg px-2 py-1 text-[11px] transition-colors',
+                                    isSelected
+                                      ? 'bg-primary text-white font-medium'
+                                      : 'bg-secondary/70 hover:bg-secondary text-foreground',
+                                  )}
+                                >
+                                  <span className="truncate">
+                                    Sitting #{idx + 1} ({s._count?.orders ?? 0} ord)
+                                  </span>
+                                  <div className="flex items-center gap-1">
+                                    <Button
+                                      size="sm"
+                                      variant={isSelected ? 'secondary' : 'outline'}
+                                      className="h-5 px-1.5 text-[10px]"
+                                      onClick={() => {
+                                        setSelectedTableId(group.tableId)
+                                        setSelectedSessionId(s.id)
+                                        setCartOpen(true)
+                                      }}
+                                    >
+                                      {isSelected ? 'Selected' : 'Select'}
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      className="h-5 px-1.5 text-[10px] text-destructive hover:bg-destructive/10 hover:text-destructive"
+                                      disabled={isEndingThis || !canEndSessions}
+                                      onClick={() => endSession(group.tableId, `${label} (Sitting #${idx + 1})`, false, s.id)}
+                                      title="End this sitting only"
+                                    >
+                                      {isEndingThis ? '…' : 'End'}
+                                    </Button>
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )}
+
                       {pending && (
                         <div className="mt-2.5 rounded-xl border border-amber-500/25 bg-amber-50/70 p-2.5 dark:bg-amber-500/10">
                           <p className="text-[11px] font-semibold text-amber-900 dark:text-amber-200">
@@ -904,7 +999,13 @@ function SessionStateBadge({ state }: { state: FloorState }) {
                             'mb-1.5 h-8 w-full text-xs',
                             state === 'payment-due' && 'border-[#f97316]/45 bg-[#f97316]/5 text-[#c2410c] hover:bg-[#f97316]/10 dark:text-[#fdba74]',
                           )}
-                          onClick={() => setBillTable({ id: group.tableId, name: label })}
+                          onClick={() => setBillTable({
+                            id: group.tableId,
+                            name: label,
+                            checkId: selectedTableId === group.tableId && selectedSessionId
+                              ? liveSessions.find((s: any) => s.id === selectedSessionId)?.check?.id
+                              : undefined,
+                          })}
                           disabled={!canEndSessions}
                         >
                           <Receipt className="mr-1.5 size-3.5" />
@@ -912,17 +1013,38 @@ function SessionStateBadge({ state }: { state: FloorState }) {
                         </Button>
                       )}
 
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => endSession(group.tableId, label)}
-                        disabled={endingTable === group.tableId || !canEndSessions || state === 'closed' || state === 'idle'}
-                        title={!canEndSessions ? 'You do not have permission to manage the floor' : undefined}
-                        className="mt-auto h-8 w-full text-xs"
-                      >
-                        <LogOut className="mr-1.5 size-3.5" />
-                        {endingTable === group.tableId ? 'Ending…' : tr('pos.endSession')}
-                      </Button>
+                      {(() => {
+                        const isMulti = liveSessions.length > 1
+                        const activeSessionId = selectedTableId === group.tableId && selectedSessionId
+                          ? selectedSessionId
+                          : isMulti
+                            ? undefined
+                            : liveSessions[0]?.id
+                        const targetLabel = isMulti && activeSessionId
+                          ? `${label} (Sitting #${liveSessions.findIndex((s: any) => s.id === activeSessionId) + 1})`
+                          : label
+                        const isEnding = endingTable === group.tableId || (activeSessionId && endingTable === `${group.tableId}:${activeSessionId}`)
+
+                        return (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => endSession(group.tableId, targetLabel, false, activeSessionId)}
+                            disabled={Boolean(isEnding) || !canEndSessions || state === 'closed' || state === 'idle'}
+                            title={!canEndSessions ? 'You do not have permission to manage the floor' : undefined}
+                            className="mt-auto h-8 w-full text-xs"
+                          >
+                            <LogOut className="mr-1.5 size-3.5" />
+                            {isEnding
+                              ? 'Ending…'
+                              : isMulti
+                                ? activeSessionId
+                                  ? 'End Selected Sitting'
+                                  : 'End All Sittings'
+                                : tr('pos.endSession')}
+                          </Button>
+                        )
+                      })()}
                     </div>
                   )
                 })}
@@ -935,6 +1057,7 @@ function SessionStateBadge({ state }: { state: FloorState }) {
       <TableCheckDialog
         tableId={billTable?.id ?? null}
         tableName={billTable?.name ?? null}
+        checkId={billTable?.checkId ?? null}
         open={billTable !== null}
         onOpenChange={(v) => !v && setBillTable(null)}
         currencySymbol={tenant.currencySymbol}
@@ -949,6 +1072,9 @@ function SessionStateBadge({ state }: { state: FloorState }) {
           setOrderType={setOrderType}
           selectedTableId={selectedTableId}
           setSelectedTableId={setSelectedTableId}
+          selectedSessionId={selectedSessionId}
+          setSelectedSessionId={setSelectedSessionId}
+          liveSessions={selectedTableId ? (floor.find((f: any) => f.tableId === selectedTableId)?.liveSessions || []) : []}
           customerName={customerName}
           setCustomerName={setCustomerName}
           customerPhone={customerPhone}
@@ -1004,6 +1130,9 @@ function SessionStateBadge({ state }: { state: FloorState }) {
             setOrderType={setOrderType}
             selectedTableId={selectedTableId}
             setSelectedTableId={setSelectedTableId}
+            selectedSessionId={selectedSessionId}
+            setSelectedSessionId={setSelectedSessionId}
+            liveSessions={selectedTableId ? (floor.find((f: any) => f.tableId === selectedTableId)?.liveSessions || []) : []}
             customerName={customerName}
             setCustomerName={setCustomerName}
             customerPhone={customerPhone}
@@ -1271,6 +1400,9 @@ interface CartPanelProps {
   setOrderType: (t: any) => void
   selectedTableId: string | null
   setSelectedTableId: (id: string | null) => void
+  selectedSessionId: string | null
+  setSelectedSessionId: (id: string | null) => void
+  liveSessions: any[]
   customerName: string
   setCustomerName: (v: string) => void
   customerPhone: string
@@ -1306,6 +1438,7 @@ interface CartPanelProps {
 function CartPanel(p: CartPanelProps) {
   const tr = useT()
   const { embedded } = p
+  const isAmbiguousSitting = p.orderType === 'DINE_IN' && Boolean(p.selectedTableId) && p.liveSessions.length > 1 && !p.selectedSessionId
   return (
     <div className={cn('flex flex-col h-full min-h-0 flex-1', embedded && 'overflow-hidden')}>
       {/* Order type + table/customer */}
@@ -1314,7 +1447,10 @@ function CartPanel(p: CartPanelProps) {
           {(['DINE_IN', 'TAKEAWAY', 'DELIVERY'] as const).map((t) => (
             <button
               key={t}
-              onClick={() => p.setOrderType(t)}
+              onClick={() => {
+                p.setOrderType(t)
+                if (t !== 'DINE_IN') p.setSelectedTableId(null)
+              }}
               className={cn(
                 'rounded-md py-1.5 text-[11px] font-semibold transition-premium',
                 p.orderType === t
@@ -1327,16 +1463,65 @@ function CartPanel(p: CartPanelProps) {
           ))}
         </div>
         {p.orderType === 'DINE_IN' ? (
-          <Select value={p.selectedTableId || ''} onValueChange={(v) => p.setSelectedTableId(v)}>
-            <SelectTrigger className="bg-secondary/50 border-0 h-9">
-              <SelectValue placeholder={tr('pos.selectTable')} />
-            </SelectTrigger>
-            <SelectContent>
-              {p.tables.map((t) => (
-                <SelectItem key={t.id} value={t.id}>{t.name} · {t.seats} seats · {t.area}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <div className="space-y-2">
+            <Select value={p.selectedTableId || ''} onValueChange={(v) => p.setSelectedTableId(v)}>
+              <SelectTrigger className="bg-secondary/50 border-0 h-9">
+                <SelectValue placeholder={tr('pos.selectTable')} />
+              </SelectTrigger>
+              <SelectContent>
+                {p.tables.map((t) => (
+                  <SelectItem key={t.id} value={t.id}>{t.name} · {t.seats} seats · {t.area}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            {p.selectedTableId && p.liveSessions.length > 1 && (
+              <div className="space-y-1.5 rounded-lg border border-amber-500/40 bg-amber-500/5 p-2.5">
+                <div className="flex items-center justify-between text-[11px] font-semibold text-amber-600 dark:text-amber-400">
+                  <span>Diner Sitting (Required)</span>
+                  <span className="text-[10px] text-amber-600/80 dark:text-amber-400/80">{p.liveSessions.length} active sittings</span>
+                </div>
+                <Select
+                  value={p.selectedSessionId || ''}
+                  onValueChange={(v) => p.setSelectedSessionId(v || null)}
+                >
+                  <SelectTrigger className={cn(
+                    "bg-background border h-8 text-xs",
+                    !p.selectedSessionId ? "border-amber-500 text-amber-600 dark:text-amber-400 font-medium" : "border-border"
+                  )}>
+                    <SelectValue placeholder="⚠️ Select sitting / bill..." />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {p.liveSessions.map((s: any, idx: number) => {
+                      const timeStr = s.createdAt ? new Date(s.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
+                      const orderCount = s._count?.orders ?? 0
+                      return (
+                        <SelectItem key={s.id} value={s.id}>
+                          Sitting #{idx + 1} · {timeStr} · {orderCount} order{orderCount === 1 ? '' : 's'} ({s.id.slice(0, 8)})
+                        </SelectItem>
+                      )
+                    })}
+                  </SelectContent>
+                </Select>
+                {!p.selectedSessionId ? (
+                  <p className="text-[10.5px] text-amber-600 dark:text-amber-400 leading-tight">
+                    This table has multiple active diner bills. Select which party to add these items to.
+                  </p>
+                ) : (
+                  <p className="text-[10.5px] text-muted-foreground leading-tight">
+                    Adding to Sitting #{p.liveSessions.findIndex((s: any) => s.id === p.selectedSessionId) + 1} ({p.selectedSessionId.slice(0, 8)})
+                  </p>
+                )}
+              </div>
+            )}
+
+            {p.selectedTableId && p.liveSessions.length === 1 && (
+              <div className="flex items-center justify-between text-[11px] text-muted-foreground px-1">
+                <span>Active sitting: Sitting #1</span>
+                <span className="font-mono text-[10px] text-muted-foreground/80">({p.liveSessions[0].id.slice(0, 8)})</span>
+              </div>
+            )}
+          </div>
         ) : (
           <div className="grid grid-cols-2 gap-2">
             <Input
@@ -1476,12 +1661,14 @@ function CartPanel(p: CartPanelProps) {
         </div>
         <Button
           onClick={p.onSubmit}
-          disabled={p.submitting || p.cart.length === 0 || !p.canCheckout}
-          title={!p.canCheckout ? "You don't have permission to create orders" : undefined}
+          disabled={p.submitting || p.cart.length === 0 || !p.canCheckout || isAmbiguousSitting}
+          title={!p.canCheckout ? "You don't have permission to create orders" : isAmbiguousSitting ? "Please select which diner sitting to add this order to" : undefined}
           className="w-full h-10 text-sm font-semibold bg-gradient-to-r from-primary to-primary-hover hover:shadow-glow-primary transition-premium border-0"
         >
           {p.submitting ? (
             <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Placing order…</>
+          ) : isAmbiguousSitting ? (
+            <>Select Diner Sitting</>
           ) : (
             <><CreditCard className="h-4 w-4 mr-2" /> {tr('pos.checkout')} · {p.currencySymbol}{p.total.toFixed(2)}</>
           )}

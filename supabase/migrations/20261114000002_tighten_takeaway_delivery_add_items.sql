@@ -16,6 +16,11 @@ declare
   v_order public.orders;
   v_item jsonb;
   v_menu record;
+  v_portion record;
+  v_portion_id uuid;
+  v_portion_name text;
+  v_portion_price numeric(10, 2);
+  v_item_price numeric(10, 2);
   v_next_kot integer;
   v_items_total numeric(12, 2) := 0;
   v_tax_rate numeric(6, 4) := 0.08;
@@ -76,13 +81,30 @@ begin
 
   -- 6. Insert new items and validate availability server-side
   for v_item in select value from jsonb_array_elements(p_items) loop
-    select id, tenant_id, available into v_menu
+    select id, tenant_id, available, price, name into v_menu
       from public.menu_items
      where id = (v_item->>'menu_item_id')::uuid;
 
     if v_menu is null or v_menu.tenant_id <> p_tenant or v_menu.available = false then
       raise exception 'ITEM_UNAVAILABLE:%', (v_item->>'menu_item_id') using errcode = 'P0001';
     end if;
+
+    v_portion_id := nullif(v_item->>'portion_id', '')::uuid;
+    v_portion_name := null;
+    v_portion_price := null;
+
+    if v_portion_id is not null then
+      select id, name, price into v_portion
+        from public.dish_portions
+       where id = v_portion_id and menu_item_id = v_menu.id;
+      if v_portion.id is not null then
+        v_portion_name := v_portion.name;
+        v_portion_price := v_portion.price;
+      end if;
+    end if;
+
+    -- Authoritative server price: portion price if portion chosen, otherwise menu item price
+    v_item_price := coalesce(v_portion_price, v_menu.price);
 
     insert into public.order_items (
       order_id,
@@ -98,11 +120,11 @@ begin
       idempotency_key
     ) values (
       p_order_id,
-      (v_item->>'menu_item_id')::uuid,
-      v_item->>'name',
-      nullif(v_item->>'portion_id', ''),
-      nullif(v_item->>'portion', ''),
-      (v_item->>'price')::numeric,
+      v_menu.id,
+      coalesce(v_item->>'name', v_menu.name),
+      v_portion_id,
+      v_portion_name,
+      v_item_price,
       greatest(1, (v_item->>'quantity')::integer),
       nullif(v_item->>'notes', ''),
       'PENDING',

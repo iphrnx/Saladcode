@@ -47,7 +47,11 @@ const UUID_RE =
  */
 export function scrubIds(value: unknown): string {
   return String(value ?? "")
-    .replace(UUID_RE, " ")
+    .replace(/\(\s*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\s*\)/gi, "")
+    .replace(/\b(?:check|order)\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\s*/gi, "")
+    .replace(UUID_RE, "")
+    .replace(/\(\s*\)/g, "")
+    .replace(/\[\s*\]/g, "")
     .replace(/\s{2,}/g, " ")
     .replace(/\s+([.,;:!?])/g, "$1")
     .trim();

@@ -203,18 +203,23 @@ async function put(req: Request): Promise<Response> {
         .upsert(rows, { onConflict: "tenant_id,key" });
       if (error) return json(req, { error: error.message }, 500);
 
-      // If Auto Accept Orders was enabled, auto-accept any pending activation orders
+      // If Auto Accept Orders was enabled, auto-accept any pending activation orders for THIS tenant only
       if (settingsPayload.auto_accept_orders === "true") {
-        await db
+        const { data: pendingOrders } = await db
           .from("orders")
           .update({ status: "PENDING" })
           .eq("tenant_id", tenantId)
-          .eq("status", "PENDING_ACTIVATION");
+          .eq("status", "PENDING_ACTIVATION")
+          .select("id");
 
-        await db
-          .from("order_items")
-          .update({ status: "PENDING" })
-          .eq("status", "PENDING_ACTIVATION");
+        if (pendingOrders && pendingOrders.length > 0) {
+          const orderIds = pendingOrders.map((o: { id: string }) => o.id);
+          await db
+            .from("order_items")
+            .update({ status: "PENDING" })
+            .in("order_id", orderIds)
+            .eq("status", "PENDING_ACTIVATION");
+        }
 
         await db
           .from("table_sessions")

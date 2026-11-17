@@ -795,7 +795,7 @@ async function endSession(req: Request): Promise<Response> {
 
       const list = outstanding ?? [];
       if (list.length > 0) {
-        const unpaid = list.filter((o: any) => !["PAID", "REFUNDED"].includes(String(o.payment_status)));
+        const unpaid = list.filter((o: any) => !["PAID", "REFUNDED"].includes(String(o.payment_status).toUpperCase()));
         return json(
           req,
           {

@@ -136,7 +136,9 @@ export function OrderDetailDrawer({
                   Order #{order.orderNumber}
                 </p>
                 <p className="truncate text-[12px] text-muted-foreground">
-                  {order.table ? `${order.table.name} · ${order.table.area}` : order.orderType}
+                  {order.table
+                    ? (order.table.area?.trim() ? `${order.table.name} · ${order.table.area.trim()}` : order.table.name)
+                    : order.orderType}
                 </p>
                 <p className="truncate text-[12px] text-muted-foreground">
                   {when(order.createdAt)}
