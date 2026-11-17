@@ -88,6 +88,17 @@ export function OrderDetailDrawer({
   const cancelled = order.status === 'CANCELLED'
   const done = order.status === 'COMPLETED'
   const isHeld = order.status === 'PENDING_ACTIVATION'
+  const isPaid = order.paymentStatus === 'PAID'
+  const isServed = order.status === 'SERVED'
+  // Cancellation is only allowed for eligible earlier statuses (PENDING, PREPARING, READY),
+  // and is strictly disabled for SERVED, COMPLETED, PAID, or CANCELLED orders.
+  const canCancelThisOrder = Boolean(
+    canCancel &&
+    !isPaid &&
+    !isServed &&
+    !done &&
+    !cancelled
+  )
   const stepIndex = STEPS.indexOf(order.status as (typeof STEPS)[number])
   const nextStep =
     order.status === 'PENDING'
@@ -287,45 +298,7 @@ export function OrderDetailDrawer({
           ) : nextStep ? (
             /* Kitchen progression — there is a forward step to take */
             <>
-              <button
-                type="button"
-                onClick={() => {
-                  setCancelReason('')
-                  setSelectedPreset(null)
-                  setConfirmCancelOpen(true)
-                }}
-                disabled={!canCancel || cancelling || busy}
-                title={!canCancel ? 'Only Owner, Manager, and Cashier can cancel orders' : undefined}
-                className={cn(
-                  'flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl border border-border bg-card text-[13.5px] font-semibold transition-colors',
-                  canCancel
-                    ? 'text-destructive hover:border-destructive/30 hover:bg-destructive/10'
-                    : 'cursor-not-allowed text-muted-foreground opacity-60',
-                )}
-              >
-                <XCircle className="size-4" />
-                Cancel Order
-              </button>
-              <button
-                onClick={() => onUpdate(nextStep.status)}
-                disabled={!nextStep.allowed || busy}
-                title={!nextStep.allowed ? "You don't have permission for this step" : undefined}
-                className={cn(
-                  'flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl text-[13.5px] font-semibold transition-colors',
-                  nextStep.allowed
-                    ? 'bg-primary text-primary-foreground hover:bg-primary/90'
-                    : 'bg-secondary text-muted-foreground',
-                  busy && 'opacity-70 cursor-not-allowed',
-                )}
-              >
-                {busy ? <Loader2 className="size-4 animate-spin" /> : <ChefHat className="size-4" />}
-                {busy ? 'Updating…' : nextStep.label}
-              </button>
-            </>
-          ) : !done && !cancelled ? (
-            /* Served state — allow authorized staff to safely cancel if needed */
-            <div className="flex w-full flex-col gap-2">
-              {canCancel && (
+              {canCancelThisOrder && (
                 <button
                   type="button"
                   onClick={() => {
@@ -334,13 +307,34 @@ export function OrderDetailDrawer({
                     setConfirmCancelOpen(true)
                   }}
                   disabled={cancelling || busy}
-                  className="flex h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-destructive/30 bg-destructive/5 text-[13px] font-semibold text-destructive transition-colors hover:bg-destructive/10"
+                  title={!canCancel ? 'Only Owner, Manager, and Cashier can cancel orders' : undefined}
+                  className="flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl border border-border bg-card text-[13.5px] font-semibold text-destructive transition-colors hover:border-destructive/30 hover:bg-destructive/10 cursor-pointer"
                 >
                   <XCircle className="size-4" />
                   Cancel Order
                 </button>
               )}
-              <div className="flex w-full items-center justify-center gap-2 rounded-xl bg-secondary/60 py-2 text-[12px] text-muted-foreground">
+              <button
+                onClick={() => onUpdate(nextStep.status)}
+                disabled={!nextStep.allowed || busy}
+                title={!nextStep.allowed ? "You don't have permission for this step" : undefined}
+                className={cn(
+                  'flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl text-[13.5px] font-semibold transition-colors cursor-pointer',
+                  nextStep.allowed
+                    ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+                    : 'bg-secondary text-muted-foreground',
+                  busy && 'opacity-70 cursor-not-allowed',
+                  !canCancelThisOrder && 'w-full flex-none',
+                )}
+              >
+                {busy ? <Loader2 className="size-4 animate-spin" /> : <ChefHat className="size-4" />}
+                {busy ? 'Updating…' : nextStep.label}
+              </button>
+            </>
+          ) : !done && !cancelled ? (
+            /* Served state — order is served to diners; Cancel Order button is completely removed */
+            <div className="flex w-full flex-col gap-2">
+              <div className="flex w-full items-center justify-center gap-2 rounded-xl bg-secondary/60 py-2.5 text-[12px] text-muted-foreground">
                 <Check className="size-3.5 shrink-0 text-emerald-600" />
                 <span>Order served · Payment handled at table level</span>
               </div>
@@ -362,7 +356,7 @@ export function OrderDetailDrawer({
           )}
         </div>
 
-        <AlertDialog open={confirmCancelOpen} onOpenChange={setConfirmCancelOpen}>
+        <AlertDialog open={confirmCancelOpen && canCancelThisOrder} onOpenChange={setConfirmCancelOpen}>
           <AlertDialogContent className="max-w-[420px] rounded-2xl p-5">
             <AlertDialogHeader className="space-y-1.5">
               <AlertDialogTitle className="text-[17px] font-bold">

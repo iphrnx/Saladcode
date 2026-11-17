@@ -3,14 +3,15 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { guard } from "../_shared/auth.ts";
 import { admin } from "../_shared/db.ts";
 import { json, preflight } from "../_shared/http.ts";
-import { checkFeature, resolvePlan } from "../_shared/plans.ts";
+import { resolvePlan } from "../_shared/plans.ts";
 
 /**
  * /functions/v1/analytics
  *   GET   aggregated analytics for the caller's tenant (analytics.view)
  *
- * Ported faithfully from src/app/api/analytics/route.ts — same aggregations,
- * same rounding, same response shape.
+ * All active plans (Starter and Pro) have full access to advanced analytics:
+ * revenue trend, hourly distribution, order types, top selling items, top tables,
+ * and category breakdown.
  */
 
 Deno.serve(async (req: Request) => {
@@ -26,15 +27,8 @@ Deno.serve(async (req: Request) => {
   }
 });
 
-
 /* -------------------------------------------------------------------------- */
-/*  Date ranges                                                                */
-/*                                                                            */
-/*  The endpoint used to take `days` and apply it only to the chart: the KPI   */
-/*  totals were computed over the last 500 completed orders no matter what was */
-/*  selected, so "Total Revenue - 7 days" was not a 7-day figure. The window   */
-/*  is now resolved once, in the restaurant's own timezone, and used for the   */
-/*  query and every aggregation.                                              */
+/*  Date ranges & Timezone helpers                                            */
 /* -------------------------------------------------------------------------- */
 
 /** Offset in minutes of `timeZone` at the given instant. */
@@ -63,6 +57,25 @@ function zonedDateStr(at: Date, timeZone: string): string {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone, year: "numeric", month: "2-digit", day: "2-digit",
   }).format(at);
+}
+
+/** Get hour of day (0-23) in restaurant's timeZone. */
+function zonedHour(at: Date, timeZone: string): number {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hour12: false,
+      hour: "numeric",
+    }).formatToParts(at);
+    const hourPart = parts.find((p) => p.type === "hour");
+    if (hourPart) {
+      const val = parseInt(hourPart.value, 10);
+      return (val === 24 ? 0 : val) % 24;
+    }
+  } catch {
+    // fallback to UTC
+  }
+  return at.getUTCHours();
 }
 
 const DAY_MS = 86400000;
@@ -99,29 +112,39 @@ async function get(req: Request): Promise<Response> {
   const rangeStart = zonedStart(fromStr, timeZone);
   const rangeEnd = new Date(zonedStart(toStr, timeZone).getTime() + DAY_MS); // exclusive
 
-  const { data: orderRows, error: ordersError } = await db
+  // Build orders query with strict tenant isolation and valid revenue status
+  let ordersQuery = db
     .from("orders")
     .select("*, items:order_items(*), table:tables(*)")
     .eq("tenant_id", tenantId)
-    .eq("status", "COMPLETED")
+    .or("status.eq.COMPLETED,payment_status.eq.PAID")
+    .neq("status", "CANCELLED")
+    .neq("payment_status", "REFUNDED")
     .gte("created_at", rangeStart.toISOString())
     .lt("created_at", rangeEnd.toISOString())
     .order("created_at", { ascending: false })
     .limit(5000);
+
+  const locationId = url.searchParams.get("location_id") || url.searchParams.get("locationId");
+  if (locationId) {
+    ordersQuery = ordersQuery.eq("location_id", locationId);
+  }
+
+  const { data: orderRows, error: ordersError } = await ordersQuery;
   if (ordersError) return json(req, { error: ordersError.message }, 500);
 
   const orders = (orderRows ?? []).map((o: any) => {
     const table = Array.isArray(o.table) ? o.table[0] : o.table;
     return {
-      total: o.total,
-      orderType: o.order_type,
+      total: Number(o.total || 0),
+      orderType: o.order_type || "DINE_IN",
       tableId: o.table_id,
       createdAt: o.created_at,
       items: (o.items ?? []).map((it: any) => ({
         menuItemId: it.menu_item_id,
         name: it.name,
-        price: it.price,
-        quantity: it.quantity,
+        price: Number(it.price || 0),
+        quantity: Number(it.quantity || 0),
       })),
       table: table ? { name: table.name } : null,
     };
@@ -139,12 +162,12 @@ async function get(req: Request): Promise<Response> {
     dailyRevenue.push({
       date: dateStr,
       label: DAY_LABELS[new Date(`${dateStr}T00:00:00Z`).getUTCDay()],
-      revenue: +dayOrders.reduce((s: number, o: any) => s + o.total, 0).toFixed(2),
+      revenue: +dayOrders.reduce((s: number, o: any) => s + Number(o.total || 0), 0).toFixed(2),
       orders: dayOrders.length,
     });
   }
 
-  const totalRevenue = orders.reduce((s: number, o: any) => s + o.total, 0);
+  const totalRevenue = orders.reduce((s: number, o: any) => s + Number(o.total || 0), 0);
   const avgOrder = orders.length ? totalRevenue / orders.length : 0;
 
   // top items
@@ -164,7 +187,7 @@ async function get(req: Request): Promise<Response> {
     const t = o.orderType;
     if (!typeBreakdown[t]) typeBreakdown[t] = { count: 0, revenue: 0 };
     typeBreakdown[t].count++;
-    typeBreakdown[t].revenue += o.total;
+    typeBreakdown[t].revenue += Number(o.total || 0);
   }
 
   // table performance
@@ -174,14 +197,15 @@ async function get(req: Request): Promise<Response> {
     const name = o.table?.name || "Unknown";
     if (!tablePerf[o.tableId]) tablePerf[o.tableId] = { name, orders: 0, revenue: 0 };
     tablePerf[o.tableId].orders++;
-    tablePerf[o.tableId].revenue += o.total;
+    tablePerf[o.tableId].revenue += Number(o.total || 0);
   }
   const topTables = Object.values(tablePerf).sort((a, b) => b.revenue - a.revenue).slice(0, 6);
 
-  // hourly distribution
+  // hourly distribution in restaurant timezone
   const hourly: number[] = new Array(24).fill(0);
   for (const o of orders) {
-    hourly[new Date(o.createdAt).getHours()]++;
+    const h = zonedHour(new Date(o.createdAt), timeZone);
+    hourly[h]++;
   }
 
   // category breakdown
@@ -201,62 +225,71 @@ async function get(req: Request): Promise<Response> {
   for (const o of orders) {
     for (const it of o.items) {
       const cat = catMap[it.menuItemId] || "Other";
-      catRevenue[cat] = (catRevenue[cat] || 0) + it.price * it.quantity;
+      catRevenue[cat] = (catRevenue[cat] || 0) + Number(it.price || 0) * Number(it.quantity || 0);
     }
   }
   const categoryBreakdown = Object.entries(catRevenue)
-    .map(([name, value]) => ({ name, value: +value.toFixed(2) }))
+    .map(([name, value]) => ({ name, value: +Number(value || 0).toFixed(2) }))
     .sort((a, b) => b.value - a.value);
 
-  // "Today" is a separate question from the selected range — when the range is
-  // a past month, today's orders are not in `orders` at all — so it is queried
-  // on its own.
+  // Today vs yesterday for KPI card
   const todayStart = zonedStart(todayStr, timeZone);
   const tomorrowStart = new Date(todayStart.getTime() + DAY_MS);
   const yesterdayStart = new Date(todayStart.getTime() - DAY_MS);
-  const { data: recentRows } = await db
+  let recentQuery = db
     .from("orders")
     .select("total, created_at")
     .eq("tenant_id", tenantId)
-    .eq("status", "COMPLETED")
+    .or("status.eq.COMPLETED,payment_status.eq.PAID")
+    .neq("status", "CANCELLED")
+    .neq("payment_status", "REFUNDED")
     .gte("created_at", yesterdayStart.toISOString())
     .lt("created_at", tomorrowStart.toISOString());
+  if (locationId) {
+    recentQuery = recentQuery.eq("location_id", locationId);
+  }
+  const { data: recentRows } = await recentQuery;
   const recent = recentRows ?? [];
   const todaysOrders = recent.filter((o: any) => new Date(o.created_at) >= todayStart);
-  const todaysRevenue = todaysOrders.reduce((s: number, o: any) => s + o.total, 0);
+  const todaysRevenue = todaysOrders.reduce((s: number, o: any) => s + Number(o.total || 0), 0);
 
   const yestOrders = recent.filter((o: any) => new Date(o.created_at) < todayStart);
-  const yestRevenue = yestOrders.reduce((s: number, o: any) => s + o.total, 0);
+  const yestRevenue = yestOrders.reduce((s: number, o: any) => s + Number(o.total || 0), 0);
   const revenueChange = yestRevenue ? ((todaysRevenue - yestRevenue) / yestRevenue) * 100 : 0;
 
-  // Advanced analytics is a Pro feature. The keys are still in the answer,
-  // empty rather than absent, so the screen keeps working and the restaurant
-  // simply sees nothing to look at until they upgrade.
+  // Plan verification: Starter and Pro both unlock full advanced analytics.
+  // Multi-location reporting is enabled for Pro tenants.
   const plan = await resolvePlan(tenantId);
-  const advanced = checkFeature(plan, "advanced_analytics").ok;
+  const multiLocationEnabled = checkFeature(plan, "multi_location_reporting").ok;
+
+  const { data: locRows } = await db
+    .from("locations")
+    .select("id, name, is_primary")
+    .eq("tenant_id", tenantId)
+    .eq("active", true)
+    .order("is_primary", { ascending: false });
 
   return json(req, {
     range: { from: fromStr, to: toStr, days: dailyRevenue.length, timezone: timeZone },
-    // Basic analytics — every plan gets this.
     totalRevenue: +totalRevenue.toFixed(2),
     totalOrders: orders.length,
     avgOrder: +avgOrder.toFixed(2),
     dailyRevenue,
     topItems: topItems.map((t) => ({ ...t, revenue: +t.revenue.toFixed(2) })),
     categoryBreakdown,
-    // Advanced analytics — Pro only.
-    advanced,
-    todaysRevenue: advanced ? +todaysRevenue.toFixed(2) : 0,
-    todaysOrders: advanced ? todaysOrders.length : 0,
-    revenueChange: advanced ? +revenueChange.toFixed(1) : 0,
-    typeBreakdown: advanced
-      ? Object.entries(typeBreakdown).map(([type, v]) => ({
-          type,
-          ...v,
-          revenue: +v.revenue.toFixed(2),
-        }))
-      : [],
-    topTables: advanced ? topTables.map((t) => ({ ...t, revenue: +t.revenue.toFixed(2) })) : [],
-    hourly: advanced ? hourly : [],
+    // Advanced analytics unlocked for Starter & Pro
+    advanced: true,
+    todaysRevenue: +todaysRevenue.toFixed(2),
+    todaysOrders: todaysOrders.length,
+    revenueChange: +revenueChange.toFixed(1),
+    typeBreakdown: Object.entries(typeBreakdown).map(([type, v]) => ({
+      type,
+      ...v,
+      revenue: +v.revenue.toFixed(2),
+    })),
+    topTables: topTables.map((t) => ({ ...t, revenue: +t.revenue.toFixed(2) })),
+    hourly,
+    locations: (locRows ?? []).map((l: any) => ({ id: l.id, name: l.name, isPrimary: l.is_primary })),
+    multiLocationEnabled,
   });
 }

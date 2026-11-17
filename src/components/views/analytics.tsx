@@ -21,9 +21,9 @@ import type { DateRange } from 'react-day-picker'
 import { format, startOfMonth, subDays } from 'date-fns'
 import { Separator } from '@/components/ui/separator'
 import {
-  TrendingUp, TrendingDown, IndianRupee, ShoppingBag, ClipboardList, CalendarDays,
-  ArrowUpRight, ArrowDownRight, Download, Clock, Users, Utensils, Trophy,
-  CalendarIcon, ChevronDown,
+  TrendingUp, IndianRupee, ShoppingBag, ClipboardList, CalendarDays,
+  ArrowUpRight, ArrowDownRight, Download, Clock, Utensils, Trophy,
+  CalendarIcon, ChevronDown, MapPin, Layers, Sparkles,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -32,6 +32,7 @@ interface TopItem { name: string; qty: number; revenue: number }
 interface TypeBreak { type: string; count: number; revenue: number }
 interface TopTable { name: string; orders: number; revenue: number }
 interface CatBreak { name: string; value: number }
+interface LocationOption { id: string; name: string; isPrimary: boolean }
 
 interface AnalyticsPayload {
   range?: { from: string; to: string; days: number; timezone: string }
@@ -46,14 +47,15 @@ interface AnalyticsPayload {
   typeBreakdown: TypeBreak[]
   topTables: TopTable[]
   hourly: number[]
-  /** False when the plan does not include Advanced analytics — panels empty. */
   advanced?: boolean
   categoryBreakdown: CatBreak[]
+  locations?: LocationOption[]
+  multiLocationEnabled?: boolean
 }
 
-const COLORS = ['#f97316', '#4ade80', '#fbbf24', '#60a5fa', '#c084fc', '#f472b6']
+const COLORS = ['#f97316', '#10b981', '#3b82f6', '#f59e0b', '#8b5cf6', '#ec4899']
 const CORAL = '#f97316'
-const AXIS = '#9aa3b2'
+const AXIS = '#94a3b8'
 
 const TYPE_LABEL: Record<string, string> = {
   DINE_IN: 'Dine In',
@@ -64,18 +66,20 @@ const TYPE_LABEL: Record<string, string> = {
 function ChartTooltip({ active, payload, label, currencySymbol = '₹' }: any) {
   if (!active || !payload || !payload.length) return null
   return (
-    <div className="bg-popover border border-border rounded-lg p-3 text-xs shadow-xl shadow-black/40 max-w-[220px]">
-      {label != null && <p className="font-medium mb-1">{label}</p>}
+    <div className="bg-popover/95 backdrop-blur-md border border-border/80 rounded-xl p-3 text-xs shadow-xl shadow-black/40 max-w-[220px]">
+      {label != null && <p className="font-semibold text-foreground mb-1.5">{label}</p>}
       <div className="space-y-1">
         {payload.map((p: any, i: number) => {
           const isCurrency = p.dataKey === 'revenue' || p.name?.toLowerCase().includes('revenue') || p.name?.toLowerCase().includes('avg')
           const prefix = isCurrency ? currencySymbol : ''
-          const formattedVal = isCurrency ? (p.value ?? 0).toFixed(2) : String(p.value ?? 0)
+          const formattedVal = isCurrency ? (Number(p.value) || 0).toFixed(2) : String(p.value ?? 0)
           return (
-            <div key={i} className="flex items-center gap-2">
-              <span className="inline-block w-2 h-2 rounded-full" style={{ background: p.color || p.fill }} />
-              <span className="text-muted-foreground">{p.name}:</span>
-              <span className="font-medium">{prefix}{formattedVal}</span>
+            <div key={i} className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className="inline-block size-2 shrink-0 rounded-full" style={{ background: p.color || p.fill }} />
+                <span className="text-muted-foreground truncate">{p.name}:</span>
+              </div>
+              <span className="font-semibold tabular-nums text-foreground">{prefix}{formattedVal}</span>
             </div>
           )
         })}
@@ -88,7 +92,6 @@ function ChartSkeleton({ className }: { className?: string }) {
   return <div className={cn('w-full rounded-xl bg-secondary/30 animate-pulse', className)} />
 }
 
-/** Quick ranges. Each returns a fresh object so the picker always gets new refs. */
 const RANGE_PRESETS: { label: string; build: () => DateRange }[] = [
   { label: 'Today', build: () => { const t = new Date(); return { from: t, to: t } } },
   { label: 'Yesterday', build: () => { const y = subDays(new Date(), 1); return { from: y, to: y } } },
@@ -103,60 +106,40 @@ export function AnalyticsView() {
   const { denied, setDenied, handleLoad, handleLoadQuiet } = useAccessDenied()
   const [analytics, setAnalytics] = useState<AnalyticsPayload | null>(null)
   const [loading, setLoading] = useState(true)
-  // Defaults to today alone. A single day is what an owner checks during
-  // service; longer windows are one tap away in the presets.
   const [range, setRange] = useState<DateRange>(() => {
     const today = new Date()
     return { from: today, to: today }
   })
   const [rangeOpen, setRangeOpen] = useState(false)
+  const [selectedLocationId, setSelectedLocationId] = useState<string>('')
+  const [locationOpen, setLocationOpen] = useState(false)
   const { scrollRef, collapsed } = useScrollCollapse()
-  // Below lg the popover switches to the compact mobile layout: presets as a
-  // horizontal strip, a single scrollable month, capped to the viewport.
   const isCompact = useMediaQuery('(max-width: 1023px)')
 
-  // The tenant id is a stable string. `data` itself is replaced by the realtime
-  // layer's 4-second delta poll (a summary spread) even when nothing changed,
-  // so the fetch must key on the id — keying on `data` re-fired the load on
-  // every empty poll, flashed the skeletons, and re-requested /api/analytics
-  // every four seconds forever.
   const tenantId = data?.tenant?.id
-  // A slow response for an older range must never overwrite a newer one.
   const requestSeq = useRef(0)
   const lastOrderBook = useRef<AppData['orders'] | null>(null)
   const lastBgRefreshAt = useRef(0)
   const bgTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  /**
-   * Fetch analytics for the current range.
-   *
-   * `mode` decides what the screen does while the request is in flight:
-   *   - 'skeleton' (first load, explicit date change) may show the loading
-   *     placeholders — the user asked for a new dataset;
-   *   - 'silent' (background refresh after the order book changed) keeps the
-   *     current data on screen and swaps it when the response lands.
-   */
   const fetchAnalytics = useCallback(async (mode: 'skeleton' | 'silent') => {
     if (!tenantId) return
     const seq = ++requestSeq.current
     if (mode === 'skeleton') {
       setLoading(true)
-      // A fresh skeleton load also satisfies any just-arrived order change, so
-      // the background path does not immediately duplicate it.
       lastBgRefreshAt.current = Date.now()
     }
     try {
       const from = range.from ? format(range.from, 'yyyy-MM-dd') : ''
       const to = range.to ? format(range.to, 'yyyy-MM-dd') : from
-      const res = await edgeFetch(`/api/analytics?from=${from}&to=${to}`, {
+      const locQuery = selectedLocationId ? `&location_id=${selectedLocationId}` : ''
+      const res = await edgeFetch(`/api/analytics?from=${from}&to=${to}${locQuery}`, {
         headers: { 'x-tenant-id': tenantId },
       })
       await failIfNotOk(res, 'analytics')
       const json = await res.json()
-      if (seq !== requestSeq.current) return // a newer request owns the screen
+      if (seq !== requestSeq.current) return
       setAnalytics(json)
-      // A retry that succeeds must clear the refusal, or the screen would stay
-      // on Access Denied after the role was granted the permission.
       setDenied(null)
     } catch (err) {
       if (seq !== requestSeq.current) return
@@ -165,27 +148,17 @@ export function AnalyticsView() {
     } finally {
       if (mode === 'skeleton' && seq === requestSeq.current) setLoading(false)
     }
-  }, [tenantId, range, handleLoad, handleLoadQuiet])
+  }, [tenantId, range, selectedLocationId, handleLoad, handleLoadQuiet])
 
-  // Primary load: on mount and on every explicit date change. `fetchAnalytics`
-  // is recreated only when the tenant or the range changes, so this effect
-  // never refires for the realtime layer's data-object churn.
   useEffect(() => {
     fetchAnalytics('skeleton')
   }, [fetchAnalytics])
 
-  /**
-   * Background refresh: when the order book actually changed (a new array
-   * identity — the 4s summary poll does not create one), fetch the new
-   * aggregates silently, at most once per 30s, with a trailing fetch that
-   * collects changes arriving inside the quiet window. Existing charts stay
-   * visible the whole time.
-   */
   useEffect(() => {
     const orders = data?.orders
     if (!orders) return
     if (lastOrderBook.current === null) {
-      lastOrderBook.current = orders // first sight — the skeleton load covers it
+      lastOrderBook.current = orders
       return
     }
     if (orders === lastOrderBook.current) return
@@ -203,18 +176,10 @@ export function AnalyticsView() {
     }
   }, [data?.orders, fetchAnalytics])
 
-  // Clear a pending background timer on unmount.
   useEffect(() => () => {
     if (bgTimer.current) clearTimeout(bgTimer.current)
   }, [])
 
-  /**
-   * Download the report as CSV.
-   *
-   * Built from the payload already on screen, so what you export is exactly
-   * what you are looking at. A BOM is prepended so Excel reads the rupee sign
-   * correctly, and the file is named for the range it covers.
-   */
   const exportReport = () => {
     if (!analytics || !data) return
     const rows: (string | number)[][] = []
@@ -266,7 +231,6 @@ export function AnalyticsView() {
       const str = String(v ?? '')
       return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str
     }
-    // The BOM is what makes Excel render ₹ rather than mojibake.
     const csv = '\uFEFF' + rows.map((r) => r.map(esc).join(',')).join('\r\n')
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }))
     const link = document.createElement('a')
@@ -282,53 +246,113 @@ export function AnalyticsView() {
   }
 
   if (!data) return null
-  // A permission failure must not fall through to the dashboard: every KPI
-  // reads `?? 0`, so a role that may not see analytics would be shown
-  // "₹0.00" revenue — a claim about the business rather than about the role.
   if (denied) return <AccessDenied failure={denied} onRetry={() => fetchAnalytics('skeleton')} view="analytics" />
-  const sym = data.tenant.currencySymbol
+
+  // Enforce rupee sign everywhere
+  const sym = (data.tenant.currencySymbol && data.tenant.currencySymbol !== '$') ? data.tenant.currencySymbol : '₹'
+
   const rangeLabel = range.from
     ? range.to && format(range.from, 'yyyy-MM-dd') !== format(range.to, 'yyyy-MM-dd')
       ? `${format(range.from, 'd MMM')} – ${format(range.to, 'd MMM yyyy')}`
       : format(range.from, 'd MMM yyyy')
     : 'Select dates'
+
   const typeTotal = (analytics?.typeBreakdown ?? []).reduce((s, t) => s + t.revenue, 0) || 1
+  const locations = analytics?.locations ?? []
+  const hasMultipleLocations = locations.length > 1
+  const selectedLocation = locations.find((l) => l.id === selectedLocationId)
+
+  // Find peak hour for sales by hour
+  const hourlyData = (analytics?.hourly ?? []).map((orders, h) => ({
+    hour: `${h}:00`,
+    orders,
+    displayHour: h === 0 ? '12 AM' : h === 12 ? '12 PM' : h > 12 ? `${h - 12} PM` : `${h} AM`,
+  }))
+  const peakHour = hourlyData.reduce((prev, curr) => (curr.orders > prev.orders ? curr : prev), { hour: '—', orders: 0, displayHour: '—' })
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full flex flex-col bg-background">
       {/* Header (collapsible on scroll) */}
       <header
         className={cn(
-          'px-3.5 md:px-6 border-b border-border/60 transition-all duration-200 ease-out',
-          collapsed ? 'pt-1.5 pb-1.5' : 'pt-3 md:pt-6 pb-2.5',
+          'px-3.5 md:px-6 border-b border-border/60 transition-all duration-200 ease-out bg-card/40 backdrop-blur-md sticky top-0 z-20',
+          collapsed ? 'py-2' : 'pt-3 md:pt-5 pb-3',
         )}
       >
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="min-w-0">
-            <h2
-              className={cn(
-                'font-bold tracking-tight transition-all duration-200 ease-out truncate',
-                collapsed ? 'text-base md:text-lg' : 'text-lg md:text-2xl',
-              )}
-            >
-              Analytics
-            </h2>
+            <div className="flex items-center gap-2">
+              <h2
+                className={cn(
+                  'font-bold tracking-tight transition-all duration-200 ease-out truncate',
+                  collapsed ? 'text-base md:text-lg' : 'text-lg md:text-2xl',
+                )}
+              >
+                Analytics
+              </h2>
+              <span className="hidden sm:inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-semibold text-primary">
+                <Sparkles className="size-3" /> Live
+              </span>
+            </div>
             <p
               className={cn(
-                'text-sm text-muted-foreground transition-all duration-200 ease-out',
-                collapsed ? 'max-h-0 opacity-0 overflow-hidden mt-0' : 'max-h-8 opacity-100 mt-0.5',
+                'text-xs text-muted-foreground transition-all duration-200 ease-out truncate',
+                collapsed ? 'max-h-0 opacity-0 overflow-hidden mt-0' : 'max-h-6 opacity-100 mt-0.5',
               )}
             >
-              Performance insights · {data.tenant.name}
+              Performance insights & revenue metrics · {data.tenant.name}
             </p>
           </div>
+
           <div className="flex items-center gap-2 flex-wrap">
+            {/* Multi-location selector (when multiple locations exist) */}
+            {hasMultipleLocations && (
+              <Popover open={locationOpen} onOpenChange={setLocationOpen}>
+                <PopoverTrigger asChild>
+                  <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs font-normal border-border/70 bg-card">
+                    <MapPin className="size-3.5 text-primary" />
+                    <span className="truncate max-w-[120px]">{selectedLocation ? selectedLocation.name : 'All Locations'}</span>
+                    <ChevronDown className="size-3 opacity-60" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="end" className="w-48 p-1">
+                  <div className="space-y-0.5">
+                    <button
+                      type="button"
+                      onClick={() => { setSelectedLocationId(''); setLocationOpen(false) }}
+                      className={cn(
+                        'w-full text-left px-2.5 py-1.5 text-xs rounded-md font-medium transition-colors',
+                        selectedLocationId === '' ? 'bg-primary text-primary-foreground' : 'hover:bg-secondary text-foreground'
+                      )}
+                    >
+                      All Locations
+                    </button>
+                    {locations.map((loc) => (
+                      <button
+                        key={loc.id}
+                        type="button"
+                        onClick={() => { setSelectedLocationId(loc.id); setLocationOpen(false) }}
+                        className={cn(
+                          'w-full text-left px-2.5 py-1.5 text-xs rounded-md font-medium transition-colors flex items-center justify-between',
+                          selectedLocationId === loc.id ? 'bg-primary text-primary-foreground' : 'hover:bg-secondary text-foreground'
+                        )}
+                      >
+                        <span className="truncate">{loc.name}</span>
+                        {loc.isPrimary && <span className="text-[10px] opacity-75 font-normal ml-1">Primary</span>}
+                      </button>
+                    ))}
+                  </div>
+                </PopoverContent>
+              </Popover>
+            )}
+
+            {/* Date range picker */}
             <Popover open={rangeOpen} onOpenChange={setRangeOpen}>
               <PopoverTrigger asChild>
-                <Button variant="secondary" size="sm" className="h-9 gap-2 font-normal">
-                  <CalendarIcon className="h-4 w-4 opacity-70" />
-                  {rangeLabel}
-                  <ChevronDown className="h-3.5 w-3.5 opacity-60" />
+                <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs font-normal border-border/70 bg-card">
+                  <CalendarIcon className="size-3.5 text-muted-foreground" />
+                  <span>{rangeLabel}</span>
+                  <ChevronDown className="size-3 opacity-60" />
                 </Button>
               </PopoverTrigger>
               <PopoverContent
@@ -337,7 +361,6 @@ export function AnalyticsView() {
                 className="w-auto max-w-[calc(100vw-2rem)] p-0"
               >
                 <div className="flex max-h-[75vh] flex-col lg:flex-row">
-                  {/* Presets: horizontal scroll strip on mobile, vertical rail on desktop */}
                   <div
                     className={cn(
                       'flex shrink-0 gap-1 border-border p-2',
@@ -360,7 +383,6 @@ export function AnalyticsView() {
                       </button>
                     ))}
                   </div>
-                  {/* Calendar: one scrollable month on mobile, two side by side on desktop */}
                   <div className="flex-1 overflow-y-auto scrollbar-thin">
                     <Calendar
                       mode="range"
@@ -375,110 +397,122 @@ export function AnalyticsView() {
                 </div>
               </PopoverContent>
             </Popover>
+
             <Button
-              variant="secondary"
+              variant="outline"
               size="sm"
+              className="h-8 text-xs border-border/70 bg-card hover:bg-secondary"
               onClick={exportReport}
               disabled={!analytics || loading}
             >
-              <Download className="h-4 w-4 mr-1.5" /> Export
+              <Download className="size-3.5 mr-1 text-primary" /> Export
             </Button>
           </div>
         </div>
       </header>
 
-      {/* Scrollable content */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto scrollbar-thin px-3.5 md:px-6 pt-1 pb-4 md:pb-6 space-y-5">
-        {/* KPI cards */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          <KpiCard icon={IndianRupee} label="Total Revenue" value={loading ? '—' : `${sym}${(analytics?.totalRevenue ?? 0).toFixed(2)}`} sub={`${analytics?.range?.days ?? 0} ${(analytics?.range?.days ?? 0) === 1 ? 'day' : 'days'}`} tint="coral" />
-          <KpiCard icon={ClipboardList} label="Total Orders" value={loading ? '—' : String(analytics?.totalOrders ?? 0)} sub="completed" tint="green" />
-          <KpiCard icon={ShoppingBag} label="Avg Order" value={loading ? '—' : `${sym}${(analytics?.avgOrder ?? 0).toFixed(2)}`} sub="per transaction" tint="amber" />
-          <KpiCard icon={CalendarDays} label="Today's Revenue" value={loading ? '—' : `${sym}${(analytics?.todaysRevenue ?? 0).toFixed(2)}`} sub={`${analytics?.todaysOrders ?? 0} orders today`} change={analytics?.revenueChange} tint="blue" />
+      {/* Main Content Area */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto scrollbar-thin px-3.5 md:px-6 pt-3 pb-6 space-y-4">
+        {/* KPI Grid (4 balanced cards across) */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <KpiCard
+            icon={IndianRupee}
+            label="Total Revenue"
+            value={loading ? '—' : `${sym}${(analytics?.totalRevenue ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+            sub={`${analytics?.range?.days ?? 0} ${(analytics?.range?.days ?? 0) === 1 ? 'day' : 'days'} period`}
+            accent="coral"
+          />
+          <KpiCard
+            icon={ClipboardList}
+            label="Completed Orders"
+            value={loading ? '—' : (analytics?.totalOrders ?? 0).toLocaleString('en-IN')}
+            sub="Paid & fulfilled"
+            accent="green"
+          />
+          <KpiCard
+            icon={ShoppingBag}
+            label="Avg Order Value"
+            value={loading ? '—' : `${sym}${(analytics?.avgOrder ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+            sub="Per completed ticket"
+            accent="amber"
+          />
+          <KpiCard
+            icon={CalendarDays}
+            label="Today's Sales"
+            value={loading ? '—' : `${sym}${(analytics?.todaysRevenue ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+            sub={`${analytics?.todaysOrders ?? 0} orders today`}
+            change={analytics?.revenueChange}
+            accent="blue"
+          />
         </div>
 
-        {/* Revenue trend */}
-        <Card className="rounded-2xl border border-border bg-card p-4 md:p-4 md:p-6">
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <h3 className="font-semibold">Revenue Trend</h3>
-              <p className="text-xs text-muted-foreground">Daily revenue · {rangeLabel}</p>
-            </div>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <span className="inline-block w-2 h-2 rounded-full" style={{ background: CORAL }} /> Revenue
-            </div>
-          </div>
-          {loading ? (
-            <ChartSkeleton className="h-[200px] md:h-[280px]" />
-          ) : (
-            <div className="h-[200px] md:h-[280px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={analytics?.dailyRevenue ?? []} margin={{ top: 8, right: 8, bottom: 0, left: -16 }}>
-                  <defs>
-                    <linearGradient id="revGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor={CORAL} stopOpacity={0.4} />
-                      <stop offset="100%" stopColor={CORAL} stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-                  <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fill: AXIS, fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${sym}${v}`} />
-                  <Tooltip content={<ChartTooltip currencySymbol={sym} />} />
-                  <Area type="monotone" dataKey="revenue" stroke={CORAL} strokeWidth={2.5} fill="url(#revGradient)" />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-        </Card>
-
-        {/* Top items + Order types */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <Card className="rounded-2xl border border-border bg-card p-4 md:p-4 md:p-6 lg:col-span-2">
-            <div className="flex items-center justify-between mb-4">
+        {/* Row 2: Revenue Trend (2 cols) + Order Types Donut (1 col) */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+          <Card className="rounded-xl border border-border/70 bg-card p-4 lg:col-span-2 shadow-sm">
+            <div className="flex items-center justify-between mb-3">
               <div>
-                <h3 className="font-semibold">Top Selling Items</h3>
-                <p className="text-xs text-muted-foreground">By quantity sold</p>
+                <h3 className="text-sm font-bold tracking-tight">Revenue Trend</h3>
+                <p className="text-[11px] text-muted-foreground">Daily sales progression · {rangeLabel}</p>
               </div>
-              <Trophy className="h-4 w-4 text-muted-foreground" />
+              <div className="flex items-center gap-2 text-[11px] font-medium text-muted-foreground">
+                <span className="inline-block size-2 rounded-full bg-primary" />
+                <span>Revenue ({sym})</span>
+              </div>
             </div>
             {loading ? (
-              <ChartSkeleton className="h-[240px] md:h-[260px]" />
+              <ChartSkeleton className="h-[210px]" />
             ) : (
-              <div className="h-[240px] md:h-[260px]">
+              <div className="h-[210px]">
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={analytics?.topItems ?? []} layout="vertical" margin={{ top: 0, right: 16, bottom: 0, left: 40 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" horizontal={false} />
-                    <XAxis type="number" tick={{ fill: AXIS, fontSize: 11 }} axisLine={false} tickLine={false} />
-                    <YAxis type="category" dataKey="name" tick={{ fill: AXIS, fontSize: 11 }} axisLine={false} tickLine={false} width={90} />
-                    <Tooltip content={<ChartTooltip currencySymbol={sym} />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
-                    <Bar dataKey="qty" name="Quantity" fill={CORAL} radius={[0, 6, 6, 0]} barSize={18} />
-                  </BarChart>
+                  <AreaChart data={analytics?.dailyRevenue ?? []} margin={{ top: 8, right: 12, bottom: 0, left: -16 }}>
+                    <defs>
+                      <linearGradient id="revGradient" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={CORAL} stopOpacity={0.35} />
+                        <stop offset="100%" stopColor={CORAL} stopOpacity={0.0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                    <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} />
+                    <YAxis tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${sym}${v >= 1000 ? `${(v/1000).toFixed(1)}k` : v}`} />
+                    <Tooltip content={<ChartTooltip currencySymbol={sym} />} />
+                    <Area type="monotone" dataKey="revenue" name="Revenue" stroke={CORAL} strokeWidth={2.2} fill="url(#revGradient)" />
+                  </AreaChart>
                 </ResponsiveContainer>
               </div>
             )}
           </Card>
 
-          <Card className="rounded-2xl border border-border bg-card p-4 md:p-4 md:p-6">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="font-semibold">Order Types</h3>
-                <p className="text-xs text-muted-foreground">Revenue share</p>
+          <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm flex flex-col justify-between">
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <h3 className="text-sm font-bold tracking-tight">Order Types</h3>
+                  <p className="text-[11px] text-muted-foreground">Revenue by fulfillment channel</p>
+                </div>
+                <Utensils className="size-4 text-muted-foreground" />
               </div>
-              <Utensils className="h-4 w-4 text-muted-foreground" />
-            </div>
-            {analytics?.advanced === false && (
-              <p className="mb-3 rounded-lg border border-amber-200/70 bg-amber-50/60 px-2.5 py-2 text-[11.5px] leading-relaxed text-amber-900">
-                Order types are part of Advanced analytics, which is not on your current plan.
-              </p>
-            )}
-            {loading ? (
-              <ChartSkeleton className="h-[200px]" />
-            ) : (
-              <>
-                <div className="h-[180px]">
+
+              {loading ? (
+                <ChartSkeleton className="h-[150px]" />
+              ) : (analytics?.typeBreakdown ?? []).length === 0 ? (
+                <div className="flex h-[150px] items-center justify-center text-xs text-muted-foreground">
+                  No order types recorded
+                </div>
+              ) : (
+                <div className="h-[140px]">
                   <ResponsiveContainer width="100%" height="100%">
                     <PieChart>
-                      <Pie data={analytics?.typeBreakdown ?? []} dataKey="revenue" nameKey="type" cx="50%" cy="50%" innerRadius={45} outerRadius={70} paddingAngle={3} stroke="none">
+                      <Pie
+                        data={analytics?.typeBreakdown ?? []}
+                        dataKey="revenue"
+                        nameKey="type"
+                        cx="50%"
+                        cy="50%"
+                        innerRadius={42}
+                        outerRadius={65}
+                        paddingAngle={3}
+                        stroke="none"
+                      >
                         {(analytics?.typeBreakdown ?? []).map((_, i) => (
                           <Cell key={i} fill={COLORS[i % COLORS.length]} />
                         ))}
@@ -487,76 +521,169 @@ export function AnalyticsView() {
                     </PieChart>
                   </ResponsiveContainer>
                 </div>
-                <div className="mt-3 space-y-2">
-                  {(analytics?.typeBreakdown ?? []).map((t, i) => {
-                    const pct = typeTotal ? (t.revenue / typeTotal) * 100 : 0
-                    return (
-                      <div key={t.type} className="flex items-center justify-between text-xs">
-                        <div className="flex items-center gap-2">
-                          <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: COLORS[i % COLORS.length] }} />
-                          <span className="text-muted-foreground">{TYPE_LABEL[t.type] || t.type}</span>
-                        </div>
-                        <span className="font-medium">{pct.toFixed(1)}%</span>
-                      </div>
-                    )
-                  })}
-                </div>
-              </>
-            )}
+              )}
+            </div>
+
+            <div className="space-y-1.5 pt-2 border-t border-border/40">
+              {(analytics?.typeBreakdown ?? []).map((t, i) => {
+                const pct = typeTotal ? (t.revenue / typeTotal) * 100 : 0
+                return (
+                  <div key={t.type} className="flex items-center justify-between text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="inline-block size-2 shrink-0 rounded-full" style={{ background: COLORS[i % COLORS.length] }} />
+                      <span className="text-muted-foreground truncate">{TYPE_LABEL[t.type] || t.type}</span>
+                      <span className="text-[10px] text-muted-foreground/70">({t.count})</span>
+                    </div>
+                    <div className="flex items-center gap-1.5 font-medium">
+                      <span>{pct.toFixed(0)}%</span>
+                      <span className="text-muted-foreground text-[11px]">·</span>
+                      <span className="text-foreground">{sym}{t.revenue.toFixed(0)}</span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
           </Card>
         </div>
 
-        {/* Hourly + Category */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <Card className="rounded-2xl border border-border bg-card p-4 md:p-4 md:p-6">
-            <div className="flex items-center justify-between mb-4">
+        {/* Row 3: Hourly Distribution (2 cols) + Top Tables (1 col) */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+          <Card className="rounded-xl border border-border/70 bg-card p-4 lg:col-span-2 shadow-sm">
+            <div className="flex items-center justify-between mb-3">
               <div>
-                <h3 className="font-semibold">Sales by Hour</h3>
-                <p className="text-xs text-muted-foreground">Order volume per hour</p>
+                <h3 className="text-sm font-bold tracking-tight">Sales by Hour</h3>
+                <p className="text-[11px] text-muted-foreground">Order volume distribution across the day ({analytics?.range?.timezone || 'Local'})</p>
               </div>
-              <Clock className="h-4 w-4 text-muted-foreground" />
+              {peakHour.orders > 0 && (
+                <div className="flex items-center gap-1.5 rounded-md bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
+                  <Clock className="size-3" />
+                  <span>Peak: {peakHour.displayHour} ({peakHour.orders} orders)</span>
+                </div>
+              )}
             </div>
-            {analytics?.advanced === false && (
-              <p className="mb-3 rounded-lg border border-amber-200/70 bg-amber-50/60 px-2.5 py-2 text-[11.5px] leading-relaxed text-amber-900">
-                Sales by hour is part of Advanced analytics, which is not on your current plan.
-              </p>
-            )}
             {loading ? (
-              <ChartSkeleton className="h-[240px]" />
+              <ChartSkeleton className="h-[200px]" />
             ) : (
-              <div className="h-[240px]">
+              <div className="h-[200px]">
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={(analytics?.hourly ?? []).map((v, h) => ({ hour: `${h}:00`, orders: v }))} margin={{ top: 0, right: 8, bottom: 0, left: -16 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-                    <XAxis dataKey="hour" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} interval={3} />
-                    <YAxis tick={{ fill: AXIS, fontSize: 11 }} axisLine={false} tickLine={false} />
-                    <Tooltip content={<ChartTooltip currencySymbol={sym} />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
-                    <Bar dataKey="orders" name="Orders" fill={CORAL} radius={[4, 4, 0, 0]} barSize={14} />
+                  <BarChart data={hourlyData} margin={{ top: 4, right: 8, bottom: 0, left: -20 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false} />
+                    <XAxis dataKey="hour" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} interval={2} />
+                    <YAxis tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} />
+                    <Tooltip content={<ChartTooltip currencySymbol={sym} />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
+                    <Bar dataKey="orders" name="Orders" fill={CORAL} radius={[3, 3, 0, 0]} barSize={12} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
             )}
           </Card>
 
-          <Card className="rounded-2xl border border-border bg-card p-4 md:p-4 md:p-6">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="font-semibold">Revenue by Category</h3>
-                <p className="text-xs text-muted-foreground">Top performing categories</p>
+          <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm flex flex-col justify-between">
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <h3 className="text-sm font-bold tracking-tight">Top Tables</h3>
+                  <p className="text-[11px] text-muted-foreground">Highest performing tables</p>
+                </div>
+                <Trophy className="size-4 text-amber-500" />
               </div>
-              <Users className="h-4 w-4 text-muted-foreground" />
+
+              {loading ? (
+                <div className="space-y-2 mt-2">
+                  {[1, 2, 3].map((i) => (
+                    <div key={i} className="h-9 rounded-lg bg-secondary/30 animate-pulse" />
+                  ))}
+                </div>
+              ) : (analytics?.topTables ?? []).length === 0 ? (
+                <div className="flex h-[180px] items-center justify-center text-xs text-muted-foreground">
+                  No table data available
+                </div>
+              ) : (
+                <div className="space-y-1.5 mt-1">
+                  {(analytics?.topTables ?? []).slice(0, 5).map((t, i) => (
+                    <div
+                      key={t.name + i}
+                      className="flex items-center justify-between p-2 rounded-lg bg-secondary/25 hover:bg-secondary/40 transition-colors text-xs"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className={cn(
+                          'inline-flex items-center justify-center size-5 rounded text-[10px] font-bold shrink-0',
+                          i === 0 ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30' :
+                          i === 1 ? 'bg-slate-300/20 text-slate-300 border border-slate-400/30' :
+                          i === 2 ? 'bg-orange-700/20 text-orange-400 border border-orange-600/30' :
+                          'bg-secondary text-muted-foreground'
+                        )}>
+                          {i + 1}
+                        </span>
+                        <span className="font-medium truncate max-w-[100px]">{t.name}</span>
+                        <span className="text-[10px] text-muted-foreground">{t.orders} orders</span>
+                      </div>
+                      <span className="font-semibold tabular-nums text-foreground">{sym}{t.revenue.toFixed(2)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="pt-2 text-[10px] text-muted-foreground text-center">
+              Ranked by total settled check revenue
+            </div>
+          </Card>
+        </div>
+
+        {/* Row 4: Top Selling Items (1 col) + Revenue by Category (1 col) */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+          <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <h3 className="text-sm font-bold tracking-tight">Top Selling Items</h3>
+                <p className="text-[11px] text-muted-foreground">Highest quantity menu favorites</p>
+              </div>
+              <Trophy className="size-4 text-muted-foreground" />
             </div>
             {loading ? (
-              <ChartSkeleton className="h-[240px]" />
+              <ChartSkeleton className="h-[210px]" />
+            ) : (analytics?.topItems ?? []).length === 0 ? (
+              <div className="flex h-[210px] items-center justify-center text-xs text-muted-foreground">
+                No items sold yet
+              </div>
             ) : (
-              <div className="h-[240px]">
+              <div className="h-[210px]">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={analytics?.topItems ?? []} layout="vertical" margin={{ top: 0, right: 12, bottom: 0, left: 30 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" horizontal={false} />
+                    <XAxis type="number" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} />
+                    <YAxis type="category" dataKey="name" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} width={85} />
+                    <Tooltip content={<ChartTooltip currencySymbol={sym} />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
+                    <Bar dataKey="qty" name="Qty Sold" fill={CORAL} radius={[0, 4, 4, 0]} barSize={14} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </Card>
+
+          <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <h3 className="text-sm font-bold tracking-tight">Revenue by Category</h3>
+                <p className="text-[11px] text-muted-foreground">Category contribution to gross revenue</p>
+              </div>
+              <Layers className="size-4 text-muted-foreground" />
+            </div>
+            {loading ? (
+              <ChartSkeleton className="h-[210px]" />
+            ) : (analytics?.categoryBreakdown ?? []).length === 0 ? (
+              <div className="flex h-[210px] items-center justify-center text-xs text-muted-foreground">
+                No category data available
+              </div>
+            ) : (
+              <div className="h-[210px]">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={analytics?.categoryBreakdown ?? []} margin={{ top: 0, right: 8, bottom: 0, left: -16 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false} />
                     <XAxis dataKey="name" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} />
-                    <YAxis tick={{ fill: AXIS, fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${sym}${v}`} />
-                    <Tooltip content={<ChartTooltip currencySymbol={sym} />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
-                    <Bar dataKey="value" name="Revenue" radius={[4, 4, 0, 0]} barSize={28}>
+                    <YAxis tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${sym}${v >= 1000 ? `${(v/1000).toFixed(1)}k` : v}`} />
+                    <Tooltip content={<ChartTooltip currencySymbol={sym} />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
+                    <Bar dataKey="value" name="Revenue" radius={[4, 4, 0, 0]} barSize={22}>
                       {(analytics?.categoryBreakdown ?? []).map((_, i) => (
                         <Cell key={i} fill={COLORS[i % COLORS.length]} />
                       ))}
@@ -567,79 +694,50 @@ export function AnalyticsView() {
             )}
           </Card>
         </div>
-
-        {/* Top tables */}
-        <Card className="rounded-2xl border border-border bg-card p-4 md:p-4 md:p-6">
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <h3 className="font-semibold">Top Tables</h3>
-              <p className="text-xs text-muted-foreground">Highest revenue tables</p>
-            </div>
-            <Users className="h-4 w-4 text-muted-foreground" />
-          </div>
-          {loading ? (
-            <div className="space-y-2">
-              {[1, 2, 3, 4].map((i) => (
-                <div key={i} className="h-12 rounded-xl bg-secondary/30 animate-pulse" />
-              ))}
-            </div>
-          ) : (analytics?.topTables ?? []).length === 0 ? (
-            <p className="text-sm text-muted-foreground py-8 text-center">
-              {analytics?.advanced === false ? 'Not included in your plan' : 'No table data'}
-            </p>
-          ) : (
-            <div className="space-y-1">
-              <div className="grid grid-cols-12 gap-3 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground">
-                <span className="col-span-1">#</span>
-                <span className="col-span-5 sm:col-span-6">Table</span>
-                <span className="col-span-2 text-right">Orders</span>
-                <span className="col-span-4 whitespace-nowrap text-right sm:col-span-3">Revenue</span>
-              </div>
-              <Separator />
-              <div className="max-h-96 overflow-y-auto scrollbar-thin">
-                {(analytics?.topTables ?? []).map((t, i) => (
-                  <div key={t.name + i} className="grid grid-cols-12 gap-3 items-center px-3 py-2.5 rounded-xl hover:bg-secondary/40 transition-colors">
-                    <span className={cn('col-span-1 inline-flex items-center justify-center w-7 h-7 rounded-lg text-xs font-bold', i === 0 ? 'bg-amber-500/15 text-amber-400' : i === 1 ? 'bg-zinc-300/15 text-zinc-300' : i === 2 ? 'bg-orange-700/20 text-orange-500' : 'bg-secondary text-muted-foreground')}>
-                      {i + 1}
-                    </span>
-                    <span className="col-span-5 sm:col-span-6 font-medium text-sm truncate">{t.name}</span>
-                    <span className="col-span-2 text-right text-sm text-muted-foreground">{t.orders}</span>
-                    <span className="col-span-4 whitespace-nowrap text-right text-sm font-semibold sm:col-span-3">{sym}{t.revenue.toFixed(2)}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </Card>
       </div>
     </div>
   )
 }
 
-function KpiCard({ icon: Icon, label, value, sub, change, tint }: { icon: any; label: string; value: string; sub?: string; change?: number; tint: 'coral' | 'green' | 'amber' | 'blue' }) {
-  const tints: Record<string, string> = {
-    coral: 'bg-primary/15 text-primary',
-    green: 'bg-green-500/15 text-green-400',
-    amber: 'bg-amber-500/15 text-amber-400',
-    blue: 'bg-blue-500/15 text-blue-400',
+function KpiCard({
+  icon: Icon,
+  label,
+  value,
+  sub,
+  change,
+  accent,
+}: {
+  icon: any
+  label: string
+  value: string
+  sub?: string
+  change?: number
+  accent: 'coral' | 'green' | 'amber' | 'blue'
+}) {
+  const accents: Record<string, string> = {
+    coral: 'bg-primary/10 text-primary border-primary/20',
+    green: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    amber: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+    blue: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
   }
   const up = (change ?? 0) >= 0
+
   return (
-    <Card className="rounded-2xl border border-border bg-card p-4">
-      <div className="flex items-start justify-between mb-3">
-        <div className={cn('w-10 h-10 rounded-xl flex items-center justify-center', tints[tint])}>
-          <Icon className="h-5 w-5" />
+    <Card className="rounded-xl border border-border/70 bg-card p-3.5 shadow-sm transition-all hover:border-border">
+      <div className="flex items-start justify-between mb-2">
+        <div className={cn('size-8 rounded-lg flex items-center justify-center border', accents[accent])}>
+          <Icon className="size-4" />
         </div>
         {change !== undefined && (
-          <span className={cn('inline-flex items-center gap-0.5 text-xs font-medium px-1.5 py-0.5 rounded-md', up ? 'bg-green-500/15 text-green-400' : 'bg-red-500/15 text-red-400')}>
-            {up ? <ArrowUpRight className="h-3 w-3" /> : <ArrowDownRight className="h-3 w-3" />}
+          <span className={cn('inline-flex items-center gap-0.5 text-[11px] font-semibold px-1.5 py-0.5 rounded', up ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400')}>
+            {up ? <ArrowUpRight className="size-3" /> : <ArrowDownRight className="size-3" />}
             {Math.abs(change).toFixed(1)}%
           </span>
         )}
       </div>
-      <p className="text-xs text-muted-foreground mb-0.5">{label}</p>
-      <p className="text-lg md:text-2xl font-bold tabular-nums truncate">{value}</p>
-      {sub && <p className="text-xs text-muted-foreground mt-1 truncate">{sub}</p>}
+      <p className="text-[11px] font-medium text-muted-foreground">{label}</p>
+      <p className="text-xl md:text-2xl font-bold tracking-tight tabular-nums truncate text-foreground">{value}</p>
+      {sub && <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{sub}</p>}
     </Card>
   )
 }

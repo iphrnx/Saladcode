@@ -35,7 +35,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import {
   Settings, Store, SlidersHorizontal, CreditCard, AlertTriangle, Save, Building2, MapPin, Phone, Mail, Globe, Clock, Trash2, Check, Sparkles, User, Palette, Bell, Lock, KeyRound, Smartphone, Moon, Sun, Languages, ShieldCheck, ChevronDown, FileText, Star, ExternalLink, RefreshCw, MessageSquare, Send, Loader2, ChevronRight, Instagram, Facebook, Youtube,
-  CheckCircle2, XCircle, Receipt, Clock as ClockIcon,
+  CheckCircle2, XCircle, Receipt, ReceiptIndianRupee, Clock as ClockIcon,
   Printer, RotateCcw, FileDown,
   ArrowLeft, CalendarClock, History, Wallet, Calendar,
 } from 'lucide-react'
@@ -152,7 +152,7 @@ function BillingCard({ className, children }: { className?: string; children: Re
     // was 48px taller than one with two. Spacing inside a card is set by the
     // elements themselves (mt-*), which is what makes every section read at
     // the same rhythm.
-    <Card data-billing-card className={cn('gap-0 rounded-2xl border-border bg-card p-5 md:p-6', className)}>
+    <Card data-billing-card className={cn('gap-0 rounded-xl border border-border/70 bg-card p-4 md:p-5 shadow-sm transition-all', className)}>
       {children}
     </Card>
   )
@@ -211,12 +211,12 @@ function StatusPill({ tone, label }: { tone: 'success' | 'info' | 'warn' | 'dang
 
 function BillingEmpty({ icon, title, hint }: { icon: React.ReactNode; title: string; hint?: string }) {
   return (
-    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border px-4 py-8 text-center">
-      <span className="mb-2 flex size-8 items-center justify-center rounded-lg bg-secondary/60 text-muted-foreground">
+    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border/70 bg-secondary/15 px-4 py-5 text-center">
+      <span className="mb-1.5 flex size-7 items-center justify-center rounded-lg bg-secondary/60 text-muted-foreground">
         {icon}
       </span>
-      <p className="text-[13px] font-medium text-foreground/80">{title}</p>
-      {hint && <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{hint}</p>}
+      <p className="text-[12.5px] font-medium text-foreground/85">{title}</p>
+      {hint && <p className="mt-0.5 text-[11.5px] leading-relaxed text-muted-foreground">{hint}</p>}
     </div>
   )
 }
@@ -688,7 +688,7 @@ export function SettingsView() {
       phone: t.phone || '',
       address: t.address || '',
       currency: t.currency || 'INR',
-      currencySymbol: t.currencySymbol || '$',
+      currencySymbol: t.currencySymbol || '₹',
       logo: t.logo || '',
       gstin: d.settings.gstin || '',
       fssai: d.settings.fssai || '',
@@ -758,7 +758,7 @@ export function SettingsView() {
     if (tenantForm.phone !== (t.phone || '')) return true
     if (tenantForm.address !== (t.address || '')) return true
     if (tenantForm.currency !== (t.currency || 'INR')) return true
-    if (tenantForm.currencySymbol !== (t.currencySymbol || '$')) return true
+    if (tenantForm.currencySymbol !== (t.currencySymbol || '₹')) return true
     if (tenantForm.logo !== (t.logo || '')) return true
     if (tenantForm.gstin !== (data.settings.gstin || '')) return true
     if (tenantForm.fssai !== (data.settings.fssai || '')) return true
@@ -2460,7 +2460,7 @@ export function SettingsView() {
                 <BillingCard>
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <BillingSectionHead
-                      icon={<Receipt className="size-4" />}
+                      icon={<ReceiptIndianRupee className="size-4" />}
                       title="Last payment"
                       extra={
                         <StatusPill
@@ -2566,15 +2566,14 @@ export function SettingsView() {
                 )}
                 {billingInterval === 'monthly' && (
                   <p className="mb-3 rounded-xl border border-border bg-secondary/30 px-3 py-2.5 text-[12px] leading-relaxed text-muted-foreground">
-                    <span className="font-medium text-foreground">AutoPay.</span>{' '}
-                    You authorise a monthly debit by card or UPI AutoPay. Cancel any time and keep
-                    access until the month you paid for ends.
+                    <span className="font-medium text-foreground">Cancel anytime.</span>{' '}
+                    Your plan stays active until your paid period ends.
                   </p>
                 )}
 
                 <div className="grid gap-3 md:grid-cols-2">
                   {plans.filter((plan) => plan.billingMode !== 'onetime').map((plan) => {
-                    const isCurrent = sub?.planId === plan.id
+                    const isCurrent = Boolean(billingSnapshot.inForce && sub?.planId === plan.id)
                     const isTrialPlan = sub?.isTrial && plan.id === 'pro'
                     const amount = priceFor(plan, billingInterval)
                     const savings = annualSavings(plan)
@@ -2697,7 +2696,7 @@ export function SettingsView() {
               {/* ---- the payment history ---- */}
               <BillingCard>
                 <BillingSectionHead
-                  icon={<Receipt className="size-4" />}
+                  icon={<ReceiptIndianRupee className="size-4" />}
                   title="Payment history"
                   count={payments.length}
                   extra={
@@ -2714,7 +2713,7 @@ export function SettingsView() {
                 />
                 {payments.length === 0 ? (
                   <BillingEmpty
-                    icon={<Receipt className="size-4" />}
+                    icon={<ReceiptIndianRupee className="size-4" />}
                     title="No payments yet"
                     hint="When you pay for a plan, the receipt appears here."
                   />
@@ -2733,22 +2732,26 @@ export function SettingsView() {
               {/* ---- usage against the plan's limits ---- */}
               <BillingCard>
                 <BillingSectionHead icon={<SlidersHorizontal className="size-4" />} title="Usage limits" />
-                <div className="grid gap-4 sm:grid-cols-3">
+                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                   <UsageStat
-                    label="Staff members"
-                    value={data.users.length}
-                    limit={sub?.limits?.staff ?? null}
+                    label="QR codes / Tables"
+                    value={data.tables?.length ?? 0}
+                    limit={sub?.limits?.tables ?? sub?.limits?.qrCodes ?? (sub?.planId === 'pro' ? 100 : 50)}
                   />
                   <UsageStat
                     label="Menu items"
-                    value={data.menuItems.length}
-                    limit={sub?.limits?.menuItems ?? null}
+                    value={data.menuItems?.length ?? 0}
+                    limit={sub?.limits?.menuItems ?? (sub?.planId === 'pro' ? 200 : 100)}
+                  />
+                  <UsageStat
+                    label="Staff members"
+                    value={data.users?.length ?? 0}
+                    limit={sub?.limits?.staff ?? (sub?.planId === 'pro' ? 10 : 5)}
                   />
                   <UsageStat
                     label="Restaurant locations"
-                    // Counted from the database by the server, not assumed.
                     value={locationCount ?? manageData?.locationCount ?? 1}
-                    limit={sub?.limits?.locations ?? null}
+                    limit={sub?.limits?.locations ?? (sub?.planId === 'pro' ? 3 : 1)}
                   />
                 </div>
               </BillingCard>
@@ -2881,8 +2884,8 @@ export function SettingsView() {
                     <AlertDialogDescription asChild>
                       <div className="space-y-2 text-[13px] leading-relaxed">
                         <p>
-                          The AutoPay mandate is cancelled with Razorpay today, so{' '}
-                          <span className="font-semibold text-foreground">no further debits</span> happen.
+                          Your subscription is cancelled today, so{' '}
+                          <span className="font-semibold text-foreground">no further charges</span> will occur.
                         </p>
                         <p>
                           You keep full access to {sub?.planName ?? 'your plan'} until{' '}
@@ -3262,17 +3265,24 @@ function Field({
 }
 
 function UsageStat({ label, value, limit }: { label: string; value: number; limit: number | null }) {
-  // A null limit means the plan does not cap this — Pro has unlimited staff
-  // and unlimited menu items — and dividing by it would be nonsense.
   const unlimited = limit === null || limit === undefined
   const pct = unlimited ? 0 : Math.min(100, Math.round((value / limit) * 100))
-  const over = !unlimited && value >= limit
+  const isOver = !unlimited && value > limit
+  const isFull = !unlimited && value === limit
   return (
-    <div className="rounded-xl border border-border bg-secondary/20 p-3.5">
-      <p className="text-[12px] font-medium text-muted-foreground">{label}</p>
-      <p className="mt-1 text-2xl font-bold tracking-tight">
+    <div className="rounded-xl border border-border/70 bg-card p-3.5 shadow-sm transition-all hover:border-primary/20">
+      <div className="flex items-center justify-between">
+        <p className="text-[11.5px] font-medium text-muted-foreground">{label}</p>
+        <span className={cn(
+          'text-[10px] font-semibold px-1.5 py-0.5 rounded',
+          isOver ? 'bg-destructive/15 text-destructive' : isFull ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400' : 'bg-primary/10 text-primary'
+        )}>
+          {unlimited ? 'Unlimited' : isOver ? 'Exceeded' : isFull ? 'At Limit' : `${pct}%`}
+        </span>
+      </div>
+      <p className="mt-1 text-xl font-bold tracking-tight">
         {value}
-        <span className="text-sm font-normal text-muted-foreground">
+        <span className="text-xs font-normal text-muted-foreground">
           {unlimited ? ' · unlimited' : ` / ${limit}`}
         </span>
       </p>
@@ -3280,12 +3290,18 @@ function UsageStat({ label, value, limit }: { label: string; value: number; limi
         <>
           <div className="mt-2.5 h-1.5 rounded-full bg-secondary overflow-hidden">
             <div
-              className={cn('h-full rounded-full', over ? 'bg-destructive' : 'bg-primary')}
+              className={cn(
+                'h-full rounded-full transition-all duration-300',
+                isOver ? 'bg-destructive' : isFull ? 'bg-amber-500' : 'bg-primary'
+              )}
               style={{ width: `${pct}%` }}
             />
           </div>
-          <p className={cn('text-xs mt-1.5', over ? 'text-destructive' : 'text-muted-foreground')}>
-            {over ? 'Limit reached — upgrade plan' : `${pct}% used`}
+          <p className={cn(
+            'text-[11px] mt-1.5 font-medium',
+            isOver ? 'text-destructive' : isFull ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'
+          )}>
+            {isOver ? 'Limit exceeded — upgrade plan' : isFull ? 'Plan limit reached' : `${pct}% used`}
           </p>
         </>
       )}
@@ -3527,12 +3543,12 @@ function ManageBillingView(props: {
             )}
           </BillingCard>
 
-          {/* ---- the live AutoPay mandate ---- */}
+          {/* ---- the live recurring payment mandate ---- */}
           {manage.mandate && (
             <BillingCard>
               <BillingSectionHead
                 icon={<ShieldCheck className="size-4" />}
-                title="AutoPay mandate"
+                title="Recurring payment mandate"
                 extra={
                   <span className="ml-auto">
                     <StatusPill tone={mandateTone(manage.mandate)} label={mandateStateLabel(manage.mandate)} />
@@ -3665,7 +3681,7 @@ function ManageBillingView(props: {
           {/* ---- payment history & invoices ---- */}
           <BillingCard>
             <BillingSectionHead
-              icon={<Receipt className="size-4" />}
+              icon={<ReceiptIndianRupee className="size-4" />}
               title="Payment history & invoices"
               extra={
                 payments.length > 0 ? <Badge variant="secondary" className="text-[10px]">{payments.length}</Badge> : undefined
@@ -3673,7 +3689,7 @@ function ManageBillingView(props: {
             />
             {payments.length === 0 ? (
               <BillingEmpty
-                icon={<Receipt className="size-4" />}
+                icon={<ReceiptIndianRupee className="size-4" />}
                 title="No payments yet"
                 hint="When you pay for a plan, the receipt appears here."
               />
@@ -3696,7 +3712,7 @@ function ManageBillingView(props: {
               <li>A plan activates only after a payment is verified — an authorised mandate is never a payment.</li>
               <li>Scheduled changes start on their date, never before; cancelling one never touches the current plan.</li>
               <li>Cancelling a subscription stops future debits; access continues until the paid period ends.</li>
-              <li>AutoPay is shown only when Razorpay confirms a live mandate on this subscription.</li>
+              <li>Recurring billing is shown only when Razorpay confirms a live mandate on this subscription.</li>
               <li>Invoices are issued when a payment is verified and can be re-downloaded any time — they never change.</li>
             </ul>
           </BillingCard>

@@ -1877,7 +1877,11 @@ function OrderCard({
       : next
         ? (keyPerms[ORDER_STATUS_KEYS[next]] ?? false)
         : false
-  const canCancelOrder = canCancel && !['COMPLETED', 'CANCELLED'].includes(displayStatus)
+  const isPaid = order.paymentStatus === 'PAID'
+  const canCancelOrder =
+    canCancel &&
+    !isPaid &&
+    !['SERVED', 'COMPLETED', 'CANCELLED'].includes(displayStatus)
   const billReady = displayStatus === 'COMPLETED'
 
   const where =

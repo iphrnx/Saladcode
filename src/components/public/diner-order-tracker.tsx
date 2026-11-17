@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ChevronDown, Loader2, Receipt, Check, ChefHat, Bell, Utensils, X } from 'lucide-react'
+import { ChevronDown, Loader2, CookingPot, Check, ChefHat, Bell, Utensils, X } from 'lucide-react'
 import { edgeFetch } from '@/lib/edge'
 import { cn } from '@/lib/utils'
 
@@ -62,7 +62,7 @@ function StatusIcon({ status, className }: { status: string; className?: string 
   if (status === 'READY') return <Bell className={className} />
   if (status === 'SERVED') return <Utensils className={className} />
   if (status === 'COMPLETED') return <Check className={className} />
-  return <Receipt className={className} />
+  return <CookingPot className={className} />
 }
 
 export function DinerOrderTracker({
@@ -218,7 +218,7 @@ export function DinerOrderTracker({
           {loading && count === 0 ? (
             <Loader2 className="size-4 animate-spin" />
           ) : (
-            <StatusIcon status={live[0]?.status ?? 'COMPLETED'} className="size-4" />
+            <StatusIcon status={live[0]?.status ?? (orders.length > 0 ? 'COMPLETED' : 'IDLE')} className="size-4" />
           )}
         </span>
         {count > 0 && (

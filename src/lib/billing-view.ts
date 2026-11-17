@@ -291,7 +291,7 @@ export interface BillingPlanFacts {
   priceMonthly: number
   priceYearly?: number | null
   currency: string
-  limits?: { locations: number | null; staff: number | null; menuItems: number | null }
+  limits?: { locations: number | null; staff: number | null; menuItems: number | null; tables?: number | null; qrCodes?: number | null }
 }
 
 /** What the server decided about renewal — never a date in prose. */
@@ -404,7 +404,7 @@ export function paymentModeLabel(
   if (mandate && (mandate.state === 'active' || mandate.state === 'authorised')) {
     return `${interval} · AutoPay`
   }
-  if (plan.paymentMode === 'autopay') return `${interval} · renewal unverified`
+  if (plan.paymentMode === 'autopay') return `${interval} · Renewal unverified`
   return `${interval} · payment mode not recorded`
 }
 

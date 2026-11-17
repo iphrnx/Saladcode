@@ -1030,6 +1030,30 @@ async function cancelOrder(req: Request, id: string): Promise<Response> {
   const db = admin();
   const actor = g.session.subjectId ?? null;
 
+  // Fast pre-flight validation on current order state
+  const { data: currentOrder, error: fetchErr } = await db
+    .from("orders")
+    .select("status, payment_status")
+    .eq("id", id)
+    .eq("tenant_id", g.session.tenantId)
+    .maybeSingle();
+
+  if (fetchErr) return json(req, { error: fetchErr.message }, 500);
+  if (!currentOrder) return json(req, { error: "Order not found." }, 404);
+
+  if (currentOrder.status === "SERVED") {
+    return json(req, { error: "This order has already been served and cannot be cancelled." }, 409);
+  }
+  if (currentOrder.status === "COMPLETED") {
+    return json(req, { error: "This order has already been completed and cannot be cancelled." }, 409);
+  }
+  if (currentOrder.payment_status === "PAID") {
+    return json(req, { error: "This order is already paid. Please issue a refund before cancelling." }, 409);
+  }
+  if (currentOrder.status === "CANCELLED") {
+    return json(req, { ok: true, status: "CANCELLED", already_cancelled: true });
+  }
+
   const { data: result, error: txError } = await db.rpc("cancel_order_tx", {
     p_tenant: g.session.tenantId,
     p_order_id: id,
@@ -1041,6 +1065,9 @@ async function cancelOrder(req: Request, id: string): Promise<Response> {
     const msg = String(txError.message || "");
     if (msg.includes("ORDER_NOT_FOUND")) {
       return json(req, { error: "Order not found." }, 404);
+    }
+    if (msg.includes("ORDER_ALREADY_SERVED")) {
+      return json(req, { error: "This order has already been served and cannot be cancelled." }, 409);
     }
     if (msg.includes("ORDER_ALREADY_COMPLETED")) {
       return json(req, { error: "This order has already been completed and cannot be cancelled." }, 409);
@@ -1149,7 +1176,7 @@ async function update(req: Request, id: string | null): Promise<Response> {
     PENDING: ["PREPARING", "CANCELLED"],
     PREPARING: ["READY", "CANCELLED"],
     READY: ["SERVED", "CANCELLED"],
-    SERVED: ["COMPLETED", "CANCELLED"],
+    SERVED: ["COMPLETED"],
     COMPLETED: [],
     CANCELLED: [],
   };
@@ -1168,6 +1195,15 @@ async function update(req: Request, id: string | null): Promise<Response> {
       return refuse("table-sessions.manage");
     }
     if (target === "CANCELLED") {
+      if (current.status === "SERVED") {
+        return json(req, { error: "This order has already been served and cannot be cancelled." }, 409);
+      }
+      if (current.status === "COMPLETED") {
+        return json(req, { error: "This order has already been completed and cannot be cancelled." }, 409);
+      }
+      if (current.payment_status === "PAID") {
+        return json(req, { error: "This order is already paid. Please issue a refund before cancelling." }, 409);
+      }
       return await cancelOrder(req, id);
     }
     if (target === "PENDING" && current.status === "PENDING_ACTIVATION") {

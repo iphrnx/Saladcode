@@ -84,7 +84,7 @@ export const PAST_DUE_GRACE_MS = 7 * DAY_MS;
  * The gated features, and the keys a plan carries in
  * `subscription_plans.feature_keys` when it includes one.
  */
-export const PRO_ONLY_FEATURES = ["advanced_analytics"] as const;
+export const PRO_ONLY_FEATURES = ["multi_location_reporting"] as const;
 
 export type PlanFeature = (typeof PRO_ONLY_FEATURES)[number];
 
@@ -420,8 +420,8 @@ export function checkFeature(
   return {
     ok: false,
     error:
-      feature === "advanced_analytics"
-        ? "Advanced analytics is a Pro feature. Upgrade your plan to see it."
+      feature === "multi_location_reporting"
+        ? "Multi-location reporting is a Pro feature. Upgrade your plan to see it."
         : "That feature is not on your plan.",
   };
 }

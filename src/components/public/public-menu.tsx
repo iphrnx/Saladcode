@@ -180,23 +180,23 @@ function tagMeta(tag: string): { label: string; icon?: React.ReactNode; cls: str
     'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold leading-none'
   switch (t) {
     case 'spicy':
-      return { label: 'Spicy', icon: <Flame className="size-2.5" />, cls: `${base} bg-red-500/15 text-red-500` }
+      return { label: 'Spicy', icon: <Flame className="size-2.5" />, cls: `${base} bg-red-500/15 text-red-600 dark:text-red-400` }
     case 'veg':
-      return { label: 'Veg', icon: <Leaf className="size-2.5" />, cls: `${base} bg-emerald-500/15 text-emerald-400` }
+      return { label: 'Veg', icon: <Leaf className="size-2.5" />, cls: `${base} bg-emerald-500/15 text-emerald-600 dark:text-emerald-400` }
     case 'vegan':
-      return { label: 'Vegan', icon: <Leaf className="size-2.5" />, cls: `${base} bg-green-500/15 text-green-400` }
+      return { label: 'Vegan', icon: <Leaf className="size-2.5" />, cls: `${base} bg-green-500/15 text-green-600 dark:text-green-400` }
     case 'new':
-      return { label: 'New', icon: <Sparkles className="size-2.5" />, cls: `${base} bg-amber-500/15 text-amber-400` }
+      return { label: 'New', icon: <Sparkles className="size-2.5" />, cls: `${base} bg-amber-500/15 text-amber-600 dark:text-amber-400` }
     case 'bestseller':
-      return { label: 'Bestseller', icon: <Star className="size-2.5 fill-current" />, cls: `${base} bg-orange-500/15 text-orange-400` }
+      return { label: 'Bestseller', icon: <Star className="size-2.5 fill-current" />, cls: `${base} bg-orange-500/15 text-orange-600 dark:text-orange-400` }
     case 'non-veg':
-      return { label: 'Non-Veg', cls: `${base} bg-rose-50 text-rose-600` }
+      return { label: 'Non-Veg', cls: `${base} bg-rose-500/15 text-rose-600 dark:text-rose-400` }
     case 'jain':
-      return { label: 'Jain', icon: <Sparkles className="size-2.5" />, cls: `${base} bg-amber-500/15 text-amber-400` }
+      return { label: 'Jain', icon: <Sparkles className="size-2.5" />, cls: `${base} bg-amber-500/15 text-amber-600 dark:text-amber-400` }
     case 'gluten-free':
-      return { label: 'GF', cls: `${base} bg-purple-50 text-purple-600` }
+      return { label: 'GF', cls: `${base} bg-purple-500/15 text-purple-600 dark:text-purple-400` }
     default:
-      return { label: tag.toUpperCase(), cls: `${base} bg-slate-100 text-foreground` }
+      return { label: tag.toUpperCase(), cls: `${base} bg-secondary text-secondary-foreground` }
   }
 }
 
@@ -1649,8 +1649,7 @@ export function PublicMenu() {
         {cart.length > 0 && !cartOpen && (
           <button
             onClick={() => setCartOpen(true)}
-            className="fixed bottom-24 right-1/2 translate-x-[15.5rem] sm:translate-x-[16rem] z-40 size-12 rounded-full shadow-lg flex items-center justify-center text-white transition-transform active:scale-95"
-            style={{ background: INK }}
+            className="fixed bottom-24 right-1/2 translate-x-[15.5rem] sm:translate-x-[16rem] z-40 size-12 rounded-full shadow-lg flex items-center justify-center text-white bg-slate-900 dark:bg-card dark:text-foreground border border-border/80 transition-transform active:scale-95 cursor-pointer"
             aria-label="Open cart"
           >
             <ShoppingBag className="size-5" />
@@ -1766,9 +1765,9 @@ export function PublicMenu() {
                     ))}
 
                     {/* Suggested note */}
-                    <div className="rounded-2xl bg-[#fff4f0] border border-[#ffe0d6] p-3 text-xs text-foreground flex items-start gap-2">
-                      <Sparkles className="size-3.5 mt-0.5 shrink-0" style={{ color: CORAL }} />
-                      <span>
+                    <div className="rounded-2xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/80 dark:border-orange-500/25 p-3 text-xs text-orange-950 dark:text-orange-100 flex items-start gap-2.5">
+                      <Sparkles className="size-3.5 mt-0.5 shrink-0 text-orange-600 dark:text-orange-400" />
+                      <span className="leading-relaxed font-medium">
                         Add notes for the kitchen — allergies, spice level, or
                         special requests.
                       </span>
@@ -2053,7 +2052,7 @@ export function MenuItemCard({
 
         {/* Price + action */}
         <div className="mt-auto pt-2 flex items-center justify-between">
-          <span className="font-bold text-base" style={{ color: INK }}>
+          <span className="font-bold text-base text-foreground tabular-nums">
             {formatPrice(displayPrice, currency)}
           </span>
           {activeQty === 0 ? (
@@ -2155,8 +2154,7 @@ export function CartLine({
               {item.name}
               {item.portion && (
                 <span
-                  className="ml-1.5 rounded-full border px-1.5 py-px text-[10px] font-semibold align-middle"
-                  style={{ borderColor: '#ffe0d6', color: CORAL, background: '#fff4f0' }}
+                  className="ml-1.5 rounded-full border border-orange-200 dark:border-orange-500/30 bg-orange-50 dark:bg-orange-950/40 px-1.5 py-px text-[10px] font-semibold text-orange-700 dark:text-orange-300 align-middle"
                 >
                   {item.portion}
                 </span>
@@ -2170,7 +2168,7 @@ export function CartLine({
               <Trash2 className="size-4" />
             </button>
           </div>
-          <p className="text-xs text-muted-foreground mt-0.5">
+          <p className="text-xs text-muted-foreground font-medium mt-0.5">
             {formatPrice(item.price, currency)} each
           </p>
 
@@ -2197,7 +2195,7 @@ export function CartLine({
                 <Plus className="size-3.5" />
               </button>
             </div>
-            <span className="font-bold text-sm">{formatPrice(lineTotal, currency)}</span>
+            <span className="font-bold text-sm text-foreground tabular-nums">{formatPrice(lineTotal, currency)}</span>
           </div>
         </div>
       </div>
@@ -2206,7 +2204,7 @@ export function CartLine({
         value={item.notes || ''}
         onChange={(e) => onNotesChange(e.target.value)}
         placeholder="Add notes (no onions, extra spicy…)"
-        className="mt-3 min-h-9 text-xs rounded-lg bg-background border-border focus-visible:ring-primary/30 focus-visible:border-primary resize-none"
+        className="mt-3 min-h-9 text-xs rounded-lg bg-background text-foreground placeholder:text-muted-foreground/80 border-border focus-visible:ring-primary/30 focus-visible:border-primary resize-none"
         rows={1}
       />
     </div>
@@ -2224,10 +2222,9 @@ function EmptyCart({ onClose }: { onClose: () => void }) {
         <X className="size-4" />
       </button>
       <div
-        className="mx-auto size-16 rounded-2xl flex items-center justify-center"
-        style={{ background: '#fff4f0' }}
+        className="mx-auto size-16 rounded-2xl flex items-center justify-center bg-orange-50 dark:bg-orange-950/40 border border-orange-200/80 dark:border-orange-500/25 text-orange-600 dark:text-orange-400"
       >
-        <ShoppingBag className="size-7" style={{ color: CORAL }} />
+        <ShoppingBag className="size-7 text-primary" />
       </div>
       <h3 className="mt-4 text-lg font-bold">Your cart is empty</h3>
       <p className="mt-1 text-sm text-muted-foreground">
@@ -2291,13 +2288,13 @@ function SuccessView({
 
           <div className="mt-6 w-full rounded-2xl bg-card p-4 border border-border text-left space-y-3">
             <div className="flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">Order number</span>
-              <span className="font-bold text-base">#{order.orderNumber}</span>
+              <span className="text-xs text-muted-foreground font-medium">Order number</span>
+              <span className="font-bold text-base text-foreground">#{order.orderNumber}</span>
             </div>
             {tableName && (
               <div className="flex items-center justify-between">
-                <span className="text-xs text-muted-foreground">Table</span>
-                <span className="font-semibold text-sm">{tableName}</span>
+                <span className="text-xs text-muted-foreground font-medium">Table</span>
+                <span className="font-semibold text-sm text-foreground">{tableName}</span>
               </div>
             )}
 
@@ -2309,16 +2306,16 @@ function SuccessView({
                 <div className="space-y-2">
                   {lines.map((line, i) => (
                     <div key={line.id ?? `${line.name}-${i}`} className="flex items-start justify-between gap-3 text-sm">
-                      <span className="min-w-0 flex-1 text-foreground/90">
-                        <span className="text-muted-foreground font-medium">{line.quantity}× </span>
-                        <span className="break-words">{line.name}</span>
+                      <span className="min-w-0 flex-1 text-foreground">
+                        <span className="text-foreground/80 font-semibold">{line.quantity}× </span>
+                        <span className="break-words font-medium">{line.name}</span>
                         {line.portion && (
                           <span className="ml-1.5 rounded bg-primary/10 border border-primary/20 px-1 py-px text-[10px] font-semibold text-primary align-middle">
                             {line.portion}
                           </span>
                         )}
                       </span>
-                      <span className="shrink-0 text-muted-foreground whitespace-nowrap">
+                      <span className="shrink-0 text-foreground font-semibold tabular-nums whitespace-nowrap">
                         {formatPrice(line.price * line.quantity, currency)}
                       </span>
                     </div>
@@ -2329,23 +2326,23 @@ function SuccessView({
 
             <Separator className="bg-muted" />
             <div className="flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">Total</span>
-              <span className="font-bold text-sm">
+              <span className="text-xs font-semibold text-foreground/80">Total</span>
+              <span className="font-bold text-base text-foreground tabular-nums">
                 {formatPrice(order.total, currency)}
               </span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">Estimated prep time</span>
-              <span className="font-semibold text-sm inline-flex items-center gap-1">
-                <Clock className="size-3.5" style={{ color: CORAL }} />
+              <span className="text-xs text-muted-foreground font-medium">Estimated prep time</span>
+              <span className="font-semibold text-sm text-foreground inline-flex items-center gap-1">
+                <Clock className="size-3.5 text-primary" />
                 ~{estimatedPrep || 20} min
               </span>
             </div>
           </div>
 
-          <div className="mt-4 w-full rounded-2xl bg-[#fff4f0] border border-[#ffe0d6] p-3 text-xs text-foreground flex items-start gap-2">
-            <Clock className="size-3.5 mt-0.5 shrink-0" style={{ color: CORAL }} />
-            <span>
+          <div className="mt-4 w-full rounded-2xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/80 dark:border-orange-500/25 p-3 text-xs text-orange-950 dark:text-orange-100 flex items-start gap-2.5">
+            <Clock className="size-3.5 mt-0.5 shrink-0 text-orange-600 dark:text-orange-400" />
+            <span className="leading-relaxed font-medium">
               Your order status will be updated by the kitchen. Sit tight — your
               meal is on the way!
             </span>
