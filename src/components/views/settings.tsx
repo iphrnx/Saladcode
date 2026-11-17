@@ -7,7 +7,7 @@ import { cn } from '@/lib/utils'
 import { useScrollCollapse } from '@/lib/use-scroll-collapse'
 import { ImageUpload } from '@/components/shared/image-upload'
 import { PhoneInput } from '@/components/shared/phone-input'
-import { applyTheme } from '@/lib/theme'
+import { applyTheme, type Theme } from '@/lib/theme'
 import { createClient } from '@/lib/supabase/client'
 import {
   MENU_THEMES,
@@ -712,8 +712,10 @@ export function SettingsView() {
     const u = d.currentUser
     setProfileForm({ name: u.name || '', email: u.email || '', phone: u.phone || '', avatar: u.avatar || '' })
     // prefs
+    const themeToApply = (d.settings.pref_theme as Theme) || 'dark'
+    applyTheme(themeToApply)
     setPrefs({
-      theme: d.settings.pref_theme || 'dark',
+      theme: themeToApply,
       language: d.settings.pref_language || 'en',
       dateFormat: (d.settings.pref_date_format as DateFormatPattern) || 'DD/MM/YYYY',
       emailAlerts: d.settings.pref_email_alerts !== 'false',
@@ -859,6 +861,7 @@ export function SettingsView() {
           window.localStorage.setItem('the-salad-activation-sound', prefs.soundAlerts ? 'on' : 'off')
         } catch {}
       }
+      applyTheme(prefs.theme as Theme)
       setTaxRate(String(validTaxRate))
       setServiceCharge(String(validServiceCharge))
       // Re-read them, so the form matches what the database now holds and the
@@ -1899,22 +1902,20 @@ export function SettingsView() {
                       </div>
                     </div>
                     <Select value={prefs.theme} disabled={!canManageSettings} onValueChange={(v) => {
-                      setPrefs(p => ({ ...p, theme: v }))
-                      applyTheme(v as 'dark' | 'light' | 'system')
-                      // Saved here, not left to the Save button: this control
-                      // applies the moment it is chosen, so it must persist the
-                      // moment it is chosen. Otherwise the theme changes under
-                      // your hand and is still the old one in the account — which
-                      // is what "it reverted" looks like after a reload, or on
-                      // the next device. Only this key is sent, so no half-finished
-                      // edit elsewhere is saved along with it.
+                      const nextTheme = v as Theme
+                      setPrefs(p => ({ ...p, theme: nextTheme }))
+                      applyTheme(nextTheme)
                       void edgeFetch('/api/settings', {
                         method: 'PUT',
                         headers,
-                        body: JSON.stringify({ settings: { pref_theme: v } }),
+                        body: JSON.stringify({ settings: { pref_theme: nextTheme } }),
                       })
-                        .then((res) => {
-                          if (!res.ok) toast.error('Theme applied here, but could not be saved to your account')
+                        .then(async (res) => {
+                          if (!res.ok) {
+                            toast.error('Theme applied here, but could not be saved to your account')
+                          } else {
+                            await refresh()
+                          }
                         })
                         .catch(() => toast.error('Theme applied here, but could not be saved to your account'))
                       toast.success(`Theme changed to ${v}`, { description: 'Applied and saved' })

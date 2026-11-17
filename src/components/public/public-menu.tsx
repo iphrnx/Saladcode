@@ -43,6 +43,7 @@ import {
   normaliseMenuTheme,
   type MenuTheme,
 } from '@/lib/menu-theme'
+import { initTheme } from '@/lib/theme'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { BillDialog } from '@/components/shared/bill-dialog'
@@ -1226,6 +1227,10 @@ export function PublicMenu() {
   // renders in a portal are in the same palette as the menu.
   useEffect(() => {
     applyMenuTheme(menuTheme)
+    return () => {
+      // Restore user's app theme when exiting public menu preview
+      initTheme()
+    }
   }, [menuTheme])
 
   // The theme this diner was last shown, read once the restaurant is known.

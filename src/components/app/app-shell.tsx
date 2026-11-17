@@ -7,7 +7,7 @@ import { AppDataProvider, useApp } from './data-context'
 import { Sidebar, MobileMoreSheet } from './sidebar'
 import { Header } from './header'
 import { useStore } from '@/lib/store'
-import { initTheme } from '@/lib/theme'
+import { initTheme, applyTheme, type Theme } from '@/lib/theme'
 import { DashboardView } from '@/components/views/dashboard'
 import { TrialBanner } from '@/components/app/trial-banner'
 import { canView, firstAllowedView } from '@/lib/permissions'
@@ -117,15 +117,22 @@ function ShellContent() {
     initTheme()
   }, [])
 
-  // Synchronize runtime preferences (compact mode & language) to the document root
+  // Synchronize runtime preferences (theme, compact mode & language) to the document root
   useEffect(() => {
     if (typeof document === 'undefined') return
+    const serverTheme = data?.settings?.pref_theme as Theme | undefined
+    if (serverTheme && (serverTheme === 'light' || serverTheme === 'dark' || serverTheme === 'system')) {
+      applyTheme(serverTheme)
+    } else {
+      initTheme()
+    }
+
     const isCompact = data?.settings?.pref_compact_mode === 'true'
     document.documentElement.setAttribute('data-compact', isCompact ? 'true' : 'false')
 
     const lang = data?.settings?.pref_language || 'en'
     document.documentElement.setAttribute('lang', lang)
-  }, [data?.settings?.pref_compact_mode, data?.settings?.pref_language])
+  }, [data?.settings?.pref_theme, data?.settings?.pref_compact_mode, data?.settings?.pref_language])
 
   // No tenant in DB — send to onboarding wizard
   useEffect(() => {
