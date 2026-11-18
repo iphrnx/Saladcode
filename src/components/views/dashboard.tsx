@@ -42,6 +42,7 @@ export function DashboardView() {
   // Mirrors "a checkout is in flight" synchronously — see submitOrder.
   const submittingRef = useRef(false)
   const [offline, setOffline] = useState(false)
+  const [forceNewSitting, setForceNewSitting] = useState(false)
 
   // Synchronize configured default order type when starting a new session or loading settings
   const defaultOrderType = data?.settings?.pref_default_order_type as 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY' | undefined
@@ -488,6 +489,21 @@ export function DashboardView() {
     const seenCheckIds = new Set<string>()
     const seenSessionIds = new Set<string>()
 
+    // Pre-calculate count of unnamed sessions per order type to distinguish multiple unnamed sessions
+    const unnamedCountByType: Record<string, number> = { TAKEAWAY: 0, DELIVERY: 0 }
+    for (const group of sessions) {
+      for (const s of (group.sessions || [])) {
+        if (s.status === 'ACTIVE' && (s.orderType === 'TAKEAWAY' || s.orderType === 'DELIVERY' || !group.tableId)) {
+          const type = (s.orderType || (group.tableId ? 'DINE_IN' : 'TAKEAWAY')) as 'TAKEAWAY' | 'DELIVERY'
+          const name = (s.customerName || '').trim()
+          if (!name || name.toLowerCase() === 'guest') {
+            unnamedCountByType[type] = (unnamedCountByType[type] || 0) + 1
+          }
+        }
+      }
+    }
+    const unnamedIndexByType: Record<string, number> = { TAKEAWAY: 0, DELIVERY: 0 }
+
     // 1. Live sessions from the active floor groups
     for (const group of sessions) {
       const live = (group.sessions || []).filter((s: any) => s.status === 'ACTIVE')
@@ -549,11 +565,28 @@ export function DashboardView() {
 
         const isTakeawayOrDelivery = s.orderType === 'TAKEAWAY' || s.orderType === 'DELIVERY' || !group.tableId
         const derivedOrderType = (s.orderType || (group.tableId ? 'DINE_IN' : 'TAKEAWAY')) as 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
-        const displayName = isTakeawayOrDelivery
-          ? (s.customerName
-              ? `${derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'} · ${s.customerName}`
-              : (group.table?.name || (derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery')))
-          : (group.table?.name || 'Table')
+        const rawCustName = (s.customerName || '').trim()
+        const isGuest = !rawCustName || rawCustName.toLowerCase() === 'guest'
+
+        let sessionNumber: number | null = null
+        let displayName = ''
+
+        if (isTakeawayOrDelivery) {
+          const typeLabel = derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'
+          if (!isGuest) {
+            displayName = `${typeLabel} · ${rawCustName}`
+          } else {
+            displayName = `${typeLabel} · Guest`
+            const totalUnnamed = unnamedCountByType[derivedOrderType] || 0
+            if (totalUnnamed > 1) {
+              unnamedIndexByType[derivedOrderType] = (unnamedIndexByType[derivedOrderType] || 0) + 1
+              sessionNumber = unnamedIndexByType[derivedOrderType]
+            }
+          }
+        } else {
+          displayName = group.table?.name || 'Table'
+          sessionNumber = totalLiveAtTable > 1 && group.tableId ? idx + 1 : null
+        }
 
         cards.push({
           id: `sess-${s.id}`,
@@ -563,7 +596,7 @@ export function DashboardView() {
           orderType: derivedOrderType,
           customerName: s.customerName,
           area: isTakeawayOrDelivery ? (derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery') : group.table?.area,
-          sessionNumber: totalLiveAtTable > 1 && group.tableId ? idx + 1 : null,
+          sessionNumber,
           total: +total.toFixed(2),
           paid: +paid.toFixed(2),
           outstanding: +outstanding.toFixed(2),
@@ -590,10 +623,11 @@ export function DashboardView() {
 
       const isTakeawayOrDelivery = b.orderType === 'TAKEAWAY' || b.orderType === 'DELIVERY' || !b.tableId
       const derivedOrderType = (b.orderType || (b.tableId ? 'DINE_IN' : 'TAKEAWAY')) as 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
+      const rawCustName = (b.customerName || '').trim()
+      const isGuest = !rawCustName || rawCustName.toLowerCase() === 'guest'
+      const typeLabel = derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'
       const displayName = isTakeawayOrDelivery
-        ? (b.customerName
-            ? `${derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'} · ${b.customerName}`
-            : (derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'))
+        ? (!isGuest ? `${typeLabel} · ${rawCustName}` : `${typeLabel} · Guest`)
         : (b.tableName || 'Table')
 
       cards.push({
@@ -633,6 +667,7 @@ export function DashboardView() {
     orderType?: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
     customerName?: string
   }) => {
+    setForceNewSitting(false)
     if (!card.sessionId) return
 
     // 1. Clicking the already-selected session card -> Deselect & Restore
@@ -720,6 +755,7 @@ export function DashboardView() {
   }
 
   const handleDeselectSession = () => {
+    setForceNewSitting(false)
     if (!selectedSessionId) return
     if (tenantId && userId) {
       savePosSessionDraft(tenantId, userId, selectedSessionId, {
@@ -743,6 +779,15 @@ export function DashboardView() {
       setSelectedSessionId(null)
     }
     preSelectSnapshotRef.current = null
+  }
+
+  const handleNewSitting = () => {
+    handleDeselectSession()
+    setForceNewSitting(true)
+  }
+
+  const handleCancelNewSitting = () => {
+    setForceNewSitting(false)
   }
 
   // Listen for payments and session closures broadcast across windows/tabs/realtime
@@ -898,14 +943,18 @@ export function DashboardView() {
       const liveSessions = floorTable?.liveSessions || []
       if (liveSessions.length > 1) {
         if (!selectedSessionId || !liveSessions.some((s: any) => s.id === selectedSessionId)) {
-          toast.error('This table has multiple active diner sessions. Please select which sitting/bill to add this order to.')
-          return
+          if (!forceNewSitting) {
+            toast.error('This table has multiple active diner sessions. Please select which sitting/bill to add this order to.')
+            return
+          }
+          activeSessionId = null
+        } else {
+          activeSessionId = selectedSessionId
         }
-        activeSessionId = selectedSessionId
       } else if (liveSessions.length === 1) {
-        activeSessionId = liveSessions[0].id
+        activeSessionId = forceNewSitting ? null : liveSessions[0].id
       } else if (floorTable?.check?.sessionId) {
-        activeSessionId = floorTable.check.sessionId
+        activeSessionId = forceNewSitting ? null : floorTable.check.sessionId
       }
     } else {
       // Takeaway or Delivery
@@ -949,6 +998,7 @@ export function DashboardView() {
     )
     setCustomerName('')
     setCustomerPhone('')
+    setForceNewSitting(false)
     setCartOpen(false)
   }
 
@@ -1175,7 +1225,7 @@ export function DashboardView() {
                       <div className="flex items-center justify-between gap-2">
                         <p className="truncate font-semibold text-foreground">
                           {card.tableName}
-                          {card.sessionNumber ? ` · Sitting #${card.sessionNumber}` : ''}
+                          {card.sessionNumber ? ` · Sitting ${card.sessionNumber}` : ''}
                         </p>
                         <span
                           className={cn(
@@ -1263,6 +1313,10 @@ export function DashboardView() {
           currencySymbol={tenant.currencySymbol}
           taxRate={tenant.taxRate}
           serviceRate={tenant.serviceCharge}
+          activeSessionCards={activeSessionCards}
+          forceNewSitting={forceNewSitting}
+          onNewSitting={handleNewSitting}
+          onCancelNewSitting={handleCancelNewSitting}
         />
       </div>
 
@@ -1322,6 +1376,10 @@ export function DashboardView() {
             currencySymbol={tenant.currencySymbol}
             taxRate={tenant.taxRate}
             serviceRate={tenant.serviceCharge}
+            activeSessionCards={activeSessionCards}
+            forceNewSitting={forceNewSitting}
+            onNewSitting={handleNewSitting}
+            onCancelNewSitting={handleCancelNewSitting}
           />
         </SheetContent>
       </Sheet>
@@ -1595,12 +1653,17 @@ interface CartPanelProps {
   currencySymbol: string
   taxRate: number
   serviceRate: number
+  activeSessionCards?: any[]
+  forceNewSitting?: boolean
+  onNewSitting?: () => void
+  onCancelNewSitting?: () => void
 }
 
 function CartPanel(p: CartPanelProps) {
   const tr = useT()
   const { embedded } = p
-  const isAmbiguousSitting = p.orderType === 'DINE_IN' && Boolean(p.selectedTableId) && p.liveSessions.length > 1 && !p.selectedSessionId
+  const tableName = p.tables.find((t) => t.id === p.selectedTableId)?.name || 'Table'
+  const isAmbiguousSitting = p.orderType === 'DINE_IN' && Boolean(p.selectedTableId) && p.liveSessions.length > 1 && !p.selectedSessionId && !p.forceNewSitting
   return (
     <div className={cn('flex flex-col h-full min-h-0 flex-1', embedded && 'overflow-hidden')}>
       {/* Order type + table/customer */}
@@ -1645,11 +1708,14 @@ function CartPanel(p: CartPanelProps) {
                 </div>
                 <Select
                   value={p.selectedSessionId || ''}
-                  onValueChange={(v) => p.setSelectedSessionId(v || null)}
+                  onValueChange={(v) => {
+                    p.setSelectedSessionId(v || null)
+                    if (v && p.onCancelNewSitting) p.onCancelNewSitting()
+                  }}
                 >
                   <SelectTrigger className={cn(
                     "bg-background border h-8 text-xs",
-                    !p.selectedSessionId ? "border-amber-500 text-amber-600 dark:text-amber-400 font-medium" : "border-border"
+                    !p.selectedSessionId && !p.forceNewSitting ? "border-amber-500 text-amber-600 dark:text-amber-400 font-medium" : "border-border"
                   )}>
                     <SelectValue placeholder="⚠️ Select sitting / bill..." />
                   </SelectTrigger>
@@ -1659,29 +1725,79 @@ function CartPanel(p: CartPanelProps) {
                       const orderCount = s._count?.orders ?? 0
                       return (
                         <SelectItem key={s.id} value={s.id}>
-                          Sitting #{idx + 1} · {timeStr} · {orderCount} order{orderCount === 1 ? '' : 's'} ({s.id.slice(0, 8)})
+                          Sitting {idx + 1}{timeStr ? ` · ${timeStr}` : ''}{orderCount > 0 ? ` · ${orderCount} order${orderCount === 1 ? '' : 's'}` : ''}
                         </SelectItem>
                       )
                     })}
                   </SelectContent>
                 </Select>
-                {!p.selectedSessionId ? (
-                  <p className="text-[10.5px] text-amber-600 dark:text-amber-400 leading-tight">
-                    This table has multiple active diner bills. Select which party to add these items to.
-                  </p>
+                {p.forceNewSitting ? (
+                  <div className="flex items-center justify-between text-[11px] font-medium text-muted-foreground pt-0.5">
+                    <span>Starting new sitting at {tableName}</span>
+                    <button
+                      type="button"
+                      onClick={p.onCancelNewSitting}
+                      className="text-[10.5px] text-primary hover:text-primary-hover font-semibold shrink-0 ml-2 underline"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : !p.selectedSessionId ? (
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10.5px] text-amber-600 dark:text-amber-400 leading-tight">
+                      This table has multiple active diner bills. Select which party to add these items to.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={p.onNewSitting || p.onDeselectSession}
+                      className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 underline"
+                    >
+                      New Sitting
+                    </button>
+                  </div>
                 ) : (
-                  <p className="text-[10.5px] text-muted-foreground leading-tight">
-                    Adding to Sitting #{p.liveSessions.findIndex((s: any) => s.id === p.selectedSessionId) + 1} ({p.selectedSessionId.slice(0, 8)})
-                  </p>
+                  <div className="flex items-center justify-between text-[11px] font-medium text-primary leading-tight pt-0.5">
+                    <span>Adding to {tableName} · Sitting {p.liveSessions.findIndex((s: any) => s.id === p.selectedSessionId) + 1}</span>
+                    <button
+                      type="button"
+                      onClick={p.onNewSitting || p.onDeselectSession}
+                      className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 ml-2 underline"
+                    >
+                      New Sitting
+                    </button>
+                  </div>
                 )}
               </div>
             )}
 
             {p.selectedTableId && p.liveSessions.length === 1 && (
-              <div className="flex items-center justify-between text-[11px] text-muted-foreground px-1">
-                <span>Active sitting: Sitting #1</span>
-                <span className="font-mono text-[10px] text-muted-foreground/80">({p.liveSessions[0].id.slice(0, 8)})</span>
-              </div>
+              p.forceNewSitting ? (
+                <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/30 px-2.5 py-1.5 text-[11px]">
+                  <span className="font-medium text-muted-foreground truncate">
+                    Starting new sitting at {tableName}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={p.onCancelNewSitting}
+                    className="text-[10.5px] text-primary hover:text-primary-hover font-semibold shrink-0 ml-2 underline"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <div className="flex items-center justify-between rounded-lg border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-[11px]">
+                  <span className="font-medium text-primary truncate">
+                    Adding to {tableName}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={p.onNewSitting || p.onDeselectSession}
+                    className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 ml-2 underline"
+                  >
+                    New Sitting
+                  </button>
+                </div>
+              )
             )}
           </div>
         ) : (
@@ -1700,20 +1816,41 @@ function CartPanel(p: CartPanelProps) {
                 className="bg-secondary/50 border-border text-sm h-9"
               />
             </div>
-            {p.selectedSessionId && (
-              <div className="flex items-center justify-between rounded-lg border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-[11px]">
-                <span className="font-medium text-primary truncate">
-                  Adding to active {p.orderType === 'TAKEAWAY' ? 'takeaway' : 'delivery'} sitting ({p.selectedSessionId.slice(0, 8)})
-                </span>
-                <button
-                  type="button"
-                  onClick={() => p.onDeselectSession ? p.onDeselectSession() : p.setSelectedSessionId(null)}
-                  className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 ml-2 underline"
-                >
-                  New Sitting
-                </button>
-              </div>
-            )}
+            {p.selectedSessionId && (() => {
+              const typeLabel = p.orderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'
+              const rawName = p.customerName?.trim()
+              let displayLabel = ''
+
+              if (rawName && rawName.toLowerCase() !== 'guest') {
+                displayLabel = `Adding to ${typeLabel} · ${rawName}`
+              } else {
+                const unnamedSameType = (p.activeSessionCards || []).filter(
+                  (c: any) => c.orderType === p.orderType && (!c.customerName?.trim() || c.customerName.trim().toLowerCase() === 'guest')
+                )
+                if (unnamedSameType.length > 1) {
+                  const idx = unnamedSameType.findIndex((c: any) => c.sessionId === p.selectedSessionId)
+                  const sittingNum = idx >= 0 ? idx + 1 : 1
+                  displayLabel = `Adding to ${typeLabel} · Guest · Sitting ${sittingNum}`
+                } else {
+                  displayLabel = `Adding to ${typeLabel} · Guest`
+                }
+              }
+
+              return (
+                <div className="flex items-center justify-between rounded-lg border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-[11px]">
+                  <span className="font-medium text-primary truncate">
+                    {displayLabel}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => p.onDeselectSession ? p.onDeselectSession() : p.setSelectedSessionId(null)}
+                    className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 ml-2 underline"
+                  >
+                    New Sitting
+                  </button>
+                </div>
+              )
+            })()}
           </div>
         )}
       </div>
