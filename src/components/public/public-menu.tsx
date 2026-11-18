@@ -97,6 +97,7 @@ type MenuItem = {
   tags?: string | null
   calories?: number | null
   rating: number
+  available?: boolean | null
   category?: { id: string; name: string; icon?: string | null } | null
 }
 
@@ -1054,10 +1055,24 @@ export function PublicMenu() {
     // Synchronous double-click guard: `busy` is React state and two clicks
     // can land before it flushes. The ref closes the window.
     if (placingRef.current) return
-    if (!sessionToken || !sessionTenantId) {
+    if (sessionState !== 'active' || !sessionToken || !sessionTenantId) {
+      toast.error('This table session has ended or is not active. Please scan table QR to continue.')
       lockDinerSession(setSessionState)
       return
     }
+
+    // Validate that cart items exist and are available in current menu
+    if (menuItems.length > 0) {
+      const availableItemIds = new Set(
+        menuItems.filter((m) => m.available !== false).map((m) => m.id),
+      )
+      const staleItem = cart.find((c) => !availableItemIds.has(c.menuItemId))
+      if (staleItem) {
+        toast.error('One or more items in your cart are no longer available. Please review your cart.')
+        return
+      }
+    }
+
     const items = cart.map((c) => ({
       menuItemId: c.menuItemId,
       portionId: c.portionId || undefined,
@@ -1145,7 +1160,16 @@ export function PublicMenu() {
   useEffect(() => {
     if (!sessionTenantId || !sessionToken) return
     const q = orderQueue(sessionTenantId, sessionToken, {
-      onConfirmed: (order, entry) => handleOrderConfirmed(order, entry),
+      onConfirmed: (order, entry) => {
+        placingRef.current = false
+        handleOrderConfirmed(order, entry)
+      },
+      onFailed: (error, entry) => {
+        placingRef.current = false
+        const msg = cleanOrderErrorMessage(error)
+        toast.error(`Order Failed: ${msg}`)
+        q.retire(entry.key)
+      },
       onChange: (entries) => {
         setQueueEntries(entries)
         placingRef.current = entries.some(
@@ -1153,6 +1177,7 @@ export function PublicMenu() {
         )
       },
     })
+    q.retireAllFailed()
     setQueueEntries(q.load())
     const stop = startOrderQueue(sessionTenantId, sessionToken, {})
     const onOn = () => setOffline(false)
@@ -1814,58 +1839,29 @@ export function PublicMenu() {
                     const activeEntry = queueEntries.find((e) => e.state === 'pending' || e.state === 'submitting')
                     const busy = Boolean(activeEntry)
                     const isRetrying = Boolean(activeEntry && activeEntry.attempts > 0)
-                    const failedEntry = queueEntries.find((e) => e.state === 'failed')
 
                     return (
                       <div className="space-y-2">
                         {isRetrying && (
                           <p className="text-center text-xs text-amber-600 dark:text-amber-400 py-1 font-medium">
-                            Order pending, retrying automatically…
+                            Order pending, reconnecting…
                           </p>
                         )}
-                        {failedEntry ? (
-                          <div className="rounded-2xl border border-destructive/20 bg-destructive/5 p-3.5 text-xs space-y-2.5">
-                            <p className="font-semibold text-destructive">
-                              {cleanOrderErrorMessage(failedEntry.lastError)}
-                            </p>
-                            <div className="flex items-center gap-2">
-                              <Button
-                                onClick={() =>
-                                  orderQueue(sessionTenantId ?? '', sessionToken ?? '', {}).retry(failedEntry.key)
-                                }
-                                className="h-10 flex-1 rounded-xl text-white font-semibold shadow-sm"
-                                style={{ background: CORAL }}
-                              >
-                                Retry Now
-                              </Button>
-                              <Button
-                                variant="outline"
-                                onClick={() => {
-                                  void orderQueue(sessionTenantId ?? '', sessionToken ?? '', {}).dismiss(failedEntry.key)
-                                }}
-                                className="h-10 px-3.5 rounded-xl text-muted-foreground border-border hover:bg-muted"
-                              >
-                                Dismiss
-                              </Button>
-                            </div>
-                          </div>
-                        ) : (
-                          <Button
-                            onClick={placeOrder}
-                            disabled={busy || cart.length === 0}
-                            className="w-full h-12 text-white text-base font-semibold rounded-2xl shadow-sm transition active:scale-[0.99]"
-                            style={{ background: CORAL }}
-                          >
-                            {busy ? (
-                              <>
-                                <Loader2 className="size-4 animate-spin" />
-                                Placing order…
-                              </>
-                            ) : (
-                              <>Place Order · {formatPrice(grandTotal, currency)}</>
-                            )}
-                          </Button>
-                        )}
+                        <Button
+                          onClick={placeOrder}
+                          disabled={busy || cart.length === 0}
+                          className="w-full h-12 text-white text-base font-semibold rounded-2xl shadow-sm transition active:scale-[0.99]"
+                          style={{ background: CORAL }}
+                        >
+                          {busy ? (
+                            <>
+                              <Loader2 className="size-4 animate-spin" />
+                              Placing order…
+                            </>
+                          ) : (
+                            <>Place Order · {formatPrice(grandTotal, currency)}</>
+                          )}
+                        </Button>
                       </div>
                     )
                   })()}

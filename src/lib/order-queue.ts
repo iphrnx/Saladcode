@@ -62,6 +62,8 @@ export interface QueueEntry {
 export interface QueueHooks {
   /** The order is on the server (fresh commit or reconciled). */
   onConfirmed?: (order: any, entry: QueueEntry) => void
+  /** The order permanently failed / was rejected. */
+  onFailed?: (error: string, entry: QueueEntry) => void
   /** An entry changed state (pending/submitting/failed). */
   onChange?: (entries: QueueEntry[]) => void
 }
@@ -191,7 +193,7 @@ export async function submitEntry(
 }
 
 export function cleanOrderErrorMessage(raw?: string): string {
-  if (!raw) return 'Order could not be sent. Please tap Retry.'
+  if (!raw) return 'Unable to place order. Please review your cart and try again.'
   const lower = raw.toLowerCase()
   if (
     lower.includes('session_invalid_or_ended') ||
@@ -216,8 +218,14 @@ export function cleanOrderErrorMessage(raw?: string): string {
   if (lower.includes('403') || lower.includes('forbidden')) {
     return 'You do not have permission to place this order.'
   }
-  if (lower.includes('item_unavailable') || lower.includes('unavailable')) {
-    return 'One or more items in your cart are currently unavailable. Please review your cart.'
+  if (
+    lower.includes('item_unavailable') ||
+    lower.includes('unavailable') ||
+    lower.includes('none of the items exist') ||
+    lower.includes('not exist in the menu') ||
+    lower.includes('items exist in the menu')
+  ) {
+    return 'One or more items in your cart do not exist or are no longer available. Please review your cart.'
   }
   if (
     lower.includes('column') ||
@@ -385,6 +393,29 @@ export class OrderQueue {
     await Promise.all(failedKeys.map((key) => this.dismiss(key)))
   }
 
+  /** Safely retire a failed entry after user notification, moving it to historical error log. */
+  retire(key: string) {
+    const entries = this.load()
+    const entry = entries.find((e) => e.key === key)
+    if (!entry) return
+    try {
+      const historyKey = `${this.storageKey}-history`
+      const historyRaw = this.storage.getItem(historyKey)
+      const history = historyRaw ? JSON.parse(historyRaw) : []
+      history.unshift({ ...entry, retiredAt: this.now() })
+      this.storage.setItem(historyKey, JSON.stringify(history.slice(0, 30)))
+    } catch {}
+    this.save(entries.filter((e) => e.key !== key))
+  }
+
+  /** Safely retire all failed entries from active queue to history. */
+  retireAllFailed() {
+    const failedKeys = this.load().filter((e) => e.state === 'failed').map((e) => e.key)
+    for (const key of failedKeys) {
+      this.retire(key)
+    }
+  }
+
   private confirm(key: string, order: any) {
     const entries = this.load()
     const entry = entries.find((e) => e.key === key)
@@ -437,30 +468,33 @@ export class OrderQueue {
         if (result.outcome === 'confirmed') {
           this.confirm(due.key, result.order)
         } else if (result.outcome === 'rejected') {
+          const failedEntry = { ...held, state: 'failed' as const, lastError: result.error, claimId: null, claimAt: null }
           this.save(
             currentEntries.map((e) =>
-              e.key === due.key
-                ? { ...e, state: 'failed' as const, lastError: result.error, claimId: null, claimAt: null }
-                : e,
+              e.key === due.key ? failedEntry : e,
             ),
           )
+          this.hooks.onFailed?.(result.error, failedEntry)
         } else {
           const attempts = held.attempts + 1
+          const isFailed = attempts >= MAX_ATTEMPTS
+          const updatedEntry = {
+            ...held,
+            state: isFailed ? ('failed' as const) : ('pending' as const),
+            attempts,
+            nextAttemptAt: this.now() + backoffDelayMs(attempts),
+            lastError: result.error,
+            claimId: null,
+            claimAt: null,
+          }
           this.save(
             currentEntries.map((e) =>
-              e.key === due.key
-                ? {
-                    ...e,
-                    state: attempts >= MAX_ATTEMPTS ? ('failed' as const) : ('pending' as const),
-                    attempts,
-                    nextAttemptAt: this.now() + backoffDelayMs(attempts),
-                    lastError: result.error,
-                    claimId: null,
-                    claimAt: null,
-                  }
-                : e,
+              e.key === due.key ? updatedEntry : e,
             ),
           )
+          if (isFailed) {
+            this.hooks.onFailed?.(result.error, updatedEntry)
+          }
         }
       }
     } finally {
@@ -502,6 +536,7 @@ export function orderQueue(tenantId: string, actorId: string, hooks: QueueHooks 
   } else {
     // Latest non-empty hooks win — a remounting component must not lose confirmations.
     if (hooks.onConfirmed) (q as any).hooks.onConfirmed = hooks.onConfirmed
+    if (hooks.onFailed) (q as any).hooks.onFailed = hooks.onFailed
     if (hooks.onChange) (q as any).hooks.onChange = hooks.onChange
   }
   return q

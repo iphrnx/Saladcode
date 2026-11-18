@@ -13,7 +13,7 @@ import { hasPermission, hasEffectivePermission } from '@/lib/permissions'
 import { sortTables } from '@/lib/table-order'
 import { cn } from '@/lib/utils'
 import { normalizePortions, type MenuPortion } from '@/lib/portions'
-import { orderQueue, startOrderQueue, type QueueEntry } from '@/lib/order-queue'
+import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
 import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft } from '@/lib/pos-cart'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -101,6 +101,7 @@ export function DashboardView() {
     if (!tenantId || !userId) return
     const q = orderQueue(tenantId, userId, {
       onConfirmed: (order, entry) => {
+        submittingRef.current = false
         setLastOrder(order)
         subtractCartLines(entry.payload.items ?? [])
         setPromoCode('')
@@ -123,6 +124,12 @@ export function DashboardView() {
         refresh()
         setCartOpen(false)
       },
+      onFailed: (error, entry) => {
+        submittingRef.current = false
+        const msg = cleanOrderErrorMessage(error)
+        toast.error(`Order Failed: ${msg}`)
+        q.retire(entry.key)
+      },
       onChange: (entries) => {
         setQueueEntries(entries)
         submittingRef.current = entries.some(
@@ -130,6 +137,7 @@ export function DashboardView() {
         )
       },
     })
+    q.retireAllFailed()
     setQueueEntries(q.load())
     const stop = startOrderQueue(tenantId, userId, {})
     const onOn = () => setOffline(false)
@@ -176,7 +184,6 @@ export function DashboardView() {
   }, [cart, orderType, selectedTableId, selectedSessionId, customerName, customerPhone, promoCode, tenantId, userId])
 
   const queueBusy = queueEntries.some((e) => e.state === 'pending' || e.state === 'submitting')
-  const failedEntries = queueEntries.filter((e) => e.state === 'failed')
 
   const menuItems = data?.menuItems ?? []
   const categories = data?.categories ?? []
@@ -956,6 +963,16 @@ export function DashboardView() {
       } else if (floorTable?.check?.sessionId) {
         activeSessionId = forceNewSitting ? null : floorTable.check.sessionId
       }
+
+      if (activeSessionId && floorTable) {
+        const isLive =
+          (floorTable.liveSessions || []).some((s: any) => s.id === activeSessionId) ||
+          floorTable.check?.sessionId === activeSessionId
+        if (!isLive) {
+          toast.error('The selected table session has ended or is closed. Please start or select an active session.')
+          return
+        }
+      }
     } else {
       // Takeaway or Delivery
       if (selectedSessionId) {
@@ -965,7 +982,28 @@ export function DashboardView() {
         toast.error('Please enter customer name')
         return
       }
+      if (activeSessionId && sessions.length > 0) {
+        const allActive = sessions.flatMap((g: any) => g.sessions || []).filter((s: any) => s.status === 'ACTIVE')
+        const isLive = allActive.some((s: any) => s.id === activeSessionId)
+        if (!isLive) {
+          toast.error('The selected session has ended or is closed. Please start or select an active session.')
+          return
+        }
+      }
     }
+
+    // Validate that cart items exist and are available in current menu
+    if (data?.menuItems && data.menuItems.length > 0) {
+      const availableItemIds = new Set(
+        data.menuItems.filter((m: any) => m.available !== false).map((m: any) => m.id),
+      )
+      const staleItem = cart.find((c) => !availableItemIds.has(c.menuItemId))
+      if (staleItem) {
+        toast.error('One or more items in your cart are no longer available. Please review your cart.')
+        return
+      }
+    }
+
     // Snapshot the checkout into the persistent queue and hand it the
     // idempotency key. Online, it confirms in a moment; offline, it keeps the
     // order safe and retries until it lands. The cart is only cleared by the
@@ -1002,75 +1040,19 @@ export function DashboardView() {
     setCartOpen(false)
   }
 
-  const q = tenantId && userId ? orderQueue(tenantId, userId, {}) : null
-
   return (
     <div className="flex h-full min-h-0">
       {/* Menu area */}
       <div className="flex-1 flex flex-col min-w-0 min-h-0">
-        {/* Order queue status — the cashier always knows where their order
-            stands: sending, waiting for the network, or needing attention. */}
-        {(queueBusy || failedEntries.length > 0) && (
-          <div className="fixed bottom-3 left-3 z-50 max-w-[calc(100vw-1.5rem)] space-y-1.5">
-            {queueBusy && (
-              <div className="flex items-center gap-2 rounded-full border border-border bg-background/95 px-3 py-1.5 text-[11px] font-medium text-muted-foreground shadow-lg backdrop-blur">
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-                {offline
-                  ? tr('pos.queue.offline')
-                  : tr('pos.queue.sending')}
-              </div>
-            )}
-            {failedEntries.length > 1 && (
-              <div className="flex items-center justify-between gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-1.5 text-[11px] shadow-lg backdrop-blur">
-                <span className="font-semibold text-destructive">
-                  {failedEntries.length} orders could not be sent
-                </span>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    className="rounded-full bg-primary px-2 py-0.5 font-semibold text-white hover:opacity-90 transition-opacity"
-                    onClick={() => q?.retryAll()}
-                  >
-                    {tr('common.retry')} All
-                  </button>
-                  <button
-                    className="rounded-full border border-border bg-background px-2 py-0.5 text-muted-foreground hover:bg-muted transition-colors"
-                    onClick={() => {
-                      void q?.dismissAll()
-                    }}
-                  >
-                    {tr('common.dismiss')} All
-                  </button>
-                </div>
-              </div>
-            )}
-            {failedEntries.map((e) => (
-              <div
-                key={e.key}
-                className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-background/95 px-3 py-1.5 text-[11px] shadow-lg backdrop-blur"
-              >
-                <span className="font-medium text-destructive max-w-[220px] truncate" title={e.lastError || tr('pos.queue.failed')}>
-                  {e.lastError || tr('pos.queue.failed')}
-                </span>
-                <button
-                  className="rounded-full bg-primary px-2 py-0.5 font-semibold text-white shrink-0 hover:opacity-90 transition-opacity"
-                  onClick={() => q?.retry(e.key)}
-                >
-                  {tr('common.retry')}
-                </button>
-                <button
-                  className="rounded-full border border-border px-2 py-0.5 text-muted-foreground shrink-0 hover:bg-muted transition-colors"
-                  onClick={() => {
-                    void q?.dismiss(e.key).then((r) => {
-                      if (r === 'confirmed') toast.success('Order actually went through')
-                      else if (r === 'uncertain')
-                        toast.error('Still no answer — kept the order pending')
-                    })
-                  }}
-                >
-                  {tr('common.dismiss')}
-                </button>
-              </div>
-            ))}
+        {/* Order queue status — clean sending/offline indicator */}
+        {queueBusy && (
+          <div className="fixed bottom-3 left-3 z-50 max-w-[calc(100vw-1.5rem)]">
+            <div className="flex items-center gap-2 rounded-full border border-border bg-background/95 px-3 py-1.5 text-[11px] font-medium text-muted-foreground shadow-lg backdrop-blur">
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+              {offline
+                ? tr('pos.queue.offline')
+                : tr('pos.queue.sending')}
+            </div>
           </div>
         )}
         {/* Restaurant header — collapses on scroll to give menu cards more room */}
