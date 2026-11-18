@@ -333,6 +333,14 @@ export class OrderQueue {
     void this.process()
   }
 
+  /** Retry all failed entries in the queue. */
+  retryAll() {
+    const failedKeys = this.load().filter((e) => e.state === 'failed').map((e) => e.key)
+    for (const key of failedKeys) {
+      this.retry(key)
+    }
+  }
+
   /**
    * Explicit human discard. Before dropping, reconcile: if the server has the
    * order after all, this is not a discard — it is a confirmation.
@@ -369,6 +377,12 @@ export class OrderQueue {
       // Keep it pending and report uncertain.
       return 'uncertain'
     }
+  }
+
+  /** Dismiss all failed entries from the queue. */
+  async dismissAll(): Promise<void> {
+    const failedKeys = this.load().filter((e) => e.state === 'failed').map((e) => e.key)
+    await Promise.all(failedKeys.map((key) => this.dismiss(key)))
   }
 
   private confirm(key: string, order: any) {

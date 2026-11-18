@@ -970,22 +970,45 @@ export function DashboardView() {
                   : tr('pos.queue.sending')}
               </div>
             )}
+            {failedEntries.length > 1 && (
+              <div className="flex items-center justify-between gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-1.5 text-[11px] shadow-lg backdrop-blur">
+                <span className="font-semibold text-destructive">
+                  {failedEntries.length} orders could not be sent
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    className="rounded-full bg-primary px-2 py-0.5 font-semibold text-white hover:opacity-90 transition-opacity"
+                    onClick={() => q?.retryAll()}
+                  >
+                    {tr('common.retry')} All
+                  </button>
+                  <button
+                    className="rounded-full border border-border bg-background px-2 py-0.5 text-muted-foreground hover:bg-muted transition-colors"
+                    onClick={() => {
+                      void q?.dismissAll()
+                    }}
+                  >
+                    {tr('common.dismiss')} All
+                  </button>
+                </div>
+              </div>
+            )}
             {failedEntries.map((e) => (
               <div
                 key={e.key}
                 className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-background/95 px-3 py-1.5 text-[11px] shadow-lg backdrop-blur"
               >
-                <span className="font-medium text-destructive">
-                  {tr('pos.queue.failed')}
+                <span className="font-medium text-destructive max-w-[220px] truncate" title={e.lastError || tr('pos.queue.failed')}>
+                  {e.lastError || tr('pos.queue.failed')}
                 </span>
                 <button
-                  className="rounded-full bg-primary px-2 py-0.5 font-semibold text-white"
+                  className="rounded-full bg-primary px-2 py-0.5 font-semibold text-white shrink-0 hover:opacity-90 transition-opacity"
                   onClick={() => q?.retry(e.key)}
                 >
                   {tr('common.retry')}
                 </button>
                 <button
-                  className="rounded-full border border-border px-2 py-0.5 text-muted-foreground"
+                  className="rounded-full border border-border px-2 py-0.5 text-muted-foreground shrink-0 hover:bg-muted transition-colors"
                   onClick={() => {
                     void q?.dismiss(e.key).then((r) => {
                       if (r === 'confirmed') toast.success('Order actually went through')
