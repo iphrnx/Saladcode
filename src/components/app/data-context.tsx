@@ -962,7 +962,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       // diner had already closed the menu until the page was reloaded.
       .on('broadcast', { event: 'SESSION_ENDED' }, (msg: any) => {
         if (isCancelled) return
-        const sessId = msg?.payload?.sessionId
+        const sessId = msg?.payload?.sessionId || msg?.payload?.order?.sessionId
         if (sessId) {
           setTableSessions((prev) => ({
             ...prev,
@@ -972,14 +972,26 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
               endedAt: msg?.payload?.endedAt ?? new Date().toISOString(),
             },
           }))
+          try {
+            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+              const bc = new BroadcastChannel('the_salad_orders_sync')
+              bc.postMessage({
+                type: 'SESSION_ENDED',
+                sessionId: sessId,
+                tableId: msg?.payload?.tableId,
+                status: 'ENDED',
+              })
+              bc.close()
+            }
+          } catch {}
         }
         setSessionRevision((n) => n + 1)
         void runDeltaSync()
       })
       .on('broadcast', { event: 'SESSION_UPDATED' }, (msg: any) => {
         if (isCancelled) return
-        const sessId = msg?.payload?.sessionId
-        const st = msg?.payload?.status
+        const sessId = msg?.payload?.sessionId || msg?.payload?.order?.sessionId
+        const st = msg?.payload?.status || msg?.payload?.order?.status
         if (sessId && st === 'ENDED') {
           setTableSessions((prev) => ({
             ...prev,
@@ -989,6 +1001,18 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
               endedAt: msg?.payload?.endedAt ?? new Date().toISOString(),
             },
           }))
+          try {
+            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+              const bc = new BroadcastChannel('the_salad_orders_sync')
+              bc.postMessage({
+                type: 'SESSION_ENDED',
+                sessionId: sessId,
+                tableId: msg?.payload?.tableId,
+                status: 'ENDED',
+              })
+              bc.close()
+            }
+          } catch {}
         }
         setSessionRevision((n) => n + 1)
         void runDeltaSync()
@@ -996,6 +1020,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       .on('broadcast', { event: 'CHECK_UPDATED' }, (msg: any) => {
         if (isCancelled) return
         const chkId = msg?.payload?.checkId
+        const sessId = msg?.payload?.sessionId || msg?.payload?.order?.sessionId
         if (chkId && (msg?.payload?.reason === 'FINALISED' || msg?.payload?.status === 'PAID')) {
           setChecks((prev) => ({
             ...prev,
@@ -1006,6 +1031,20 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
               invoiceNumber: msg?.payload?.invoiceNumber ?? prev[chkId]?.invoiceNumber ?? null,
             },
           }))
+          try {
+            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+              const bc = new BroadcastChannel('the_salad_orders_sync')
+              bc.postMessage({
+                type: 'CHECK_UPDATED',
+                checkId: chkId,
+                sessionId: sessId,
+                tableId: msg?.payload?.tableId,
+                status: 'PAID',
+                reason: 'FINALISED',
+              })
+              bc.close()
+            }
+          } catch {}
         }
         setSessionRevision((n) => n + 1)
         void runDeltaSync()

@@ -1603,7 +1603,7 @@ export function OrdersView() {
           onCompletePay={() => {
             const target = ordersSitting
             openSitting(null)
-            if (target.tableId && target.checkId) {
+            if (target.checkId || target.sessionId || target.tableId) {
               setPaySitting(target)
             } else {
               setPayOrder(target.latest)

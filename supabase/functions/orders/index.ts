@@ -1559,9 +1559,9 @@ async function update(req: Request, id: string | null): Promise<Response> {
 
   const order = mapOrder(updated);
 
-  // If order was marked COMPLETED for a table, instantly end any active session
-  // for that table. Best-effort — a failure must not fail the request.
-  if (order.status === "COMPLETED" && order.tableId) {
+  // If order was marked COMPLETED for a table or takeaway/delivery session, instantly end any active session
+  // for that table or session. Best-effort — a failure must not fail the request.
+  if (order.status === "COMPLETED" && (order.tableId || order.tableSessionId)) {
     try {
       // End THIS order's session, not the whole table — and only once nothing
       // else on that session is still outstanding. A diner can place several
@@ -1583,7 +1583,7 @@ async function update(req: Request, id: string | null): Promise<Response> {
       // and numbered here, an unpaid one is left open and flagged.
       await admin().rpc("settle_check_on_session_end", {
         p_tenant: order.tenantId,
-        p_table: order.tableId,
+        p_table: order.tableId ?? null,
         p_actor: null,
         p_session: order.tableSessionId ?? null,
       });
@@ -1598,9 +1598,17 @@ async function update(req: Request, id: string | null): Promise<Response> {
     order,
     sessionToken: await sessionTokenFor(order),
   });
-  if (order.status === "COMPLETED" && order.tableId) {
+  if (order.status === "COMPLETED" && (order.tableId || order.tableSessionId)) {
     await publishToStaff(order.tenantId, "SESSION_ENDED", {
-      order: { id: order.id, tableId: order.tableId, status: "COMPLETED" },
+      sessionId: order.tableSessionId ?? null,
+      tableId: order.tableId ?? null,
+      status: "ENDED",
+      order: { id: order.id, tableId: order.tableId, sessionId: order.tableSessionId, status: "COMPLETED" },
+    });
+    await publishToStaff(order.tenantId, "SESSION_UPDATED", {
+      sessionId: order.tableSessionId ?? null,
+      tableId: order.tableId ?? null,
+      status: "ENDED",
     });
   }
 
@@ -2018,9 +2026,9 @@ async function sync(req: Request): Promise<Response> {
     for (const c of checkRows) {
       checks[c.id] = {
         orderCount: 0,
-        subtotal: Number(c.subtotal ?? 0),
-        tax: Number(c.tax ?? 0),
-        total: Number(c.total ?? 0),
+        subtotal: 0,
+        tax: 0,
+        total: 0,
         paid: Number(c.paid_total ?? 0),
         outstanding: 0,
         status: c.status,
@@ -2032,10 +2040,17 @@ async function sync(req: Request): Promise<Response> {
       const c = checks[(o as any).check_id];
       if (!c) continue;
       c.orderCount += 1;
-      if (c.status !== "PAID") {
-        c.subtotal += Number((o as any).items_total ?? 0) - Number((o as any).discount ?? 0);
-        c.tax += Number((o as any).tax ?? 0);
-        c.total += Number((o as any).total ?? 0);
+      c.subtotal += Number((o as any).items_total ?? 0) - Number((o as any).discount ?? 0);
+      c.tax += Number((o as any).tax ?? 0);
+      c.total += Number((o as any).total ?? 0);
+    }
+    for (const c of checkRows) {
+      const entry = checks[c.id];
+      if (!entry) continue;
+      if (entry.orderCount === 0 || entry.status === "PAID") {
+        entry.subtotal = Number(c.subtotal ?? 0);
+        entry.tax = Number(c.tax ?? 0);
+        entry.total = Number(c.total ?? 0);
       }
     }
     for (const p of checkPayments) {

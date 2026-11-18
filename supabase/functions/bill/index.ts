@@ -556,53 +556,73 @@ async function auditMoney(
 }
 
 async function broadcastCheck(tenantId: string, checkId: string, reason: string) {
-  await publishToStaff(tenantId, "CHECK_UPDATED", { checkId, reason });
-
   const { data: check } = await admin()
     .from("table_checks")
-    .select("table_id, session_id")
+    .select("table_id, session_id, anchor_session_id, status, invoice_number")
     .eq("id", checkId)
     .eq("tenant_id", tenantId)
     .maybeSingle();
   if (!check) return;
 
-  if (check.session_id) {
+  const targetSessionId = check.session_id || check.anchor_session_id;
+  const isPaid = reason === "FINALISED" || check.status === "PAID";
+
+  await publishToStaff(tenantId, "CHECK_UPDATED", {
+    checkId,
+    tableId: check.table_id,
+    sessionId: targetSessionId,
+    status: isPaid ? "PAID" : check.status,
+    reason,
+    invoiceNumber: check.invoice_number ?? null,
+  });
+
+  if (targetSessionId) {
     if (reason === "FINALISED") {
       await publishToStaff(tenantId, "SESSION_ENDED", {
         tableId: check.table_id,
-        sessionId: check.session_id,
+        sessionId: targetSessionId,
         status: "ENDED",
+        endedAt: new Date().toISOString(),
+        invoiceNumber: check.invoice_number ?? null,
+        order: { sessionId: targetSessionId, status: "ENDED" },
       });
       await publishToStaff(tenantId, "SESSION_UPDATED", {
         tableId: check.table_id,
-        sessionId: check.session_id,
+        sessionId: targetSessionId,
         status: "ENDED",
       });
     }
     const { data: s } = await admin()
       .from("table_sessions")
       .select("token")
-      .eq("id", check.session_id)
+      .eq("id", targetSessionId)
       .maybeSingle();
     if (s?.token) {
-      publishToDiner(s.token, "CHECK_UPDATED", { checkId, reason });
+      publishToDiner(s.token, "CHECK_UPDATED", { checkId, reason, status: isPaid ? "PAID" : check.status });
       if (reason === "FINALISED") {
         publishToDiner(s.token, "SESSION_ENDED", {
           tableId: check.table_id,
-          sessionId: check.session_id,
+          sessionId: targetSessionId,
           status: "ENDED",
         });
       }
     }
-  } else {
+  } else if (check.table_id) {
     const { data: sessions } = await admin()
       .from("table_sessions")
-      .select("token")
+      .select("id, token")
       .eq("table_id", check.table_id)
       .eq("tenant_id", tenantId)
       .eq("status", "ACTIVE");
     for (const s of sessions ?? []) {
       publishToDiner(s.token, "CHECK_UPDATED", { checkId, reason });
+      if (reason === "FINALISED") {
+        publishToDiner(s.token, "SESSION_ENDED", {
+          tableId: check.table_id,
+          sessionId: s.id,
+          status: "ENDED",
+        });
+      }
     }
   }
 }
@@ -759,6 +779,7 @@ async function settleCash(req: Request): Promise<Response> {
     tableId: tblId,
     checkId: chkId,
     sessionId: sessId,
+    status: "PAID",
     reason: "FINALISED",
     invoiceNumber: invNum,
   });
@@ -769,6 +790,7 @@ async function settleCash(req: Request): Promise<Response> {
       status: "ENDED",
       endedAt: new Date().toISOString(),
       invoiceNumber: invNum,
+      order: { sessionId: sessId, status: "ENDED" },
     });
     await publishToStaff(tid, "SESSION_UPDATED", {
       tableId: tblId,

@@ -308,8 +308,16 @@ async function endTableSession(params: { tenantId: string; sessionId?: string; t
  * which every diner could also read.
  */
 async function publishSessionEnded(tenantId: string, payload: any, sessionToken?: string | null) {
-  await publishToStaff(tenantId, "SESSION_ENDED", { order: payload });
-  if (sessionToken) publishToDiner(sessionToken, "SESSION_ENDED", { order: payload });
+  const staffPayload = {
+    ...payload,
+    sessionId: payload?.sessionId ?? payload?.id,
+    tableId: payload?.tableId ?? null,
+    status: "ENDED",
+    order: payload,
+  };
+  await publishToStaff(tenantId, "SESSION_ENDED", staffPayload);
+  await publishToStaff(tenantId, "SESSION_UPDATED", staffPayload);
+  if (sessionToken) publishToDiner(sessionToken, "SESSION_ENDED", staffPayload);
 }
 
 function mapTable(row: any) {
@@ -684,8 +692,38 @@ async function active(req: Request): Promise<Response> {
     (s as any).check = (s.id && checkBySession[s.id]) || (s.tableId && checkByTable[s.tableId]) || null;
   }
 
+  // Exclude sessions that have ended and are fully paid / have no outstanding balance,
+  // as well as abandoned empty sessions with 0 orders and 0 check total.
+  const activeSessions = sessions.filter((s) => {
+    const chk = (s.id && checkBySession[s.id]) || (s.tableId && checkByTable[s.tableId]);
+    const orders = s.order_rows || [];
+    const liveOrders = orders.filter((o: any) => o.status !== "CANCELLED" && o.status !== "PENDING_ACTIVATION");
+
+    if (s.status === "ENDED") {
+      // An ended session with zero due or paid check is completely finished
+      if (!chk || chk.status === "PAID" || chk.outstanding <= 0.01) {
+        return false;
+      }
+    }
+
+    if (s.status === "ACTIVE") {
+      // If check is already PAID and all orders are completed, it is finished
+      if (chk && chk.status === "PAID") return false;
+      if (chk && chk.total > 0 && chk.outstanding <= 0.01 && liveOrders.every((o: any) => o.status === "COMPLETED")) {
+        return false;
+      }
+      // If zero live orders and zero check total, exclude if older than 3 minutes
+      if (liveOrders.length === 0 && (!chk || chk.total <= 0)) {
+        const ageMs = Date.now() - new Date(s.createdAt).getTime();
+        if (ageMs > 3 * 60_000) return false;
+      }
+    }
+
+    return true;
+  });
+
   const byTable: Record<string, { id: string; tableId: string | null; table: any; orderType: string; customerName?: string; sessions: any[] }> = {};
-  for (const s of sessions) {
+  for (const s of activeSessions) {
     const groupKey = s.tableId ? s.tableId : `session-${s.id}`;
     if (!byTable[groupKey]) {
       const groupTable = s.table ?? {

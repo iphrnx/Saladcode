@@ -522,6 +522,13 @@ export function DashboardView() {
           outstanding = ordersTotal
         }
 
+        // Exclude fully paid, completed, ended, or abandoned empty sessions
+        if (s.status === 'ENDED') return
+        if (s.check?.status === 'PAID') return
+        if (groupCheck?.status === 'PAID' && totalLiveAtTable === 1) return
+        if (total > 0 && outstanding <= 0.01 && (s.check?.status === 'PAID' || (activeOrders.length > 0 && activeOrders.every((o: any) => o.status === 'COMPLETED')))) return
+        if (total === 0 && activeOrders.length === 0) return
+
         // Status derivation
         let statusLabel = 'active'
         let statusTone: 'amber' | 'emerald' | 'rose' | 'slate' = 'emerald'
@@ -571,6 +578,7 @@ export function DashboardView() {
       if (b.checkId && seenCheckIds.has(b.checkId)) continue
       if (b.sessionId && seenSessionIds.has(b.sessionId)) continue
       if (Number(b.outstanding || 0) <= 0.01) continue
+      if (b.status === 'PAID' || b.status === 'VOID') continue
 
       const alreadyRepresented = cards.some(
         (c) =>
@@ -736,6 +744,81 @@ export function DashboardView() {
     }
     preSelectSnapshotRef.current = null
   }
+
+  // Listen for payments and session closures broadcast across windows/tabs/realtime
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('BroadcastChannel' in window)) return
+    const bc = new BroadcastChannel('the_salad_orders_sync')
+    const handleMsg = (ev: MessageEvent) => {
+      const msg = ev?.data
+      if (!msg) return
+      if (msg.type === 'CHECK_UPDATED' || msg.type === 'SESSION_ENDED') {
+        const endedSessionId = msg.sessionId
+        const paidCheckId = msg.checkId
+        const isPaidOrEnded = msg.status === 'PAID' || msg.status === 'ENDED' || msg.reason === 'FINALISED'
+
+        if (isPaidOrEnded) {
+          // Immediately update local React state to remove settled card without waiting for poll
+          setSessions((prev) =>
+            prev
+              .map((group) => {
+                const updatedSessions = (group.sessions || []).filter((s: any) => {
+                  if (endedSessionId && s.id === endedSessionId) return false
+                  if (paidCheckId && s.check?.id === paidCheckId) return false
+                  return true
+                })
+                const isGroupCheckPaid = group.check?.id === paidCheckId
+                return {
+                  ...group,
+                  sessions: updatedSessions,
+                  check: isGroupCheckPaid ? { ...group.check, status: 'PAID', outstanding: 0 } : group.check,
+                }
+              })
+              .filter(
+                (g) =>
+                  (g.sessions && g.sessions.length > 0) ||
+                  (g.check && g.check.status !== 'PAID' && Number(g.check.outstanding || 0) > 0.01)
+              )
+          )
+
+          setPendingBills((prev) =>
+            prev.filter((b) => {
+              if (endedSessionId && b.sessionId === endedSessionId) return false
+              if (paidCheckId && b.checkId === paidCheckId) return false
+              return true
+            })
+          )
+
+          // If the selected session was the one that just settled, safely deselect and restore draft
+          if (endedSessionId && selectedSessionId === endedSessionId) {
+            if (tenantId && userId) {
+              clearPosSessionDraft(tenantId, userId, endedSessionId)
+            }
+            const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
+            if (pre) {
+              replaceCart(pre.cart)
+              setSessionContext(pre.selectedTableId, null, pre.orderType)
+              setCustomerName(pre.customerName ?? '')
+              setCustomerPhone(pre.customerPhone ?? '')
+              setPromoCode(pre.promoCode ?? '')
+            } else {
+              setSelectedSessionId(null)
+            }
+            preSelectSnapshotRef.current = null
+          }
+
+          // Trigger a background re-sync
+          void loadSessions()
+        }
+      }
+    }
+
+    bc.addEventListener('message', handleMsg)
+    return () => {
+      bc.removeEventListener('message', handleMsg)
+      bc.close()
+    }
+  }, [selectedSessionId, tenantId, userId, loadSessions, replaceCart, setSessionContext, setSelectedSessionId])
 
   const endSession = async (tableId: string, tableName?: string, force = false, sessionId?: string) => {
     setEndingTable(sessionId ? `${tableId}:${sessionId}` : tableId)
