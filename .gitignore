@@ -31,3 +31,7 @@ npm-debug.log*
 # Supabase local
 .supabase/
 
+# Cloudflare & OpenNext
+.open-next/
+.wrangler/
+

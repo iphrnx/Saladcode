@@ -387,14 +387,13 @@ export function OrdersView() {
   const sittings = useMemo<Sitting[]>(() => {
     const buckets = new Map<string, Order[]>()
     for (const o of orders) {
-      // Takeaway and Delivery orders are strictly self-contained and identified exclusively by order:id
       const isTakeawayOrDelivery = o.orderType === 'TAKEAWAY' || o.orderType === 'DELIVERY'
-      const key = isTakeawayOrDelivery
-        ? `order:${o.id}`
-        : o.tableSessionId
-          ? `session:${o.tableSessionId}`
-          : o.checkId
-            ? `check:${o.checkId}`
+      const key = o.tableSessionId
+        ? `session:${o.tableSessionId}`
+        : o.checkId
+          ? `check:${o.checkId}`
+          : isTakeawayOrDelivery
+            ? `order:${o.id}`
             : (o.orderType === 'DINE_IN' && o.tableId)
               ? `table:${o.tableId}`
               : `order:${o.id}`
@@ -878,7 +877,7 @@ export function OrdersView() {
    * ending by table alone would close the other party's sitting too.
    */
   const endSitting = async (sitting: Sitting, force = false) => {
-    if (!sitting.tableId || endingSession) return
+    if ((!sitting.tableId && !sitting.sessionId) || endingSession) return
     const targetKey = sitting.sessionId ?? sitting.tableId
     setEndingSession(targetKey)
     try {
@@ -886,7 +885,7 @@ export function OrdersView() {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-tenant-id': tenant!.id },
         body: JSON.stringify({
-          tableId: sitting.tableId,
+          ...(sitting.tableId ? { tableId: sitting.tableId } : {}),
           ...(sitting.sessionId ? { sessionId: sitting.sessionId } : {}),
           force,
         }),
@@ -2378,7 +2377,9 @@ function SittingCard({
       : Math.max(0, billTotal - billPaid)
   const cardName = sitting.tableName
     ? (sitting.sessionLabel ? `${sitting.tableName} · ${sitting.sessionLabel}` : sitting.tableName)
-    : `Order #${sitting.latest.orderNumber}`
+    : (sitting.latest.customerName
+        ? `${ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType} · ${sitting.latest.customerName}`
+        : `Order #${sitting.latest.orderNumber}`)
   const sessionStats = [
     { icon: ClipboardCheck, label: `${validOrders.length} Order${validOrders.length === 1 ? '' : 's'}` },
     { icon: Layers, label: `${sitting.qtyCount} Item${sitting.qtyCount === 1 ? '' : 's'}` },
@@ -2440,9 +2441,9 @@ function SittingCard({
             <DropdownMenuItem onClick={() => onOpenOrders(sitting)}>
               <Layers className="mr-2 size-4" /> View orders &amp; bill
             </DropdownMenuItem>
-            {sitting.tableId && (
+            {canEndSession && (
               <DropdownMenuItem
-                disabled={!canEndSession || !active || ending}
+                disabled={!active || ending}
                 onClick={() => onEndSession(sitting)}
               >
                 <XCircle className="mr-2 size-4" /> {ending ? 'Ending…' : 'End session'}

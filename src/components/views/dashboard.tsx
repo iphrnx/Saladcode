@@ -462,9 +462,12 @@ export function DashboardView() {
   const activeSessionCards = useMemo(() => {
     interface SessionCardItem {
       id: string
-      tableId: string
+      sessionId?: string
+      tableId: string | null
       tableName: string
       area?: string
+      orderType?: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
+      customerName?: string
       sessionNumber?: number | null
       total: number
       paid: number
@@ -529,12 +532,23 @@ export function DashboardView() {
           statusTone = 'slate'
         }
 
+        const isTakeawayOrDelivery = s.orderType === 'TAKEAWAY' || s.orderType === 'DELIVERY' || !group.tableId
+        const derivedOrderType = (s.orderType || (group.tableId ? 'DINE_IN' : 'TAKEAWAY')) as 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
+        const displayName = isTakeawayOrDelivery
+          ? (s.customerName
+              ? `${derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'} · ${s.customerName}`
+              : (group.table?.name || (derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery')))
+          : (group.table?.name || 'Table')
+
         cards.push({
           id: `sess-${s.id}`,
-          tableId: group.tableId,
-          tableName: group.table?.name || 'Table',
-          area: group.table?.area,
-          sessionNumber: totalLiveAtTable > 1 ? idx + 1 : null,
+          sessionId: s.id,
+          tableId: group.tableId ?? null,
+          tableName: displayName,
+          orderType: derivedOrderType,
+          customerName: s.customerName,
+          area: isTakeawayOrDelivery ? (derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery') : group.table?.area,
+          sessionNumber: totalLiveAtTable > 1 && group.tableId ? idx + 1 : null,
           total: +total.toFixed(2),
           paid: +paid.toFixed(2),
           outstanding: +outstanding.toFixed(2),
@@ -657,10 +671,15 @@ export function DashboardView() {
       } else if (floorTable?.check?.sessionId) {
         activeSessionId = floorTable.check.sessionId
       }
-    }
-    if (orderType !== 'DINE_IN' && !customerName.trim()) {
-      toast.error('Please enter customer name')
-      return
+    } else {
+      // Takeaway or Delivery
+      if (selectedSessionId) {
+        activeSessionId = selectedSessionId
+      }
+      if (!customerName.trim() && !activeSessionId) {
+        toast.error('Please enter customer name')
+        return
+      }
     }
     // Snapshot the checkout into the persistent queue and hand it the
     // idempotency key. Online, it confirms in a moment; offline, it keeps the
@@ -681,12 +700,12 @@ export function DashboardView() {
       'pos',
       {
         tableId: orderType === 'DINE_IN' ? selectedTableId : null,
-        tableSessionId: orderType === 'DINE_IN' ? (activeSessionId || undefined) : undefined,
+        tableSessionId: activeSessionId || undefined,
         orderType,
         items,
         promoCode: promoCode || undefined,
-        customerName: orderType !== 'DINE_IN' ? customerName : undefined,
-        customerPhone: orderType !== 'DINE_IN' ? customerPhone : undefined,
+        customerName: orderType !== 'DINE_IN' ? (customerName.trim() || undefined) : undefined,
+        customerPhone: orderType !== 'DINE_IN' ? (customerPhone.trim() || undefined) : undefined,
         servedById: data.currentUser.id,
       },
       items.length,
@@ -874,52 +893,75 @@ export function DashboardView() {
               </p>
             ) : (
               <div className="flex gap-3 overflow-x-auto scrollbar-thin pb-2">
-                {activeSessionCards.map((card) => (
-                  <div
-                    key={card.id}
-                    data-active-session-card
-                    className={cn(
-                      'w-56 shrink-0 rounded-2xl border bg-card p-3.5 text-left select-none transition-colors',
-                      card.statusTone === 'amber'
-                        ? 'border-amber-500/40 dark:border-amber-500/30'
-                        : card.statusTone === 'emerald'
-                          ? 'border-emerald-500/30 dark:border-emerald-500/20'
-                          : 'border-border/80'
-                    )}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <p className="truncate font-semibold text-foreground">
-                        {card.tableName}
-                        {card.sessionNumber ? ` · Sitting #${card.sessionNumber}` : ''}
-                      </p>
-                      <span
-                        className={cn(
-                          'shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium',
-                          card.statusTone === 'amber'
-                            ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
+                {activeSessionCards.map((card) => {
+                  const isSelected = Boolean(card.sessionId && selectedSessionId === card.sessionId)
+                  return (
+                    <div
+                      key={card.id}
+                      data-active-session-card
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => {
+                        if (!card.sessionId) return
+                        if (selectedSessionId === card.sessionId) {
+                          setSelectedSessionId(null)
+                        } else {
+                          setSelectedSessionId(card.sessionId)
+                          if (card.tableId) {
+                            setOrderType('DINE_IN')
+                            setSelectedTableId(card.tableId)
+                          } else {
+                            if (card.orderType) setOrderType(card.orderType)
+                            setSelectedTableId(null)
+                            if (card.customerName) setCustomerName(card.customerName)
+                          }
+                        }
+                      }}
+                      className={cn(
+                        'w-56 shrink-0 rounded-2xl border bg-card p-3.5 text-left select-none transition-all cursor-pointer',
+                        isSelected
+                          ? 'ring-2 ring-primary border-primary bg-primary/5 shadow-sm'
+                          : card.statusTone === 'amber'
+                            ? 'border-amber-500/40 dark:border-amber-500/30 hover:border-amber-500/60'
                             : card.statusTone === 'emerald'
-                              ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
-                              : 'bg-secondary text-muted-foreground'
-                        )}
-                      >
-                        {card.statusLabel}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-[11px] text-muted-foreground">
-                      {card.area ? `${card.area} · ` : ''}
-                      <span className={cn(card.outstanding > 0 ? 'font-medium text-foreground' : '')}>
+                              ? 'border-emerald-500/30 dark:border-emerald-500/20 hover:border-emerald-500/50'
+                              : 'border-border/80 hover:border-border'
+                      )}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="truncate font-semibold text-foreground">
+                          {card.tableName}
+                          {card.sessionNumber ? ` · Sitting #${card.sessionNumber}` : ''}
+                        </p>
+                        <span
+                          className={cn(
+                            'shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium',
+                            card.statusTone === 'amber'
+                              ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
+                              : card.statusTone === 'emerald'
+                                ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
+                                : 'bg-secondary text-muted-foreground'
+                          )}
+                        >
+                          {card.statusLabel}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-[11px] text-muted-foreground">
+                        {card.area ? `${card.area} · ` : ''}
+                        <span className={cn(card.outstanding > 0 ? 'font-medium text-foreground' : '')}>
+                          {tenant.currencySymbol}
+                          {Number(card.outstanding).toLocaleString('en-IN')} due
+                        </span>
+                      </p>
+                      <p className="mt-0.5 text-[10.5px] text-muted-foreground">
                         {tenant.currencySymbol}
-                        {Number(card.outstanding).toLocaleString('en-IN')} due
-                      </span>
-                    </p>
-                    <p className="mt-0.5 text-[10.5px] text-muted-foreground">
-                      {tenant.currencySymbol}
-                      {Number(card.paid).toLocaleString('en-IN')} of{' '}
-                      {tenant.currencySymbol}
-                      {Number(card.total).toLocaleString('en-IN')} paid
-                    </p>
-                  </div>
-                ))}
+                        {Number(card.paid).toLocaleString('en-IN')} of{' '}
+                        {tenant.currencySymbol}
+                        {Number(card.total).toLocaleString('en-IN')} paid
+                      </p>
+                    </div>
+                  )
+                })}
               </div>
             )}
           </div>
@@ -1396,19 +1438,35 @@ function CartPanel(p: CartPanelProps) {
             )}
           </div>
         ) : (
-          <div className="grid grid-cols-2 gap-2">
-            <Input
-              value={p.customerName}
-              onChange={(e) => p.setCustomerName(e.target.value)}
-              placeholder="Customer name"
-              className="bg-secondary/50 border-border text-sm h-9"
-            />
-            <Input
-              value={p.customerPhone}
-              onChange={(e) => p.setCustomerPhone(e.target.value)}
-              placeholder="Phone"
-              className="bg-secondary/50 border-border text-sm h-9"
-            />
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-2">
+              <Input
+                value={p.customerName}
+                onChange={(e) => p.setCustomerName(e.target.value)}
+                placeholder="Customer name"
+                className="bg-secondary/50 border-border text-sm h-9"
+              />
+              <Input
+                value={p.customerPhone}
+                onChange={(e) => p.setCustomerPhone(e.target.value)}
+                placeholder="Phone"
+                className="bg-secondary/50 border-border text-sm h-9"
+              />
+            </div>
+            {p.selectedSessionId && (
+              <div className="flex items-center justify-between rounded-lg border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-[11px]">
+                <span className="font-medium text-primary truncate">
+                  Adding to active {p.orderType === 'TAKEAWAY' ? 'takeaway' : 'delivery'} sitting ({p.selectedSessionId.slice(0, 8)})
+                </span>
+                <button
+                  type="button"
+                  onClick={() => p.setSelectedSessionId(null)}
+                  className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 ml-2 underline"
+                >
+                  New Sitting
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

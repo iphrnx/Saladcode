@@ -1,10 +1,13 @@
 {
-  "name": "the-salad",
+  "name": "saladcode",
   "version": "0.2.1",
   "private": true,
   "scripts": {
     "dev": "next dev -p ${PORT:-3001} 2>&1 | tee dev.log",
-    "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
+    "build": "opennextjs-cloudflare build",
+    "build:next": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
+    "preview": "opennextjs-cloudflare build && wrangler dev",
+    "deploy": "opennextjs-cloudflare build && wrangler deploy",
     "start": "NODE_ENV=production node .next/standalone/server.js 2>&1 | tee server.log",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
@@ -129,6 +132,7 @@
     "zustand": "^5.0.6"
   },
   "devDependencies": {
+    "@opennextjs/cloudflare": "^1.20.17",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^26.6.4",
     "@types/react": "^19",
@@ -139,7 +143,8 @@
     "tailwindcss": "^4",
     "tsx": "^4.23.15",
     "tw-animate-css": "^1.3.5",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wrangler": "^4.164.0"
   },
   "description": "The Salad — multitenant restaurant platform"
 }

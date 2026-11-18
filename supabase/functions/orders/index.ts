@@ -716,42 +716,62 @@ async function create(req: Request): Promise<Response> {
     let tableId: string | null = null;
     let tableSessionId: string | null = null;
 
-    if (b.tableId) {
-      tableId = b.tableId;
+    if (orderType === "DINE_IN" || b.tableId) {
+      if (b.tableId) {
+        tableId = b.tableId;
+        if (b.tableSessionId) {
+          tableSessionId = String(b.tableSessionId);
+          // Verify requested session exists on this table and is active
+          const { data: requestedSession } = await db
+            .from("table_sessions")
+            .select("id, status")
+            .eq("tenant_id", tenantId)
+            .eq("table_id", tableId)
+            .eq("id", tableSessionId)
+            .maybeSingle();
+          if (!requestedSession || requestedSession.status !== "ACTIVE") {
+            return json(req, {
+              error: "Selected diner session is not active or not found on this table. Please refresh and select an active sitting.",
+              code: "SESSION_INACTIVE",
+            }, 400);
+          }
+        } else {
+          // Safe resolution when no session was explicitly specified:
+          // If multiple active diner sittings exist on this table, reject ambiguous placement
+          // to prevent cross-diner billing corruption.
+          const { data: activeSessions } = await db
+            .from("table_sessions")
+            .select("id")
+            .eq("tenant_id", tenantId)
+            .eq("table_id", tableId)
+            .eq("status", "ACTIVE");
+          if (activeSessions && activeSessions.length > 1) {
+            return json(req, {
+              error: "This table has multiple active diner sessions. Please select the specific sitting/check before placing an order.",
+              code: "AMBIGUOUS_TABLE_SESSION",
+            }, 400);
+          }
+          if (activeSessions && activeSessions.length === 1) {
+            tableSessionId = activeSessions[0].id;
+          }
+        }
+      }
+    } else if (orderType === "TAKEAWAY" || orderType === "DELIVERY") {
+      tableId = null;
       if (b.tableSessionId) {
         tableSessionId = String(b.tableSessionId);
-        // Verify requested session exists on this table and is active
+        // Verify requested session exists, matches order type, belongs to tenant, and is active
         const { data: requestedSession } = await db
           .from("table_sessions")
-          .select("id, status")
+          .select("id, status, order_type")
           .eq("tenant_id", tenantId)
-          .eq("table_id", tableId)
           .eq("id", tableSessionId)
           .maybeSingle();
-        if (!requestedSession || requestedSession.status !== "ACTIVE") {
+        if (!requestedSession || requestedSession.status !== "ACTIVE" || requestedSession.order_type !== orderType) {
           return json(req, {
-            error: "Selected diner session is not active or not found on this table. Please refresh and select an active sitting.",
+            error: `Selected ${orderType.toLowerCase()} session is no longer active. Please refresh and select an active session or create a new order.`,
             code: "SESSION_INACTIVE",
           }, 400);
-        }
-      } else {
-        // Safe resolution when no session was explicitly specified:
-        // If multiple active diner sittings exist on this table, reject ambiguous placement
-        // to prevent cross-diner billing corruption.
-        const { data: activeSessions } = await db
-          .from("table_sessions")
-          .select("id")
-          .eq("tenant_id", tenantId)
-          .eq("table_id", tableId)
-          .eq("status", "ACTIVE");
-        if (activeSessions && activeSessions.length > 1) {
-          return json(req, {
-            error: "This table has multiple active diner sessions. Please select the specific sitting/check before placing an order.",
-            code: "AMBIGUOUS_TABLE_SESSION",
-          }, 400);
-        }
-        if (activeSessions && activeSessions.length === 1) {
-          tableSessionId = activeSessions[0].id;
         }
       }
     }

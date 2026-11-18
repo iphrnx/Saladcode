@@ -616,6 +616,10 @@ async function active(req: Request): Promise<Response> {
       id: row.id,
       tenantId: row.tenant_id,
       tableId: row.table_id,
+      orderType: row.order_type || (row.table_id ? "DINE_IN" : "TAKEAWAY"),
+      customerName: row.customer_name,
+      customerPhone: row.customer_phone,
+      notes: row.notes,
       status: row.status,
       activationStatus: String(row.activation_status ?? "ACTIVE"),
       deviceFp: row.device_fp,
@@ -638,23 +642,23 @@ async function active(req: Request): Promise<Response> {
   });
 
   // The running bill for each table and individual session, so cards show
-  // what is owed accurately, including multiple independent diner sessions at one table.
-  const tableIds = [...new Set(sessions.map((s) => s.tableId))];
+  // what is owed accurately, including multiple independent diner sessions at one table
+  // and independent Takeaway & Delivery sessions.
+  const tableIds = [...new Set(sessions.map((s) => s.tableId).filter(Boolean))] as string[];
   const sessionIds = sessions.map((s) => s.id);
   const checkBySession: Record<string, { id: string; total: number; paid: number; outstanding: number; status: string }> = {};
   const checkByTable: Record<string, { id: string; total: number; paid: number; outstanding: number; status: string }> = {};
 
-  if (tableIds.length) {
+  if (tableIds.length || sessionIds.length) {
     let checkQuery = admin()
       .from("table_checks")
       .select("id, table_id, session_id, anchor_session_id, status, total, paid_total, opened_at")
       .eq("tenant_id", tenantId);
 
-    if (sessionIds.length) {
-      checkQuery = checkQuery.or(`table_id.in.(${tableIds.join(",")}),session_id.in.(${sessionIds.join(",")})`);
-    } else {
-      checkQuery = checkQuery.in("table_id", tableIds);
-    }
+    const orConditions: string[] = [];
+    if (tableIds.length) orConditions.push(`table_id.in.(${tableIds.join(",")})`);
+    if (sessionIds.length) orConditions.push(`session_id.in.(${sessionIds.join(",")})`);
+    checkQuery = checkQuery.or(orConditions.join(","));
 
     const { data: checks } = await checkQuery.order("opened_at", { ascending: false });
 
@@ -668,7 +672,7 @@ async function active(req: Request): Promise<Response> {
       if (c.anchor_session_id && !checkBySession[c.anchor_session_id]) {
         checkBySession[c.anchor_session_id] = entry;
       }
-      if (!checkByTable[c.table_id]) {
+      if (c.table_id && !checkByTable[c.table_id]) {
         checkByTable[c.table_id] = entry;
       }
     }
@@ -676,19 +680,37 @@ async function active(req: Request): Promise<Response> {
 
   // Attach session-level checks to each session row
   for (const s of sessions) {
-    (s as any).check = (s.id && checkBySession[s.id]) || checkByTable[s.tableId] || null;
+    (s as any).check = (s.id && checkBySession[s.id]) || (s.tableId && checkByTable[s.tableId]) || null;
   }
 
-  const byTable: Record<string, { id: string; tableId: string; table: any; sessions: any[] }> = {};
+  const byTable: Record<string, { id: string; tableId: string | null; table: any; orderType: string; customerName?: string; sessions: any[] }> = {};
   for (const s of sessions) {
-    if (!byTable[s.tableId]) {
-      byTable[s.tableId] = { id: s.id, tableId: s.tableId, table: s.table, sessions: [] };
+    const groupKey = s.tableId ? s.tableId : `session-${s.id}`;
+    if (!byTable[groupKey]) {
+      const groupTable = s.table ?? {
+        id: null,
+        name: s.customerName ? `${s.orderType === "TAKEAWAY" ? "Takeaway" : "Delivery"} · ${s.customerName}` : (s.orderType === "TAKEAWAY" ? "Takeaway" : "Delivery"),
+        area: s.orderType,
+        seats: 0,
+        active: true,
+      };
+      byTable[groupKey] = {
+        id: s.id,
+        tableId: s.tableId,
+        table: groupTable,
+        orderType: s.orderType,
+        customerName: s.customerName,
+        sessions: [],
+      };
     }
-    byTable[s.tableId].sessions.push(s);
+    byTable[groupKey].sessions.push(s);
   }
 
   // Attach the bill figures to each group.
-  const groups = Object.values(byTable).map((g) => ({ ...g, check: checkByTable[g.tableId] ?? null }));
+  const groups = Object.values(byTable).map((g) => ({
+    ...g,
+    check: (g.tableId && checkByTable[g.tableId]) || (g.sessions[0]?.id && checkBySession[g.sessions[0].id]) || null,
+  }));
 
   // Bills with money still due, including sittings that have already ended.
   // A session that closes unpaid used to vanish from the floor board and leave
@@ -863,16 +885,16 @@ async function endSession(req: Request): Promise<Response> {
   // and closed; one that still owes money stays OPEN, carrying what is due.
   // Never marked paid, never deleted.
   let settlement: any = null;
-  if (tableId) {
+  if (tableId || sessionId) {
     const { data } = await admin().rpc("settle_check_on_session_end", {
       p_tenant: tenantId,
-      p_table: tableId,
+      p_table: tableId ?? null,
       p_actor: g.session.kind === "owner" ? g.session.subjectId : null,
       p_session: sessionId ?? null,
     });
     settlement = data;
     if ((data as any)?.action === "finalized") {
-      await publishToStaff(tenantId, "CHECK_UPDATED", { tableId, sessionId, reason: "FINALISED" });
+      await publishToStaff(tenantId, "CHECK_UPDATED", { tableId: tableId ?? null, sessionId: sessionId ?? null, reason: "FINALISED" });
     }
   }
 

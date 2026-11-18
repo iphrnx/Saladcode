@@ -138,7 +138,7 @@ export function TableCheckDialog({
   const canSettle = Boolean(data && data.status === 'OPEN' && outstanding <= 0 && (data.totals?.total ?? 0) > 0)
 
   const addPayment = async () => {
-    if (!data || !tableId) return
+    if (!data || (!tableId && !checkId && !data.checkId)) return
     const value = Number(amount)
     if (!Number.isFinite(value) || value <= 0) {
       toast.error('Enter an amount greater than zero')
@@ -150,7 +150,8 @@ export function TableCheckDialog({
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          tableId,
+          checkId: checkId || data.checkId,
+          tableId: tableId || undefined,
           amount: value,
           idempotencyKey: payKey ?? undefined,
         }),
@@ -173,13 +174,16 @@ export function TableCheckDialog({
   }
 
   const settle = async () => {
-    if (!data || !tableId) return
+    if (!data || (!tableId && !checkId && !data.checkId)) return
     setBusy('settle')
     try {
       const res = await edgeFetch('/api/bill/finalize', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ tableId }),
+        body: JSON.stringify({
+          checkId: checkId || data.checkId,
+          tableId: tableId || undefined,
+        }),
       })
       if (res.status === 409) {
         const body = await res.json().catch(() => null)
