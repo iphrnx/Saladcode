@@ -532,6 +532,7 @@ async function priceAndCommitOnce(
 
   if (txError) {
     const msg = String(txError.message ?? "");
+    const code = String((txError as any).code ?? "");
     // The in-transaction guards rejected a line or the promo after pricing —
     // something changed in the few milliseconds since. The caller re-prices
     // and retries once with the same key; the first attempt left nothing.
@@ -540,7 +541,7 @@ async function priceAndCommitOnce(
     }
     // Concurrency defense (Fix C1): if an idempotency key conflict occurred,
     // look up the existing order and return it as deduplicated.
-    if (idempotencyKey && (msg.includes("orders_idempotency_key_idx") || msg.includes("unique constraint"))) {
+    if (idempotencyKey && (msg.includes("orders_idempotency_key_idx") || msg.includes("unique constraint") || code === "23505")) {
       const { data: existing } = await db
         .from("orders")
         .select("id")
@@ -564,6 +565,30 @@ async function priceAndCommitOnce(
         }
       }
     }
+
+    // Specific deterministic client/session/validation errors from PL/pgSQL
+    if (
+      msg.includes("SESSION_INVALID_OR_ENDED") ||
+      msg.includes("AMBIGUOUS_TABLE_SESSION") ||
+      msg.includes("TABLE_REQUIRED_FOR_DINE_IN") ||
+      msg.includes("INVALID_STATUS") ||
+      code === "P0001" ||
+      code === "22P02" ||
+      code === "23502" ||
+      code === "23503"
+    ) {
+      console.warn("Order validation/session rejection:", { code, msg });
+      const clientMsg =
+        msg.includes("SESSION_INVALID_OR_ENDED")
+          ? "This session has ended or is invalid. Please select an active session or refresh."
+          : msg.includes("AMBIGUOUS_TABLE_SESSION")
+          ? "Multiple active sessions found for this table. Please select the specific session card."
+          : msg.includes("TABLE_REQUIRED_FOR_DINE_IN")
+          ? "A table must be selected for Dine-in orders."
+          : msg || "Invalid order details.";
+      return { ok: false, error: clientMsg, status: 400 };
+    }
+
     console.error("Order transaction error:", txError);
     return { ok: false, error: "Unable to place order. Please try again.", status: 500 };
   }
@@ -1760,6 +1785,7 @@ async function addItem(req: Request, orderId: string): Promise<Response> {
 
   if (txError) {
     const msg = String(txError.message ?? "");
+    const code = String((txError as any).code ?? "");
     if (msg.includes("ORDER_NOT_FOUND")) {
       return json(req, { error: "Order not found" }, 404);
     }
@@ -1774,6 +1800,10 @@ async function addItem(req: Request, orderId: string): Promise<Response> {
     }
     if (msg.includes("ITEM_UNAVAILABLE")) {
       return json(req, { error: "One or more items are no longer available." }, 400);
+    }
+    if (code === "P0001" || code === "22P02" || code === "23502" || code === "23503") {
+      console.warn("Add items validation error:", { code, msg });
+      return json(req, { error: msg || "Invalid item details." }, 400);
     }
     console.error("Add items error:", txError);
     return json(req, { error: "Unable to add items. Please try again." }, 500);

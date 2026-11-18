@@ -77,6 +77,53 @@ st().addToCart({ menuItemId: ITEM, name: "Spicy Handi Maggie", portion: "Spicy",
 st().subtractCartLines([{ menuItemId: ITEM, portion: "Spicy", portionId: PID, quantity: 1 } as any]);
 check("subtractCartLines decrements by payload identity", st().cart[0]?.quantity === 1, st().cart);
 
+// ── Multi-Session Cart Draft Isolation & Restoration ────────────────────────
+const { savePosSessionDraft, getPosSessionDraft, clearPosSessionDraft } = await import("../src/lib/pos-cart.ts");
+const backing = new Map<string, string>();
+(globalThis as any).window = (globalThis as any).window ?? globalThis;
+(globalThis as any).localStorage = {
+  getItem: (k: string) => backing.get(k) ?? null,
+  setItem: (k: string, v: string) => backing.set(k, v),
+  removeItem: (k: string) => backing.delete(k),
+};
+
+const T = "tenant-1";
+const U = "user-1";
+
+// 1. Default draft (unattached new order)
+savePosSessionDraft(T, U, null, {
+  cart: [{ menuItemId: "m1", name: "Chai", price: 20, quantity: 2 }],
+  orderType: "TAKEAWAY",
+  selectedTableId: null,
+  customerName: "Rohan",
+  promoCode: "",
+});
+
+// 2. Session A draft (attached to active sitting sess-A)
+savePosSessionDraft(T, U, "sess-A", {
+  cart: [{ menuItemId: ITEM, name: "Spicy Handi Maggie", portion: "Spicy", portionId: PID, price: 89, quantity: 1 }],
+  orderType: "DINE_IN",
+  selectedTableId: "table-10",
+  customerName: "",
+  promoCode: "",
+});
+
+// Verify isolation: Session A and Default do not bleed into each other
+const defDraft = getPosSessionDraft(T, U, null);
+const sessADraft = getPosSessionDraft(T, U, "sess-A");
+check("default draft preserved independently", defDraft?.cart?.length === 1 && defDraft.cart[0].menuItemId === "m1", defDraft);
+check("session A draft preserved independently", sessADraft?.cart?.length === 1 && sessADraft.cart[0].portionId === PID, sessADraft);
+
+// Session B has no draft yet
+check("unvisited session B returns null draft", getPosSessionDraft(T, U, "sess-B") === null);
+
+// Clear Session A draft after order confirmation
+clearPosSessionDraft(T, U, "sess-A");
+check("session A draft cleared after checkout", getPosSessionDraft(T, U, "sess-A") === null);
+check("default draft remains untouched after session A checkout", getPosSessionDraft(T, U, null)?.cart?.length === 1);
+
+delete (globalThis as any).localStorage;
+
 st().clearCart();
 console.log(`\n${checks - bad}/${checks} passed`);
 process.exit(bad ? 1 : 0);

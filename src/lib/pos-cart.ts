@@ -27,6 +27,8 @@ export interface PosCartSnapshot {
   orderType: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
   selectedTableId: string | null
   selectedSessionId?: string | null
+  customerName?: string
+  customerPhone?: string
   promoCode: string
   savedAt: number
 }
@@ -35,26 +37,94 @@ function suffix(tenantId: string, userId: string): string {
   return `${tenantId}-${userId}`
 }
 
+function draftsSuffix(tenantId: string, userId: string): string {
+  return `${tenantId}-${userId}-drafts`
+}
+
+function sessionDraftKey(sessionKey?: string | null): string {
+  return sessionKey?.trim() ? `sess_${sessionKey.trim()}` : 'default'
+}
+
+/** Read all session drafts for this tenant+user. */
+export function getPosSessionDrafts(
+  tenantId: string,
+  userId: string,
+): Record<string, PosCartSnapshot> {
+  const raw = readStored('posCart', draftsSuffix(tenantId, userId))
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    return typeof parsed === 'object' && parsed !== null ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/** Save a draft for a specific session (or default unattached cart). */
+export function savePosSessionDraft(
+  tenantId: string,
+  userId: string,
+  sessionKey: string | null | undefined,
+  snapshot: Omit<PosCartSnapshot, 'savedAt'>,
+): void {
+  const drafts = getPosSessionDrafts(tenantId, userId)
+  const key = sessionDraftKey(sessionKey)
+  if (snapshot.cart.length === 0) {
+    delete drafts[key]
+  } else {
+    drafts[key] = { ...snapshot, savedAt: Date.now() }
+  }
+  writeStored('posCart', JSON.stringify(drafts), draftsSuffix(tenantId, userId))
+  writeStored('posCart', JSON.stringify({ ...snapshot, savedAt: Date.now() }), suffix(tenantId, userId))
+}
+
+/** Retrieve a draft for a specific session key. */
+export function getPosSessionDraft(
+  tenantId: string,
+  userId: string,
+  sessionKey: string | null | undefined,
+): PosCartSnapshot | null {
+  const drafts = getPosSessionDrafts(tenantId, userId)
+  const key = sessionDraftKey(sessionKey)
+  return drafts[key] ?? null
+}
+
+/** Remove a draft for a specific session after confirmed order creation. */
+export function clearPosSessionDraft(
+  tenantId: string,
+  userId: string,
+  sessionKey: string | null | undefined,
+): void {
+  const drafts = getPosSessionDrafts(tenantId, userId)
+  const key = sessionDraftKey(sessionKey)
+  delete drafts[key]
+  writeStored('posCart', JSON.stringify(drafts), draftsSuffix(tenantId, userId))
+}
+
 export function persistPosCart(
   tenantId: string,
   userId: string,
   snapshot: Omit<PosCartSnapshot, 'savedAt'>,
 ): void {
-  writeStored('posCart', JSON.stringify({ ...snapshot, savedAt: Date.now() }), suffix(tenantId, userId))
+  savePosSessionDraft(tenantId, userId, snapshot.selectedSessionId, snapshot)
 }
 
 export function restorePosCart(tenantId: string, userId: string): PosCartSnapshot | null {
   const raw = readStored('posCart', suffix(tenantId, userId))
-  if (!raw) return null
-  try {
-    const parsed = JSON.parse(raw)
-    if (!parsed || !Array.isArray(parsed.cart)) return null
-    return parsed as PosCartSnapshot
-  } catch {
-    return null
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw)
+      if (parsed && Array.isArray(parsed.cart)) return parsed as PosCartSnapshot
+    } catch {}
   }
+  const drafts = getPosSessionDrafts(tenantId, userId)
+  const defaultDraft = drafts['default']
+  if (defaultDraft && Array.isArray(defaultDraft.cart)) return defaultDraft
+  const firstDraft = Object.values(drafts)[0]
+  return firstDraft && Array.isArray(firstDraft.cart) ? firstDraft : null
 }
 
 export function clearPosCart(tenantId: string, userId: string): void {
   removeStored('posCart', suffix(tenantId, userId))
+  removeStored('posCart', draftsSuffix(tenantId, userId))
 }

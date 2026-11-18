@@ -161,13 +161,30 @@ export async function submitEntry(
       return { outcome: 'confirmed', order: await res.json() }
     }
     const err = await res.json().catch(() => ({}))
-    if (res.status >= 500) {
-      return { outcome: 'uncertain', error: cleanOrderErrorMessage(err?.error) }
+    const rawError = err?.error || ''
+    const lowerError = String(rawError).toLowerCase()
+
+    // Deterministic errors will not resolve with automated retries:
+    // client validation, session invalid/ended, table missing, unavailable dishes, or any 4xx.
+    const isDeterministic =
+      res.status < 500 ||
+      lowerError.includes('session') ||
+      lowerError.includes('table_required') ||
+      lowerError.includes('unavailable') ||
+      lowerError.includes('forbidden') ||
+      lowerError.includes('unauthorized') ||
+      lowerError.includes('invalid') ||
+      lowerError.includes('syntax') ||
+      lowerError.includes('p0001') ||
+      lowerError.includes('22p02')
+
+    if (!isDeterministic && res.status >= 500) {
+      return { outcome: 'uncertain', error: cleanOrderErrorMessage(rawError) }
     }
     // A real answer from the server: the cart is wrong, the session ended, or
     // the price changed. Retrying the same payload will not fix it — a human
     // needs to see this.
-    return { outcome: 'rejected', error: cleanOrderErrorMessage(err?.error || `Rejected (${res.status})`) }
+    return { outcome: 'rejected', error: cleanOrderErrorMessage(rawError || `Rejected (${res.status})`) }
   } catch (e: any) {
     return { outcome: 'uncertain', error: e?.message || 'Network error' }
   }
@@ -176,11 +193,25 @@ export async function submitEntry(
 export function cleanOrderErrorMessage(raw?: string): string {
   if (!raw) return 'Order could not be sent. Please tap Retry.'
   const lower = raw.toLowerCase()
+  if (
+    lower.includes('session_invalid_or_ended') ||
+    lower.includes('session has ended') ||
+    lower.includes('session_ended') ||
+    lower.includes('session ended') ||
+    lower.includes('table session ended') ||
+    lower.includes('session closed') ||
+    lower.includes('session_inactive')
+  ) {
+    return 'This session has ended or is closed. Please start or select an active session.'
+  }
   if (lower.includes('401') || lower.includes('unauthorized') || lower.includes('session expired')) {
     return 'Session expired. Please sign in or re-scan table QR to submit.'
   }
-  if (lower.includes('session_ended') || lower.includes('session ended') || lower.includes('table session ended') || lower.includes('session closed')) {
-    return 'This table session has ended. Please scan the QR code again to start a new sitting.'
+  if (lower.includes('ambiguous_table_session')) {
+    return 'Multiple active sessions found for this table. Please tap the specific session card.'
+  }
+  if (lower.includes('table_required_for_dine_in') || lower.includes('table must be selected')) {
+    return 'Please select a table for Dine-in orders.'
   }
   if (lower.includes('403') || lower.includes('forbidden')) {
     return 'You do not have permission to place this order.'
@@ -207,7 +238,7 @@ export function cleanOrderErrorMessage(raw?: string): string {
     lower.includes('function ') ||
     lower.includes('sql')
   ) {
-    return 'Unable to place order. Please tap Retry.'
+    return 'Unable to place order due to a data error. Please review your cart.'
   }
   return raw
 }

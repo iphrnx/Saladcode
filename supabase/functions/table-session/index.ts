@@ -627,6 +627,7 @@ async function active(req: Request): Promise<Response> {
       lastSeenAt: row.last_seen_at,
       endedAt: row.ended_at,
       table: table ? mapTable(table) : null,
+      order_rows: orders,
       // Held orders are counted separately: they exist, but nothing is being
       // cooked and nothing is owed.
       _count: {
@@ -645,7 +646,7 @@ async function active(req: Request): Promise<Response> {
   // what is owed accurately, including multiple independent diner sessions at one table
   // and independent Takeaway & Delivery sessions.
   const tableIds = [...new Set(sessions.map((s) => s.tableId).filter(Boolean))] as string[];
-  const sessionIds = sessions.map((s) => s.id);
+  const sessionIds = [...new Set(sessions.map((s) => s.id).filter(Boolean))] as string[];
   const checkBySession: Record<string, { id: string; total: number; paid: number; outstanding: number; status: string }> = {};
   const checkByTable: Record<string, { id: string; total: number; paid: number; outstanding: number; status: string }> = {};
 
@@ -722,7 +723,7 @@ async function active(req: Request): Promise<Response> {
   // ledger, which are the truth while the sitting is live.
   const { data: owing } = await admin()
     .from("table_checks")
-    .select("id, table_id, session_id, status, opened_at, unsettled_at, table:tables(name, area)")
+    .select("id, table_id, session_id, order_type, customer_name, status, opened_at, unsettled_at, table:tables(name, area)")
     .eq("tenant_id", tenantId)
     .in("status", ["OPEN", "UNSETTLED"])
     .order("opened_at", { ascending: false })
@@ -761,12 +762,20 @@ async function active(req: Request): Promise<Response> {
     .map((c: any) => {
       const t = Array.isArray(c.table) ? c.table[0] : c.table;
       const sums = totalsByCheck[c.id] ?? { total: 0, paid: 0 };
+      const orderType = (c.order_type || (c.table_id ? "DINE_IN" : "TAKEAWAY")) as "DINE_IN" | "TAKEAWAY" | "DELIVERY";
+      const isTakeawayOrDelivery = orderType === "TAKEAWAY" || orderType === "DELIVERY" || !c.table_id;
+      const displayName = isTakeawayOrDelivery
+        ? (c.customer_name ? `${orderType === "TAKEAWAY" ? "Takeaway" : "Delivery"} · ${c.customer_name}` : (orderType === "TAKEAWAY" ? "Takeaway" : "Delivery"))
+        : (t?.name ?? "Table");
+
       return {
         checkId: c.id,
         tableId: c.table_id,
         sessionId: c.session_id ?? null,
-        tableName: t?.name ?? "Table",
-        area: t?.area ?? "",
+        orderType,
+        customerName: c.customer_name ?? null,
+        tableName: displayName,
+        area: isTakeawayOrDelivery ? (orderType === "TAKEAWAY" ? "Takeaway" : "Delivery") : (t?.area ?? ""),
         status: c.status,
         total: +sums.total.toFixed(2),
         paid: +sums.paid.toFixed(2),

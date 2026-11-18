@@ -173,6 +173,22 @@ await check("4xx → failed, kept, never auto-retried", async () => {
   assert.equal(q.load()[0].state, "failed", "failed entry is never silently discarded");
 });
 
+await check("deterministic rejection marker even under 500 → failed, never retried", async () => {
+  const f = fakeFetcher();
+  f.setRoute(() => new Response(JSON.stringify({ error: "SESSION_INVALID_OR_ENDED: session expired" }), { status: 500 }));
+  const s = new MemStorage();
+  const q = new OrderQueue(s, "k", f.fetcher, {}, () => 0);
+  q.enqueue("diner", { items: [] }, 1);
+  await sleep(10);
+  const entries = q.load();
+  assert.equal(entries[0].state, "failed", "deterministic session error must be marked failed immediately");
+  assert.match(entries[0].lastError, /ended or is closed/i);
+  // Re-process must not re-POST
+  await q.process();
+  await sleep(10);
+  assert.equal(f.posts().length, 1, "never auto-retried");
+});
+
 // -- reconcile before retry ------------------------------------------------------
 await check("retry: lookup FIRST, found → confirm without re-POST", async () => {
   const f = fakeFetcher();

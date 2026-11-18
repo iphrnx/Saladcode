@@ -14,7 +14,7 @@ import { sortTables } from '@/lib/table-order'
 import { cn } from '@/lib/utils'
 import { normalizePortions, type MenuPortion } from '@/lib/portions'
 import { orderQueue, startOrderQueue, type QueueEntry } from '@/lib/order-queue'
-import { persistPosCart, restorePosCart, clearPosCart } from '@/lib/pos-cart'
+import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft } from '@/lib/pos-cart'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
@@ -28,7 +28,7 @@ export function DashboardView() {
   const tr = useT()
   const { data, refresh, sessionRevision } = useApp()
   const { denied, handleLoad, handleAction } = useAccessDenied()
-  const { cart, addToCart, updateCartQty, removeFromCart, setCartNotes, clearCart, hydrateCart, subtractCartLines, orderType, setOrderType, selectedTableId, setSelectedTableId, selectedSessionId, setSelectedSessionId, promoCode, setPromoCode } = useStore()
+  const { cart, addToCart, updateCartQty, removeFromCart, setCartNotes, clearCart, replaceCart, hydrateCart, subtractCartLines, orderType, setOrderType, selectedTableId, setSelectedTableId, selectedSessionId, setSelectedSessionId, setSessionContext, promoCode, setPromoCode } = useStore()
   const [activeCat, setActiveCat] = useState<string>('all')
   const [search, setSearch] = useState('')
   const [lastOrder, setLastOrder] = useState<any>(null)
@@ -105,6 +105,9 @@ export function DashboardView() {
         setPromoCode('')
         setAppliedPromo(null)
         setPromoError('')
+        if (tenantId && userId) {
+          clearPosSessionDraft(tenantId, userId, entry.payload.tableSessionId)
+        }
         if (order.promoApplied === false && order.promoReason) {
           // The server is the authority on promos, and it can still decline a
           // code the cashier had already applied. Say so, or the customer is
@@ -148,23 +151,28 @@ export function DashboardView() {
     hydratedRef.current = true
     if (cart.length === 0) {
       const snapshot = restorePosCart(tenantId, userId)
-      if (snapshot?.cart?.length) hydrateCart(snapshot)
+      if (snapshot?.cart?.length) {
+        hydrateCart(snapshot)
+        if (snapshot.customerName) setCustomerName(snapshot.customerName)
+        if (snapshot.customerPhone) setCustomerPhone(snapshot.customerPhone)
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId, userId, cart.length])
 
   useEffect(() => {
     if (!tenantId || !userId) return
-    persistPosCart(tenantId, userId, {
+    savePosSessionDraft(tenantId, userId, selectedSessionId, {
       cart,
       orderType,
       selectedTableId,
       selectedSessionId,
+      customerName,
+      customerPhone,
       promoCode,
     })
-    if (cart.length === 0) clearPosCart(tenantId, userId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cart, orderType, selectedTableId, selectedSessionId, promoCode, tenantId, userId])
+  }, [cart, orderType, selectedTableId, selectedSessionId, customerName, customerPhone, promoCode, tenantId, userId])
 
   const queueBusy = queueEntries.some((e) => e.state === 'pending' || e.state === 'submitting')
   const failedEntries = queueEntries.filter((e) => e.state === 'failed')
@@ -562,16 +570,32 @@ export function DashboardView() {
     for (const b of pendingBills) {
       if (b.checkId && seenCheckIds.has(b.checkId)) continue
       if (b.sessionId && seenSessionIds.has(b.sessionId)) continue
+      if (Number(b.outstanding || 0) <= 0.01) continue
+
       const alreadyRepresented = cards.some(
-        (c) => c.tableId === b.tableId && Math.abs(c.outstanding - Number(b.outstanding)) < 0.01
+        (c) =>
+          (b.checkId && c.id === `bill-${b.checkId}`) ||
+          (b.sessionId && c.sessionId === b.sessionId) ||
+          (b.tableId && c.tableId === b.tableId && Math.abs(c.outstanding - Number(b.outstanding)) < 0.01)
       )
       if (alreadyRepresented) continue
 
+      const isTakeawayOrDelivery = b.orderType === 'TAKEAWAY' || b.orderType === 'DELIVERY' || !b.tableId
+      const derivedOrderType = (b.orderType || (b.tableId ? 'DINE_IN' : 'TAKEAWAY')) as 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
+      const displayName = isTakeawayOrDelivery
+        ? (b.customerName
+            ? `${derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'} · ${b.customerName}`
+            : (derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'))
+        : (b.tableName || 'Table')
+
       cards.push({
-        id: `bill-${b.checkId || b.tableId}`,
-        tableId: b.tableId,
-        tableName: b.tableName || 'Table',
-        area: b.area,
+        id: `bill-${b.checkId || b.tableId || b.sessionId}`,
+        sessionId: b.sessionId ?? undefined,
+        tableId: b.tableId ?? null,
+        tableName: displayName,
+        orderType: derivedOrderType,
+        customerName: b.customerName,
+        area: isTakeawayOrDelivery ? (derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery') : b.area,
         sessionNumber: null,
         total: +Number(b.total || 0).toFixed(2),
         paid: +Number(b.paid || 0).toFixed(2),
@@ -583,6 +607,135 @@ export function DashboardView() {
 
     return cards
   }, [sessions, pendingBills])
+
+  // ── Session selection & isolated cart drafts ─────────────────────────────
+  // Snapshot ref of the unattached cart to restore when deselecting an active session card
+  const preSelectSnapshotRef = useRef<{
+    cart: typeof cart
+    orderType: typeof orderType
+    selectedTableId: typeof selectedTableId
+    customerName: string
+    customerPhone: string
+    promoCode: string
+  } | null>(null)
+
+  const handleSessionCardClick = (card: {
+    sessionId?: string
+    tableId: string | null
+    orderType?: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
+    customerName?: string
+  }) => {
+    if (!card.sessionId) return
+
+    // 1. Clicking the already-selected session card -> Deselect & Restore
+    if (selectedSessionId === card.sessionId) {
+      if (tenantId && userId) {
+        savePosSessionDraft(tenantId, userId, card.sessionId, {
+          cart,
+          orderType,
+          selectedTableId,
+          selectedSessionId: card.sessionId,
+          customerName,
+          customerPhone,
+          promoCode,
+        })
+      }
+
+      const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
+      if (pre) {
+        replaceCart(pre.cart)
+        setSessionContext(pre.selectedTableId, null, pre.orderType)
+        setCustomerName(pre.customerName ?? '')
+        setCustomerPhone(pre.customerPhone ?? '')
+        setPromoCode(pre.promoCode ?? '')
+      } else {
+        setSelectedSessionId(null)
+      }
+      preSelectSnapshotRef.current = null
+      return
+    }
+
+    // 2. Selecting a session card
+    if (!selectedSessionId) {
+      // Remember current draft as pre-selection baseline
+      preSelectSnapshotRef.current = {
+        cart: [...cart],
+        orderType,
+        selectedTableId,
+        customerName,
+        customerPhone,
+        promoCode,
+      }
+      if (tenantId && userId) {
+        savePosSessionDraft(tenantId, userId, null, {
+          cart,
+          orderType,
+          selectedTableId,
+          selectedSessionId: null,
+          customerName,
+          customerPhone,
+          promoCode,
+        })
+      }
+    } else {
+      // Switching from another session -> save that session's draft
+      if (tenantId && userId) {
+        savePosSessionDraft(tenantId, userId, selectedSessionId, {
+          cart,
+          orderType,
+          selectedTableId,
+          selectedSessionId,
+          customerName,
+          customerPhone,
+          promoCode,
+        })
+      }
+    }
+
+    // Restore or initialize draft for this clicked session
+    const existingDraft = tenantId && userId ? getPosSessionDraft(tenantId, userId, card.sessionId) : null
+    const targetOrderType = card.orderType || (card.tableId ? 'DINE_IN' : 'TAKEAWAY')
+
+    if (existingDraft) {
+      replaceCart(existingDraft.cart)
+      setSessionContext(card.tableId ?? null, card.sessionId, targetOrderType)
+      setCustomerName(existingDraft.customerName ?? card.customerName ?? '')
+      setCustomerPhone(existingDraft.customerPhone ?? '')
+      setPromoCode(existingDraft.promoCode ?? '')
+    } else {
+      replaceCart([])
+      setSessionContext(card.tableId ?? null, card.sessionId, targetOrderType)
+      setCustomerName(card.customerName ?? '')
+      setCustomerPhone('')
+      setPromoCode('')
+    }
+  }
+
+  const handleDeselectSession = () => {
+    if (!selectedSessionId) return
+    if (tenantId && userId) {
+      savePosSessionDraft(tenantId, userId, selectedSessionId, {
+        cart,
+        orderType,
+        selectedTableId,
+        selectedSessionId,
+        customerName,
+        customerPhone,
+        promoCode,
+      })
+    }
+    const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
+    if (pre) {
+      replaceCart(pre.cart)
+      setSessionContext(pre.selectedTableId, null, pre.orderType)
+      setCustomerName(pre.customerName ?? '')
+      setCustomerPhone(pre.customerPhone ?? '')
+      setPromoCode(pre.promoCode ?? '')
+    } else {
+      setSelectedSessionId(null)
+    }
+    preSelectSnapshotRef.current = null
+  }
 
   const endSession = async (tableId: string, tableName?: string, force = false, sessionId?: string) => {
     setEndingTable(sessionId ? `${tableId}:${sessionId}` : tableId)
@@ -901,22 +1054,7 @@ export function DashboardView() {
                       data-active-session-card
                       role="button"
                       tabIndex={0}
-                      onClick={() => {
-                        if (!card.sessionId) return
-                        if (selectedSessionId === card.sessionId) {
-                          setSelectedSessionId(null)
-                        } else {
-                          setSelectedSessionId(card.sessionId)
-                          if (card.tableId) {
-                            setOrderType('DINE_IN')
-                            setSelectedTableId(card.tableId)
-                          } else {
-                            if (card.orderType) setOrderType(card.orderType)
-                            setSelectedTableId(null)
-                            if (card.customerName) setCustomerName(card.customerName)
-                          }
-                        }
-                      }}
+                      onClick={() => handleSessionCardClick(card)}
                       className={cn(
                         'w-56 shrink-0 rounded-2xl border bg-card p-3.5 text-left select-none transition-all cursor-pointer',
                         isSelected
@@ -989,6 +1127,7 @@ export function DashboardView() {
           setSelectedTableId={setSelectedTableId}
           selectedSessionId={selectedSessionId}
           setSelectedSessionId={setSelectedSessionId}
+          onDeselectSession={handleDeselectSession}
           liveSessions={selectedTableId ? (floor.find((f: any) => f.tableId === selectedTableId)?.liveSessions || []) : []}
           customerName={customerName}
           setCustomerName={setCustomerName}
@@ -1047,6 +1186,7 @@ export function DashboardView() {
             setSelectedTableId={setSelectedTableId}
             selectedSessionId={selectedSessionId}
             setSelectedSessionId={setSelectedSessionId}
+            onDeselectSession={handleDeselectSession}
             liveSessions={selectedTableId ? (floor.find((f: any) => f.tableId === selectedTableId)?.liveSessions || []) : []}
             customerName={customerName}
             setCustomerName={setCustomerName}
@@ -1317,6 +1457,7 @@ interface CartPanelProps {
   setSelectedTableId: (id: string | null) => void
   selectedSessionId: string | null
   setSelectedSessionId: (id: string | null) => void
+  onDeselectSession?: () => void
   liveSessions: any[]
   customerName: string
   setCustomerName: (v: string) => void
@@ -1460,7 +1601,7 @@ function CartPanel(p: CartPanelProps) {
                 </span>
                 <button
                   type="button"
-                  onClick={() => p.setSelectedSessionId(null)}
+                  onClick={() => p.onDeselectSession ? p.onDeselectSession() : p.setSelectedSessionId(null)}
                   className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 ml-2 underline"
                 >
                   New Sitting

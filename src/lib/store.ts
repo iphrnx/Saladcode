@@ -55,6 +55,7 @@ interface AppState {
   removeFromCart: (menuItemId: string, portion?: string | null, portionId?: string | null) => void
   setCartNotes: (menuItemId: string, notes: string, portion?: string | null, portionId?: string | null) => void
   clearCart: () => void
+  replaceCart: (cart: CartItem[]) => void
   /**
    * Restore a persisted cart — only into an EMPTY in-memory cart, so a fresh
    * cart built before hydration ran is never overwritten by an older snapshot.
@@ -81,6 +82,7 @@ interface AppState {
   setSelectedTableId: (id: string | null) => void
   selectedSessionId: string | null
   setSelectedSessionId: (id: string | null) => void
+  setSessionContext: (tableId: string | null, sessionId: string | null, orderType?: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY') => void
 
   // promo
   promoCode: string
@@ -129,6 +131,7 @@ export const useStore = create<AppState>((set) => ({
   removeFromCart: (menuItemId, portion, portionId) => set((s) => ({ cart: s.cart.filter((c) => !sameLine(c, menuItemId, portion, portionId)) })),
   setCartNotes: (menuItemId, notes, portion, portionId) => set((s) => ({ cart: s.cart.map((c) => (sameLine(c, menuItemId, portion, portionId) ? { ...c, notes } : c)) })),
   clearCart: () => set({ cart: [] }),
+  replaceCart: (cart) => set({ cart }),
   hydrateCart: (snapshot) =>
     set((s) =>
       s.cart.length > 0 || !snapshot.cart?.length
@@ -167,6 +170,12 @@ export const useStore = create<AppState>((set) => ({
     })),
   selectedSessionId: null,
   setSelectedSessionId: (id) => set({ selectedSessionId: id }),
+  setSessionContext: (tableId, sessionId, orderType) =>
+    set({
+      selectedTableId: tableId,
+      selectedSessionId: sessionId,
+      ...(orderType ? { orderType } : {}),
+    }),
 
   promoCode: '',
   setPromoCode: (c) => set({ promoCode: c }),
