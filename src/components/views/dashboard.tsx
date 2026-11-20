@@ -677,31 +677,9 @@ export function DashboardView() {
     setForceNewSitting(false)
     if (!card.sessionId) return
 
-    // 1. Clicking the already-selected session card -> Deselect & Restore
+    // 1. Clicking the already-selected session card -> Deselect & Restore to neutral
     if (selectedSessionId === card.sessionId) {
-      if (tenantId && userId) {
-        savePosSessionDraft(tenantId, userId, card.sessionId, {
-          cart,
-          orderType,
-          selectedTableId,
-          selectedSessionId: card.sessionId,
-          customerName,
-          customerPhone,
-          promoCode,
-        })
-      }
-
-      const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
-      if (pre) {
-        replaceCart(pre.cart)
-        setSessionContext(pre.selectedTableId, null, pre.orderType)
-        setCustomerName(pre.customerName ?? '')
-        setCustomerPhone(pre.customerPhone ?? '')
-        setPromoCode(pre.promoCode ?? '')
-      } else {
-        setSelectedSessionId(null)
-      }
-      preSelectSnapshotRef.current = null
+      handleDeselectSession()
       return
     }
 
@@ -763,8 +741,8 @@ export function DashboardView() {
 
   const handleDeselectSession = () => {
     setForceNewSitting(false)
-    if (!selectedSessionId) return
-    if (tenantId && userId) {
+    if (!selectedSessionId && !selectedTableId) return
+    if (tenantId && userId && selectedSessionId) {
       savePosSessionDraft(tenantId, userId, selectedSessionId, {
         cart,
         orderType,
@@ -784,8 +762,41 @@ export function DashboardView() {
       setPromoCode(pre.promoCode ?? '')
     } else {
       setSelectedSessionId(null)
+      setSelectedTableId(null)
+      setCustomerName('')
+      setCustomerPhone('')
+      replaceCart([])
     }
     preSelectSnapshotRef.current = null
+  }
+
+  const handleSelectSession = (sessionId: string | null) => {
+    if (!sessionId) {
+      handleDeselectSession()
+      return
+    }
+    if (!selectedSessionId) {
+      preSelectSnapshotRef.current = {
+        cart: [...cart],
+        orderType,
+        selectedTableId,
+        customerName,
+        customerPhone,
+        promoCode,
+      }
+      if (tenantId && userId) {
+        savePosSessionDraft(tenantId, userId, null, {
+          cart,
+          orderType,
+          selectedTableId,
+          selectedSessionId: null,
+          customerName,
+          customerPhone,
+          promoCode,
+        })
+      }
+    }
+    setSelectedSessionId(sessionId)
   }
 
   const handleNewSitting = () => {
@@ -948,20 +959,14 @@ export function DashboardView() {
         return
       }
       const liveSessions = floorTable?.liveSessions || []
-      if (liveSessions.length > 1) {
-        if (!selectedSessionId || !liveSessions.some((s: any) => s.id === selectedSessionId)) {
-          if (!forceNewSitting) {
-            toast.error('This table has multiple active diner sessions. Please select which sitting/bill to add this order to.')
-            return
-          }
-          activeSessionId = null
-        } else {
-          activeSessionId = selectedSessionId
+      if (selectedSessionId) {
+        activeSessionId = selectedSessionId
+      } else {
+        if (liveSessions.length > 1 && !forceNewSitting) {
+          toast.error('This table has multiple active diner sessions. Please select which sitting/bill to add this order to.')
+          return
         }
-      } else if (liveSessions.length === 1) {
-        activeSessionId = forceNewSitting ? null : liveSessions[0].id
-      } else if (floorTable?.check?.sessionId) {
-        activeSessionId = forceNewSitting ? null : floorTable.check.sessionId
+        activeSessionId = null
       }
 
       if (activeSessionId && floorTable) {
@@ -1024,6 +1029,7 @@ export function DashboardView() {
       {
         tableId: orderType === 'DINE_IN' ? selectedTableId : null,
         tableSessionId: activeSessionId || undefined,
+        createNewSitting: !activeSessionId,
         orderType,
         items,
         promoCode: promoCode || undefined,
@@ -1264,7 +1270,7 @@ export function DashboardView() {
           selectedTableId={selectedTableId}
           setSelectedTableId={setSelectedTableId}
           selectedSessionId={selectedSessionId}
-          setSelectedSessionId={setSelectedSessionId}
+          setSelectedSessionId={handleSelectSession}
           onDeselectSession={handleDeselectSession}
           liveSessions={selectedTableId ? (floor.find((f: any) => f.tableId === selectedTableId)?.liveSessions || []) : []}
           customerName={customerName}
@@ -1327,7 +1333,7 @@ export function DashboardView() {
             selectedTableId={selectedTableId}
             setSelectedTableId={setSelectedTableId}
             selectedSessionId={selectedSessionId}
-            setSelectedSessionId={setSelectedSessionId}
+            setSelectedSessionId={handleSelectSession}
             onDeselectSession={handleDeselectSession}
             liveSessions={selectedTableId ? (floor.find((f: any) => f.tableId === selectedTableId)?.liveSessions || []) : []}
             customerName={customerName}
@@ -1671,7 +1677,18 @@ function CartPanel(p: CartPanelProps) {
         </div>
         {p.orderType === 'DINE_IN' ? (
           <div className="space-y-2">
-            <Select value={p.selectedTableId || ''} onValueChange={(v) => p.setSelectedTableId(v)}>
+            <Select
+              value={p.selectedTableId || ''}
+              onValueChange={(v) => {
+                p.setSelectedTableId(v || null)
+                if (p.selectedSessionId) {
+                  p.setSelectedSessionId(null)
+                }
+                if (p.onCancelNewSitting) {
+                  p.onCancelNewSitting()
+                }
+              }}
+            >
               <SelectTrigger className="bg-secondary/50 border-0 h-9">
                 <SelectValue placeholder={tr('pos.selectTable')} />
               </SelectTrigger>
@@ -1682,24 +1699,62 @@ function CartPanel(p: CartPanelProps) {
               </SelectContent>
             </Select>
 
-            {p.selectedTableId && p.liveSessions.length > 1 && (
-              <div className="space-y-1.5 rounded-lg border border-amber-500/40 bg-amber-500/5 p-2.5">
-                <div className="flex items-center justify-between text-[11px] font-semibold text-amber-600 dark:text-amber-400">
-                  <span>Diner Sitting (Required)</span>
-                  <span className="text-[10px] text-amber-600/80 dark:text-amber-400/80">{p.liveSessions.length} active sittings</span>
+            {/* When a specific sitting is loaded */}
+            {p.selectedTableId && p.selectedSessionId ? (
+              (() => {
+                const sittingIdx = p.liveSessions.findIndex((s: any) => s.id === p.selectedSessionId)
+                const cardMatch = (p.activeSessionCards || []).find((c: any) => c.sessionId === p.selectedSessionId)
+                const sittingNum = sittingIdx >= 0
+                  ? (p.liveSessions.length > 1 ? sittingIdx + 1 : null)
+                  : (cardMatch?.sessionNumber ?? null)
+
+                const label = sittingNum
+                  ? `Adding to ${tableName} · Sitting ${sittingNum}`
+                  : `Adding to ${tableName}`
+
+                return (
+                  <div className="flex items-center justify-between rounded-lg border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-[11px]">
+                    <span className="font-medium text-primary truncate">
+                      {label}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={p.onDeselectSession}
+                      className="text-primary/70 hover:text-primary hover:bg-primary/10 rounded p-0.5 transition-colors shrink-0 ml-2"
+                      title="Unload session"
+                      aria-label="Unload session"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                )
+              })()
+            ) : p.selectedTableId && p.liveSessions.length > 1 && !p.forceNewSitting ? (
+              /* Minimal sitting selector when multiple sittings exist and none loaded */
+              <div className="space-y-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2">
+                <div className="flex items-center justify-between text-[11px] font-medium text-amber-600 dark:text-amber-400">
+                  <span>Select Sitting ({p.liveSessions.length} active)</span>
+                  <button
+                    type="button"
+                    onClick={p.onNewSitting}
+                    className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold underline"
+                  >
+                    New Sitting
+                  </button>
                 </div>
                 <Select
                   value={p.selectedSessionId || ''}
                   onValueChange={(v) => {
-                    p.setSelectedSessionId(v || null)
-                    if (v && p.onCancelNewSitting) p.onCancelNewSitting()
+                    if (v === '__new__') {
+                      if (p.onNewSitting) p.onNewSitting()
+                    } else if (v) {
+                      p.setSelectedSessionId(v)
+                      if (p.onCancelNewSitting) p.onCancelNewSitting()
+                    }
                   }}
                 >
-                  <SelectTrigger className={cn(
-                    "bg-background border h-8 text-xs",
-                    !p.selectedSessionId && !p.forceNewSitting ? "border-amber-500 text-amber-600 dark:text-amber-400 font-medium" : "border-border"
-                  )}>
-                    <SelectValue placeholder="⚠️ Select sitting / bill..." />
+                  <SelectTrigger className="bg-background border border-border h-8 text-xs">
+                    <SelectValue placeholder="Choose sitting..." />
                   </SelectTrigger>
                   <SelectContent>
                     {p.liveSessions.map((s: any, idx: number) => {
@@ -1711,76 +1766,26 @@ function CartPanel(p: CartPanelProps) {
                         </SelectItem>
                       )
                     })}
+                    <SelectItem value="__new__">
+                      + Start New Sitting
+                    </SelectItem>
                   </SelectContent>
                 </Select>
-                {p.forceNewSitting ? (
-                  <div className="flex items-center justify-between text-[11px] font-medium text-muted-foreground pt-0.5">
-                    <span>Starting new sitting at {tableName}</span>
-                    <button
-                      type="button"
-                      onClick={p.onCancelNewSitting}
-                      className="text-[10.5px] text-primary hover:text-primary-hover font-semibold shrink-0 ml-2 underline"
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                ) : !p.selectedSessionId ? (
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-[10.5px] text-amber-600 dark:text-amber-400 leading-tight">
-                      This table has multiple active diner bills. Select which party to add these items to.
-                    </p>
-                    <button
-                      type="button"
-                      onClick={p.onNewSitting || p.onDeselectSession}
-                      className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 underline"
-                    >
-                      New Sitting
-                    </button>
-                  </div>
-                ) : (
-                  <div className="flex items-center justify-between text-[11px] font-medium text-primary leading-tight pt-0.5">
-                    <span>Adding to {tableName} · Sitting {p.liveSessions.findIndex((s: any) => s.id === p.selectedSessionId) + 1}</span>
-                    <button
-                      type="button"
-                      onClick={p.onNewSitting || p.onDeselectSession}
-                      className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 ml-2 underline"
-                    >
-                      New Sitting
-                    </button>
-                  </div>
-                )}
               </div>
-            )}
-
-            {p.selectedTableId && p.liveSessions.length === 1 && (
-              p.forceNewSitting ? (
-                <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/30 px-2.5 py-1.5 text-[11px]">
-                  <span className="font-medium text-muted-foreground truncate">
-                    Starting new sitting at {tableName}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={p.onCancelNewSitting}
-                    className="text-[10.5px] text-primary hover:text-primary-hover font-semibold shrink-0 ml-2 underline"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              ) : (
-                <div className="flex items-center justify-between rounded-lg border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-[11px]">
-                  <span className="font-medium text-primary truncate">
-                    Adding to {tableName}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={p.onNewSitting || p.onDeselectSession}
-                    className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 ml-2 underline"
-                  >
-                    New Sitting
-                  </button>
-                </div>
-              )
-            )}
+            ) : p.selectedTableId && p.forceNewSitting ? (
+              <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/30 px-2.5 py-1.5 text-[11px]">
+                <span className="font-medium text-muted-foreground truncate">
+                  Starting new sitting at {tableName}
+                </span>
+                <button
+                  type="button"
+                  onClick={p.onCancelNewSitting}
+                  className="text-[10.5px] text-primary hover:text-primary-hover font-semibold shrink-0 ml-2 underline"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : (
           <div className="space-y-2">
@@ -1825,10 +1830,12 @@ function CartPanel(p: CartPanelProps) {
                   </span>
                   <button
                     type="button"
-                    onClick={() => p.onDeselectSession ? p.onDeselectSession() : p.setSelectedSessionId(null)}
-                    className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold shrink-0 ml-2 underline"
+                    onClick={p.onDeselectSession}
+                    className="text-primary/70 hover:text-primary hover:bg-primary/10 rounded p-0.5 transition-colors shrink-0 ml-2"
+                    title="Unload session"
+                    aria-label="Unload session"
                   >
-                    New Sitting
+                    <X className="h-3.5 w-3.5" />
                   </button>
                 </div>
               )

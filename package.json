@@ -54,6 +54,8 @@
     "test:platform-details": "tsx scripts/test-platform-details-offline.mts",
     "test:order-queue": "tsx scripts/test-order-queue-offline.mts",
     "test:pos-cart": "tsx scripts/test-pos-cart.mts",
+    "test:pos-active-sessions": "tsx scripts/test-pos-active-sessions.mts",
+    "test:diner-session-persistence": "tsx scripts/test-diner-session-persistence.mts",
     "test:pos-cart-ui": "tsx --env-file=.env.local scripts/verify-pos-cart.mts",
     "test:menu-sticky": "tsx --env-file=.env.local scripts/verify-menu-sticky.mts",
     "test:orders-sticky": "tsx --env-file=.env.local scripts/verify-orders-sticky.mts",

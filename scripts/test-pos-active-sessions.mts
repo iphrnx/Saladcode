@@ -24,7 +24,7 @@ const dashboardCode = fs.readFileSync(dashboardPath, "utf-8");
 const tableSessionPath = path.resolve("supabase/functions/table-session/index.ts");
 const tableSessionCode = fs.readFileSync(tableSessionPath, "utf-8");
 
-const migrationPath = path.resolve("supabase/migrations/20261117000008_safe_session_inactivity_expiry.sql");
+const migrationPath = path.resolve("supabase/migrations/20261120000000_align_session_lifecycle_30m_idle.sql");
 const migrationCode = fs.readFileSync(migrationPath, "utf-8");
 
 // ── 1. POS Dashboard UI Section Refactoring ──
@@ -41,17 +41,22 @@ test("POS dashboard completely removed the large Active Sessions floor cards", (
   assert.doesNotMatch(dashboardCode, /End Selected Sitting/);
 });
 
-test("POS dashboard compact cards are fixed-size (w-56) and non-clickable (div, not button)", () => {
+test("POS dashboard compact cards are fixed-size (w-56) and toggle session load/unload on click", () => {
   assert.match(dashboardCode, /data-active-session-card/);
-  assert.match(dashboardCode, /<div[^>]*data-active-session-card[^>]*className=\{cn\(\s*'w-56 shrink-0 rounded-2xl border/);
-  // Must NOT be a button or have onClick on the card
-  assert.doesNotMatch(dashboardCode, /<button[^>]*data-active-session-card/);
-  assert.doesNotMatch(dashboardCode, /data-active-session-card[^>]*onClick=/);
+  assert.match(dashboardCode, /w-56 shrink-0 rounded-2xl border/);
+  assert.match(dashboardCode, /onClick=\{\(\) => handleSessionCardClick\(card\)\}/);
+});
+
+test("POS dashboard renders compact loaded session strip with × unload button and no heavy picker", () => {
+  assert.match(dashboardCode, /Adding to \$\{tableName\}/);
+  assert.match(dashboardCode, /title="Unload session"/);
+  assert.match(dashboardCode, /aria-label="Unload session"/);
+  assert.doesNotMatch(dashboardCode, /<span>Diner Sitting \(Required\)<\/span>/);
 });
 
 test("POS dashboard dynamically displays table name, sitting number, due, paid, and status", () => {
   assert.match(dashboardCode, /\{card\.tableName\}/);
-  assert.match(dashboardCode, /card\.sessionNumber \? ` · Sitting #\$\{card\.sessionNumber\}` : ''/);
+  assert.match(dashboardCode, /card\.sessionNumber \? ` · Sitting \$\{card\.sessionNumber\}` : ''/);
   assert.match(dashboardCode, /\{Number\(card\.outstanding\)\.toLocaleString\('en-IN'\)\} due/);
   assert.match(dashboardCode, /\{Number\(card\.paid\)\.toLocaleString\('en-IN'\)\} of/);
   assert.match(dashboardCode, /\{Number\(card\.total\)\.toLocaleString\('en-IN'\)\} paid/);
@@ -64,7 +69,7 @@ test("POS dashboard computes activeSessionCards with deduplication and multi-sit
   assert.match(dashboardCode, /const seenCheckIds = new Set<string>\(\)/);
   assert.match(dashboardCode, /const seenSessionIds = new Set<string>\(\)/);
   // Handles multiple independent sittings at the same table
-  assert.match(dashboardCode, /sessionNumber: totalLiveAtTable > 1 \? idx \+ 1 : null/);
+  assert.match(dashboardCode, /sessionNumber = totalLiveAtTable > 1 && group\.tableId \? idx \+ 1 : null/);
   // Merges or skips already represented pending bills
   assert.match(dashboardCode, /b\.checkId && seenCheckIds\.has\(b\.checkId\)/);
 });
@@ -72,31 +77,32 @@ test("POS dashboard computes activeSessionCards with deduplication and multi-sit
 // ── 3. Edge Function Active Sessions & Inactivity Expiry ──
 test("table-session Edge Function attaches session-level checks for independent diner sessions", () => {
   assert.match(tableSessionCode, /checkBySession\[c\.session_id\]/);
-  assert.match(tableSessionCode, /\(s as any\)\.check = \(s\.id && checkBySession\[s\.id\]\) \|\| checkByTable\[s\.tableId\] \|\| null/);
+  assert.match(tableSessionCode, /\(s as any\)\.check = \(s\.id && checkBySession\[s\.id\]\) \|\| \(s\.tableId && checkByTable\[s\.tableId\]\) \|\| null/);
   assert.match(tableSessionCode, /sessionId: c\.session_id/);
 });
 
-test("table-session Edge Function checks session abandonment at 15 minutes of inactivity", () => {
-  assert.match(tableSessionCode, /now - lastSeen > 15 \* 60_000/);
+test("table-session Edge Function checks session abandonment at 30 minutes of inactivity", () => {
+  assert.match(tableSessionCode, /now - lastSeen > 30 \* 60_000/);
 });
 
-// ── 4. Safe 15-Minute Session Inactivity Expiry Database Migration ──
-test("Database migration ensures last_seen_at and close_pending_at columns exist on table_sessions", () => {
-  assert.match(migrationCode, /alter table public\.table_sessions\s+add column if not exists last_seen_at/);
-  assert.match(migrationCode, /add column if not exists close_pending_at/);
-});
-
-test("session_is_abandoned function requires 15 minutes of silence and ZERO orders/checks", () => {
+// ── 4. 30-Minute Session Lifecycle Database Migration ──
+test("session_is_abandoned function requires 30 minutes of silence and ZERO orders/checks", () => {
   assert.match(migrationCode, /create or replace function public\.session_is_abandoned/);
+  assert.match(migrationCode, /p_window interval default interval '30 minutes'/);
   assert.match(migrationCode, /coalesce\(s\.last_seen_at, s\.updated_at, s\.created_at\) < now\(\) - p_window/);
   assert.match(migrationCode, /not exists \(\s*select 1\s*from public\.orders o\s*where o\.table_session_id = s\.id\s*\)/);
-  assert.match(migrationCode, /not exists \(\s*select 1\s*from public\.table_checks c\s*where \(c\.session_id = s\.id or c\.anchor_session_id = s\.id\)\s*and c\.status in \('OPEN', 'UNSETTLED'\)\s*\)/);
+  assert.match(migrationCode, /not exists \(\s*select 1\s*from public\.table_checks c\s*join public\.check_payments cp on cp\.check_id = c\.id\s*where \(c\.session_id = s\.id or c\.anchor_session_id = s\.id\)\s*and cp\.status = 'SUCCEEDED'\s*\)/);
 });
 
-test("expire_stale_table_sessions protects all sessions with orders or unpaid checks", () => {
+test("expire_stale_table_sessions protects all sessions with orders or unpaid checks and defaults to 30 minutes", () => {
   assert.match(migrationCode, /create or replace function public\.expire_stale_table_sessions/);
+  assert.match(migrationCode, /p_after interval default interval '30 minutes'/);
   assert.match(migrationCode, /not exists \(\s*select 1\s*from public\.orders o\s*where o\.table_session_id = s\.id\s*\)/);
-  assert.match(migrationCode, /not exists \(\s*select 1\s*from public\.table_checks c\s*where \(c\.session_id = s\.id or c\.anchor_session_id = s\.id\)\s*and c\.status in \('OPEN', 'UNSETTLED'\)\s*\)/);
+  assert.match(migrationCode, /not exists \(\s*select 1\s*from public\.table_checks c\s*join public\.check_payments cp on cp\.check_id = c\.id\s*where \(c\.session_id = s\.id or c\.anchor_session_id = s\.id\)\s*and cp\.status = 'SUCCEEDED'\s*\)/);
+});
+
+test("migration schedules expire_stale_table_sessions via pg_cron every 10 minutes", () => {
+  assert.match(migrationCode, /cron\.schedule\(\s*'expire-stale-table-sessions',\s*'\*\/10 \* \* \* \*'/);
 });
 
 console.log("\n=================================================================");

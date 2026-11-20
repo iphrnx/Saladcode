@@ -628,6 +628,7 @@ async function create(req: Request): Promise<Response> {
       notes,
       servedById,
       tableSessionToken,
+      qrToken,
     } = b;
     const idempotencyKey = cleanIdempotencyKey(b.idempotencyKey);
 
@@ -730,7 +731,115 @@ async function create(req: Request): Promise<Response> {
       }
       // `held` travels with the order so the menu can show the waiting state
       // without a second round trip.
-      return json(req, { ...created.order, pendingActivation: held }, 201);
+      return json(req, {
+        ...created.order,
+        sessionToken: tableSessionToken,
+        sessionId: session.sessionId,
+        pendingActivation: held,
+      }, 201);
+    } else if (qrToken) {
+      // First order on scanned QR table: mint session only now, strictly isolating this diner
+      const { data: tableRow } = await db
+        .from("tables")
+        .select("id, tenant_id, active")
+        .eq("qr_token", String(qrToken))
+        .eq("active", true)
+        .maybeSingle();
+
+      if (!tableRow) {
+        return json(req, { error: "Invalid QR code or table is inactive." }, 404);
+      }
+
+      const gate = await rateLimit(await bucketKey("order:qr", String(qrToken)), 30, 60);
+      if (!gate.allowed) {
+        return json(
+          req,
+          { error: "Too many orders just now. Please wait a moment." },
+          429,
+        );
+      }
+
+      const { data: autoAcceptSetting } = await db
+        .from("settings")
+        .select("value")
+        .eq("tenant_id", tableRow.tenant_id)
+        .eq("key", "auto_accept_orders")
+        .maybeSingle();
+
+      const autoAccept = autoAcceptSetting?.value === "true";
+      const held = !autoAccept;
+
+      const generatedToken = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+      const { data: newSession, error: newSessionErr } = await db
+        .from("table_sessions")
+        .insert({
+          tenant_id: tableRow.tenant_id,
+          table_id: tableRow.id,
+          status: "ACTIVE",
+          activation_status: held ? "PENDING" : "ACTIVE",
+          token: generatedToken,
+          order_type: "DINE_IN",
+          activated_at: held ? null : new Date().toISOString(),
+          activation_requested_at: held ? new Date().toISOString() : null,
+        })
+        .select("id, token")
+        .single();
+
+      if (newSessionErr || !newSession) {
+        return json(req, { error: "Could not create table session. Please try again." }, 500);
+      }
+
+      const created = await priceAndCreateOrder(db, {
+        tenantId: tableRow.tenant_id,
+        tableId: tableRow.id,
+        tableSessionId: newSession.id,
+        items,
+        orderType: "DINE_IN",
+        customerName,
+        customerPhone,
+        notes,
+        promoCode,
+        servedById: null,
+        status: held ? "PENDING_ACTIVATION" : "PENDING",
+      }, idempotencyKey);
+
+      if (!created.ok) {
+        return json(
+          req,
+          {
+            error:
+              created.reason === "unavailable"
+                ? "One or more items are no longer available"
+                : created.error,
+          },
+          created.status,
+        );
+      }
+
+      if (!created.deduplicated) {
+        if (held) {
+          await publishToStaff(created.order.tenantId, "ACTIVATION_REQUESTED", {
+            order: orderEvent(created.order),
+          });
+          publishToDiner(newSession.token, "ACTIVATION_REQUESTED", {
+            order: orderEvent(created.order),
+          });
+        } else {
+          await publishOrderEvent({
+            type: "ORDER_CREATED",
+            tenantId: created.order.tenantId,
+            order: created.order,
+            sessionToken: newSession.token,
+          });
+        }
+      }
+
+      return json(req, {
+        ...created.order,
+        sessionToken: newSession.token,
+        sessionId: newSession.id,
+        pendingActivation: held,
+      }, 201);
     }
 
     // ── 2. POS / Staff / Dashboard order ───────────────────────────────────
@@ -760,13 +869,16 @@ async function create(req: Request): Promise<Response> {
               code: "SESSION_INACTIVE",
             }, 400);
           }
+        } else if (b.createNewSitting) {
+          // Explicitly creating a new sitting: do not attach to any existing session
+          tableSessionId = null;
         } else {
           // Safe resolution when no session was explicitly specified:
           // If multiple active diner sittings exist on this table, reject ambiguous placement
           // to prevent cross-diner billing corruption.
           const { data: activeSessions } = await db
             .from("table_sessions")
-            .select("id")
+            .select("id, orders(id)")
             .eq("tenant_id", tenantId)
             .eq("table_id", tableId)
             .eq("status", "ACTIVE");
@@ -777,7 +889,31 @@ async function create(req: Request): Promise<Response> {
             }, 400);
           }
           if (activeSessions && activeSessions.length === 1) {
-            tableSessionId = activeSessions[0].id;
+            // Only attach if it already has orders; never silently attach to an empty session (e.g. <3m QR scan)
+            const hasOrders = Array.isArray(activeSessions[0].orders) && activeSessions[0].orders.length > 0;
+            if (hasOrders) {
+              tableSessionId = activeSessions[0].id;
+            }
+          }
+        }
+
+        // When placing a clean new order on a table with no session attached, create a new table session cleanly
+        if (!tableSessionId) {
+          const { data: newSession } = await db
+            .from("table_sessions")
+            .insert({
+              tenant_id: tenantId,
+              table_id: tableId,
+              order_type: "DINE_IN",
+              status: "ACTIVE",
+              activation_status: "ACTIVE",
+              token: crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, ""),
+              activated_at: new Date().toISOString(),
+            })
+            .select("id")
+            .maybeSingle();
+          if (newSession) {
+            tableSessionId = newSession.id;
           }
         }
       }

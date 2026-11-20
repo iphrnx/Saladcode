@@ -100,7 +100,13 @@ export function DinerOrderTracker({
       const res = await edgeFetch('/api/table-session/orders', {
         headers: { 'x-session-token': sessionToken },
       })
-      if (!res.ok) return
+      if (!res.ok) {
+        if (res.status === 401 || res.status === 403) {
+          setOrders([])
+          seenRef.current.clear()
+        }
+        return
+      }
       const body = await res.json().catch(() => null)
       if (!Array.isArray(body?.orders)) return
 
@@ -150,7 +156,11 @@ export function DinerOrderTracker({
   // Load once, then poll — a kitchen update that is missed on the socket is
   // still seen within a few seconds, and the popover is always close to true.
   useEffect(() => {
-    if (!sessionToken) return
+    if (!sessionToken) {
+      setOrders([])
+      seenRef.current.clear()
+      return
+    }
     void load()
     const t = setInterval(load, 5000)
     return () => clearInterval(t)

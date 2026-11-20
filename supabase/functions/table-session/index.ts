@@ -82,113 +82,129 @@ async function validateTableSession(params: {
   tenantId?: string | null;
   tableId?: string | null;
   sessionToken?: string | null;
-}): Promise<{ ok: true; data: SessionShape } | { ok: false; error: string; status: number }> {
-  const { tenantId, tableId, sessionToken } = params;
+  qrToken?: string | null;
+}): Promise<
+  | { ok: true; data: SessionShape | { session: null; tenant: SessionShape["tenant"]; table: SessionShape["table"] } }
+  | { ok: false; error: string; status: number }
+> {
+  const { tenantId, tableId, sessionToken, qrToken } = params;
 
-  if (!sessionToken) {
-    return {
-      ok: false,
-      error: "Missing session credentials. Please scan the table QR code.",
-      status: 401,
-    };
-  }
+  if (sessionToken) {
+    const { data: row } = await admin()
+      .from("table_sessions")
+      .select("*, tenant:tenants(*), table:tables(*)")
+      .eq("token", sessionToken)
+      .maybeSingle();
 
-  const { data: row } = await admin()
-    .from("table_sessions")
-    .select("*, tenant:tenants(*), table:tables(*)")
-    .eq("token", sessionToken)
-    .maybeSingle();
-
-  if (!row) {
-    return { ok: false, error: "Invalid session. Please scan the table QR code.", status: 401 };
-  }
-  if (tenantId && row.tenant_id !== tenantId) {
-    return {
-      ok: false,
-      error: "Session does not match this restaurant. Please scan the table QR code.",
-      status: 403,
-    };
-  }
-  if (tableId && row.table_id !== tableId) {
-    return {
-      ok: false,
-      error: "Session does not match this table. Please scan the table QR code.",
-      status: 403,
-    };
-  }
-  if (row.status !== "ACTIVE") {
-    return {
-      ok: false,
-      error: "Session ended. Please scan the table QR code again to continue.",
-      status: 403,
-    };
-  }
-
-  // This route never ends a session on its own.
-  //
-  // Two earlier rules that did were removed for guessing wrong: a `closing_at`
-  // stamp acted on three seconds after `pagehide`, and a three-minute idle
-  // rule. `pagehide` fires on refresh, app switches and phone locks, and
-  // mobile throttles background timers — both rules ended sessions of diners
-  // who were still at the table.
-  //
-  // What replaced them, and what stands now:
-  //  - the restaurant ends a session from the POS (POST /table-session/end);
-  //  - the sweep ends one nobody ordered at after thirty minutes of silence
-  //    (`session_is_abandoned`, below);
-  //  - the sweep ends one whose page said goodbye two minutes ago and never
-  //    heartbeated again (`session_close_expired`, migration 0058). The
-  //    heartbeat this route writes is exactly the proof-of-life that keeps a
-  //    refreshed or backgrounded page's session alive.
-  //
-  // All three share one protection: a session with an order on it, in any
-  // state, is never ended by a clock or a browser — only by the restaurant.
-  const now = Date.now();
-  const lastSeen = new Date(row.last_seen_at ?? row.created_at).getTime();
-
-  // The one rule that can end a session without the restaurant asking.
-  //
-  // A diner who scans the QR, never orders, and whose page has been gone for
-  // fifteen minutes is releasing the table back to the floor. The definition
-  // lives in the database (`session_is_abandoned`), and the sweep uses the same
-  // one, so the board and this route cannot disagree about it.
-  //
-  // Note what the predicate requires: *no order at all*. A session with an
-  // order on it, in any state, is never abandoned — it ends when the restaurant
-  // ends it.
-  //
-  // This has to be asked before the heartbeat below is written: refreshing
-  // `last_seen_at` first would make every session look busy, including the one
-  // being tested.
-  if (now - lastSeen > 15 * 60_000) {
-    const { data: abandoned } = await admin().rpc("session_is_abandoned", { p_session_id: row.id });
-    if (abandoned === true) {
-      await admin()
-        .from("table_sessions")
-        .update({ status: "ENDED", ended_at: new Date().toISOString() })
-        .eq("id", row.id);
+    if (!row) {
+      return { ok: false, error: "Invalid session. Please scan the table QR code.", status: 401 };
+    }
+    if (tenantId && row.tenant_id !== tenantId) {
       return {
         ok: false,
-        error: "This table session has expired. Please scan the table QR code again to continue.",
+        error: "Session does not match this restaurant. Please scan the table QR code.",
         status: 403,
       };
     }
+    if (tableId && row.table_id !== tableId) {
+      return {
+        ok: false,
+        error: "Session does not match this table. Please scan the table QR code.",
+        status: 403,
+      };
+    }
+    if (row.status !== "ACTIVE") {
+      return {
+        ok: false,
+        error: "Session ended. Please scan the table QR code again to continue.",
+        status: 403,
+      };
+    }
+
+    const now = Date.now();
+    const lastSeen = new Date(row.last_seen_at ?? row.created_at).getTime();
+
+    if (now - lastSeen > 30 * 60_000) {
+      const { data: abandoned } = await admin().rpc("session_is_abandoned", { p_session_id: row.id });
+      if (abandoned === true) {
+        await admin()
+          .from("table_sessions")
+          .update({ status: "ENDED", ended_at: new Date().toISOString() })
+          .eq("id", row.id);
+        return {
+          ok: false,
+          error: "This table session has expired. Please scan the table QR code again to continue.",
+          status: 403,
+        };
+      }
+    }
+
+    if (now - lastSeen > 20_000) {
+      await admin()
+        .from("table_sessions")
+        .update({ last_seen_at: new Date().toISOString() })
+        .eq("id", row.id);
+    }
+
+    const data = shape(row);
+    if (!data.table || !data.table.active) {
+      return { ok: false, error: "This table is no longer available.", status: 403 };
+    }
+    return { ok: true, data };
   }
 
-  // Record the heartbeat, but only when it has gone stale. Writing on every
-  // poll would be a row update per diner per 1.5s for no extra information.
-  if (now - lastSeen > 20_000) {
-    await admin()
-      .from("table_sessions")
-      .update({ last_seen_at: new Date().toISOString() })
-      .eq("id", row.id);
+  if (qrToken) {
+    const { data: tableRow } = await admin()
+      .from("tables")
+      .select("id, name, seats, area, active, tenant:tenants(*)")
+      .eq("qr_token", qrToken)
+      .eq("active", true)
+      .maybeSingle();
+
+    if (!tableRow) {
+      return {
+        ok: false,
+        error: "Invalid QR code. Please scan the QR code on your table.",
+        status: 404,
+      };
+    }
+
+    const tenant = Array.isArray(tableRow.tenant) ? tableRow.tenant[0] : tableRow.tenant;
+    if (!tenant || !tenant.active) {
+      return {
+        ok: false,
+        error: "This restaurant is currently unavailable.",
+        status: 403,
+      };
+    }
+
+    return {
+      ok: true,
+      data: {
+        session: null,
+        tenant: {
+          id: tenant.id,
+          name: tenant.name,
+          currencySymbol: tenant.currency_symbol,
+          taxRate: Number(tenant.tax_rate),
+          serviceCharge: Number(tenant.service_charge),
+        },
+        table: {
+          id: tableRow.id,
+          name: tableRow.name,
+          seats: tableRow.seats,
+          area: tableRow.area,
+          active: tableRow.active,
+        },
+      },
+    };
   }
 
-  const data = shape(row);
-  if (!data.table || !data.table.active) {
-    return { ok: false, error: "This table is no longer available.", status: 403 };
-  }
-  return { ok: true, data };
+  return {
+    ok: false,
+    error: "Missing session credentials. Please scan the table QR code.",
+    status: 401,
+  };
 }
 
 /**
@@ -525,12 +541,13 @@ async function validate(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const tenantId = url.searchParams.get("tenantId");
   const tableId = url.searchParams.get("tableId");
+  const qrToken = url.searchParams.get("qrToken") || url.searchParams.get("table") || url.searchParams.get("qr");
   // The token travels as a header, not a query parameter: a bearer credential
   // in a URL lands in access logs and Referer/analytics. Kept the query
   // parameter as a fallback for any cached bundle from before this change.
   const sessionToken = req.headers.get("x-session-token") ?? url.searchParams.get("sessionToken");
 
-  const result = await validateTableSession({ tenantId, tableId, sessionToken });
+  const result = await validateTableSession({ tenantId, tableId, sessionToken, qrToken });
   if (!result.ok) {
     // The session is not usable, but the diner still needs to know whether
     // there is a bill waiting for them. Saying so here saves the page a
@@ -554,7 +571,7 @@ async function validate(req: Request): Promise<Response> {
     );
   }
 
-  const { tenant, table } = result.data;
+  const { tenant, table, session } = result.data;
   const db = admin();
 
   const [{ data: categories }, { data: menuItems }, { data: socialSettings }] = await Promise.all([
@@ -577,9 +594,11 @@ async function validate(req: Request): Promise<Response> {
   for (const s of socialSettings || []) social[s.key] = s.value;
 
   return json(req, {
-    sessionStatus: "ACTIVE",
-    session: result.data.session,
-    activationStatus: result.data.session.activationStatus,
+    sessionStatus: session ? "ACTIVE" : "BROWSING",
+    session: session ?? null,
+    sessionToken: session?.token ?? null,
+    sessionId: session?.id ?? null,
+    activationStatus: session?.activationStatus ?? "ACTIVE",
     tenant,
     table,
     social,
@@ -1145,7 +1164,7 @@ async function listSessions(req: Request): Promise<Response> {
 async function myOrders(req: Request): Promise<Response> {
   const token = req.headers.get("x-session-token") ?? new URL(req.url).searchParams.get("sessionToken");
   const session = token ? await tableSession(token) : null;
-  if (!session) return json(req, { error: "Session required." }, 401);
+  if (!session || session.status !== "ACTIVE") return json(req, { error: "Session required." }, 401);
 
   const { data } = await admin()
     .from("orders")
