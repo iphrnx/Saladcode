@@ -90,6 +90,7 @@ export function SessionPaymentDialog({
   const [billClosedAt, setBillClosedAt] = useState<Date | null>(null)
   const [failedAt, setFailedAt] = useState<Date | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   /** One key per attempt: a retry after a dropped connection settles the same
@@ -99,6 +100,7 @@ export function SessionPaymentDialog({
   const load = useCallback(async () => {
     if (!tableId && !checkId && !sessionId) return
     setLoading(true)
+    setLoadError(null)
     try {
       const q = new URLSearchParams()
       if (sessionId) q.set('sessionId', sessionId)
@@ -106,8 +108,12 @@ export function SessionPaymentDialog({
       if (tableId) q.set('tableId', tableId)
 
       const res = await edgeFetch(`/api/bill/check?${q.toString()}`)
-      if (!res.ok) return
+      if (!res.ok) {
+        setLoadError("Couldn't load the bill")
+        return
+      }
       const body = await res.json()
+      setLoadError(null)
       const live = (body?.orders ?? []).filter((o: any) => o.status !== 'CANCELLED')
       setItems(
         live.reduce(
@@ -172,7 +178,7 @@ export function SessionPaymentDialog({
         onPaid?.()
       }
     } catch {
-      /* the button below reports anything that matters */
+      setLoadError("Couldn't load the bill")
     } finally {
       setLoading(false)
     }
@@ -183,11 +189,13 @@ export function SessionPaymentDialog({
       setStage('pay')
       setBusy(false)
       setError(null)
+      setLoadError(null)
       setTotals(null)
       setTender(null)
       return
     }
     setLoading(true)
+    setLoadError(null)
     setTotals(null)
     setTender(null)
     keyRef.current = crypto.randomUUID()
@@ -497,7 +505,51 @@ export function SessionPaymentDialog({
               </div>
 
               {/* Bill Summary */}
-              {loading || !totals ? (
+              {loading ? (
+                <div className="mt-3.5 space-y-3 rounded-2xl border border-border/70 bg-card p-3.5 sm:p-4">
+                  <div className="flex items-center justify-between pb-2 border-b border-border/40">
+                    <div className="h-4 w-28 bg-muted animate-pulse rounded" />
+                    <div className="h-3 w-24 bg-muted animate-pulse rounded" />
+                  </div>
+                  <div className="space-y-2.5 pt-1">
+                    <div className="flex justify-between">
+                      <div className="h-3.5 w-16 bg-muted animate-pulse rounded" />
+                      <div className="h-3.5 w-14 bg-muted animate-pulse rounded" />
+                    </div>
+                    <div className="flex justify-between">
+                      <div className="h-3.5 w-20 bg-muted animate-pulse rounded" />
+                      <div className="h-3.5 w-12 bg-muted animate-pulse rounded" />
+                    </div>
+                    <div className="flex justify-between">
+                      <div className="h-3.5 w-20 bg-muted animate-pulse rounded" />
+                      <div className="h-3.5 w-12 bg-muted animate-pulse rounded" />
+                    </div>
+                  </div>
+                  <div className="h-10 w-full bg-muted/60 animate-pulse rounded-xl mt-3" />
+                </div>
+              ) : loadError ? (
+                <div className="mt-3.5 flex flex-col items-center justify-center rounded-2xl border border-destructive/20 bg-destructive/5 p-5 text-center">
+                  <div className="grid size-10 place-items-center rounded-full bg-destructive/10 text-destructive mb-2.5">
+                    <Info className="size-5" />
+                  </div>
+                  <p className="text-[14.5px] font-bold text-foreground">
+                    Couldn&apos;t load the bill
+                  </p>
+                  <p className="mt-1 text-[12px] text-muted-foreground max-w-[280px]">
+                    We were unable to retrieve the bill details for this sitting.
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void load()}
+                    disabled={loading}
+                    className="mt-3.5 h-9 gap-1.5 rounded-xl border-border px-4 text-xs font-semibold hover:bg-secondary cursor-pointer"
+                  >
+                    <RotateCw className={cn("size-3.5", loading && "animate-spin")} />
+                    Retry
+                  </Button>
+                </div>
+              ) : !totals ? (
                 <div className="mt-3.5 space-y-3 rounded-2xl border border-border/70 bg-card p-3.5 sm:p-4">
                   <div className="flex items-center justify-between pb-2 border-b border-border/40">
                     <div className="h-4 w-28 bg-muted animate-pulse rounded" />
@@ -569,7 +621,8 @@ export function SessionPaymentDialog({
               )}
 
               {/* Payment Methods */}
-              {!isFullyPaid ? (
+              {!loadError && (
+                !isFullyPaid ? (
                 <>
                   <p className="mt-3.5 flex items-center gap-1.5 text-[14px] font-bold text-foreground sm:text-[14.5px]">
                     <CreditCard className="size-4 text-primary" />
@@ -654,7 +707,7 @@ export function SessionPaymentDialog({
                     </p>
                   </div>
                 </div>
-              )}
+              ))}
             </>
           )}
 
@@ -832,7 +885,7 @@ export function SessionPaymentDialog({
           {stage === 'pay' && (
             <Button
               onClick={() => void pay()}
-              disabled={busy || loading || !totals}
+              disabled={busy || loading || !totals || Boolean(loadError)}
               className="h-12 w-full rounded-2xl bg-primary hover:bg-primary/90 text-[15px] font-bold text-primary-foreground shadow-md shadow-primary/25 transition-all cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {busy ? (

@@ -184,6 +184,20 @@ check(
   sessionPaymentSrc.includes("isFullyPaid ? (\n                'Close Bill'"),
 );
 
+// 10. Verification of bill load error handling and retry
+check(
+  "SessionPaymentDialog displays 'Couldn't load the bill' on request failure",
+  sessionPaymentSrc.includes("Couldn&apos;t load the bill") || sessionPaymentSrc.includes("Couldn't load the bill"),
+);
+check(
+  "SessionPaymentDialog provides a Retry button that calls load() only",
+  sessionPaymentSrc.includes("onClick={() => void load()}") && sessionPaymentSrc.includes("Retry"),
+);
+check(
+  "SessionPaymentDialog keeps Complete Payment disabled until bill loads",
+  sessionPaymentSrc.includes("disabled={busy || loading || !totals || Boolean(loadError)}"),
+);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);
 

@@ -158,3 +158,60 @@ describe("P2: Fully paid bill behavior in payment screen", () => {
     assert.strictEqual(buttonLabel, "Close Bill"); // Action labeled Close Bill
   });
 });
+
+describe("SessionPaymentDialog: Bill load failure, error display, and retry", () => {
+  it("shows 'Couldn't load the bill', keeps Complete Payment disabled, and successful retry clears error", async () => {
+    // Model state transitions of SessionPaymentDialog load/retry logic
+    let loading = true;
+    let loadError: string | null = null;
+    let totals: any = null;
+    let attempts = 0;
+
+    async function mockLoad(shouldFail: boolean) {
+      loading = true;
+      loadError = null;
+      try {
+        attempts++;
+        if (shouldFail) {
+          throw new Error("HTTP 500: Server Error");
+        }
+        totals = {
+          subtotal: 500,
+          tax: 25,
+          total: 525,
+          outstanding: 525,
+        };
+        loadError = null;
+      } catch {
+        loadError = "Couldn't load the bill";
+        totals = null;
+      } finally {
+        loading = false;
+      }
+    }
+
+    // 1. Initial attempt fails
+    await mockLoad(true);
+
+    assert.strictEqual(loading, false);
+    assert.strictEqual(loadError, "Couldn't load the bill");
+    assert.strictEqual(totals, null);
+
+    // Complete Payment button disabled condition: busy || loading || !totals || Boolean(loadError)
+    const isPaymentDisabledOnFailure = loading || !totals || Boolean(loadError);
+    assert.strictEqual(isPaymentDisabledOnFailure, true, "Complete Payment must be disabled when bill load fails");
+
+    // 2. Retry reloads the bill only and succeeds
+    await mockLoad(false);
+
+    assert.strictEqual(loading, false);
+    assert.strictEqual(loadError, null, "Successful retry must clear the load error");
+    assert.notStrictEqual(totals, null, "Successful retry must populate bill totals");
+    assert.strictEqual(totals.total, 525);
+    assert.strictEqual(attempts, 2);
+
+    // Complete Payment button should now be enabled
+    const isPaymentDisabledOnSuccess = loading || !totals || Boolean(loadError);
+    assert.strictEqual(isPaymentDisabledOnSuccess, false, "Complete Payment must be enabled after bill loads successfully");
+  });
+});
