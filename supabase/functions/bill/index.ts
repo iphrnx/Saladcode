@@ -73,7 +73,7 @@ async function checkForTenant(
   sessionId: string | null,
   tableId: string | null,
   checkId: string | null = null,
-): Promise<{ check: any; orders: any[]; payments: any[]; gstin: string | null; fssai: string | null; tenant: any } | null> {
+): Promise<{ check: any; orders: any[]; payments: any[]; gstin: string | null; fssai: string | null; tenant: any; table: any } | null> {
   const db = admin();
 
   // A named check wins, and does not need the table at all. Resolving by
@@ -136,15 +136,24 @@ async function checkForTenant(
 /** Everything a bill needs, for one check that has already been resolved. */
 async function loadCheck(tenantId: string, open: any) {
   const db = admin();
+  // Explicitly recover unassigned legacy orders belonging to this session so
+  // billing and settlement remain scoped to the exact same orders.
+  if (open.id && open.session_id && open.status === "OPEN") {
+    await db
+      .from("orders")
+      .update({ check_id: open.id })
+      .eq("tenant_id", tenantId)
+      .eq("table_session_id", open.session_id)
+      .is("check_id", null);
+  }
+
   let orderQuery = db
     .from("orders")
     .select("*, items:order_items(*)")
     .neq("status", "PENDING_ACTIVATION")
     .neq("status", "CANCELLED");
 
-  if (open.id && open.session_id) {
-    orderQuery = orderQuery.or(`check_id.eq.${open.id},table_session_id.eq.${open.session_id}`);
-  } else if (open.id) {
+  if (open.id) {
     orderQuery = orderQuery.eq("check_id", open.id);
   } else if (open.session_id) {
     orderQuery = orderQuery.eq("table_session_id", open.session_id);
@@ -411,6 +420,17 @@ async function getCheck(req: Request): Promise<Response> {
     return json(req, dinerDocument(check, live, payments, gstin, data.tenant, data.table, data.fssai));
   }
 
+  // Tax is the sum of what each order was charged at the time it was
+  // placed — never re-derived here, because a second calculation is a
+  // second opinion about money. Split deterministically in integer paise.
+  const gstTotalPaise = Math.round(tax * 100);
+  const cgstPaise = Math.ceil(gstTotalPaise / 2);
+  const sgstPaise = gstTotalPaise - cgstPaise;
+  const cgstAmount = +(cgstPaise / 100).toFixed(2);
+  const sgstAmount = +(sgstPaise / 100).toFixed(2);
+  const taxRate = Number(data.tenant?.tax_rate ?? 5);
+  const serviceRate = Number(data.tenant?.service_charge ?? 0);
+
   return json(req, {
     checkId: check.id,
     status: check.status,
@@ -425,48 +445,23 @@ async function getCheck(req: Request): Promise<Response> {
     invoiceNumber: check.invoice_number,
     invoiceDate: check.invoice_date,
     gstin,
-    // Tax is the sum of what each order was charged at the time it was
-    // placed — never re-derived here, because a second calculation is a
-    // second opinion about money. Split deterministically in integer paise.
-    const gstTotalPaise = Math.round(tax * 100);
-    const cgstPaise = Math.ceil(gstTotalPaise / 2);
-    const sgstPaise = gstTotalPaise - cgstPaise;
-    const cgstAmount = +(tax / 2).toFixed(2); // cgst: +(tax / 2).toFixed(2)
-    const sgstAmount = +(sgstPaise / 100).toFixed(2); // sgst: +(tax / 2).toFixed(2)
-    const taxRate = Number(data.tenant?.tax_rate ?? 5);
-    const serviceRate = Number(data.tenant?.service_charge ?? 0);
-
-    return json(req, {
-      checkId: check.id,
-      status: check.status,
-      tableId: check.table_id ?? data.table?.id ?? null,
-      tableName: data.table?.name ?? null,
-      tableArea: data.table?.area ?? null,
-      table: data.table && data.table.name?.trim()
-        ? { name: data.table.name.trim(), seats: Number(data.table.seats ?? 0), area: data.table.area?.trim() ?? "" }
-        : null,
-      openedAt: check.opened_at,
-      closedAt: check.closed_at,
-      invoiceNumber: check.invoice_number,
-      invoiceDate: check.invoice_date,
-      gstin,
+    taxRate,
+    serviceRate,
+    totals: {
+      subtotal,
+      discount,
+      tax,
+      serviceCharge,
+      total,
+      paid,
+      refunded: refundedTotal,
+      outstanding: +Math.max(0, total - paid).toFixed(2),
+      cgst: cgstAmount,
+      sgst: sgstAmount,
       taxRate,
       serviceRate,
-      totals: {
-        subtotal,
-        discount,
-        tax,
-        serviceCharge,
-        total,
-        paid,
-        refunded: refundedTotal,
-        outstanding: +Math.max(0, total - paid).toFixed(2),
-        cgst: cgstAmount,
-        sgst: sgstAmount,
-        taxRate,
-        serviceRate,
-        roundOff: 0,
-      },
+      roundOff: 0,
+    },
     orderCount: live.length,
     orders: live.map((o: any) => ({
       id: o.id,
@@ -576,18 +571,18 @@ async function auditMoney(
   tenantId: string,
   meta: string,
 ) {
-  await admin()
-    .from("security_logs")
-    .insert({
-      tenant_id: tenantId,
-      user_id: session?.kind === "owner" ? session.subjectId : null,
-      actor_staff_id: session?.kind === "staff" ? session.subjectId : null,
-      action,
-      user_agent: req.headers.get("user-agent") || "unknown",
-      meta,
-    })
-    .then(() => {})
-    .catch(() => {});
+  try {
+    await admin()
+      .from("security_logs")
+      .insert({
+        tenant_id: tenantId,
+        user_id: session?.kind === "owner" ? session.subjectId : null,
+        actor_staff_id: session?.kind === "staff" ? session.subjectId : null,
+        action,
+        user_agent: req.headers.get("user-agent") || "unknown",
+        meta,
+      });
+  } catch {}
 }
 
 async function broadcastCheck(tenantId: string, checkId: string, reason: string) {
@@ -611,7 +606,38 @@ async function broadcastCheck(tenantId: string, checkId: string, reason: string)
     invoiceNumber: check.invoice_number ?? null,
   });
 
-  if (targetSessionId) {
+  if (check.session_id) {
+    if (reason === "FINALISED") {
+      await publishToStaff(tenantId, "SESSION_ENDED", {
+        tableId: check.table_id,
+        sessionId: check.session_id,
+        status: "ENDED",
+        endedAt: new Date().toISOString(),
+        invoiceNumber: check.invoice_number ?? null,
+        order: { sessionId: check.session_id, status: "ENDED" },
+      });
+      await publishToStaff(tenantId, "SESSION_UPDATED", {
+        tableId: check.table_id,
+        sessionId: check.session_id,
+        status: "ENDED",
+      });
+    }
+    const { data: s } = await admin()
+      .from("table_sessions")
+      .select("token")
+      .eq("id", check.session_id)
+      .maybeSingle();
+    if (s?.token) {
+      publishToDiner(s.token, "CHECK_UPDATED", { checkId, reason, status: isPaid ? "PAID" : check.status });
+      if (reason === "FINALISED") {
+        publishToDiner(s.token, "SESSION_ENDED", {
+          tableId: check.table_id,
+          sessionId: check.session_id,
+          status: "ENDED",
+        });
+      }
+    }
+  } else if (targetSessionId) {
     if (reason === "FINALISED") {
       await publishToStaff(tenantId, "SESSION_ENDED", {
         tableId: check.table_id,

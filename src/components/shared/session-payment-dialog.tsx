@@ -378,7 +378,8 @@ export function SessionPaymentDialog({
   const durationText = beganAt && finishedAt ? elapsed(beganAt, finishedAt) : '—'
   const selectedMethod = METHODS.find((m) => m.value === method) ?? METHODS[0]
   const SelectedMethodIcon = selectedMethod.icon
-  const amountToPay = totals ? (totals.outstanding > 0 ? totals.outstanding : totals.total) : 0
+  const isFullyPaid = Boolean(totals && totals.outstanding <= 0)
+  const amountToPay = totals ? Math.max(0, totals.outstanding) : 0
   const amountText = money(amountToPay)
   const paidText = money(totals?.total ?? 0)
   const contextSubtitle = `${tableName ?? 'Table'}${invoiceNumber ? ` · Inv ${invoiceNumber.startsWith('#') ? invoiceNumber : `#${invoiceNumber}`}` : ''}`
@@ -557,80 +558,100 @@ export function SessionPaymentDialog({
                     )}
                   </div>
                   <div className="mt-3 flex items-center justify-between rounded-xl bg-primary/10 px-3.5 py-2.5 border border-primary/20">
-                    <span className="text-[14.5px] font-bold text-foreground sm:text-[15px]">Total Amount</span>
+                    <span className="text-[14.5px] font-bold text-foreground sm:text-[15px]">
+                      {isFullyPaid ? 'Amount Due' : totals.outstanding < totals.total ? 'Amount Due' : 'Total Amount'}
+                    </span>
                     <span className="text-[18px] font-extrabold tabular-nums text-foreground sm:text-[19px]">
-                      {money(totals.outstanding > 0 ? totals.outstanding : totals.total)}
+                      {money(amountToPay)}
                     </span>
                   </div>
                 </div>
               )}
 
               {/* Payment Methods */}
-              <p className="mt-3.5 flex items-center gap-1.5 text-[14px] font-bold text-foreground sm:text-[14.5px]">
-                <CreditCard className="size-4 text-primary" />
-                Select Payment Method
-              </p>
-              <div className="mt-2 grid grid-cols-3 gap-2 sm:gap-2.5">
-                {METHODS.map((m) => {
-                  const active = method === m.value
-                  const Icon = m.icon
-                  return (
-                    <button
-                      type="button"
-                      key={m.value}
-                      onClick={() => setMethod(m.value)}
-                      aria-pressed={active}
-                      className={cn(
-                        'relative flex flex-col items-center justify-center gap-1.5 rounded-2xl border-[1.5px] px-2 py-3 transition-all cursor-pointer',
-                        active
-                          ? 'border-primary bg-primary/[0.06] shadow-xs'
-                          : 'border-border/80 bg-card hover:border-border hover:bg-secondary/40',
-                      )}
-                    >
-                      <span
-                        className={cn(
-                          'absolute right-2 top-2 grid size-4.5 place-items-center rounded-full transition-colors',
-                          active
-                            ? 'bg-primary text-primary-foreground shadow-xs'
-                            : 'border-[1.5px] border-border/80 bg-transparent',
-                        )}
-                      >
-                        {active && <Check className="size-3" strokeWidth={3.5} />}
-                      </span>
-                      <Icon className={cn('size-5.5 sm:size-6', active ? 'text-primary' : 'text-foreground/75')} />
-                      <span className={cn('text-[13px]', active ? 'font-bold text-foreground' : 'font-medium text-foreground')}>{m.label}</span>
-                    </button>
-                  )
-                })}
-              </div>
-
-              {/* Quick tender chips for Cash checkout polish */}
-              {method === 'CASH' && totals && tenderOptions.length > 0 && (
-                <div className="mt-3 rounded-2xl border border-border/70 bg-card p-3 shadow-xs">
-                  <div className="flex items-center justify-between text-xs font-semibold text-muted-foreground mb-2">
-                    <span>Quick Tender / Change:</span>
-                    {tender !== null && tender > amountToPay && (
-                      <span className="font-bold text-emerald-600 dark:text-emerald-400">
-                        Change: {money(tender - amountToPay)}
-                      </span>
-                    )}
+              {!isFullyPaid ? (
+                <>
+                  <p className="mt-3.5 flex items-center gap-1.5 text-[14px] font-bold text-foreground sm:text-[14.5px]">
+                    <CreditCard className="size-4 text-primary" />
+                    Select Payment Method
+                  </p>
+                  <div className="mt-2 grid grid-cols-3 gap-2 sm:gap-2.5">
+                    {METHODS.map((m) => {
+                      const active = method === m.value
+                      const Icon = m.icon
+                      return (
+                        <button
+                          type="button"
+                          key={m.value}
+                          onClick={() => setMethod(m.value)}
+                          aria-pressed={active}
+                          className={cn(
+                            'relative flex flex-col items-center justify-center gap-1.5 rounded-2xl border-[1.5px] px-2 py-3 transition-all cursor-pointer',
+                            active
+                              ? 'border-primary bg-primary/[0.06] shadow-xs'
+                              : 'border-border/80 bg-card hover:border-border hover:bg-secondary/40',
+                          )}
+                        >
+                          <span
+                            className={cn(
+                              'absolute right-2 top-2 grid size-4.5 place-items-center rounded-full transition-colors',
+                              active
+                                ? 'bg-primary text-primary-foreground shadow-xs'
+                                : 'border-[1.5px] border-border/80 bg-transparent',
+                            )}
+                          >
+                            {active && <Check className="size-3" strokeWidth={3.5} />}
+                          </span>
+                          <Icon className={cn('size-5.5 sm:size-6', active ? 'text-primary' : 'text-foreground/75')} />
+                          <span className={cn('text-[13px]', active ? 'font-bold text-foreground' : 'font-medium text-foreground')}>{m.label}</span>
+                        </button>
+                      )
+                    })}
                   </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {tenderOptions.map((opt) => (
-                      <button
-                        key={opt.label}
-                        type="button"
-                        onClick={() => setTender(opt.value)}
-                        className={cn(
-                          'px-2.5 py-1 rounded-xl text-xs font-bold transition-all cursor-pointer',
-                          tender === opt.value
-                            ? 'bg-primary text-primary-foreground shadow-xs'
-                            : 'bg-secondary/50 border border-border/70 hover:bg-secondary text-foreground',
+
+                  {/* Quick tender chips for Cash checkout polish */}
+                  {method === 'CASH' && totals && tenderOptions.length > 0 && (
+                    <div className="mt-3 rounded-2xl border border-border/70 bg-card p-3 shadow-xs">
+                      <div className="flex items-center justify-between text-xs font-semibold text-muted-foreground mb-2">
+                        <span>Quick Tender / Change:</span>
+                        {tender !== null && tender > amountToPay && (
+                          <span className="font-bold text-emerald-600 dark:text-emerald-400">
+                            Change: {money(tender - amountToPay)}
+                          </span>
                         )}
-                      >
-                        {opt.label}
-                      </button>
-                    ))}
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {tenderOptions.map((opt) => (
+                          <button
+                            key={opt.label}
+                            type="button"
+                            onClick={() => setTender(opt.value)}
+                            className={cn(
+                              'px-2.5 py-1 rounded-xl text-xs font-bold transition-all cursor-pointer',
+                              tender === opt.value
+                                ? 'bg-primary text-primary-foreground shadow-xs'
+                                : 'bg-secondary/50 border border-border/70 hover:bg-secondary text-foreground',
+                            )}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="mt-3.5 flex items-center gap-2.5 rounded-2xl border border-emerald-500/20 bg-emerald-500/[0.06] px-3.5 py-3">
+                  <span className="grid size-7 shrink-0 place-items-center rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+                    <Check className="size-4" strokeWidth={3} />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="text-[13px] font-bold text-emerald-700 dark:text-emerald-400">
+                      Paid in Full
+                    </p>
+                    <p className="text-[11.5px] text-muted-foreground">
+                      This check has ₹0 due. Click Close Bill below to finalize.
+                    </p>
                   </div>
                 </div>
               )}
@@ -811,7 +832,7 @@ export function SessionPaymentDialog({
           {stage === 'pay' && (
             <Button
               onClick={() => void pay()}
-              disabled={busy || loading || !totals || totals.total <= 0}
+              disabled={busy || loading || !totals}
               className="h-12 w-full rounded-2xl bg-primary hover:bg-primary/90 text-[15px] font-bold text-primary-foreground shadow-md shadow-primary/25 transition-all cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {busy ? (
@@ -821,10 +842,16 @@ export function SessionPaymentDialog({
                   <Check className="size-3.5" strokeWidth={3.5} />
                 </span>
               )}
-              Complete Payment
-              <span className="ml-2 font-extrabold tabular-nums">
-                {amountText}
-              </span>
+              {isFullyPaid ? (
+                'Close Bill'
+              ) : (
+                <>
+                  Complete Payment
+                  <span className="ml-2 font-extrabold tabular-nums">
+                    {amountText}
+                  </span>
+                </>
+              )}
             </Button>
           )}
 
