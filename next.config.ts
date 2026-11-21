@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import path from "node:path";
 
 const isDev = process.env.NODE_ENV !== "production";
 
@@ -71,6 +72,9 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   experimental: {
     agentUpgrade: "security",
+  },
+  turbopack: {
+    root: path.resolve(process.cwd(), ".."),
   },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }]

@@ -484,18 +484,37 @@ async function priceAndCommitOnce(
   const taxRate = (tenant?.tax_rate ?? 8) / 100;
   const serviceRate = (tenant?.service_charge ?? 0) / 100;
 
-  // One authority on whether the code applies, and why not if it does not.
-  const promoEval = await evaluatePromo(db, tenantId, promoCode, itemsTotal, {
-    currencySymbol: tenant?.currency_symbol ?? "₹",
-  });
+  let discount = 0;
+  let promoCodeId: string | undefined = undefined;
+  let promoCodeStr: string | undefined = undefined;
+  let promoApplied = false;
+  let promoReason: string | null = null;
 
-  const discount = promoEval.discount;
-  const promoCodeId = promoEval.applied ? promoEval.promo.id : undefined;
-  const promoCodeStr = promoEval.applied ? promoEval.code : undefined;
+  if (promoCode && promoCode.trim()) {
+    // One authority on whether the code applies, and why not if it does not.
+    const promoEval = await evaluatePromo(db, tenantId, promoCode, itemsTotal, {
+      currencySymbol: tenant?.currency_symbol ?? "₹",
+    });
 
-  const tax = +((itemsTotal - discount) * taxRate).toFixed(2);
+    if (!promoEval.applied) {
+      return {
+        ok: false,
+        error: promoEval.reason || "Promo code cannot be applied",
+        status: 400,
+      };
+    }
+
+    discount = promoEval.discount;
+    promoCodeId = promoEval.promo?.id;
+    promoCodeStr = promoEval.code ?? undefined;
+    promoApplied = true;
+    promoReason = null;
+  }
+
+  const taxableAmount = Math.max(0, itemsTotal - discount);
+  const tax = +(taxableAmount * taxRate).toFixed(2);
   const serviceCharge = +(itemsTotal * serviceRate).toFixed(2);
-  const total = +(itemsTotal - discount + tax + serviceCharge).toFixed(2);
+  const total = +(taxableAmount + tax + serviceCharge).toFixed(2);
 
   // One transaction writes order, items and the promo usage increment (see
   // migration 0056): a failure anywhere rolls all three back together, so an
@@ -534,9 +553,11 @@ async function priceAndCommitOnce(
     const msg = String(txError.message ?? "");
     const code = String((txError as any).code ?? "");
     // The in-transaction guards rejected a line or the promo after pricing —
-    // something changed in the few milliseconds since. The caller re-prices
-    // and retries once with the same key; the first attempt left nothing.
-    if (msg.includes("PROMO_REJECTED") || msg.includes("ITEM_UNAVAILABLE")) {
+    // something changed in the few milliseconds since.
+    if (msg.includes("PROMO_REJECTED")) {
+      return { ok: false, error: "Promo code is invalid, expired, or usage limit reached", status: 409, retry: false };
+    }
+    if (msg.includes("ITEM_UNAVAILABLE")) {
       return { ok: false, error: msg, status: 409, retry: true };
     }
     // Concurrency defense (Fix C1): if an idempotency key conflict occurred,
@@ -610,8 +631,8 @@ async function priceAndCommitOnce(
   return {
     ok: true,
     order: mapOrder(orderRow),
-    promoApplied: promoEval.applied,
-    promoReason: promoEval.reason,
+    promoApplied,
+    promoReason,
     deduplicated,
   };
 }

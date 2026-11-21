@@ -428,17 +428,25 @@ export function DashboardView() {
   // matches the server's evaluatePromo() exactly, including max_discount
   // capping fixed-amount codes as well as percentages.
   let discount = 0
-  if (appliedPromo && subtotal >= appliedPromo.minOrder) {
-    discount = appliedPromo.type === 'PERCENTAGE'
-      ? (subtotal * appliedPromo.value) / 100
-      : appliedPromo.value
-    if (appliedPromo.maxDiscount > 0) discount = Math.min(discount, appliedPromo.maxDiscount)
-    discount = Math.min(discount, subtotal) // never go negative
+  const minOrder = Number(appliedPromo?.minOrder ?? appliedPromo?.min_order ?? 0)
+  if (appliedPromo && subtotal >= minOrder) {
+    const promoValue = Number(appliedPromo.value) || 0
+    const promoType = appliedPromo.type
+    const maxDiscount = Number(appliedPromo.maxDiscount ?? appliedPromo.max_discount ?? 0)
+
+    if (promoType === 'PERCENTAGE') {
+      discount = (subtotal * promoValue) / 100
+      if (maxDiscount > 0) discount = Math.min(discount, maxDiscount)
+    } else {
+      discount = promoValue
+      if (maxDiscount > 0) discount = Math.min(discount, maxDiscount)
+    }
+    discount = Math.min(subtotal, Math.max(0, discount)) // never go negative
   }
   const taxableAmount = Math.max(0, subtotal - discount)
   const tax = +((taxableAmount) * taxRate / 100).toFixed(2)
   const service = +((subtotal) * serviceRate / 100).toFixed(2)
-  const total = +(subtotal - discount + tax + service).toFixed(2)
+  const total = +(taxableAmount + tax + service).toFixed(2)
 
   // Validate the promo code against the server.
   //
