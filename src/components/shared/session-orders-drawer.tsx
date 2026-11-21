@@ -29,6 +29,7 @@ import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import { formatOrderRelativeTime } from '@/lib/order-time'
+import { formatCurrency } from '@/lib/constants'
 
 type Tab = 'orders' | 'bill' | 'activity'
 
@@ -102,11 +103,7 @@ export function SessionOrdersDrawer({
     focusOrderId ? [focusOrderId] : orders.length === 1 ? [orders[0].id] : [],
   )
 
-  const money = (n: number) =>
-    `${currencySymbol}${Number(n ?? 0).toLocaleString('en-IN', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })}`
+  const money = (n: number) => formatCurrency(n, currencySymbol)
 
   const [wasOpen, setWasOpen] = useState(open)
   const [lastFocus, setLastFocus] = useState<string | null>(focusOrderId)
@@ -133,7 +130,7 @@ export function SessionOrdersDrawer({
   const isTakeaway = orderType === 'TAKEAWAY'
   const isDelivery = orderType === 'DELIVERY'
   const defaultArea = isTakeaway || isDelivery ? null : 'Main Hall'
-  const metaSubtitle = [area || defaultArea, seats ? `${seats} Seats` : null, typeLabel]
+  const metaSubtitle = [area || defaultArea, typeLabel]
     .filter(Boolean)
     .join(' • ')
 
@@ -234,7 +231,7 @@ export function SessionOrdersDrawer({
     timelineEvents.push({
       id: 'session-ended',
       title: 'Session Ended',
-      subtitle: `${tableName} closed and settled`,
+      subtitle: `${tableName} has been closed and settled`,
       time: formatTime(effectiveEndedAt || orders[orders.length - 1]?.completedAt),
       type: 'ended',
     })
@@ -244,11 +241,12 @@ export function SessionOrdersDrawer({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         showCloseButton={false}
-        className="w-[calc(100%-1.25rem)] max-w-[560px] gap-0 overflow-hidden rounded-[28px] border border-border/80 bg-white p-0 shadow-2xl dark:bg-card"
+        className="w-[calc(100%-1.25rem)] max-w-[560px] max-h-[90dvh] flex flex-col gap-0 overflow-hidden rounded-[28px] border border-border/80 bg-white p-0 shadow-2xl dark:bg-card"
       >
         <DialogTitle className="sr-only">Session Details for {tableName}</DialogTitle>
 
-        <div className="relative max-h-[90dvh] overflow-y-auto p-4 sm:p-6 scrollbar-thin">
+        {/* Pinned Header */}
+        <div className="relative shrink-0 border-b border-border/40 p-4 sm:p-6 pb-3 text-center">
           {/* Circular Close Button */}
           <button
             type="button"
@@ -259,16 +257,16 @@ export function SessionOrdersDrawer({
             <X className="size-4" />
           </button>
 
-          {/* Centered Modal Header */}
-          <div className="pt-1 pb-3 text-center">
-            <h2 className="text-[22px] sm:text-[24px] font-extrabold tracking-tight text-foreground">
-              Session Details
-            </h2>
-            <p className="mt-0.5 text-[13px] font-medium text-muted-foreground">
-              {headerSubtitle}
-            </p>
-          </div>
+          <h2 className="text-[22px] sm:text-[24px] font-extrabold tracking-tight text-foreground">
+            Session Details
+          </h2>
+          <p className="mt-0.5 text-[13px] font-medium text-muted-foreground">
+            {headerSubtitle}
+          </p>
+        </div>
 
+        {/* Middle Scrollable Body */}
+        <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 scrollbar-thin">
           {/* Context Card */}
           <div className="flex items-center justify-between gap-3 rounded-2xl border border-orange-200/80 bg-[#FFF9F5] p-3.5 dark:border-primary/20 dark:bg-primary/[0.04]">
             <div className="flex min-w-0 items-center gap-3">
@@ -339,6 +337,7 @@ export function SessionOrdersDrawer({
           <div role="tablist" className="mt-3.5 grid grid-cols-3 gap-2">
             <button
               role="tab"
+              aria-label={`Orders (${orders.length})`}
               aria-selected={tab === 'orders'}
               onClick={() => setTab('orders')}
               className={cn(
@@ -349,10 +348,12 @@ export function SessionOrdersDrawer({
               )}
             >
               <Layers className={cn('size-4 shrink-0', tab === 'orders' ? 'text-white' : 'text-muted-foreground')} />
-              <span className="truncate">Orders ({orders.length})</span>
+              <span className="truncate">Orders</span>
+              {/* Orders ({orders.length}) */}
             </button>
             <button
               role="tab"
+              aria-label="Bill Summary"
               aria-selected={tab === 'bill'}
               onClick={() => setTab('bill')}
               className={cn(
@@ -363,7 +364,8 @@ export function SessionOrdersDrawer({
               )}
             >
               <FileText className={cn('size-4 shrink-0', tab === 'bill' ? 'text-white' : 'text-muted-foreground')} />
-              <span className="truncate">Bill Summary</span>
+              <span className="truncate">Bill</span>
+              {/* Bill Summary */}
             </button>
             <button
               role="tab"
@@ -393,7 +395,7 @@ export function SessionOrdersDrawer({
                       .map(
                         (it) =>
                           `${it.quantity} × ${it.name}${
-                            it.portion && it.portion !== 'Regular' ? ` (${it.portion})` : ''
+                            it.portion ? ` (${it.portion})` : ''
                           }`,
                       )
                       .join(', ') || 'No items'
@@ -482,9 +484,11 @@ export function SessionOrdersDrawer({
                                 <Dish src={dishImages[it.menuItemId]} />
                                 <div className="min-w-0 flex-1 leading-tight">
                                   <p className="truncate text-[13px] font-semibold text-foreground">{it.name}</p>
-                                  <p className="truncate text-[11.5px] text-muted-foreground">
-                                    {it.portion || 'Full'}
-                                  </p>
+                                  {it.portion ? (
+                                    <p className="truncate text-[11.5px] text-muted-foreground">
+                                      {it.portion}
+                                    </p>
+                                  ) : null}
                                 </div>
                                 <span className="shrink-0 text-[12px] font-semibold text-muted-foreground tabular-nums">
                                   ×{it.quantity}
@@ -656,14 +660,14 @@ export function SessionOrdersDrawer({
                         {/* Title, Subtitle, Time */}
                         <div className="flex min-w-0 flex-1 items-start justify-between gap-2 pt-0.5">
                           <div className="min-w-0">
-                            <h5 className="truncate text-[13.5px] font-bold text-foreground leading-tight">
+                            <h5 className="text-[13.5px] font-bold text-foreground leading-tight">
                               {evt.title}
                             </h5>
-                            <p className="truncate text-[12px] font-medium text-muted-foreground mt-0.5 leading-snug">
+                            <p className="text-[12px] font-medium text-muted-foreground mt-0.5 leading-snug break-words">
                               {evt.subtitle}
                             </p>
                           </div>
-                          <span className="shrink-0 text-[12px] font-medium text-muted-foreground tabular-nums">
+                          <span className="shrink-0 text-[12px] font-medium text-muted-foreground tabular-nums whitespace-nowrap">
                             {evt.time}
                           </span>
                         </div>
@@ -713,9 +717,11 @@ export function SessionOrdersDrawer({
               </div>
             )
           )}
+        </div>
 
-          {/* Footer Action Buttons */}
-          <div className="mt-3.5 grid grid-cols-2 gap-3">
+        {/* Pinned Footer Action Buttons */}
+        <div className="shrink-0 border-t border-border/40 bg-card p-4 sm:px-6">
+          <div className="grid grid-cols-2 gap-3">
             <Button
               type="button"
               variant="outline"
@@ -790,11 +796,11 @@ function calculateDuration(startIso?: string | null, endIso?: string | null): st
   if (isNaN(start)) return '—'
   const end = endIso ? new Date(endIso).getTime() : Date.now()
   const mins = Math.max(0, Math.floor((end - start) / 60000))
-  if (mins < 1) return '<1 min'
-  if (mins < 60) return `${mins} min`
+  if (mins < 1) return '<1m'
+  if (mins < 60) return `${mins}m`
   const hours = Math.floor(mins / 60)
   const rest = mins % 60
-  return rest ? `${hours} hr ${rest} min` : `${hours} hr`
+  return rest ? `${hours}h ${rest}m` : `${hours}h`
 }
 
 function when(iso: string) {

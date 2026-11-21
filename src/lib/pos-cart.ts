@@ -41,6 +41,40 @@ function draftsSuffix(tenantId: string, userId: string): string {
   return `${tenantId}-${userId}-drafts`
 }
 
+function activeSessionSuffix(tenantId: string, userId: string): string {
+  return `${tenantId}-${userId}-active-session`
+}
+
+/** Persist currently loaded POS active session id in localStorage. */
+export function savePosActiveSessionId(
+  tenantId: string,
+  userId: string,
+  sessionId: string | null | undefined,
+): void {
+  if (sessionId?.trim()) {
+    writeStored('posCart', sessionId.trim(), activeSessionSuffix(tenantId, userId))
+  } else {
+    removeStored('posCart', activeSessionSuffix(tenantId, userId))
+  }
+}
+
+/** Retrieve persisted POS active session id from localStorage. */
+export function getPosActiveSessionId(
+  tenantId: string,
+  userId: string,
+): string | null {
+  const id = readStored('posCart', activeSessionSuffix(tenantId, userId))
+  return id?.trim() || null
+}
+
+/** Clear persisted POS active session id from localStorage. */
+export function clearPosActiveSessionId(
+  tenantId: string,
+  userId: string,
+): void {
+  removeStored('posCart', activeSessionSuffix(tenantId, userId))
+}
+
 function sessionDraftKey(sessionKey?: string | null): string {
   return sessionKey?.trim() ? `sess_${sessionKey.trim()}` : 'default'
 }

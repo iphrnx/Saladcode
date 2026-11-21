@@ -54,13 +54,43 @@ test("POS dashboard renders compact loaded session strip with × unload button a
   assert.doesNotMatch(dashboardCode, /<span>Diner Sitting \(Required\)<\/span>/);
 });
 
-test("POS dashboard dynamically displays table name, sitting number, due, paid, and status", () => {
-  assert.match(dashboardCode, /\{card\.tableName\}/);
-  assert.match(dashboardCode, /card\.sessionNumber \? ` · Sitting \$\{card\.sessionNumber\}` : ''/);
-  assert.match(dashboardCode, /\{Number\(card\.outstanding\)\.toLocaleString\('en-IN'\)\} due/);
-  assert.match(dashboardCode, /\{Number\(card\.paid\)\.toLocaleString\('en-IN'\)\} of/);
-  assert.match(dashboardCode, /\{Number\(card\.total\)\.toLocaleString\('en-IN'\)\} paid/);
-  assert.match(dashboardCode, /\{card\.statusLabel\}/);
+test("POS dashboard renders 4-zone active session card with compact identifier, elapsed time, dynamic stage pills, context line, and strict 2-decimal financial values", () => {
+  // Zone 1: Compact identifier + elapsed time indicator
+  assert.match(dashboardCode, /card\.compactIdentifier/);
+  assert.match(dashboardCode, /card\.elapsedText/);
+  assert.match(dashboardCode, /card\.elapsedMinutes > 45/);
+
+  // Zone 2: Contextual order-stage badges
+  assert.match(dashboardCode, /card\.statusStage === 'New KOT'/);
+  assert.match(dashboardCode, /card\.statusStage === 'Preparing'/);
+  assert.match(dashboardCode, /card\.statusStage === 'Served'/);
+  assert.match(dashboardCode, /card\.statusStage === 'Bill Requested'/);
+  assert.match(dashboardCode, /card\.statusStage === 'Verifying'/);
+
+  // Zone 3: Context line (zone + item summary, or 'Editing in Cart')
+  assert.match(dashboardCode, /Editing in Cart/);
+  assert.match(dashboardCode, /card\.itemSummary/);
+
+  // Zone 4: Smart financial footer with strict 2-decimal formatting, 0-paid suppression, and verifying state
+  assert.match(dashboardCode, /\{formatCurrency\(card\.outstanding,\s*currencySymbol\)\}\s*due/);
+  assert.match(dashboardCode, /card\.paid > 0 && card\.paid < card\.total/);
+  assert.match(dashboardCode, /formatCurrency\(card\.paid,\s*currencySymbol\)/);
+  assert.match(dashboardCode, /Verifying payment\.\.\./);
+});
+
+test("POS dashboard includes expandable active sessions modal dialog with search and zone filtering", () => {
+  assert.match(dashboardCode, /activeSessionsModalOpen/);
+  assert.match(dashboardCode, /modalSearch/);
+  assert.match(dashboardCode, /modalZoneFilter/);
+  assert.match(dashboardCode, /<Dialog open=\{activeSessionsModalOpen\}/);
+});
+
+test("POS dashboard supports stateful cart session persistence and dynamic update order CTA", () => {
+  assert.match(dashboardCode, /savePosActiveSessionId/);
+  assert.match(dashboardCode, /getPosActiveSessionId/);
+  assert.match(dashboardCode, /clearPosActiveSessionId/);
+  assert.match(dashboardCode, /Update Order · \+/);
+  assert.match(dashboardCode, /Already Ordered/);
 });
 
 // ── 2. Independent Diner Session Aggregation & De-duplication ──

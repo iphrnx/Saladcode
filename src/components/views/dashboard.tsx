@@ -12,17 +12,209 @@ import { AccessDenied } from '@/components/shared/access-denied'
 import { hasPermission, hasEffectivePermission } from '@/lib/permissions'
 import { sortTables } from '@/lib/table-order'
 import { cn } from '@/lib/utils'
+import { formatCurrency } from '@/lib/constants'
 import { normalizePortions, type MenuPortion } from '@/lib/portions'
 import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
-import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft } from '@/lib/pos-cart'
+import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId } from '@/lib/pos-cart'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { StatusBadge, OrderTypeBadge, Tag } from '@/components/shared/badges'
-import { Search, Plus, Minus, Trash2, ShoppingBag, X, Check, CreditCard, Ticket, Clock, LogOut, Loader2, Receipt } from 'lucide-react'
+import { Search, Plus, Minus, Trash2, ShoppingBag, X, Check, CreditCard, Ticket, Clock, LogOut, Loader2, Receipt, Maximize2, ChevronRight } from 'lucide-react'
 import { toast } from 'sonner'
+
+function formatElapsed(date: Date | string | undefined | null): { text: string; mins: number } {
+  if (!date) return { text: '', mins: 0 }
+  const time = new Date(date).getTime()
+  if (isNaN(time)) return { text: '', mins: 0 }
+  const diff = Date.now() - time
+  if (diff < 0) return { text: 'just now', mins: 0 }
+  const mins = Math.floor(diff / 60000)
+  if (mins < 1) return { text: '<1m ago', mins: 0 }
+  if (mins < 60) return { text: `${mins}m ago`, mins }
+  const hrs = Math.floor(mins / 60)
+  const remMins = mins % 60
+  return { text: remMins > 0 ? `${hrs}h ${remMins}m ago` : `${hrs}h ago`, mins }
+}
+
+function getItemSummary(items: Array<{ name: string; quantity?: number }>): string {
+  if (!items || items.length === 0) return 'No items'
+  const firstItem = items[0]
+  const otherCount = items.length - 1
+  if (otherCount <= 0) {
+    return firstItem.name
+  }
+  return `${firstItem.name} +${otherCount} item${otherCount === 1 ? '' : 's'}`
+}
+
+function getSessionIdentifier(
+  tableName: string,
+  customerName?: string | null,
+  sessionNumber?: number | null,
+  orderType?: string,
+): string {
+  const custName = (customerName || '').trim()
+  const hasGuestName = custName && custName.toLowerCase() !== 'guest'
+
+  if (orderType === 'TAKEAWAY') {
+    return hasGuestName ? `Takeaway · ${custName}` : `Takeaway · S${sessionNumber || 1}`
+  }
+  if (orderType === 'DELIVERY') {
+    return hasGuestName ? `Delivery · ${custName}` : `Delivery · S${sessionNumber || 1}`
+  }
+  if (hasGuestName) {
+    return `${tableName} · ${custName}`
+  }
+  if (sessionNumber) {
+    return `${tableName} · S${sessionNumber}`
+  }
+  return `${tableName} · S1`
+}
+
+function ActiveSessionCard({
+  card,
+  isSelected,
+  currencySymbol,
+  onSelect,
+  onClick,
+  onUnload,
+  className,
+}: {
+  card: any
+  isSelected: boolean
+  currencySymbol: string
+  onSelect?: () => void
+  onClick?: () => void
+  onUnload: () => void
+  className?: string
+}) {
+  const handleClick = onClick || onSelect
+  return (
+    <div
+      data-active-session-card
+      role="button"
+      tabIndex={0}
+      onClick={handleClick}
+      className={cn(
+        'w-56 shrink-0 rounded-2xl border bg-card p-3.5 text-left select-none transition-all cursor-pointer relative flex flex-col justify-between',
+        isSelected
+          ? 'ring-2 ring-primary border-primary bg-primary/5 shadow-sm'
+          : card.statusTone === 'orange'
+            ? 'border-orange-500/40 hover:border-orange-500/70'
+            : card.statusTone === 'amber'
+              ? 'border-amber-500/40 hover:border-amber-500/70'
+              : card.statusTone === 'emerald'
+                ? 'border-emerald-500/30 hover:border-emerald-500/60'
+                : card.statusTone === 'blue'
+                  ? 'border-blue-500/40 hover:border-blue-500/70'
+                  : card.statusTone === 'purple'
+                    ? 'border-purple-500/40 hover:border-purple-500/70'
+                    : 'border-border/80 hover:border-border',
+        className
+      )}
+    >
+      <div>
+        {/* Zone 1: Header */}
+        <div className="flex items-center justify-between gap-1.5">
+          <p className="truncate font-semibold text-foreground text-xs sm:text-[13px]" title={card.compactIdentifier || card.tableName}>
+            {card.compactIdentifier || card.tableName}
+          </p>
+          <div className="flex items-center gap-1 shrink-0">
+            {card.elapsedText && (
+              <span
+                className={cn(
+                  'text-[10px]',
+                  card.elapsedMinutes > 45
+                    ? 'text-rose-600 dark:text-rose-400 font-semibold'
+                    : card.elapsedMinutes > 25
+                      ? 'text-amber-600 dark:text-amber-400 font-medium'
+                      : 'text-muted-foreground'
+                )}
+                title={card.lastActivityAt ? new Date(card.lastActivityAt).toLocaleTimeString() : undefined}
+              >
+                {card.elapsedText}
+              </span>
+            )}
+            {isSelected && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onUnload()
+                }}
+                className="text-primary hover:text-primary-hover hover:bg-primary/10 rounded p-0.5 transition-colors"
+                title="Unload session"
+                aria-label="Unload session"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Zone 2: Dynamic Status Pill */}
+        <div className="mt-1.5 flex items-center justify-between gap-1">
+          <span
+            className={cn(
+              'shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold border',
+              card.statusStage === 'New KOT'
+                ? 'bg-orange-500/15 text-orange-700 dark:text-orange-400 border-orange-500/25'
+                : card.statusStage === 'Preparing'
+                  ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/25'
+                  : card.statusStage === 'Served'
+                    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-500/25'
+                    : card.statusStage === 'Bill Requested'
+                      ? 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/25 animate-pulse'
+                      : card.statusStage === 'Verifying'
+                        ? 'bg-purple-500/15 text-purple-700 dark:text-purple-300 border-purple-500/25'
+                        : 'bg-secondary text-muted-foreground border-transparent'
+            )}
+          >
+            {card.statusLabel || card.statusStage}
+          </span>
+          <span className="text-[10px] text-muted-foreground truncate uppercase tracking-wider">
+            {card.orderType === 'TAKEAWAY' ? 'Takeaway' : card.orderType === 'DELIVERY' ? 'Delivery' : 'Dine In'}
+          </span>
+        </div>
+
+        {/* Zone 3: Context Line */}
+        <p className="mt-2 text-[11px] text-muted-foreground truncate" title={card.itemSummary}>
+          {isSelected ? (
+            <span className="font-semibold text-primary">Editing in Cart</span>
+          ) : (
+            <>
+              {card.area ? <span className="text-foreground/80 font-medium">{card.area} · </span> : ''}
+              <span>{card.itemSummary}</span>
+            </>
+          )}
+        </p>
+      </div>
+
+      {/* Zone 4: Smart Financial Footer */}
+      <div className="mt-2.5 pt-2 border-t border-border/50">
+        {card.isVerifyingPayment ? (
+          <p className="text-[11px] font-medium text-purple-600 dark:text-purple-400 animate-pulse">
+            Verifying payment...
+          </p>
+        ) : (
+          <div>
+            <p className="text-xs font-bold text-foreground">
+              {formatCurrency(card.outstanding, currencySymbol)} due
+            </p>
+            {card.paid > 0 && card.paid < card.total && (
+              <p className="text-[10.5px] text-muted-foreground mt-0.5">
+                {formatCurrency(card.paid, currencySymbol)} paid of {formatCurrency(card.total, currencySymbol)}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
 
 export function DashboardView() {
   const tr = useT()
@@ -43,6 +235,15 @@ export function DashboardView() {
   const submittingRef = useRef(false)
   const [offline, setOffline] = useState(false)
   const [forceNewSitting, setForceNewSitting] = useState(false)
+  const [activeSessionsModalOpen, setActiveSessionsModalOpen] = useState(false)
+  const [modalSearch, setModalSearch] = useState('')
+  const [modalZoneFilter, setModalZoneFilter] = useState('all')
+  const [tick, setTick] = useState(0)
+
+  useEffect(() => {
+    const timer = setInterval(() => setTick((t) => t + 1), 15000)
+    return () => clearInterval(timer)
+  }, [])
 
   // Synchronize configured default order type when starting a new session or loading settings
   const defaultOrderType = data?.settings?.pref_default_order_type as 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY' | undefined
@@ -109,7 +310,13 @@ export function DashboardView() {
         setPromoError('')
         if (tenantId && userId) {
           clearPosSessionDraft(tenantId, userId, entry.payload.tableSessionId)
+          clearPosActiveSessionId(tenantId, userId)
         }
+        setSelectedSessionId(null)
+        setSelectedTableId(null)
+        setCustomerName('')
+        setCustomerPhone('')
+        replaceCart([])
         if (order.promoApplied === false && order.promoReason) {
           // The server is the authority on promos, and it can still decline a
           // code the cashier had already applied. Say so, or the customer is
@@ -118,6 +325,8 @@ export function DashboardView() {
             description: `Order #${order.orderNumber} placed at full price.`,
             duration: 8000,
           })
+        } else if (entry.payload.tableSessionId) {
+          toast.success(`Order updated!`)
         } else {
           toast.success(`Order #${order.orderNumber} placed!`)
         }
@@ -469,11 +678,8 @@ export function DashboardView() {
   }, [sessions, pendingBills, tables])
 
   /**
-   * Compact, fixed-size active session cards.
-   *
-   * Displays all active floor sittings dynamically with table number,
-   * sitting/session identifier (when multi-diner independent sessions exist),
-   * total due, paid amount, and status via realtime without duplicates.
+   * Compact, dynamic active session cards with live state, order stage pills,
+   * item summaries, and financial tracking.
    */
   const activeSessionCards = useMemo(() => {
     interface SessionCardItem {
@@ -481,6 +687,7 @@ export function DashboardView() {
       sessionId?: string
       tableId: string | null
       tableName: string
+      compactIdentifier: string
       area?: string
       orderType?: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
       customerName?: string
@@ -488,8 +695,16 @@ export function DashboardView() {
       total: number
       paid: number
       outstanding: number
-      statusTone: 'amber' | 'emerald' | 'rose' | 'slate'
+      statusTone: 'orange' | 'amber' | 'emerald' | 'blue' | 'purple' | 'slate'
+      statusStage: 'New KOT' | 'Preparing' | 'Served' | 'Bill Requested' | 'Verifying' | 'Open'
       statusLabel: string
+      itemSummary: string
+      items: Array<{ name: string; quantity: number; portion?: string | null; status?: string }>
+      lastActivityAt: string | null
+      elapsedMinutes: number
+      elapsedText: string
+      isVerifyingPayment: boolean
+      isBillRequested: boolean
     }
 
     const cards: SessionCardItem[] = []
@@ -552,21 +767,68 @@ export function DashboardView() {
         if (total > 0 && outstanding <= 0.01 && (s.check?.status === 'PAID' || (activeOrders.length > 0 && activeOrders.every((o: any) => o.status === 'COMPLETED')))) return
         if (total === 0 && activeOrders.length === 0) return
 
-        // Status derivation
-        let statusLabel = 'active'
-        let statusTone: 'amber' | 'emerald' | 'rose' | 'slate' = 'emerald'
+        // Correlate with app orders in data.orders
+        const matchingAppOrders = (data?.orders || []).filter(
+          (o: any) => (o.tableSessionId === s.id || (group.tableId && o.tableId === group.tableId && totalLiveAtTable === 1)) && o.status !== 'CANCELLED' && o.status !== 'PENDING_ACTIVATION'
+        )
 
-        if (s.activationStatus === 'PENDING') {
-          statusLabel = 'pending'
+        // Gather all dish items across orders
+        const allItems: Array<{ name: string; quantity: number; portion?: string | null; status?: string }> = []
+        const combinedOrderSources = matchingAppOrders.length > 0 ? matchingAppOrders : activeOrders
+        for (const ord of combinedOrderSources) {
+          if (Array.isArray(ord.items)) {
+            for (const it of ord.items) {
+              allItems.push({
+                name: it.name,
+                quantity: Number(it.quantity || 1),
+                portion: it.portion,
+                status: it.status || ord.status,
+              })
+            }
+          }
+        }
+        const itemSummary = getItemSummary(allItems)
+
+        // Elapsed time / last activity
+        const lastActivityAt = s.lastSeenAt || s.updatedAt || s.createdAt || combinedOrderSources[0]?.createdAt || combinedOrderSources[0]?.created_at || null
+        const elapsed = formatElapsed(lastActivityAt)
+
+        // Payment verification and bill requested detection
+        const isVerifyingPayment = Boolean(
+          s.paymentVerificationPending ||
+          (s.check && s.check.status === 'VERIFYING') ||
+          combinedOrderSources.some((o: any) => o.payment_status === 'VERIFYING' || o.paymentStatus === 'PENDING_VERIFICATION')
+        )
+        const isBillRequested = Boolean(
+          s.billRequested ||
+          s.check?.status === 'UNSETTLED' ||
+          groupCheck?.status === 'UNSETTLED'
+        )
+
+        // Dynamic status pill
+        let statusStage: 'New KOT' | 'Preparing' | 'Served' | 'Bill Requested' | 'Verifying' | 'Open' = 'Open'
+        let statusTone: 'orange' | 'amber' | 'emerald' | 'blue' | 'purple' | 'slate' = 'slate'
+
+        if (isVerifyingPayment) {
+          statusStage = 'Verifying'
+          statusTone = 'purple'
+        } else if (isBillRequested) {
+          statusStage = 'Bill Requested'
+          statusTone = 'blue'
+        } else if (s.activationStatus === 'PENDING' || orders.some((o: any) => o.status === 'PENDING' || o.status === 'PENDING_ACTIVATION') || matchingAppOrders.some((o: any) => o.status === 'PENDING' || o.status === 'PENDING_ACTIVATION')) {
+          statusStage = 'New KOT'
+          statusTone = 'orange'
+        } else if (combinedOrderSources.some((o: any) => o.status === 'CONFIRMED' || o.status === 'PREPARING')) {
+          statusStage = 'Preparing'
           statusTone = 'amber'
-        } else if (outstanding > 0) {
-          statusLabel = groupCheck?.status === 'UNSETTLED' ? 'closed · due' : 'open'
-          statusTone = 'amber'
-        } else if (total > 0 && outstanding === 0) {
-          statusLabel = 'paid'
+        } else if (combinedOrderSources.length > 0 && combinedOrderSources.every((o: any) => o.status === 'READY' || o.status === 'SERVED' || o.status === 'COMPLETED')) {
+          statusStage = 'Served'
           statusTone = 'emerald'
+        } else if (outstanding > 0) {
+          statusStage = 'Open'
+          statusTone = 'amber'
         } else {
-          statusLabel = 'active'
+          statusStage = 'Open'
           statusTone = 'slate'
         }
 
@@ -595,11 +857,14 @@ export function DashboardView() {
           sessionNumber = totalLiveAtTable > 1 && group.tableId ? idx + 1 : null
         }
 
+        const compactIdentifier = getSessionIdentifier(displayName, s.customerName, sessionNumber, derivedOrderType)
+
         cards.push({
           id: `sess-${s.id}`,
           sessionId: s.id,
           tableId: group.tableId ?? null,
           tableName: displayName,
+          compactIdentifier,
           orderType: derivedOrderType,
           customerName: s.customerName,
           area: isTakeawayOrDelivery ? (derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery') : group.table?.area,
@@ -608,7 +873,15 @@ export function DashboardView() {
           paid: +paid.toFixed(2),
           outstanding: +outstanding.toFixed(2),
           statusTone,
-          statusLabel,
+          statusStage,
+          statusLabel: statusStage,
+          itemSummary,
+          items: allItems,
+          lastActivityAt,
+          elapsedMinutes: elapsed.mins,
+          elapsedText: elapsed.text,
+          isVerifyingPayment,
+          isBillRequested,
         })
       })
     }
@@ -637,11 +910,34 @@ export function DashboardView() {
         ? (!isGuest ? `${typeLabel} · ${rawCustName}` : `${typeLabel} · Guest`)
         : (b.tableName || 'Table')
 
+      const matchingAppOrders = (data?.orders || []).filter(
+        (o: any) => (b.sessionId && o.tableSessionId === b.sessionId) || (b.tableId && o.tableId === b.tableId)
+      )
+      const allItems: Array<{ name: string; quantity: number; portion?: string | null; status?: string }> = []
+      for (const ord of matchingAppOrders) {
+        if (Array.isArray(ord.items)) {
+          for (const it of ord.items) {
+            allItems.push({
+              name: it.name,
+              quantity: Number(it.quantity || 1),
+              portion: it.portion,
+              status: it.status || ord.status,
+            })
+          }
+        }
+      }
+      const itemSummary = getItemSummary(allItems)
+      const lastActivityAt = b.openedAt || null
+      const elapsed = formatElapsed(lastActivityAt)
+      const compactIdentifier = getSessionIdentifier(displayName, b.customerName, null, derivedOrderType)
+      const statusStage = b.status === 'UNSETTLED' ? 'Bill Requested' : 'Open'
+
       cards.push({
         id: `bill-${b.checkId || b.tableId || b.sessionId}`,
         sessionId: b.sessionId ?? undefined,
         tableId: b.tableId ?? null,
         tableName: displayName,
+        compactIdentifier,
         orderType: derivedOrderType,
         customerName: b.customerName,
         area: isTakeawayOrDelivery ? (derivedOrderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery') : b.area,
@@ -649,13 +945,21 @@ export function DashboardView() {
         total: +Number(b.total || 0).toFixed(2),
         paid: +Number(b.paid || 0).toFixed(2),
         outstanding: +Number(b.outstanding || 0).toFixed(2),
-        statusTone: 'amber',
-        statusLabel: b.status === 'UNSETTLED' ? 'closed · due' : 'open',
+        statusTone: statusStage === 'Bill Requested' ? 'blue' : 'amber',
+        statusStage,
+        statusLabel: statusStage,
+        itemSummary,
+        items: allItems,
+        lastActivityAt,
+        elapsedMinutes: elapsed.mins,
+        elapsedText: elapsed.text,
+        isVerifyingPayment: false,
+        isBillRequested: b.status === 'UNSETTLED',
       })
     }
 
     return cards
-  }, [sessions, pendingBills])
+  }, [sessions, pendingBills, data?.orders, tick])
 
   // ── Session selection & isolated cart drafts ─────────────────────────────
   // Snapshot ref of the unattached cart to restore when deselecting an active session card
@@ -673,9 +977,15 @@ export function DashboardView() {
     tableId: string | null
     orderType?: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
     customerName?: string
+    isVerifyingPayment?: boolean
   }) => {
     setForceNewSitting(false)
     if (!card.sessionId) return
+
+    if (card.isVerifyingPayment) {
+      toast.info('Payment verification in progress for this session. Editing is temporarily locked.')
+      return
+    }
 
     // 1. Clicking the already-selected session card -> Deselect & Restore to neutral
     if (selectedSessionId === card.sessionId) {
@@ -720,6 +1030,11 @@ export function DashboardView() {
       }
     }
 
+    // Persist loaded session id so page refresh doesn't drop active editing state
+    if (tenantId && userId && card.sessionId) {
+      savePosActiveSessionId(tenantId, userId, card.sessionId)
+    }
+
     // Restore or initialize draft for this clicked session
     const existingDraft = tenantId && userId ? getPosSessionDraft(tenantId, userId, card.sessionId) : null
     const targetOrderType = card.orderType || (card.tableId ? 'DINE_IN' : 'TAKEAWAY')
@@ -742,16 +1057,19 @@ export function DashboardView() {
   const handleDeselectSession = () => {
     setForceNewSitting(false)
     if (!selectedSessionId && !selectedTableId) return
-    if (tenantId && userId && selectedSessionId) {
-      savePosSessionDraft(tenantId, userId, selectedSessionId, {
-        cart,
-        orderType,
-        selectedTableId,
-        selectedSessionId,
-        customerName,
-        customerPhone,
-        promoCode,
-      })
+    if (tenantId && userId) {
+      clearPosActiveSessionId(tenantId, userId)
+      if (selectedSessionId) {
+        savePosSessionDraft(tenantId, userId, selectedSessionId, {
+          cart,
+          orderType,
+          selectedTableId,
+          selectedSessionId,
+          customerName,
+          customerPhone,
+          promoCode,
+        })
+      }
     }
     const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
     if (pre) {
@@ -769,6 +1087,78 @@ export function DashboardView() {
     }
     preSelectSnapshotRef.current = null
   }
+
+  const handleUnloadSession = () => {
+    setForceNewSitting(false)
+    if (tenantId && userId) {
+      if (selectedSessionId) {
+        clearPosSessionDraft(tenantId, userId, selectedSessionId)
+      }
+      clearPosActiveSessionId(tenantId, userId)
+    }
+    setSelectedSessionId(null)
+    setSelectedTableId(null)
+    setCustomerName('')
+    setCustomerPhone('')
+    setPromoCode('')
+    setAppliedPromo(null)
+    setPromoError('')
+    replaceCart([])
+    preSelectSnapshotRef.current = null
+  }
+
+  // Restore persisted active session from localStorage on initial page load / refresh
+  const restoredSessionRef = useRef(false)
+  useEffect(() => {
+    if (!tenantId || !userId || !sessionsLoadedOnce.current || restoredSessionRef.current) return
+    restoredSessionRef.current = true
+    const savedActiveSessionId = getPosActiveSessionId(tenantId, userId)
+    if (savedActiveSessionId && !selectedSessionId) {
+      const match = activeSessionCards.find((c) => c.sessionId === savedActiveSessionId)
+      if (match) {
+        handleSessionCardClick(match)
+      } else {
+        clearPosActiveSessionId(tenantId, userId)
+      }
+    }
+  }, [tenantId, userId, activeSessionCards, selectedSessionId])
+
+  const loadedSessionOrders = useMemo(() => {
+    if (!selectedSessionId) return []
+    const appOrders = (data?.orders || []).filter(
+      (o: any) => o.tableSessionId === selectedSessionId && o.status !== 'CANCELLED'
+    )
+    if (appOrders.length > 0) return appOrders
+    for (const group of sessions) {
+      const found = (group.sessions || []).find((s: any) => s.id === selectedSessionId)
+      if (found && found.order_rows) return found.order_rows
+    }
+    return []
+  }, [selectedSessionId, data?.orders, sessions])
+
+  const modalZones = useMemo(() => {
+    const set = new Set<string>()
+    for (const card of activeSessionCards) {
+      if (card.area) set.add(card.area)
+    }
+    return ['all', ...Array.from(set)]
+  }, [activeSessionCards])
+
+  const filteredModalCards = useMemo(() => {
+    return activeSessionCards.filter((card) => {
+      if (modalZoneFilter !== 'all' && card.area !== modalZoneFilter) return false
+      if (modalSearch.trim()) {
+        const q = modalSearch.toLowerCase().trim()
+        const matchName = (card.tableName || '').toLowerCase().includes(q)
+        const matchIdent = (card.compactIdentifier || '').toLowerCase().includes(q)
+        const matchCust = (card.customerName || '').toLowerCase().includes(q)
+        const matchSummary = (card.itemSummary || '').toLowerCase().includes(q)
+        const matchItems = (card.items || []).some((it: any) => (it.name || '').toLowerCase().includes(q))
+        if (!matchName && !matchIdent && !matchCust && !matchSummary && !matchItems) return false
+      }
+      return true
+    })
+  }, [activeSessionCards, modalZoneFilter, modalSearch])
 
   const handleSelectSession = (sessionId: string | null) => {
     if (!sessionId) {
@@ -963,7 +1353,7 @@ export function DashboardView() {
         activeSessionId = selectedSessionId
       } else {
         if (liveSessions.length > 1 && !forceNewSitting) {
-          toast.error('This table has multiple active diner sessions. Please select which sitting/bill to add this order to.')
+          toast.error('This table has multiple active diner sessions. Please select which diner/bill to add this order to.')
           return
         }
         activeSessionId = null
@@ -1171,16 +1561,34 @@ export function DashboardView() {
             )}
           </div>
 
-          {/* Active Sessions: Compact, fixed-size, non-expandable, non-clickable cards */}
+          {/* Active Sessions Strip */}
           <div className="mt-8">
-            <div className="mb-3 flex items-center gap-2">
-              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-                Active Sessions
-              </h3>
-              {activeSessionCards.length > 0 && (
-                <span className="rounded-full bg-primary/15 px-2 py-0.5 text-[11px] font-medium text-primary">
-                  {activeSessionCards.length}
-                </span>
+            <div className="mb-3 flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => setActiveSessionsModalOpen(true)}
+                className="group flex items-center gap-2 hover:opacity-85 transition-opacity text-left cursor-pointer"
+                aria-label="Expand active sessions"
+              >
+                <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground group-hover:text-foreground transition-colors">
+                  Active Sessions
+                </h3>
+                <Maximize2 className="h-3.5 w-3.5 text-muted-foreground opacity-60 group-hover:opacity-100 transition-opacity" />
+                {activeSessionCards.length > 0 && (
+                  <span className="rounded-full bg-primary/15 px-2 py-0.5 text-[11px] font-medium text-primary group-hover:bg-primary/25 transition-colors">
+                    {activeSessionCards.length}
+                  </span>
+                )}
+              </button>
+              {activeSessionCards.length > 3 && (
+                <button
+                  type="button"
+                  onClick={() => setActiveSessionsModalOpen(true)}
+                  className="text-xs text-primary hover:text-primary-hover font-medium flex items-center gap-1"
+                >
+                  View all ({activeSessionCards.length})
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
               )}
             </div>
 
@@ -1193,55 +1601,15 @@ export function DashboardView() {
                 {activeSessionCards.map((card) => {
                   const isSelected = Boolean(card.sessionId && selectedSessionId === card.sessionId)
                   return (
-                    <div
+                    <ActiveSessionCard
                       key={card.id}
-                      data-active-session-card
-                      role="button"
-                      tabIndex={0}
+                      card={card}
+                      isSelected={isSelected}
+                      currencySymbol={tenant.currencySymbol}
                       onClick={() => handleSessionCardClick(card)}
-                      className={cn(
-                        'w-56 shrink-0 rounded-2xl border bg-card p-3.5 text-left select-none transition-all cursor-pointer',
-                        isSelected
-                          ? 'ring-2 ring-primary border-primary bg-primary/5 shadow-sm'
-                          : card.statusTone === 'amber'
-                            ? 'border-amber-500/40 dark:border-amber-500/30 hover:border-amber-500/60'
-                            : card.statusTone === 'emerald'
-                              ? 'border-emerald-500/30 dark:border-emerald-500/20 hover:border-emerald-500/50'
-                              : 'border-border/80 hover:border-border'
-                      )}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="truncate font-semibold text-foreground">
-                          {card.tableName}
-                          {card.sessionNumber ? ` · Sitting ${card.sessionNumber}` : ''}
-                        </p>
-                        <span
-                          className={cn(
-                            'shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium',
-                            card.statusTone === 'amber'
-                              ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
-                              : card.statusTone === 'emerald'
-                                ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
-                                : 'bg-secondary text-muted-foreground'
-                          )}
-                        >
-                          {card.statusLabel}
-                        </span>
-                      </div>
-                      <p className="mt-1 text-[11px] text-muted-foreground">
-                        {card.area ? `${card.area} · ` : ''}
-                        <span className={cn(card.outstanding > 0 ? 'font-medium text-foreground' : '')}>
-                          {tenant.currencySymbol}
-                          {Number(card.outstanding).toLocaleString('en-IN')} due
-                        </span>
-                      </p>
-                      <p className="mt-0.5 text-[10.5px] text-muted-foreground">
-                        {tenant.currencySymbol}
-                        {Number(card.paid).toLocaleString('en-IN')} of{' '}
-                        {tenant.currencySymbol}
-                        {Number(card.total).toLocaleString('en-IN')} paid
-                      </p>
-                    </div>
+                      onSelect={() => handleSessionCardClick(card)}
+                      onUnload={handleDeselectSession}
+                    />
                   )
                 })}
               </div>
@@ -1250,6 +1618,90 @@ export function DashboardView() {
 
         </div>
       </div>
+
+      {/* Expandable Active Sessions Modal */}
+      <Dialog open={activeSessionsModalOpen} onOpenChange={setActiveSessionsModalOpen}>
+        <DialogContent className="max-w-4xl max-h-[85vh] flex flex-col p-5 sm:p-6 overflow-hidden">
+          <DialogHeader className="shrink-0 pb-3 border-b border-border">
+            <DialogTitle className="text-lg font-bold flex items-center gap-2">
+              Active Sessions
+              {activeSessionCards.length > 0 && (
+                <span className="rounded-full bg-primary/15 px-2.5 py-0.5 text-xs font-semibold text-primary">
+                  {activeSessionCards.length}
+                </span>
+              )}
+            </DialogTitle>
+            <DialogDescription className="text-xs text-muted-foreground">
+              Live overview of all floor tables, takeaway, and delivery sittings. Tap any session to view or add items in cart.
+            </DialogDescription>
+          </DialogHeader>
+
+          {/* Search & Zone Filter Bar */}
+          <div className="py-3 space-y-2.5 shrink-0">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              <Input
+                value={modalSearch}
+                onChange={(e) => setModalSearch(e.target.value)}
+                placeholder="Search by table, sitting, guest name, or dishes..."
+                className="pl-9 h-9 text-xs sm:text-sm bg-secondary/40 border-border"
+              />
+              {modalSearch && (
+                <button
+                  onClick={() => setModalSearch('')}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* Zone Filters */}
+            <div className="flex gap-1.5 overflow-x-auto scrollbar-none py-1">
+              {modalZones.map((zone) => (
+                <button
+                  key={zone}
+                  onClick={() => setModalZoneFilter(zone)}
+                  className={cn(
+                    "px-3 py-1 rounded-full text-xs font-medium whitespace-nowrap transition-colors",
+                    modalZoneFilter === zone
+                      ? "bg-primary text-primary-foreground shadow-sm"
+                      : "bg-secondary text-muted-foreground hover:bg-secondary/80 hover:text-foreground"
+                  )}
+                >
+                  {zone === 'all' ? `All (${activeSessionCards.length})` : zone}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Modal Cards Grid */}
+          <div className="flex-1 overflow-y-auto pr-1 min-h-0">
+            {filteredModalCards.length === 0 ? (
+              <div className="py-12 text-center text-muted-foreground text-sm">
+                No active sessions match your search or filter.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {filteredModalCards.map((card) => (
+                  <ActiveSessionCard
+                    key={card.id}
+                    card={card}
+                    isSelected={Boolean(card.sessionId && selectedSessionId === card.sessionId)}
+                    currencySymbol={tenant.currencySymbol}
+                    className="w-full shrink"
+                    onSelect={() => {
+                      handleSessionCardClick(card)
+                      setActiveSessionsModalOpen(false)
+                    }}
+                    onUnload={handleDeselectSession}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <TableCheckDialog
         tableId={billTable?.id ?? null}
@@ -1272,6 +1724,8 @@ export function DashboardView() {
           selectedSessionId={selectedSessionId}
           setSelectedSessionId={handleSelectSession}
           onDeselectSession={handleDeselectSession}
+          onUnloadSession={handleUnloadSession}
+          committedOrders={loadedSessionOrders}
           liveSessions={selectedTableId ? (floor.find((f: any) => f.tableId === selectedTableId)?.liveSessions || []) : []}
           customerName={customerName}
           setCustomerName={setCustomerName}
@@ -1335,6 +1789,8 @@ export function DashboardView() {
             selectedSessionId={selectedSessionId}
             setSelectedSessionId={handleSelectSession}
             onDeselectSession={handleDeselectSession}
+            onUnloadSession={handleUnloadSession}
+            committedOrders={loadedSessionOrders}
             liveSessions={selectedTableId ? (floor.find((f: any) => f.tableId === selectedTableId)?.liveSessions || []) : []}
             customerName={customerName}
             setCustomerName={setCustomerName}
@@ -1610,6 +2066,8 @@ interface CartPanelProps {
   selectedSessionId: string | null
   setSelectedSessionId: (id: string | null) => void
   onDeselectSession?: () => void
+  onUnloadSession?: () => void
+  committedOrders?: any[]
   liveSessions: any[]
   customerName: string
   setCustomerName: (v: string) => void
@@ -1652,6 +2110,34 @@ function CartPanel(p: CartPanelProps) {
   const { embedded } = p
   const tableName = p.tables.find((t) => t.id === p.selectedTableId)?.name || 'Table'
   const isAmbiguousSitting = p.orderType === 'DINE_IN' && Boolean(p.selectedTableId) && p.liveSessions.length > 1 && !p.selectedSessionId && !p.forceNewSitting
+  const cardMatch = (p.activeSessionCards || []).find((c: any) => c.sessionId === p.selectedSessionId)
+
+  const committedItems = useMemo(() => {
+    if (!p.selectedSessionId) return []
+    if (cardMatch?.items && cardMatch.items.length > 0) {
+      return cardMatch.items
+    }
+    if (p.committedOrders && p.committedOrders.length > 0) {
+      const items: any[] = []
+      for (const ord of p.committedOrders) {
+        if (Array.isArray(ord.items)) {
+          for (const it of ord.items) {
+            items.push({
+              id: it.id,
+              name: it.name,
+              portion: it.portion,
+              price: Number(it.price || 0),
+              quantity: Number(it.quantity || 1),
+              status: it.status || ord.status,
+            })
+          }
+        }
+      }
+      if (items.length > 0) return items
+    }
+    return []
+  }, [p.selectedSessionId, cardMatch?.items, p.committedOrders])
+
   return (
     <div className={cn('flex flex-col h-full min-h-0 flex-1', embedded && 'overflow-hidden')}>
       {/* Order type + table/customer */}
@@ -1675,7 +2161,37 @@ function CartPanel(p: CartPanelProps) {
             </button>
           ))}
         </div>
-        {p.orderType === 'DINE_IN' ? (
+
+        {/* Stateful Header Card: When a session is loaded, replace Select table dropdown */}
+        {p.selectedSessionId ? (
+          <div className="rounded-xl border border-primary/40 bg-primary/5 p-3 flex items-center justify-between shadow-xs">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <span className="inline-block w-2 h-2 rounded-full bg-primary animate-pulse shrink-0" />
+                <h4 className="font-semibold text-sm truncate text-foreground">
+                  {cardMatch?.compactIdentifier || (cardMatch?.sessionNumber ? `Adding to ${tableName} · S${cardMatch.sessionNumber}` : `Adding to ${tableName}`)}
+                </h4>
+              </div>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                <span className="font-semibold text-foreground">
+                  {formatCurrency(cardMatch?.outstanding ?? 0, p.currencySymbol)} due
+                </span>
+                {Number(cardMatch?.paid ?? 0) > 0 && (
+                  <span> · {formatCurrency(Number(cardMatch?.paid ?? 0), p.currencySymbol)} paid</span>
+                )}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={p.onUnloadSession || p.onDeselectSession}
+              className="rounded-lg p-1.5 text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors shrink-0 ml-2"
+              title="Unload session"
+              aria-label="Unload session"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        ) : p.orderType === 'DINE_IN' ? (
           <div className="space-y-2">
             <Select
               value={p.selectedTableId || ''}
@@ -1699,47 +2215,17 @@ function CartPanel(p: CartPanelProps) {
               </SelectContent>
             </Select>
 
-            {/* When a specific sitting is loaded */}
-            {p.selectedTableId && p.selectedSessionId ? (
-              (() => {
-                const sittingIdx = p.liveSessions.findIndex((s: any) => s.id === p.selectedSessionId)
-                const cardMatch = (p.activeSessionCards || []).find((c: any) => c.sessionId === p.selectedSessionId)
-                const sittingNum = sittingIdx >= 0
-                  ? (p.liveSessions.length > 1 ? sittingIdx + 1 : null)
-                  : (cardMatch?.sessionNumber ?? null)
-
-                const label = sittingNum
-                  ? `Adding to ${tableName} · Sitting ${sittingNum}`
-                  : `Adding to ${tableName}`
-
-                return (
-                  <div className="flex items-center justify-between rounded-lg border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-[11px]">
-                    <span className="font-medium text-primary truncate">
-                      {label}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={p.onDeselectSession}
-                      className="text-primary/70 hover:text-primary hover:bg-primary/10 rounded p-0.5 transition-colors shrink-0 ml-2"
-                      title="Unload session"
-                      aria-label="Unload session"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                )
-              })()
-            ) : p.selectedTableId && p.liveSessions.length > 1 && !p.forceNewSitting ? (
+            {p.selectedTableId && p.liveSessions.length > 1 && !p.forceNewSitting ? (
               /* Minimal sitting selector when multiple sittings exist and none loaded */
               <div className="space-y-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2">
                 <div className="flex items-center justify-between text-[11px] font-medium text-amber-600 dark:text-amber-400">
-                  <span>Select Sitting ({p.liveSessions.length} active)</span>
+                  <span>Select Diner ({p.liveSessions.length} active)</span>
                   <button
                     type="button"
                     onClick={p.onNewSitting}
                     className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold underline"
                   >
-                    New Sitting
+                    New Diner
                   </button>
                 </div>
                 <Select
@@ -1754,7 +2240,7 @@ function CartPanel(p: CartPanelProps) {
                   }}
                 >
                   <SelectTrigger className="bg-background border border-border h-8 text-xs">
-                    <SelectValue placeholder="Choose sitting..." />
+                    <SelectValue placeholder="Choose diner..." />
                   </SelectTrigger>
                   <SelectContent>
                     {p.liveSessions.map((s: any, idx: number) => {
@@ -1762,12 +2248,12 @@ function CartPanel(p: CartPanelProps) {
                       const orderCount = s._count?.orders ?? 0
                       return (
                         <SelectItem key={s.id} value={s.id}>
-                          Sitting {idx + 1}{timeStr ? ` · ${timeStr}` : ''}{orderCount > 0 ? ` · ${orderCount} order${orderCount === 1 ? '' : 's'}` : ''}
+                          Diner {idx + 1}{timeStr ? ` · ${timeStr}` : ''}{orderCount > 0 ? ` · ${orderCount} order${orderCount === 1 ? '' : 's'}` : ''}
                         </SelectItem>
                       )
                     })}
                     <SelectItem value="__new__">
-                      + Start New Sitting
+                      + Start New Diner
                     </SelectItem>
                   </SelectContent>
                 </Select>
@@ -1775,7 +2261,7 @@ function CartPanel(p: CartPanelProps) {
             ) : p.selectedTableId && p.forceNewSitting ? (
               <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/30 px-2.5 py-1.5 text-[11px]">
                 <span className="font-medium text-muted-foreground truncate">
-                  Starting new sitting at {tableName}
+                  Starting new diner session at {tableName}
                 </span>
                 <button
                   type="button"
@@ -1803,61 +2289,85 @@ function CartPanel(p: CartPanelProps) {
                 className="bg-secondary/50 border-border text-sm h-9"
               />
             </div>
-            {p.selectedSessionId && (() => {
-              const typeLabel = p.orderType === 'TAKEAWAY' ? 'Takeaway' : 'Delivery'
-              const rawName = p.customerName?.trim()
-              let displayLabel = ''
-
-              if (rawName && rawName.toLowerCase() !== 'guest') {
-                displayLabel = `Adding to ${typeLabel} · ${rawName}`
-              } else {
-                const unnamedSameType = (p.activeSessionCards || []).filter(
-                  (c: any) => c.orderType === p.orderType && (!c.customerName?.trim() || c.customerName.trim().toLowerCase() === 'guest')
-                )
-                if (unnamedSameType.length > 1) {
-                  const idx = unnamedSameType.findIndex((c: any) => c.sessionId === p.selectedSessionId)
-                  const sittingNum = idx >= 0 ? idx + 1 : 1
-                  displayLabel = `Adding to ${typeLabel} · Guest · Sitting ${sittingNum}`
-                } else {
-                  displayLabel = `Adding to ${typeLabel} · Guest`
-                }
-              }
-
-              return (
-                <div className="flex items-center justify-between rounded-lg border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-[11px]">
-                  <span className="font-medium text-primary truncate">
-                    {displayLabel}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={p.onDeselectSession}
-                    className="text-primary/70 hover:text-primary hover:bg-primary/10 rounded p-0.5 transition-colors shrink-0 ml-2"
-                    title="Unload session"
-                    aria-label="Unload session"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              )
-            })()}
           </div>
         )}
       </div>
 
       {/* Items */}
       <div className="flex-1 overflow-y-auto scrollbar-thin px-4 min-h-0">
-        {p.cart.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-16 text-center">
-            <div className="w-16 h-16 rounded-full bg-secondary flex items-center justify-center mb-3">
-              <ShoppingBag className="h-7 w-7 text-muted-foreground" />
+        {/* Already Ordered items (read-only section) */}
+        {p.selectedSessionId && committedItems.length > 0 && (
+          <div className="pt-3 pb-1 space-y-2">
+            <div className="flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-muted-foreground px-1">
+              <span className="flex items-center gap-1.5">
+                <Check className="h-3.5 w-3.5 text-emerald-500" />
+                Already Ordered
+                <span className="ml-1 rounded-full bg-secondary px-1.5 py-0.2 text-[10px] font-medium text-foreground">
+                  {committedItems.length}
+                </span>
+              </span>
+              <span className="text-[10px] text-muted-foreground font-normal">Read-only</span>
             </div>
-            <p className="text-sm font-medium">{tr('pos.cartEmpty')}</p>
-            <p className="text-xs text-muted-foreground mt-1">{tr('pos.cartHint')}</p>
+            <div className="space-y-1 rounded-xl border border-border/70 bg-secondary/15 p-2">
+              {committedItems.map((item: any, idx: number) => (
+                <div key={item.id || idx} className="flex items-center justify-between text-xs py-1.5 px-2 rounded-lg bg-card/70">
+                  <div className="min-w-0 flex-1 flex items-center gap-2">
+                    <span className="font-bold text-muted-foreground text-[11px] shrink-0">
+                      {item.quantity}×
+                    </span>
+                    <span className="truncate font-medium text-foreground">
+                      {item.name}
+                      {item.portion && (
+                        <span className="ml-1 rounded bg-secondary px-1 py-0.5 text-[9px] text-muted-foreground">
+                          {item.portion}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0 ml-2">
+                    <span className="text-[11px] font-semibold text-muted-foreground">
+                      {formatCurrency(Number(item.price || 0) * Number(item.quantity || 1), p.currencySymbol)}
+                    </span>
+                    {item.status && (
+                      <span className={cn(
+                        "rounded px-1.5 py-0.2 text-[9px] font-semibold uppercase",
+                        item.status === 'SERVED' ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" :
+                        item.status === 'PREPARING' ? "bg-amber-500/15 text-amber-600 dark:text-amber-400" :
+                        "bg-secondary text-muted-foreground"
+                      )}>
+                        {item.status.toLowerCase()}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
+        )}
+
+        {/* Newly added items or empty state */}
+        {p.cart.length === 0 ? (
+          p.selectedSessionId && committedItems.length > 0 ? (
+            <div className="rounded-xl border border-dashed border-border/80 bg-secondary/10 p-5 text-center my-4">
+              <p className="text-xs font-semibold text-foreground">Tap menu items to add to this order</p>
+              <p className="text-[11px] text-muted-foreground mt-0.5">Newly tapped items will appear here before updating</p>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <div className="w-16 h-16 rounded-full bg-secondary flex items-center justify-center mb-3">
+                <ShoppingBag className="h-7 w-7 text-muted-foreground" />
+              </div>
+              <p className="text-sm font-medium">{tr('pos.cartEmpty')}</p>
+              <p className="text-xs text-muted-foreground mt-1">{tr('pos.cartHint')}</p>
+            </div>
+          )
         ) : (
-          <div className="space-y-3 py-4">
+          <div className="space-y-3 py-3">
             <div className="flex items-center justify-between text-xs text-muted-foreground px-1">
-              <span>Item</span>
+              <span className="font-semibold text-foreground flex items-center gap-1.5">
+                {p.selectedSessionId && <Plus className="h-3.5 w-3.5 text-primary" />}
+                {p.selectedSessionId ? `New Items to Add (${p.cart.length})` : 'Item'}
+              </span>
               <span>Qty · Price</span>
             </div>
             <Separator />
@@ -1965,16 +2475,38 @@ function CartPanel(p: CartPanelProps) {
         </div>
         <Button
           onClick={p.onSubmit}
-          disabled={p.submitting || p.cart.length === 0 || !p.canCheckout || isAmbiguousSitting}
-          title={!p.canCheckout ? "You don't have permission to create orders" : isAmbiguousSitting ? "Please select which diner sitting to add this order to" : undefined}
+          disabled={p.submitting || p.cart.length === 0 || !p.canCheckout || isAmbiguousSitting || cardMatch?.isVerifyingPayment}
+          title={
+            cardMatch?.isVerifyingPayment
+              ? "Payment verification is pending for this session"
+              : !p.canCheckout
+              ? "You don't have permission to create orders"
+              : isAmbiguousSitting
+              ? "Please select which diner session to add this order to"
+              : p.cart.length === 0
+              ? (p.selectedSessionId ? "Add menu items to update this order" : "Cart is empty")
+              : undefined
+          }
           className="w-full h-10 text-sm font-semibold bg-gradient-to-r from-primary to-primary-hover hover:shadow-glow-primary transition-premium border-0"
         >
           {p.submitting ? (
-            <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Placing order…</>
+            <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> {p.selectedSessionId ? 'Updating order…' : 'Placing order…'}</>
           ) : isAmbiguousSitting ? (
-            <>Select Diner Sitting</>
+            <>Select Diner Session</>
+          ) : p.selectedSessionId ? (
+            p.cart.length === 0 ? (
+              <>Update Order · Select items</>
+            ) : (
+              <>
+                <Check className="h-4 w-4 mr-2" />
+                Update Order · +{formatCurrency(p.total, p.currencySymbol)}
+                <span className="ml-1.5 text-xs opacity-85 font-normal">
+                  (Total: {formatCurrency(Number(cardMatch?.total ?? 0) + p.total, p.currencySymbol)})
+                </span>
+              </>
+            )
           ) : (
-            <><CreditCard className="h-4 w-4 mr-2" /> {tr('pos.checkout')} · {p.currencySymbol}{p.total.toFixed(2)}</>
+            <><CreditCard className="h-4 w-4 mr-2" /> Place Order · {formatCurrency(p.total, p.currencySymbol)}</>
           )}
         </Button>
       </div>

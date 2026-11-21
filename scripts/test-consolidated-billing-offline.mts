@@ -61,9 +61,11 @@ check(
 );
 
 check(
-  "Edge bill function splits CGST and SGST accurately",
-  billEdgeSrc.includes("cgst: +(tax / 2).toFixed(2)") &&
-    billEdgeSrc.includes("sgst: +(tax / 2).toFixed(2)"),
+  "Edge bill function splits CGST and SGST accurately via integer paise split",
+  billEdgeSrc.includes("cgst: cgstAmount") &&
+    billEdgeSrc.includes("sgst: sgstAmount") &&
+    billEdgeSrc.includes("cgstPaise = Math.ceil(gstTotalPaise / 2)") &&
+    billEdgeSrc.includes("sgstPaise = gstTotalPaise - cgstPaise"),
 );
 
 check(
@@ -138,6 +140,63 @@ check("Tax matches sum of eligible taxes (47.50)", tax === 47.5);
 check("Grand total matches 420 + 587.50 = 1007.50", grandTotal === 1007.5);
 check("Net paid correctly includes succeeded payments (1007.50) and excludes void (100)", netPaid === 1007.5);
 check("Remaining due is accurately 0.00 after full payment", due === 0);
+
+// 7. Verification of odd-paisa GST totals
+const testOddTaxes = [0.01, 0.03, 0.05, 0.07, 0.09, 0.15, 0.25, 1.03, 33.75, 100.03];
+const allOddTaxesSumCleanly = testOddTaxes.every((t) => {
+  const gstTotalPaise = Math.round(t * 100);
+  const cgstPaise = Math.ceil(gstTotalPaise / 2);
+  const sgstPaise = gstTotalPaise - cgstPaise;
+  const cgstAmount = +(cgstPaise / 100).toFixed(2);
+  const sgstAmount = +(sgstPaise / 100).toFixed(2);
+  return +(cgstAmount + sgstAmount).toFixed(2) === t;
+});
+check("Odd-paisa GST totals sum strictly to original tax with zero paisa lost", allOddTaxesSumCleanly);
+
+// 8. Verification of independent sessions order scoping & legacy recovery
+check(
+  "Edge bill function scopes order queries strictly to check_id to prevent leaking sibling session orders",
+  billEdgeSrc.includes('orderQuery = orderQuery.eq("check_id", open.id);') &&
+    !billEdgeSrc.includes('orderQuery.or(`check_id.eq.${open.id},table_session_id.eq.${open.session_id}`)'),
+);
+check(
+  "Edge bill function explicitly recovers unassigned legacy orders with is('check_id', null)",
+  billEdgeSrc.includes('.is("check_id", null)'),
+);
+check(
+  "Edge bill function surfaces any backfill failure rather than ignoring write errors",
+  billEdgeSrc.includes("throw new Error(`Failed to attach unassigned orders to bill:") &&
+    billEdgeSrc.includes("Could not load bill:"),
+);
+
+// 9. Verification of fully paid bill behavior
+check(
+  "SessionPaymentDialog computes isFullyPaid and amountToPay as 0 when outstanding <= 0",
+  sessionPaymentSrc.includes("const isFullyPaid = Boolean(totals && totals.outstanding <= 0)") &&
+    sessionPaymentSrc.includes("const amountToPay = totals ? Math.max(0, totals.outstanding) : 0"),
+);
+check(
+  "SessionPaymentDialog hides tender options and payment methods when fully paid",
+  sessionPaymentSrc.includes("!isFullyPaid"),
+);
+check(
+  "SessionPaymentDialog labels remaining action 'Close Bill' when fully paid",
+  sessionPaymentSrc.includes("isFullyPaid ? (\n                'Close Bill'"),
+);
+
+// 10. Verification of bill load error handling and retry
+check(
+  "SessionPaymentDialog displays 'Couldn't load the bill' on request failure",
+  sessionPaymentSrc.includes("Couldn&apos;t load the bill") || sessionPaymentSrc.includes("Couldn't load the bill"),
+);
+check(
+  "SessionPaymentDialog provides a Retry button that calls load() only",
+  sessionPaymentSrc.includes("onClick={() => void load()}") && sessionPaymentSrc.includes("Retry"),
+);
+check(
+  "SessionPaymentDialog keeps Complete Payment disabled until bill loads",
+  sessionPaymentSrc.includes("disabled={busy || loading || !totals || Boolean(loadError)}"),
+);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

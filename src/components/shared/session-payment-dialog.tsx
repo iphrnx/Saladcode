@@ -1,25 +1,13 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Banknote, CalendarDays, Check, CreditCard, Info, Layers, Loader2, Power, ReceiptText, RotateCw, Smartphone, Table2, Timer, Wallet, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Banknote, CalendarDays, Check, CreditCard, Info, Layers, Loader2, Power, ReceiptText, RotateCw, Table2, Timer, Wallet, X } from 'lucide-react'
 import { edgeFetch } from '@/lib/edge'
 import { describeFailure } from '@/lib/api-error'
+import { formatCurrency } from '@/lib/constants'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-
-/**
- * Taking payment for one sitting.
- *
- * Three faces of the same act: choose a method, see it fail, see it succeed.
- * The figures come from the server's check — this dialog adds nothing up and
- * decides nothing about money; it posts one payment for the amount owed and
- * then asks the bill to close, and reports whatever the server said.
- *
- * What it will not do is claim a success it did not get: "Payment Successful"
- * is only reachable after the payment call returned and the finalise call
- * returned, and the invoice number shown is the one the server issued.
- */
 
 function UpiLogo({ className }: { className?: string }) {
   return (
@@ -40,7 +28,11 @@ const METHODS: { value: Method; label: string; icon: any }[] = [
 
 type Totals = {
   subtotal: number
+  discount?: number
   tax: number
+  serviceCharge?: number
+  serviceRate?: number
+  roundOff?: number
   total: number
   outstanding: number
 }
@@ -63,7 +55,7 @@ export function SessionPaymentDialog({
   checkId: string | null
   sessionId?: string | null
   tableName: string | null
-  /** "Main Hall · 4 Seats · Dine In" — the sitting's own description. */
+  /** "Main Hall · Dine In" — the sitting's own description. */
   tableHint?: string
   currencySymbol?: string
   open: boolean
@@ -78,10 +70,11 @@ export function SessionPaymentDialog({
    *  the duration on the closing screen is never invented. */
   startedAt?: string | null
 }) {
-  const money = (n: number) => `${currencySymbol}${Number(n ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  const money = (n: number) => formatCurrency(n, currencySymbol)
 
   const [stage, setStage] = useState<'pay' | 'failed' | 'done'>('pay')
   const [method, setMethod] = useState<Method>('CASH')
+  const [tender, setTender] = useState<number | null>(null)
   const [totals, setTotals] = useState<Totals | null>(null)
   const [items, setItems] = useState(0)
   const [orderCount, setOrderCount] = useState(0)
@@ -96,7 +89,8 @@ export function SessionPaymentDialog({
   const [billOpenedAt, setBillOpenedAt] = useState<Date | null>(null)
   const [billClosedAt, setBillClosedAt] = useState<Date | null>(null)
   const [failedAt, setFailedAt] = useState<Date | null>(null)
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   /** One key per attempt: a retry after a dropped connection settles the same
@@ -106,19 +100,21 @@ export function SessionPaymentDialog({
   const load = useCallback(async () => {
     if (!tableId && !checkId && !sessionId) return
     setLoading(true)
+    setLoadError(null)
     try {
       const q = new URLSearchParams()
+      if (sessionId) q.set('sessionId', sessionId)
       if (checkId) q.set('checkId', checkId)
-      else if (sessionId) q.set('sessionId', sessionId)
-      else if (tableId) q.set('tableId', tableId)
+      if (tableId) q.set('tableId', tableId)
 
       const res = await edgeFetch(`/api/bill/check?${q.toString()}`)
-      if (!res.ok) return
+      if (!res.ok) {
+        setLoadError("Couldn't load the bill")
+        return
+      }
       const body = await res.json()
+      setLoadError(null)
       const live = (body?.orders ?? []).filter((o: any) => o.status !== 'CANCELLED')
-      // Orders and items are two different counts. Reporting the number of
-      // orders as the number of dishes made "3 Orders · 3 Items" out of a
-      // table that ordered ten.
       setItems(
         live.reduce(
           (n: number, o: any) =>
@@ -128,30 +124,44 @@ export function SessionPaymentDialog({
       )
       setOrderCount(live.length)
       setOrdersList(live)
-      /* The check returns the tax already split; if not split, we derive
-         CGST and SGST equally at standard GST proportions. */
-      const cgst = Number(body?.totals?.cgst ?? 0)
-      const sgst = Number(body?.totals?.sgst ?? 0)
+
+      const subtotal = Number(body?.totals?.subtotal ?? 0)
+      const discount = Number(body?.totals?.discount ?? 0)
       const totalTax = Number(body?.totals?.tax ?? 0)
-      const taxable = Number(body?.totals?.subtotal ?? 0) - Number(body?.totals?.discount ?? 0)
-      const finalCgst = cgst > 0 ? cgst : totalTax > 0 ? totalTax / 2 : 0
-      const finalSgst = sgst > 0 ? sgst : totalTax > 0 ? totalTax / 2 : 0
-      setBreakup(
-        finalCgst > 0
-          ? {
-              cgstRate: taxable > 0 ? +((finalCgst / taxable) * 100).toFixed(1) : 2.5,
-              sgstRate: taxable > 0 ? +((finalSgst / taxable) * 100).toFixed(1) : 2.5,
-              cgst: finalCgst,
-              sgst: finalSgst,
-            }
-          : null,
-      )
-      setTotals({
-        subtotal: Number(body?.totals?.subtotal ?? 0),
-        tax: Number(body?.totals?.tax ?? 0),
-        total: Number(body?.totals?.total ?? 0),
-        outstanding: Number(body?.totals?.outstanding ?? 0),
+      const serviceCharge = Number(body?.totals?.serviceCharge ?? 0)
+      const total = Number(body?.totals?.total ?? 0)
+      const outstanding = Number(body?.totals?.outstanding ?? 0)
+      const serviceRate = Number(body?.totals?.serviceRate ?? body?.serviceRate ?? (subtotal > 0 && serviceCharge > 0 ? Math.round((serviceCharge / subtotal) * 100) : 0))
+      const roundOff = Number(body?.totals?.roundOff ?? body?.roundOff ?? 0)
+
+      /* The check returns the tax already split; if not split, we derive
+         CGST and SGST deterministically in integer paise. */
+      const gstTotalPaise = Math.round(totalTax * 100)
+      const cgstPaise = Math.ceil(gstTotalPaise / 2)
+      const sgstPaise = gstTotalPaise - cgstPaise
+      const cgst = Number(body?.totals?.cgst ?? +(cgstPaise / 100).toFixed(2))
+      const sgst = Number(body?.totals?.sgst ?? +(sgstPaise / 100).toFixed(2))
+      const taxable = Math.max(0, subtotal - discount)
+      const taxRate = Number(body?.taxRate ?? body?.totals?.taxRate ?? (taxable > 0 ? +((totalTax / taxable) * 100).toFixed(1) : 5))
+
+      setBreakup({
+        cgstRate: +(taxRate / 2).toFixed(1),
+        sgstRate: +(taxRate / 2).toFixed(1),
+        cgst,
+        sgst,
       })
+
+      setTotals({
+        subtotal,
+        discount,
+        tax: totalTax,
+        serviceCharge,
+        serviceRate,
+        roundOff,
+        total,
+        outstanding,
+      })
+
       const invNum = body?.invoiceNumber ?? body?.check?.invoice_number ?? null
       setInvoiceNumber(invNum)
       setBillOpenedAt(body?.openedAt ? new Date(body.openedAt) : null)
@@ -168,7 +178,7 @@ export function SessionPaymentDialog({
         onPaid?.()
       }
     } catch {
-      /* the button below reports anything that matters */
+      setLoadError("Couldn't load the bill")
     } finally {
       setLoading(false)
     }
@@ -179,8 +189,15 @@ export function SessionPaymentDialog({
       setStage('pay')
       setBusy(false)
       setError(null)
+      setLoadError(null)
+      setTotals(null)
+      setTender(null)
       return
     }
+    setLoading(true)
+    setLoadError(null)
+    setTotals(null)
+    setTender(null)
     keyRef.current = crypto.randomUUID()
     void load()
   }, [open, load])
@@ -306,8 +323,6 @@ export function SessionPaymentDialog({
           return
         }
 
-        // Payment recorded successfully: update totals state immediately so subsequent retries
-        // (if finalize fails or is interrupted) do not re-attempt payment or cause OVERPAYMENT errors.
         setTotals((prev) =>
           prev
             ? {
@@ -364,13 +379,6 @@ export function SessionPaymentDialog({
   const failedAtLabel = failedAt
     ? `Today, ${failedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
     : '—'
-  /**
-   * The sitting's bookends, as the closing screen reports them.
-   *
-   * Started: the sitting's own start where the board knows it, otherwise the
-   * check's `opened_at`. Ended: the server's `closed_at` for the check, falling
-   * back to the moment this sheet saw the settlement succeed.
-   */
   const beganAt = startedAt ? new Date(startedAt) : billOpenedAt
   const finishedAt = billClosedAt ?? paidAt
   const startedLabel = beganAt ? clock(beganAt) : '—'
@@ -378,183 +386,340 @@ export function SessionPaymentDialog({
   const durationText = beganAt && finishedAt ? elapsed(beganAt, finishedAt) : '—'
   const selectedMethod = METHODS.find((m) => m.value === method) ?? METHODS[0]
   const SelectedMethodIcon = selectedMethod.icon
-  const amountText = money(totals?.outstanding || totals?.total || 0)
+  const isFullyPaid = Boolean(totals && totals.outstanding <= 0)
+  const amountToPay = totals ? Math.max(0, totals.outstanding) : 0
+  const amountText = money(amountToPay)
   const paidText = money(totals?.total ?? 0)
   const contextSubtitle = `${tableName ?? 'Table'}${invoiceNumber ? ` · Inv ${invoiceNumber.startsWith('#') ? invoiceNumber : `#${invoiceNumber}`}` : ''}`
+
+  // Clean table hint: drop "4 Seats" so metadata does not clip
+  const cleanHint = useMemo(() => {
+    if (!tableHint) return 'All orders in this session'
+    return tableHint
+      .replace(/·\s*\d+\s*Seats\s*(·|$)/i, '· ')
+      .replace(/·\s*$/, '')
+      .trim() || 'All orders in this session'
+  }, [tableHint])
+
+  // Quick tender chips for Cash
+  const tenderOptions = useMemo(() => {
+    if (!amountToPay || amountToPay <= 0) return []
+    const chips: { label: string; value: number }[] = [
+      { label: 'Exact', value: amountToPay },
+    ]
+    const roundedUp = Math.ceil(amountToPay)
+    if (roundedUp > amountToPay && !chips.some((c) => c.value === roundedUp)) {
+      chips.push({ label: money(roundedUp), value: roundedUp })
+    }
+    const benchmarks = [100, 200, 500, 1000, 2000]
+    for (const b of benchmarks) {
+      if (b > amountToPay && chips.length < 4) {
+        chips.push({ label: `₹${b}`, value: b })
+      }
+    }
+    return chips
+  }, [amountToPay, currencySymbol])
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         showCloseButton={false}
-        className="w-[calc(100%-1.25rem)] max-w-[420px] gap-0 overflow-hidden rounded-[28px] border border-border/60 bg-card p-0 shadow-2xl sm:max-w-[440px]"
+        className="w-[calc(100%-1.25rem)] max-w-[420px] max-h-[90dvh] flex flex-col gap-0 overflow-hidden rounded-[28px] border border-border/60 bg-card p-0 shadow-2xl sm:max-w-[440px]"
       >
         <DialogTitle className="sr-only">
           {stage === 'done' ? 'Payment successful' : stage === 'failed' ? 'Payment failed' : 'Complete payment'}
         </DialogTitle>
 
-        <div className="relative max-h-[88dvh] overflow-y-auto px-4 pb-5 pt-5 sm:px-6 sm:pb-6 sm:pt-6">
-          {/* One way out of every face of this sheet. */}
+        {/* Pinned Header */}
+        <div className="relative shrink-0 border-b border-border/40 px-4 pt-4 pb-3 sm:px-6">
           <button
             type="button"
             onClick={() => onOpenChange(false)}
             aria-label="Close"
-            className="absolute right-4 top-4 z-10 grid size-9 place-items-center rounded-full border border-border/80 bg-card text-foreground shadow-sm transition-colors hover:bg-secondary"
+            className="absolute right-4 top-4 z-10 grid size-9 place-items-center rounded-full border border-border/80 bg-card text-foreground shadow-sm transition-colors hover:bg-secondary cursor-pointer"
           >
             <X className="size-4.5" strokeWidth={2.4} />
           </button>
 
+          {stage === 'pay' && (
+            <div className="flex items-start gap-3 pr-11">
+              <span className="grid size-11 shrink-0 place-items-center rounded-2xl bg-primary/10 text-primary ring-1 ring-primary/20 sm:size-12">
+                <Wallet className="size-5.5 sm:size-6 text-primary" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <h2 className="text-[20px] font-extrabold leading-tight tracking-tight text-foreground sm:text-[22px]">
+                  Complete Payment
+                </h2>
+                <p className="mt-0.5 truncate text-[12.5px] text-muted-foreground sm:text-[13px]">
+                  Settle the bill for {tableName ?? 'this session'}
+                </p>
+              </div>
+            </div>
+          )}
+
+          {stage === 'done' && (
+            <div className="text-center pr-9">
+              <h2 className="text-[20px] font-extrabold leading-tight tracking-tight text-foreground sm:text-[22px]">
+                Payment Successful
+              </h2>
+              <p className="mt-0.5 truncate text-[12px] text-muted-foreground">
+                {tableName ?? 'This session'} has been closed and settled.
+              </p>
+            </div>
+          )}
+
+          {stage === 'failed' && (
+            <div className="text-center pr-9">
+              <h2 className="text-[20px] font-extrabold leading-tight tracking-tight text-destructive sm:text-[22px]">
+                Payment Failed
+              </h2>
+              <p className="mt-0.5 truncate text-[12px] text-muted-foreground">
+                {contextSubtitle}
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Scrollable Middle Body */}
+        <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 sm:px-6 scrollbar-thin">
           {/* ---- choosing a method ---- */}
           {stage === 'pay' && (
             <>
-              {/* Header: what this sheet is for, and which table. */}
-              <div className="flex items-start gap-3 pr-11">
-                <span className="grid size-11 shrink-0 place-items-center rounded-2xl bg-primary/10 text-primary ring-1 ring-primary/20 sm:size-12">
-                  <Wallet className="size-5.5 sm:size-6 text-primary" />
-                </span>
-                <div className="min-w-0 flex-1">
-                  <h2 className="text-[20px] font-extrabold leading-tight tracking-tight text-foreground sm:text-[22px]">
-                    Complete Payment
-                  </h2>
-                  <p className="mt-0.5 truncate text-[12.5px] text-muted-foreground sm:text-[13px]">
-                    Settle the bill for {tableName ?? 'this table'}
-                  </p>
-                </div>
-              </div>
-
-              {/* The table, and that this is every order on it. */}
-              <div className="mt-3.5 flex items-center gap-2.5 rounded-2xl bg-primary/[0.04] px-3.5 py-3 border border-primary/20">
+              {/* Session / Table Banner */}
+              <div className="flex items-center gap-2.5 rounded-2xl bg-primary/[0.04] px-3.5 py-3 border border-primary/20">
                 <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary border border-primary/20">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="size-5.5 text-primary">
-                    <path d="M7 11V7a3 3 0 0 1 3-3h4a3 3 0 0 1 3 3v4" />
-                    <rect x="5" y="11" width="14" height="3" rx="1.5" />
-                    <path d="M7 14v6" />
-                    <path d="M17 14v6" />
-                  </svg>
+                  <Table2 className="size-5.5 text-primary" />
                 </span>
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-[16px] font-bold leading-tight text-foreground sm:text-[17px]">
-                    {tableName ?? 'Table'}
+                    {tableName ?? 'Session'}
                   </p>
                   <p className="truncate text-[11.5px] text-muted-foreground sm:text-[12px]">
-                    {tableHint || 'All orders on this table'}
+                    {cleanHint}
                   </p>
                 </div>
-                <span className="shrink-0 rounded-full bg-primary/10 px-3 py-1 text-xs font-semibold text-primary">
-                  Consolidated Bill
+                {/* Consolidated Bill / Session Bill */}
+                <span aria-label="Consolidated Bill" className="shrink-0 rounded-full bg-primary/10 px-3 py-1 text-xs font-semibold text-primary">
+                  Session Bill
                 </span>
               </div>
 
-              {/* The money, line by line, from the server's check. */}
-              <div className="mt-3.5 rounded-2xl border border-border/70 bg-card p-3.5 shadow-xs sm:p-4">
-                <div className="flex items-center justify-between gap-2 border-b border-border/50 pb-2.5">
-                  <p className="flex items-center gap-1.5 text-[14.5px] font-bold text-foreground sm:text-[15px]">
-                    <Layers className="size-4 text-primary" />
-                    Bill Summary
+              {/* Bill Summary */}
+              {loading ? (
+                <div className="mt-3.5 space-y-3 rounded-2xl border border-border/70 bg-card p-3.5 sm:p-4">
+                  <div className="flex items-center justify-between pb-2 border-b border-border/40">
+                    <div className="h-4 w-28 bg-muted animate-pulse rounded" />
+                    <div className="h-3 w-24 bg-muted animate-pulse rounded" />
+                  </div>
+                  <div className="space-y-2.5 pt-1">
+                    <div className="flex justify-between">
+                      <div className="h-3.5 w-16 bg-muted animate-pulse rounded" />
+                      <div className="h-3.5 w-14 bg-muted animate-pulse rounded" />
+                    </div>
+                    <div className="flex justify-between">
+                      <div className="h-3.5 w-20 bg-muted animate-pulse rounded" />
+                      <div className="h-3.5 w-12 bg-muted animate-pulse rounded" />
+                    </div>
+                    <div className="flex justify-between">
+                      <div className="h-3.5 w-20 bg-muted animate-pulse rounded" />
+                      <div className="h-3.5 w-12 bg-muted animate-pulse rounded" />
+                    </div>
+                  </div>
+                  <div className="h-10 w-full bg-muted/60 animate-pulse rounded-xl mt-3" />
+                </div>
+              ) : loadError ? (
+                <div className="mt-3.5 flex flex-col items-center justify-center rounded-2xl border border-destructive/20 bg-destructive/5 p-5 text-center">
+                  <div className="grid size-10 place-items-center rounded-full bg-destructive/10 text-destructive mb-2.5">
+                    <Info className="size-5" />
+                  </div>
+                  <p className="text-[14.5px] font-bold text-foreground">
+                    Couldn&apos;t load the bill
                   </p>
-                  <span className="shrink-0 text-[11.5px] font-medium text-muted-foreground sm:text-[12px]">
-                    ({orderCount} Order{orderCount === 1 ? '' : 's'} · {items} Item{items === 1 ? '' : 's'})
-                  </span>
+                  <p className="mt-1 text-[12px] text-muted-foreground max-w-[280px]">
+                    We were unable to retrieve the bill details for this sitting.
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void load()}
+                    disabled={loading}
+                    className="mt-3.5 h-9 gap-1.5 rounded-xl border-border px-4 text-xs font-semibold hover:bg-secondary cursor-pointer"
+                  >
+                    <RotateCw className={cn("size-3.5", loading && "animate-spin")} />
+                    Retry
+                  </Button>
                 </div>
+              ) : !totals ? (
+                <div className="mt-3.5 space-y-3 rounded-2xl border border-border/70 bg-card p-3.5 sm:p-4">
+                  <div className="flex items-center justify-between pb-2 border-b border-border/40">
+                    <div className="h-4 w-28 bg-muted animate-pulse rounded" />
+                    <div className="h-3 w-24 bg-muted animate-pulse rounded" />
+                  </div>
+                  <div className="space-y-2.5 pt-1">
+                    <div className="flex justify-between">
+                      <div className="h-3.5 w-16 bg-muted animate-pulse rounded" />
+                      <div className="h-3.5 w-14 bg-muted animate-pulse rounded" />
+                    </div>
+                    <div className="flex justify-between">
+                      <div className="h-3.5 w-20 bg-muted animate-pulse rounded" />
+                      <div className="h-3.5 w-12 bg-muted animate-pulse rounded" />
+                    </div>
+                    <div className="flex justify-between">
+                      <div className="h-3.5 w-20 bg-muted animate-pulse rounded" />
+                      <div className="h-3.5 w-12 bg-muted animate-pulse rounded" />
+                    </div>
+                  </div>
+                  <div className="h-10 w-full bg-muted/60 animate-pulse rounded-xl mt-3" />
+                </div>
+              ) : (
+                <div className="mt-3.5 rounded-2xl border border-border/70 bg-card p-3.5 shadow-xs sm:p-4">
+                  <div className="flex items-center justify-between gap-2 border-b border-border/50 pb-2.5">
+                    <p className="flex items-center gap-1.5 text-[14.5px] font-bold text-foreground sm:text-[15px]">
+                      <Layers className="size-4 text-primary" />
+                      Bill Summary
+                    </p>
+                    <span className="shrink-0 text-[11.5px] font-medium text-muted-foreground sm:text-[12px]">
+                      ({orderCount} Order{orderCount === 1 ? '' : 's'} · {items} Item{items === 1 ? '' : 's'})
+                    </span>
+                  </div>
 
-                <div className="mt-2.5 space-y-2 text-[13px]">
-                  <Row label="Subtotal" value={money(totals?.subtotal ?? 0)} />
-                  {breakup && (
-                    <>
-                      <Row label={`CGST (${fmtPct(breakup.cgstRate)}%)`} value={money(breakup.cgst)} />
-                      <Row label={`SGST (${fmtPct(breakup.sgstRate)}%)`} value={money(breakup.sgst)} />
-                    </>
-                  )}
-                  {!breakup && <Row label="Tax" value={money(totals?.tax ?? 0)} />}
+                  <div className="mt-2.5 space-y-2 text-[13px]">
+                    <Row label="Subtotal" value={money(totals.subtotal)} />
+                    {totals.discount !== undefined && totals.discount > 0 && (
+                      <Row label="Discount" value={`−${money(totals.discount)}`} />
+                    )}
+                    {breakup ? (
+                      <>
+                        <Row label={`CGST (${fmtPct(breakup.cgstRate)}%)`} value={money(breakup.cgst)} />
+                        <Row label={`SGST (${fmtPct(breakup.sgstRate)}%)`} value={money(breakup.sgst)} />
+                      </>
+                    ) : (
+                      <Row label="GST" value={money(totals.tax)} />
+                    )}
+                    {totals.serviceCharge !== undefined && totals.serviceCharge > 0 && (
+                      <Row
+                        label={`Service Charge (${totals.serviceRate ? `${totals.serviceRate}%` : '2%'})`}
+                        value={money(totals.serviceCharge)}
+                      />
+                    )}
+                    {totals.roundOff !== undefined && totals.roundOff !== 0 && (
+                      <Row
+                        label="Round Off"
+                        value={`${totals.roundOff > 0 ? '+' : ''}${money(totals.roundOff)}`}
+                      />
+                    )}
+                  </div>
+                  <div className="mt-3 flex items-center justify-between rounded-xl bg-primary/10 px-3.5 py-2.5 border border-primary/20">
+                    <span className="text-[14.5px] font-bold text-foreground sm:text-[15px]">
+                      {isFullyPaid ? 'Amount Due' : totals.outstanding < totals.total ? 'Amount Due' : 'Total Amount'}
+                    </span>
+                    <span className="text-[18px] font-extrabold tabular-nums text-foreground sm:text-[19px]">
+                      {money(amountToPay)}
+                    </span>
+                  </div>
                 </div>
-                <div className="mt-3 flex items-center justify-between rounded-xl bg-primary/10 px-3.5 py-2.5 border border-primary/20">
-                  <span className="text-[14.5px] font-bold text-foreground sm:text-[15px]">Total Amount</span>
-                  <span className="text-[18px] font-extrabold tabular-nums text-foreground sm:text-[19px]">
-                    {money(totals?.outstanding || totals?.total || 0)}
-                  </span>
-                </div>
-              </div>
+              )}
 
-              {/* How the money arrives. */}
-              <p className="mt-4 flex items-center gap-1.5 text-[14.5px] font-bold text-foreground sm:text-[15px]">
-                <CreditCard className="size-4 text-primary" />
-                Select Payment Method
-              </p>
-              <div className="mt-2.5 grid grid-cols-3 gap-2 sm:gap-2.5">
-                {METHODS.map((m) => {
-                  const active = method === m.value
-                  const Icon = m.icon
-                  return (
-                    <button
-                      type="button"
-                      key={m.value}
-                      onClick={() => setMethod(m.value)}
-                      aria-pressed={active}
-                      className={cn(
-                        'relative flex flex-col items-center justify-center gap-1.5 rounded-2xl border-[1.5px] px-2 py-3.5 transition-all cursor-pointer',
-                        active
-                          ? 'border-primary bg-primary/[0.06] shadow-xs'
-                          : 'border-border/80 bg-card hover:border-border hover:bg-secondary/40',
-                      )}
-                    >
-                      <span
-                        className={cn(
-                          'absolute right-2.5 top-2.5 grid size-5 place-items-center rounded-full transition-colors',
-                          active
-                            ? 'bg-primary text-primary-foreground shadow-xs'
-                            : 'border-[1.5px] border-border/80 bg-transparent',
+              {/* Payment Methods */}
+              {!loadError && (
+                !isFullyPaid ? (
+                <>
+                  <p className="mt-3.5 flex items-center gap-1.5 text-[14px] font-bold text-foreground sm:text-[14.5px]">
+                    <CreditCard className="size-4 text-primary" />
+                    Select Payment Method
+                  </p>
+                  <div className="mt-2 grid grid-cols-3 gap-2 sm:gap-2.5">
+                    {METHODS.map((m) => {
+                      const active = method === m.value
+                      const Icon = m.icon
+                      return (
+                        <button
+                          type="button"
+                          key={m.value}
+                          onClick={() => setMethod(m.value)}
+                          aria-pressed={active}
+                          className={cn(
+                            'relative flex flex-col items-center justify-center gap-1.5 rounded-2xl border-[1.5px] px-2 py-3 transition-all cursor-pointer',
+                            active
+                              ? 'border-primary bg-primary/[0.06] shadow-xs'
+                              : 'border-border/80 bg-card hover:border-border hover:bg-secondary/40',
+                          )}
+                        >
+                          <span
+                            className={cn(
+                              'absolute right-2 top-2 grid size-4.5 place-items-center rounded-full transition-colors',
+                              active
+                                ? 'bg-primary text-primary-foreground shadow-xs'
+                                : 'border-[1.5px] border-border/80 bg-transparent',
+                            )}
+                          >
+                            {active && <Check className="size-3" strokeWidth={3.5} />}
+                          </span>
+                          <Icon className={cn('size-5.5 sm:size-6', active ? 'text-primary' : 'text-foreground/75')} />
+                          <span className={cn('text-[13px]', active ? 'font-bold text-foreground' : 'font-medium text-foreground')}>{m.label}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+
+                  {/* Quick tender chips for Cash checkout polish */}
+                  {method === 'CASH' && totals && tenderOptions.length > 0 && (
+                    <div className="mt-3 rounded-2xl border border-border/70 bg-card p-3 shadow-xs">
+                      <div className="flex items-center justify-between text-xs font-semibold text-muted-foreground mb-2">
+                        <span>Quick Tender / Change:</span>
+                        {tender !== null && tender > amountToPay && (
+                          <span className="font-bold text-emerald-600 dark:text-emerald-400">
+                            Change: {money(tender - amountToPay)}
+                          </span>
                         )}
-                      >
-                        {active && <Check className="size-3" strokeWidth={3.5} />}
-                      </span>
-                      <Icon className={cn('size-6 sm:size-7', active ? 'text-primary' : 'text-foreground/75')} />
-                      <span className={cn('text-[13.5px]', active ? 'font-bold text-foreground' : 'font-medium text-foreground')}>{m.label}</span>
-                    </button>
-                  )
-                })}
-              </div>
-
-              <Button
-                onClick={() => void pay()}
-                disabled={busy || loading || !totals}
-                className="mt-4 h-12 w-full rounded-2xl bg-primary hover:bg-primary/90 text-[15px] font-bold text-primary-foreground shadow-md shadow-primary/25 transition-all cursor-pointer flex items-center justify-center gap-2"
-              >
-                {busy ? (
-                  <Loader2 className="mr-2 size-5 animate-spin" />
-                ) : (
-                  <span className="grid size-5.5 place-items-center rounded-full bg-white/20 text-white">
-                    <Check className="size-3.5" strokeWidth={3.5} />
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {tenderOptions.map((opt) => (
+                          <button
+                            key={opt.label}
+                            type="button"
+                            onClick={() => setTender(opt.value)}
+                            className={cn(
+                              'px-2.5 py-1 rounded-xl text-xs font-bold transition-all cursor-pointer',
+                              tender === opt.value
+                                ? 'bg-primary text-primary-foreground shadow-xs'
+                                : 'bg-secondary/50 border border-border/70 hover:bg-secondary text-foreground',
+                            )}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="mt-3.5 flex items-center gap-2.5 rounded-2xl border border-emerald-500/20 bg-emerald-500/[0.06] px-3.5 py-3">
+                  <span className="grid size-7 shrink-0 place-items-center rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+                    <Check className="size-4" strokeWidth={3} />
                   </span>
-                )}
-                Complete Payment
-                <span className="ml-2 font-extrabold tabular-nums">
-                  {money(totals?.outstanding || totals?.total || 0)}
-                </span>
-              </Button>
+                  <div className="min-w-0">
+                    <p className="text-[13px] font-bold text-emerald-700 dark:text-emerald-400">
+                      Paid in Full
+                    </p>
+                    <p className="text-[11.5px] text-muted-foreground">
+                      This check has ₹0 due. Click Close Bill below to finalize.
+                    </p>
+                  </div>
+                </div>
+              ))}
             </>
           )}
 
           {/* ---- it failed ---- */}
           {stage === 'failed' && (
-            <>
-              <div className="relative mx-auto mt-1 grid size-24 place-items-center">
+            <div className="py-2">
+              <div className="relative mx-auto mt-1 grid size-20 place-items-center">
                 <span aria-hidden className="absolute inset-1 rounded-full bg-red-500/12" />
-                <span className="relative grid size-16 place-items-center rounded-full bg-red-500 text-white shadow-lg shadow-red-500/30">
-                  <X className="size-8" strokeWidth={3.2} />
+                <span className="relative grid size-14 place-items-center rounded-full bg-red-500 text-white shadow-lg shadow-red-500/30">
+                  <X className="size-7" strokeWidth={3.2} />
                 </span>
-                <span aria-hidden className="absolute left-3 top-2 h-1.5 w-3.5 rotate-45 rounded-full bg-red-500" />
-                <span aria-hidden className="absolute right-3 top-2 h-1.5 w-3.5 -rotate-45 rounded-full bg-red-500" />
-                <span aria-hidden className="absolute left-0 top-11 h-1.5 w-3 rounded-full bg-red-500" />
-                <span aria-hidden className="absolute right-0 top-11 h-1.5 w-3 rounded-full bg-red-500" />
-                <span aria-hidden className="absolute bottom-3 left-2.5 h-1.5 w-2.5 -rotate-30 rounded-full bg-red-400" />
-                <span aria-hidden className="absolute bottom-3 right-2.5 h-1.5 w-2.5 rotate-30 rounded-full bg-red-400" />
               </div>
-
-              <h2 className="mt-3 text-center text-[24px] font-bold leading-tight tracking-tight text-foreground sm:text-[26px]">
-                Payment Failed
-              </h2>
-              <p className="mt-1 text-center text-[14px] font-medium text-muted-foreground">
-                {contextSubtitle}
-              </p>
 
               {/* 3-column summary */}
               <div className="mt-4 grid grid-cols-3 divide-x divide-border/60 rounded-2xl border border-border/70 bg-secondary/30 py-3 text-center">
@@ -565,7 +730,7 @@ export function SessionPaymentDialog({
                   </p>
                 </div>
                 <div className="min-w-0 px-2">
-                  <p className="text-[11.5px] font-medium text-muted-foreground">Attempted Via</p>
+                  <p className="text-[11.5px] font-medium text-muted-foreground">Method</p>
                   <p className="mt-1 inline-flex max-w-full items-center justify-center gap-1.5 text-[14px] font-bold text-foreground sm:text-[15px]">
                     <SelectedMethodIcon className="size-4 shrink-0 text-primary" />
                     <span className="truncate">{selectedMethod.label}</span>
@@ -591,52 +756,20 @@ export function SessionPaymentDialog({
                   </p>
                 </div>
               </div>
-
-              <Button
-                onClick={() => {
-                  setStage('pay')
-                  // Only regenerate key if money is still outstanding.
-                  // If payment already succeeded and only finalize failed, keep key and proceed directly to finalize.
-                  if ((totals?.outstanding ?? 0) > 0) {
-                    keyRef.current = crypto.randomUUID()
-                  }
-                  void pay()
-                }}
-                disabled={busy}
-                className="mt-4 h-12 w-full rounded-2xl bg-primary text-[15px] font-semibold text-primary-foreground shadow-md shadow-primary/20 hover:bg-primary/90"
-              >
-                {busy ? <Loader2 className="mr-2 size-5 animate-spin" /> : <RotateCw className="mr-2 size-4.5" />}
-                Retry Payment ({selectedMethod.label})
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => setStage('pay')}
-                className="mt-2.5 h-11 w-full rounded-2xl text-[14.5px] font-semibold text-foreground"
-              >
-                <CreditCard className="mr-2 size-4.5 text-muted-foreground" />
-                Choose Another Method
-              </Button>
-              <Button
-                variant="ghost"
-                onClick={() => onOpenChange(false)}
-                className="mt-2 h-11 w-full rounded-2xl bg-secondary/50 text-[14.5px] font-semibold text-foreground hover:bg-secondary"
-              >
-                Cancel
-              </Button>
-            </>
+            </div>
           )}
 
           {/* ---- it worked ---- */}
           {stage === 'done' && (
-            <>
-              {/* The warm orange cloche that means the table is done with. */}
-              <div className="relative mx-auto mt-0.5 grid size-22 place-items-center">
+            <div className="py-2">
+              {/* Cloche graphic */}
+              <div className="relative mx-auto mt-0.5 grid size-20 place-items-center">
                 <span aria-hidden className="absolute inset-2 rounded-full bg-primary/[0.10] blur-[10px]" />
                 <svg
                   viewBox="0 0 84 68"
                   fill="none"
                   aria-hidden="true"
-                  className="relative h-17 w-21 drop-shadow-[0_4px_10px_rgba(249,115,22,0.25)]"
+                  className="relative h-15 w-18 drop-shadow-[0_4px_10px_rgba(249,115,22,0.25)]"
                 >
                   <defs>
                     <linearGradient id="clocheDomeGrad" x1="22" y1="14" x2="62" y2="50" gradientUnits="userSpaceOnUse">
@@ -645,36 +778,24 @@ export function SessionPaymentDialog({
                       <stop offset="100%" stopColor="#EA580C" />
                     </linearGradient>
                   </defs>
-                  {/* Celebratory rays */}
                   <path d="M18 19L11 12M13 31H5M66 19L73 12M71 31H79" stroke="#F97316" strokeWidth="2.8" strokeLinecap="round" />
-                  {/* Top knob */}
                   <circle cx="42" cy="14" r="3.6" fill="#F97316" />
-                  {/* Dome */}
                   <path d="M15 47C15 30.5 27 19 42 19C57 19 69 30.5 69 47H15Z" fill="url(#clocheDomeGrad)" />
-                  {/* Soft specular highlight */}
                   <path d="M23.5 40C25 31 31 25.5 38.5 24" stroke="white" strokeOpacity="0.45" strokeWidth="2.4" strokeLinecap="round" />
-                  {/* Base tray */}
                   <rect x="10" y="47" width="64" height="5" rx="2.5" fill="#f97316" />
                 </svg>
-                <span className="absolute bottom-1 right-1 grid size-7 place-items-center rounded-full bg-primary text-primary-foreground shadow-md shadow-primary/35 ring-2 ring-card">
-                  <Check className="size-4" strokeWidth={3.5} />
+                <span className="absolute bottom-1 right-1 grid size-6 place-items-center rounded-full bg-primary text-primary-foreground shadow-md shadow-primary/35 ring-2 ring-card">
+                  <Check className="size-3.5" strokeWidth={3.5} />
                 </span>
               </div>
 
-              <h2 className="mt-1.5 text-center text-[25px] font-extrabold leading-tight tracking-tight text-foreground sm:text-[27px]">
-                Payment Successful
-              </h2>
-              <p className="mt-1 text-center text-[13px] leading-snug text-muted-foreground sm:text-[13.5px]">
-                {tableName ?? 'This sitting'} has been closed and settled.
-              </p>
-
-              {/* Invoice & Status Banner */}
+              {/* Invoice Banner */}
               {invoiceNumber && (
-                <div className="mt-3.5 flex items-center justify-between rounded-2xl border border-emerald-300/80 bg-emerald-50/80 px-4 py-2.5 dark:border-emerald-800 dark:bg-emerald-950/40">
+                <div className="mt-3 flex items-center justify-between rounded-2xl border border-emerald-300/80 bg-emerald-50/80 px-4 py-2.5 dark:border-emerald-800 dark:bg-emerald-950/40">
                   <div className="flex items-center gap-2">
-                    <ReceiptText className="size-4.5 text-emerald-700 dark:text-emerald-400" />
+                    <ReceiptText className="size-4 text-emerald-700 dark:text-emerald-400" />
                     <span className="text-xs font-bold text-emerald-800 dark:text-emerald-300 uppercase tracking-wider">
-                      Invoice Number
+                      Invoice
                     </span>
                   </div>
                   <span className="font-mono text-sm font-extrabold text-emerald-900 dark:text-emerald-200">
@@ -683,156 +804,199 @@ export function SessionPaymentDialog({
                 </div>
               )}
 
-              {/* Which table it was, and that it is paid. */}
-              <div className="mt-4 flex items-center gap-3 rounded-2xl border border-border/60 bg-card px-3.5 py-3 shadow-[0_1px_3px_rgba(15,23,42,0.04)]">
-                <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary">
-                  <Table2 className="size-5.5" strokeWidth={1.9} />
+              {/* Table details */}
+              <div className="mt-3 flex items-center gap-3 rounded-2xl border border-border/60 bg-card px-3.5 py-2.5 shadow-[0_1px_3px_rgba(15,23,42,0.04)]">
+                <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary">
+                  <Table2 className="size-5" strokeWidth={1.9} />
                 </span>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-[16.5px] font-bold leading-tight text-foreground sm:text-[17.5px]">
-                    {tableName ?? 'Table'}
+                  <p className="truncate text-[16px] font-bold leading-tight text-foreground sm:text-[17px]">
+                    {tableName ?? 'Session'}
                   </p>
-                  <p className="mt-0.5 truncate text-[12px] text-muted-foreground sm:text-[12.5px]">
-                    {tableHint || 'All orders on this table'}
+                  <p className="truncate text-[11.5px] text-muted-foreground">
+                    {cleanHint}
                   </p>
                 </div>
-                <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[#DCFCE7] px-3 py-1 text-[12.5px] font-semibold text-[#15803D] dark:bg-emerald-500/[0.15] dark:text-emerald-400">
-                  <span className="grid size-4 place-items-center rounded-full bg-[#16A34A] text-white">
-                    <Check className="size-2.5" strokeWidth={3.6} />
+                <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[#DCFCE7] px-2.5 py-0.5 text-xs font-semibold text-[#15803D] dark:bg-emerald-500/[0.15] dark:text-emerald-400">
+                  <span className="grid size-3.5 place-items-center rounded-full bg-[#16A34A] text-white">
+                    <Check className="size-2" strokeWidth={3.6} />
                   </span>
                   Paid
                 </span>
               </div>
 
-              {/* When it ran. */}
-              <div className="mt-2.5 grid grid-cols-3 divide-x divide-border/60 rounded-2xl border border-border/60 bg-secondary/30 py-3">
+              {/* When it ran: compact duration formatting */}
+              <div className="mt-2.5 grid grid-cols-3 divide-x divide-border/60 rounded-2xl border border-border/60 bg-secondary/30 py-2.5">
                 <Fact icon={CalendarDays} label="Started at" value={startedLabel} />
                 <Fact icon={Power} label="Ended at" value={endedLabel} />
                 <Fact icon={Timer} label="Duration" value={durationText} />
               </div>
 
-              {/* What it came to, line by line, from the settled check. */}
-              <div className="mt-2.5 rounded-2xl border border-border/60 bg-card p-3.5 shadow-[0_1px_3px_rgba(15,23,42,0.04)]">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="flex items-center gap-2 text-[15px] font-bold text-foreground sm:text-[15.5px]">
-                    <Layers className="size-4.5 text-primary" />
+              {/* Bill Summary in Payment Successful */}
+              <div className="mt-2.5 rounded-2xl border border-border/60 bg-card p-3 shadow-[0_1px_3px_rgba(15,23,42,0.04)]">
+                <div className="flex items-center justify-between gap-2 border-b border-border/50 pb-2">
+                  <p className="flex items-center gap-1.5 text-[14px] font-bold text-foreground">
+                    <Layers className="size-4 text-primary" />
                     Bill Summary
                   </p>
-                  <span className="shrink-0 text-[12px] font-medium text-muted-foreground sm:text-[12.5px]">
+                  <span className="shrink-0 text-[11.5px] font-medium text-muted-foreground">
                     {orderCount} Order{orderCount === 1 ? '' : 's'} · {items} Item{items === 1 ? '' : 's'}
                   </span>
                 </div>
-                <div className="mt-2.5 divide-y divide-border/35 border-t border-border/50 pt-1 text-[13px] sm:text-[13.5px]">
-                  <div className="py-1.5">
-                    <Row label="Subtotal" value={money(totals?.subtotal ?? 0)} />
-                  </div>
+                <div className="mt-2 space-y-1.5 text-[12.5px] sm:text-[13px]">
+                  <Row label="Subtotal" value={money(totals?.subtotal ?? 0)} />
+                  {totals?.discount !== undefined && totals.discount > 0 && (
+                    <Row label="Discount" value={`−${money(totals.discount)}`} />
+                  )}
                   {breakup ? (
                     <>
-                      <div className="py-1.5">
-                        <Row label={`CGST (${fmtPct(breakup.cgstRate)}%)`} value={money(breakup.cgst)} />
-                      </div>
-                      <div className="py-1.5">
-                        <Row label={`SGST (${fmtPct(breakup.sgstRate)}%)`} value={money(breakup.sgst)} />
-                      </div>
+                      <Row label={`CGST (${fmtPct(breakup.cgstRate)}%)`} value={money(breakup.cgst)} />
+                      <Row label={`SGST (${fmtPct(breakup.sgstRate)}%)`} value={money(breakup.sgst)} />
                     </>
                   ) : (
-                    <div className="py-1.5">
-                      <Row label="Tax" value={money(totals?.tax ?? 0)} />
-                    </div>
+                    <Row label="GST" value={money(totals?.tax ?? 0)} />
+                  )}
+                  {totals?.serviceCharge !== undefined && totals.serviceCharge > 0 && (
+                    <Row
+                      label={`Service Charge (${totals.serviceRate ? `${totals.serviceRate}%` : '2%'})`}
+                      value={money(totals.serviceCharge)}
+                    />
+                  )}
+                  {totals?.roundOff !== undefined && totals.roundOff !== 0 && (
+                    <Row
+                      label="Round Off"
+                      value={`${totals.roundOff > 0 ? '+' : ''}${money(totals.roundOff)}`}
+                    />
                   )}
                 </div>
-                <div className="mt-2 flex items-center justify-between rounded-xl bg-primary/10 px-3.5 py-2.5">
-                  <span className="text-[15px] font-bold text-foreground sm:text-[16px]">Total Paid</span>
-                  <span className="text-[18px] font-extrabold tabular-nums text-foreground sm:text-[19px]">
+                <div className="mt-2.5 flex items-center justify-between rounded-xl bg-primary/10 px-3.5 py-2">
+                  <span className="text-[14.5px] font-bold text-foreground">Total Paid</span>
+                  <span className="text-[17px] font-extrabold tabular-nums text-foreground">
                     {paidText}
                   </span>
                 </div>
               </div>
+            </div>
+          )}
+        </div>
 
-              {/* The two things worth doing next: the paper, or the sitting. */}
-              <div className="mt-5 grid grid-cols-2 gap-3 pb-1">
-                <Button
-                  onClick={() => onViewBill?.()}
-                  className="h-12 gap-2 whitespace-nowrap rounded-2xl bg-primary px-3 text-[14px] font-semibold text-primary-foreground shadow-sm shadow-primary/25 hover:bg-primary/90 sm:text-[15px]"
-                >
-                  <ReceiptText className="size-4.5" />
-                  View Bill
-                </Button>
-                <Button
-                  variant="outline"
-                  onClick={() => (onViewSession ? onViewSession() : onOpenChange(false))}
-                  className="h-12 gap-2 whitespace-nowrap rounded-2xl border-border bg-card px-3 text-[14px] font-semibold text-foreground hover:bg-secondary sm:text-[15px]"
-                >
-                  <Info className="size-4.5 text-primary" />
-                  Session Details
-                </Button>
-              </div>
-            </>
+        {/* Pinned Footer Action Buttons */}
+        <div className="shrink-0 border-t border-border/40 bg-card px-4 py-3 sm:px-6">
+          {stage === 'pay' && (
+            <Button
+              onClick={() => void pay()}
+              disabled={busy || loading || !totals || Boolean(loadError)}
+              className="h-12 w-full rounded-2xl bg-primary hover:bg-primary/90 text-[15px] font-bold text-primary-foreground shadow-md shadow-primary/25 transition-all cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {busy ? (
+                <Loader2 className="mr-2 size-5 animate-spin" />
+              ) : (
+                <span className="grid size-5.5 place-items-center rounded-full bg-white/20 text-white">
+                  <Check className="size-3.5" strokeWidth={3.5} />
+                </span>
+              )}
+              {isFullyPaid ? (
+                'Close Bill'
+              ) : (
+                <>
+                  Complete Payment
+                  <span className="ml-2 font-extrabold tabular-nums">
+                    {amountText}
+                  </span>
+                </>
+              )}
+            </Button>
           )}
 
+          {stage === 'done' && (
+            <div className="grid grid-cols-2 gap-3">
+              <Button
+                onClick={() => onViewBill?.()}
+                className="h-11 gap-2 whitespace-nowrap rounded-xl bg-primary px-3 text-[14px] font-semibold text-primary-foreground shadow-sm shadow-primary/25 hover:bg-primary/90 cursor-pointer"
+              >
+                <ReceiptText className="size-4" />
+                View Bill
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  if (onViewSession) onViewSession()
+                  else onOpenChange(false)
+                }}
+                className="h-11 gap-2 whitespace-nowrap rounded-xl border border-border bg-card px-3 text-[14px] font-semibold text-foreground hover:bg-secondary cursor-pointer"
+              >
+                Done
+              </Button>
+            </div>
+          )}
+
+          {stage === 'failed' && (
+            <div className="flex flex-col gap-2">
+              <Button
+                onClick={() => {
+                  setStage('pay')
+                  if ((totals?.outstanding ?? 0) > 0) {
+                    keyRef.current = crypto.randomUUID()
+                  }
+                  void pay()
+                }}
+                disabled={busy}
+                className="h-11 w-full rounded-xl bg-primary text-[14.5px] font-semibold text-primary-foreground shadow-md shadow-primary/20 hover:bg-primary/90 cursor-pointer"
+              >
+                {busy ? <Loader2 className="mr-2 size-4.5 animate-spin" /> : <RotateCw className="mr-2 size-4" />}
+                Retry Payment ({selectedMethod.label})
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setStage('pay')}
+                className="h-10 w-full rounded-xl text-[14px] font-semibold text-foreground hover:bg-secondary cursor-pointer"
+              >
+                <CreditCard className="mr-2 size-4 text-muted-foreground" />
+                Choose Another Method
+              </Button>
+            </div>
+          )}
         </div>
       </DialogContent>
     </Dialog>
   )
 }
 
-/** One figure in the summary strip. */
-/** One line of the receipt. */
-function Receipt({ label, value, strong }: { label: string; value: string; strong?: boolean }) {
-  return (
-    <div className="flex items-center justify-between gap-2 py-2.5">
-      <span className="text-[12.5px] text-muted-foreground">{label}</span>
-      <span
-        className={cn(
-          'min-w-0 truncate text-right tabular-nums',
-          strong ? 'text-[14px] font-bold text-foreground' : 'text-[13px] font-medium text-foreground',
-        )}
-      >
-        {value}
-      </span>
-    </div>
-  )
-}
-
 function Row({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex items-baseline justify-between gap-2">
+    <div className="flex items-center justify-between">
       <span className="text-muted-foreground">{label}</span>
       <span className="font-semibold tabular-nums text-foreground">{value}</span>
     </div>
   )
 }
 
-/** 2.5 rather than 2.50, 5 rather than 5.0 — a rate, not money. */
 function fmtPct(n: number) {
   return String(Number(n.toFixed(2)))
 }
 
-/** One fact in the sitting's strip: an icon, what it is, what it read. */
 function Fact({ icon: Icon, label, value }: { icon: any; label: string; value: string }) {
   return (
-    <div className="flex min-w-0 items-center justify-center gap-2 px-2">
-      <Icon className="size-[18px] shrink-0 text-primary" strokeWidth={2.1} />
+    <div className="flex min-w-0 items-center justify-center gap-1.5 px-1.5">
+      <Icon className="size-4 shrink-0 text-primary" strokeWidth={2.1} />
       <div className="min-w-0">
-        <p className="truncate text-[11px] leading-tight text-muted-foreground sm:text-[11.5px]">{label}</p>
-        <p className="truncate text-[13.5px] font-bold leading-tight tabular-nums text-foreground sm:text-[14px]">{value}</p>
+        <p className="truncate text-[10.5px] leading-tight text-muted-foreground">{label}</p>
+        <p className="truncate text-[12.5px] font-bold leading-tight tabular-nums text-foreground">{value}</p>
       </div>
     </div>
   )
 }
 
-/** A clock time for a sitting's bookends — "05:21 PM". */
 function clock(d: Date) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }).toUpperCase()
 }
 
-/** How long the sitting ran, in the units that are still true. */
+/** How long the sitting ran: compact duration formatting (e.g. "14h 17m", "45m") */
 function elapsed(from: Date, to: Date) {
   const mins = Math.max(0, Math.floor((to.getTime() - from.getTime()) / 60000))
-  if (mins < 1) return '<1 min'
-  if (mins < 60) return `${mins} min`
+  if (mins < 1) return '<1m'
+  if (mins < 60) return `${mins}m`
   const hours = Math.floor(mins / 60)
   const rest = mins % 60
-  return rest ? `${hours} hr ${rest} min` : `${hours} hr`
+  return rest ? `${hours}h ${rest}m` : `${hours}h`
 }
-

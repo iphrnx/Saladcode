@@ -629,7 +629,7 @@ async function active(req: Request): Promise<Response> {
   const recentlyClosed = new Date(Date.now() - 3 * 60_000).toISOString();
   const { data, error } = await admin()
     .from("table_sessions")
-    .select("*, table:tables(*), order_rows:orders(id, status, payment_status, total)")
+    .select("*, table:tables(*), order_rows:orders(id, status, payment_status, total, created_at, items:order_items(id, name, quantity, price, portion, portion_id, status))")
     .eq("tenant_id", tenantId)
     .or(`status.eq.ACTIVE,and(status.eq.ENDED,ended_at.gte.${recentlyClosed})`)
     .order("created_at", { ascending: false });
