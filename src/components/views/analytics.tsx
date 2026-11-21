@@ -37,6 +37,7 @@ interface PaymentMethodSummary {
   cash: { amount: number; count: number }
   upi: { amount: number; count: number }
   card: { amount: number; count: number }
+  other?: { amount: number; count: number }
   total: number
 }
 
@@ -249,7 +250,14 @@ export function AnalyticsView() {
       push('Cash', analytics.paymentMethods.cash.count, money(analytics.paymentMethods.cash.amount))
       push('UPI', analytics.paymentMethods.upi.count, money(analytics.paymentMethods.upi.amount))
       push('Card', analytics.paymentMethods.card.count, money(analytics.paymentMethods.card.amount))
-      push('Total Reconciled', analytics.paymentMethods.cash.count + analytics.paymentMethods.upi.count + analytics.paymentMethods.card.count, money(analytics.paymentMethods.total))
+      if (analytics.paymentMethods.other && analytics.paymentMethods.other.count > 0) {
+        push('Other / Legacy', analytics.paymentMethods.other.count, money(analytics.paymentMethods.other.amount))
+      }
+      const totalTx = analytics.paymentMethods.cash.count +
+                      analytics.paymentMethods.upi.count +
+                      analytics.paymentMethods.card.count +
+                      (analytics.paymentMethods.other?.count ?? 0)
+      push('Total Reconciled', totalTx, money(analytics.paymentMethods.total))
       blank()
     }
 
@@ -329,7 +337,7 @@ export function AnalyticsView() {
 
   // Payment method totals & percentages
   const pm = analytics?.paymentMethods
-  const pmTotal = (pm?.cash.amount ?? 0) + (pm?.upi.amount ?? 0) + (pm?.card.amount ?? 0) || 1
+  const pmTotal = (pm?.cash.amount ?? 0) + (pm?.upi.amount ?? 0) + (pm?.card.amount ?? 0) + (pm?.other?.amount ?? 0) || 1
 
   // Category totals for inline percentages
   const catTotal = (analytics?.categoryBreakdown ?? []).reduce((s, c) => s + c.value, 0) || 1
@@ -799,7 +807,7 @@ export function AnalyticsView() {
             <CreditCard className="size-4 text-muted-foreground" />
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className={cn("grid gap-3", (pm?.other && pm.other.count > 0) ? "grid-cols-1 sm:grid-cols-2 lg:grid-cols-4" : "grid-cols-1 sm:grid-cols-3")}>
             <PaymentCard
               icon={Banknote}
               method="Cash"
@@ -827,6 +835,17 @@ export function AnalyticsView() {
               currencySymbol={sym}
               color="purple"
             />
+            {pm?.other && pm.other.count > 0 && (
+              <PaymentCard
+                icon={Receipt}
+                method="Other / Legacy"
+                amount={pm.other.amount}
+                count={pm.other.count}
+                total={pmTotal}
+                currencySymbol={sym}
+                color="amber"
+              />
+            )}
           </div>
         </Card>
       </div>
@@ -849,13 +868,14 @@ function PaymentCard({
   count: number
   total: number
   currencySymbol: string
-  color: 'emerald' | 'blue' | 'purple'
+  color: 'emerald' | 'blue' | 'purple' | 'amber'
 }) {
   const pct = total > 0 ? ((amount / total) * 100).toFixed(1) : '0.0'
   const colorMap = {
     emerald: 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20',
     blue: 'text-blue-500 bg-blue-500/10 border-blue-500/20',
     purple: 'text-purple-500 bg-purple-500/10 border-purple-500/20',
+    amber: 'text-amber-500 bg-amber-500/10 border-amber-500/20',
   }
 
   return (

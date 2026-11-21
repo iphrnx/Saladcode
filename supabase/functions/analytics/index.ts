@@ -1,17 +1,11 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { corsHeaders, handleCors } from "../_shared/cors.ts";
+import { json, preflight } from "../_shared/http.ts";
+import { guard } from "../_shared/auth.ts";
+import { admin } from "../_shared/db.ts";
 import { resolvePlan, checkFeature } from "../_shared/plans.ts";
 
 const DAY_MS = 86_400_000;
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-function json(req: Request, data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...corsHeaders(req), "Content-Type": "application/json" },
-  });
-}
 
 function zoneOffsetMinutes(at: Date, timeZone: string): number {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -81,23 +75,21 @@ async function fetchAllPages<T>(
 }
 
 serve(async (req: Request) => {
-  const corsResponse = handleCors(req);
-  if (corsResponse) return corsResponse;
+  const p = preflight(req);
+  if (p) return p;
 
   if (req.method !== "GET") {
     return json(req, { error: "Method not allowed" }, 405);
   }
 
-  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-  const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  const db = createClient(supabaseUrl, supabaseKey);
+  // 1. Enforce analytics.view permission and derive tenant from authenticated session
+  const g = await guard(req, { permission: "analytics.view" });
+  if (!g.ok) return g.response;
 
-  const tenantId = req.headers.get("x-tenant-id");
-  if (!tenantId) {
-    return json(req, { error: "Missing x-tenant-id header" }, 400);
-  }
+  const tenantId = g.session.tenantId;
+  const db = admin();
 
-  // Pre-fetch tenant settings for timezone
+  // Tenant settings for timezone
   const { data: tenantSettings } = await db
     .from("settings")
     .select("timezone")
@@ -127,7 +119,7 @@ serve(async (req: Request) => {
   /* -------------------------------------------------------------------------- */
   /* Pre-load metadata for location resolution, tables, staff, and categories    */
   /* -------------------------------------------------------------------------- */
-  // 1. Tables for tenant
+  // 1. Tables for tenant (persisted table location for Dine-in)
   const { data: allTenantTables } = await db
     .from("tables")
     .select("id, name, location_id")
@@ -137,16 +129,15 @@ serve(async (req: Request) => {
     tableMap.set(t.id, t);
   }
 
-  // 2. Staff for tenant (to resolve Takeaway / Delivery location from staff profile)
+  // 2. Staff for tenant: supported columns are id, location_id, name, employee_id
   const { data: tenantStaff } = await db
     .from("staff")
-    .select("id, profile_id, location_id")
+    .select("id, location_id")
     .eq("tenant_id", tenantId);
   const staffLocMap = new Map<string, string>();
   for (const s of tenantStaff ?? []) {
     if (s.location_id) {
       staffLocMap.set(s.id, s.location_id);
-      if (s.profile_id) staffLocMap.set(s.profile_id, s.location_id);
     }
   }
 
@@ -163,7 +154,7 @@ serve(async (req: Request) => {
   }
 
   /* -------------------------------------------------------------------------- */
-  /* Location Resolver: verifies location without guessing missing data        */
+  /* Location Resolver: verifies persisted location data tied to transaction    */
   /* -------------------------------------------------------------------------- */
   const checkMap = new Map<string, any>();
 
@@ -172,14 +163,16 @@ serve(async (req: Request) => {
     table_id?: string | null;
     check_id?: string | null;
     staff_id?: string | null;
-    created_by?: string | null;
     served_by_id?: string | null;
   }): string | null {
+    // 1. Direct location on entity
     if (entity.location_id) return entity.location_id;
+    // 2. From table (Dine-in)
     if (entity.table_id && tableMap.has(entity.table_id)) {
       const loc = tableMap.get(entity.table_id)?.location_id;
       if (loc) return loc;
     }
+    // 3. From associated check
     if (entity.check_id && checkMap.has(entity.check_id)) {
       const chk = checkMap.get(entity.check_id);
       if (chk.location_id) return chk.location_id;
@@ -188,10 +181,12 @@ serve(async (req: Request) => {
         if (loc) return loc;
       }
     }
-    const staffId = entity.staff_id || entity.served_by_id || entity.created_by;
+    // 4. From staff tied to transaction (Takeaway/Delivery)
+    const staffId = entity.staff_id || entity.served_by_id;
     if (staffId && staffLocMap.has(staffId)) {
       return staffLocMap.get(staffId) ?? null;
     }
+    // 5. Unverifiable historical location data: left unassigned (do not guess)
     return null;
   }
 
@@ -204,7 +199,31 @@ serve(async (req: Request) => {
   /* -------------------------------------------------------------------------- */
   /* 1. Database Settlement Queries with Deterministic Pagination               */
   /* -------------------------------------------------------------------------- */
-  // A. Table checks closed within [rangeStart, rangeEnd)
+  // A. Authoritative Settlement Payments (check_payments) within [rangeStart, rangeEnd)
+  let paymentRows: any[] = [];
+  try {
+    paymentRows = await fetchAllPages(async (from, to) => {
+      return await db
+        .from("check_payments")
+        .select("id, check_id, amount, method, status, staff_id, created_at")
+        .eq("tenant_id", tenantId)
+        .eq("status", "SUCCEEDED")
+        .gte("created_at", rangeStart.toISOString())
+        .lt("created_at", rangeEnd.toISOString())
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true })
+        .range(from, to);
+    });
+  } catch (err: any) {
+    return json(req, { error: err.message }, 500);
+  }
+
+  // Pre-load checks linked to payments
+  const paymentCheckIds = Array.from(
+    new Set(paymentRows.map((p) => p.check_id).filter(Boolean))
+  );
+
+  // B. Table checks closed within [rangeStart, rangeEnd)
   let rangeChecks: any[] = [];
   try {
     rangeChecks = await fetchAllPages(async (from, to) => {
@@ -225,29 +244,8 @@ serve(async (req: Request) => {
 
   for (const c of rangeChecks) checkMap.set(c.id, c);
 
-  // B. Authoritative Settlement Payments (check_payments) within [rangeStart, rangeEnd)
-  let paymentRows: any[] = [];
-  try {
-    paymentRows = await fetchAllPages(async (from, to) => {
-      return await db
-        .from("check_payments")
-        .select("id, check_id, amount, method, status, staff_id, created_by, created_at")
-        .eq("tenant_id", tenantId)
-        .eq("status", "SUCCEEDED")
-        .gte("created_at", rangeStart.toISOString())
-        .lt("created_at", rangeEnd.toISOString())
-        .order("created_at", { ascending: true })
-        .order("id", { ascending: true })
-        .range(from, to);
-    });
-  } catch (err: any) {
-    return json(req, { error: err.message }, 500);
-  }
-
   // Pre-load any checks linked to payments that were not closed in the same window
-  const missingCheckIds = Array.from(
-    new Set(paymentRows.map((p) => p.check_id).filter((cid) => cid && !checkMap.has(cid)))
-  );
+  const missingCheckIds = paymentCheckIds.filter((cid) => !checkMap.has(cid));
   if (missingCheckIds.length > 0) {
     for (let i = 0; i < missingCheckIds.length; i += 100) {
       const chunk = missingCheckIds.slice(i, i + 100);
@@ -319,16 +317,103 @@ serve(async (req: Request) => {
   const allRangeOrders = Array.from(orderMap.values());
 
   /* -------------------------------------------------------------------------- */
-  /* 2. Location Scoping across Collections and Orders                           */
+  /* 2. Determine Authoritative Settlement Source and Reconcile Full Settlements */
   /* -------------------------------------------------------------------------- */
-  const filteredPayments = paymentRows.filter((p) => matchesSelectedLocation(p));
-  const filteredChecks = rangeChecks.filter((c) => matchesSelectedLocation(c));
+  // Checks with authoritative ledger settlements across history
+  const checksWithLedger = new Set<string>();
+  // To avoid duplicate ledger entries if multiple records exist, take the authoritative full-settlement payment per check
+  const authoritativeLedgerPaymentByCheck = new Map<string, any>();
+  for (const p of paymentRows) {
+    if (p.check_id) {
+      checksWithLedger.add(p.check_id);
+      if (!authoritativeLedgerPaymentByCheck.has(p.check_id)) {
+        authoritativeLedgerPaymentByCheck.set(p.check_id, p);
+      }
+    }
+  }
+
+  interface ReconciledRevenueEvent {
+    id: string;
+    amount: number;
+    settledAt: Date;
+    method: "CASH" | "UPI" | "CARD" | "OTHER";
+    locationId: string | null;
+  }
+  const reconciledEvents: ReconciledRevenueEvent[] = [];
+
+  // A. Ledger-backed full settlements
+  for (const p of paymentRows) {
+    const rawMethod = String(p.method || "").toUpperCase();
+    const method: "CASH" | "UPI" | "CARD" | "OTHER" =
+      rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
+
+    const settleTime = new Date(p.created_at);
+    // Apply date filter after determining authoritative source
+    if (settleTime >= rangeStart && settleTime < rangeEnd) {
+      reconciledEvents.push({
+        id: p.id,
+        amount: Number(p.amount || 0),
+        settledAt: settleTime,
+        method,
+        locationId: resolveLocation(p),
+      });
+    }
+  }
+
+  // B. Legacy checks without ledger payments across history
+  for (const c of rangeChecks) {
+    if (!checksWithLedger.has(c.id)) {
+      const checkAmt = Number(c.paid_total > 0 ? c.paid_total : c.total || 0);
+      if (checkAmt > 0) {
+        const settleTime = c.closed_at
+          ? new Date(c.closed_at)
+          : (c.invoice_date ? new Date(c.invoice_date) : new Date(c.created_at));
+
+        if (settleTime >= rangeStart && settleTime < rangeEnd) {
+          reconciledEvents.push({
+            id: c.id,
+            amount: checkAmt,
+            settledAt: settleTime,
+            method: "OTHER", // Accurate classification for legacy records lacking method
+            locationId: resolveLocation(c),
+          });
+        }
+      }
+    }
+  }
+
+  // C. Standalone qualifying orders without checks
+  for (const o of allRangeOrders) {
+    if (!o.check_id) {
+      let settleTime = o.paid_at ? new Date(o.paid_at) : new Date(o.completed_at || o.created_at);
+      if (settleTime >= rangeStart && settleTime < rangeEnd) {
+        const rawMethod = String(o.payment_method || "").toUpperCase();
+        const method: "CASH" | "UPI" | "CARD" | "OTHER" =
+          rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
+
+        reconciledEvents.push({
+          id: o.id,
+          amount: Number(o.total || 0),
+          settledAt: settleTime,
+          method,
+          locationId: resolveLocation(o),
+        });
+      }
+    }
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /* 3. Location Filter Application across All Metrics                          */
+  /* -------------------------------------------------------------------------- */
+  const filteredEvents = reconciledEvents.filter((e) => {
+    if (!selectedLocationId) return true;
+    return e.locationId === selectedLocationId;
+  });
 
   const qualifyingOrders: any[] = [];
   for (const o of allRangeOrders) {
     if (!matchesSelectedLocation(o)) continue;
 
-    // Determine authoritative settlement timestamp
     let settlementTime: Date | null = null;
     const isPaidStatus = o.payment_status === "PAID" || o.payment_status === "paid";
     const isCompletedStatus = o.status === "COMPLETED";
@@ -382,97 +467,25 @@ serve(async (req: Request) => {
     });
   }
 
-  /* -------------------------------------------------------------------------- */
-  /* 3. Unified Financial Reconciliation (Entity Level: Checks & Orders)        */
-  /* -------------------------------------------------------------------------- */
-  // Find which checks have ledger records (check_payments)
-  const checksWithLedger = new Set<string>();
-  for (const p of filteredPayments) {
-    if (p.check_id) checksWithLedger.add(p.check_id);
-  }
-
+  // Payment method breakdowns (Cash, UPI, Card, Other accurately reported)
   let cashAmount = 0, cashCount = 0;
   let upiAmount = 0, upiCount = 0;
   let cardAmount = 0, cardCount = 0;
+  let otherAmount = 0, otherCount = 0;
 
-  // 1. Process ledger payments
-  for (const p of filteredPayments) {
-    const amt = Number(p.amount || 0);
-    const m = String(p.method || "").toUpperCase();
-    if (m === "CASH") {
-      cashAmount += amt;
+  for (const e of filteredEvents) {
+    if (e.method === "CASH") {
+      cashAmount += e.amount;
       cashCount++;
-    } else if (m === "UPI") {
-      upiAmount += amt;
+    } else if (e.method === "UPI") {
+      upiAmount += e.amount;
       upiCount++;
-    } else if (m === "CARD") {
-      cardAmount += amt;
+    } else if (e.method === "CARD") {
+      cardAmount += e.amount;
       cardCount++;
-    }
-  }
-
-  // 2. Identify verified legacy settlements without ledger records
-  interface ReconciledRevenueEvent {
-    amount: number;
-    settledAt: Date;
-    method?: string;
-  }
-  const reconciledEvents: ReconciledRevenueEvent[] = [];
-
-  // A. All ledger payments are authoritative events
-  for (const p of filteredPayments) {
-    reconciledEvents.push({
-      amount: Number(p.amount || 0),
-      settledAt: new Date(p.created_at),
-      method: String(p.method || "").toUpperCase(),
-    });
-  }
-
-  // B. Legacy checks without ledger payments
-  for (const c of filteredChecks) {
-    if (!checksWithLedger.has(c.id)) {
-      const checkAmt = Number(c.paid_total > 0 ? c.paid_total : c.total || 0);
-      if (checkAmt > 0) {
-        const checkSettleTime = c.closed_at
-          ? new Date(c.closed_at)
-          : (c.invoice_date ? new Date(c.invoice_date) : new Date(c.created_at));
-        reconciledEvents.push({
-          amount: checkAmt,
-          settledAt: checkSettleTime,
-          method: "LEGACY",
-        });
-      }
-    }
-  }
-
-  // C. Standalone qualifying orders without checks
-  for (const o of qualifyingOrders) {
-    if (!o.checkId) {
-      reconciledEvents.push({
-        amount: Number(o.total || 0),
-        settledAt: o.settledAt,
-        method: o.paymentMethod ? String(o.paymentMethod).toUpperCase() : "CASH",
-      });
-      // Attribute standalone payment method to cash/upi/card counters
-      const m = (o.paymentMethod || "CASH").toUpperCase();
-      if (m === "CASH") { cashAmount += o.total; cashCount++; }
-      else if (m === "UPI") { upiAmount += o.total; upiCount++; }
-      else if (m === "CARD") { cardAmount += o.total; cardCount++; }
-    }
-  }
-
-  // Fallback for environments with orders only and no checks/payments created yet
-  if (reconciledEvents.length === 0 && qualifyingOrders.length > 0) {
-    for (const o of qualifyingOrders) {
-      reconciledEvents.push({
-        amount: Number(o.total || 0),
-        settledAt: o.settledAt,
-        method: o.paymentMethod ? String(o.paymentMethod).toUpperCase() : "CASH",
-      });
-      const m = (o.paymentMethod || "CASH").toUpperCase();
-      if (m === "CASH") { cashAmount += o.total; cashCount++; }
-      else if (m === "UPI") { upiAmount += o.total; upiCount++; }
-      else if (m === "CARD") { cardAmount += o.total; cardCount++; }
+    } else {
+      otherAmount += e.amount;
+      otherCount++;
     }
   }
 
@@ -484,8 +497,7 @@ serve(async (req: Request) => {
     const dayStart = new Date(t);
     const dayEnd = new Date(t + DAY_MS);
 
-    // Filter authoritative reconciled events in this day bucket
-    const dayEvents = reconciledEvents.filter(
+    const dayEvents = filteredEvents.filter(
       (e) => e.settledAt >= dayStart && e.settledAt < dayEnd
     );
     const dayRevenue = dayEvents.reduce((s, e) => s + e.amount, 0);
@@ -589,46 +601,52 @@ serve(async (req: Request) => {
     .sort((a, b) => b.value - a.value);
 
   /* -------------------------------------------------------------------------- */
-  /* 10. Today vs Yesterday (scoped to selected location and reconciled)       */
+  /* 10. Today vs Yesterday (queried independently of historical report range)  */
   /* -------------------------------------------------------------------------- */
   const todayStart = zonedStart(todayStr, timeZone);
   const tomorrowStart = new Date(todayStart.getTime() + DAY_MS);
   const yesterdayStart = new Date(todayStart.getTime() - DAY_MS);
 
-  // Today's reconciled revenue and orders
-  const todayReconciledEvents = reconciledEvents.filter(
-    (e) => e.settledAt >= todayStart && e.settledAt < tomorrowStart
-  );
-  let todaysRevenue = +(todayReconciledEvents.reduce((s, e) => s + e.amount, 0)).toFixed(2);
+  // Independent query for Today's full settlement payments
+  const { data: todayDbPayments } = await db
+    .from("check_payments")
+    .select("id, check_id, amount, method, status, staff_id, created_at")
+    .eq("tenant_id", tenantId)
+    .eq("status", "SUCCEEDED")
+    .gte("created_at", todayStart.toISOString())
+    .lt("created_at", tomorrowStart.toISOString());
 
-  const todaysOrdersList = qualifyingOrders.filter(
-    (o) => o.settledAt >= todayStart && o.settledAt < tomorrowStart
-  );
-  const todaysOrders = todaysOrdersList.length;
+  const filteredTodayPayments = (todayDbPayments ?? []).filter((p: any) => matchesSelectedLocation(p));
+  let todaysRevenue = +(filteredTodayPayments.reduce((s: number, p: any) => s + Number(p.amount || 0), 0)).toFixed(2);
 
-  if (todaysRevenue === 0 && todaysOrdersList.length > 0) {
-    todaysRevenue = +(todaysOrdersList.reduce((s, o) => s + o.total, 0)).toFixed(2);
+  // Independent query for Today's completed orders
+  const { data: todayDbOrders } = await db
+    .from("orders")
+    .select("id, table_id, check_id, served_by_id, total, status, payment_status, paid_at")
+    .eq("tenant_id", tenantId)
+    .neq("status", "CANCELLED")
+    .neq("status", "REJECTED")
+    .gte("paid_at", todayStart.toISOString())
+    .lt("paid_at", tomorrowStart.toISOString());
+
+  const filteredTodayOrders = (todayDbOrders ?? []).filter((o: any) => matchesSelectedLocation(o));
+  const todaysOrders = filteredTodayOrders.length;
+
+  if (todaysRevenue === 0 && filteredTodayOrders.length > 0) {
+    todaysRevenue = +(filteredTodayOrders.reduce((s: number, o: any) => s + Number(o.total || 0), 0)).toFixed(2);
   }
 
-  // Yesterday's reconciled revenue
-  const yestReconciledEvents = reconciledEvents.filter(
-    (e) => e.settledAt >= yesterdayStart && e.settledAt < todayStart
-  );
-  let yestRevenue = +(yestReconciledEvents.reduce((s, e) => s + e.amount, 0)).toFixed(2);
+  // Independent query for Yesterday's full settlement payments
+  const { data: yestDbPayments } = await db
+    .from("check_payments")
+    .select("id, check_id, amount, method, status, staff_id, created_at")
+    .eq("tenant_id", tenantId)
+    .eq("status", "SUCCEEDED")
+    .gte("created_at", yesterdayStart.toISOString())
+    .lt("created_at", todayStart.toISOString());
 
-  // If yesterday is outside the main queried range, query DB with the same location scope
-  if (yesterdayStart < rangeStart) {
-    const { data: yestDbPayments } = await db
-      .from("check_payments")
-      .select("id, check_id, amount, method, status, staff_id, created_by, created_at")
-      .eq("tenant_id", tenantId)
-      .eq("status", "SUCCEEDED")
-      .gte("created_at", yesterdayStart.toISOString())
-      .lt("created_at", todayStart.toISOString());
-
-    const filteredYestPayments = (yestDbPayments ?? []).filter((p: any) => matchesSelectedLocation(p));
-    yestRevenue = +(filteredYestPayments.reduce((s: number, p: any) => s + Number(p.amount || 0), 0)).toFixed(2);
-  }
+  const filteredYestPayments = (yestDbPayments ?? []).filter((p: any) => matchesSelectedLocation(p));
+  let yestRevenue = +(filteredYestPayments.reduce((s: number, p: any) => s + Number(p.amount || 0), 0)).toFixed(2);
 
   let revenueChange = 0;
   if (yestRevenue > 0) {
@@ -649,7 +667,7 @@ serve(async (req: Request) => {
     .eq("active", true)
     .order("is_primary", { ascending: false });
 
-  const paymentBreakdownTotal = +(cashAmount + upiAmount + cardAmount).toFixed(2);
+  const paymentBreakdownTotal = +(cashAmount + upiAmount + cardAmount + otherAmount).toFixed(2);
 
   return json(req, {
     range: { from: fromStr, to: toStr, days: dailyRevenue.length, timezone: timeZone },
@@ -673,6 +691,7 @@ serve(async (req: Request) => {
       cash: { amount: +cashAmount.toFixed(2), count: cashCount },
       upi: { amount: +upiAmount.toFixed(2), count: upiCount },
       card: { amount: +cardAmount.toFixed(2), count: cardCount },
+      other: { amount: +otherAmount.toFixed(2), count: otherCount },
       total: paymentBreakdownTotal > 0 ? paymentBreakdownTotal : totalRevenue,
     },
     locations: (locRows ?? []).map((l: any) => ({ id: l.id, name: l.name, isPrimary: l.is_primary })),
