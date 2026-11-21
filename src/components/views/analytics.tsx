@@ -128,35 +128,56 @@ export function AnalyticsView() {
 
   const tenantId = data?.tenant?.id
   const requestSeq = useRef(0)
+  const activeSkeletonSeq = useRef<number | null>(null)
+  const activeFilters = useRef({ from: '', to: '', locationId: '' })
   const lastOrderBook = useRef<AppData['orders'] | null>(null)
   const bgTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const fetchAnalytics = useCallback(async (mode: 'skeleton' | 'silent') => {
     if (!tenantId) return
+    const from = range.from ? format(range.from, 'yyyy-MM-dd') : ''
+    const to = range.to ? format(range.to, 'yyyy-MM-dd') : from
+    const locationId = selectedLocationId || ''
     const seq = ++requestSeq.current
+
+    activeFilters.current = { from, to, locationId }
     if (mode === 'skeleton') {
-      void Promise.resolve().then(() => {
-        if (seq === requestSeq.current) setLoading(true)
-      })
+      activeSkeletonSeq.current = seq
+      setLoading(true)
     }
+
+    let isFilterActive = false
     try {
-      const from = range.from ? format(range.from, 'yyyy-MM-dd') : ''
-      const to = range.to ? format(range.to, 'yyyy-MM-dd') : from
-      const locQuery = selectedLocationId ? `&location_id=${selectedLocationId}` : ''
+      const locQuery = locationId ? `&location_id=${locationId}` : ''
       const res = await edgeFetch(`/api/analytics?from=${from}&to=${to}${locQuery}`, {
         headers: { 'x-tenant-id': tenantId },
       })
       await failIfNotOk(res, 'analytics')
       const json = await res.json()
-      if (seq !== requestSeq.current) return
+
+      isFilterActive = activeFilters.current.from === from &&
+                       activeFilters.current.to === to &&
+                       activeFilters.current.locationId === locationId
+
+      // Stale responses from old date ranges, locations, or superseded requests cannot overwrite
+      if (!isFilterActive || seq < requestSeq.current) return
+
       setAnalytics(json)
       setDenied(null)
     } catch (err) {
-      if (seq !== requestSeq.current) return
+      isFilterActive = activeFilters.current.from === from &&
+                       activeFilters.current.to === to &&
+                       activeFilters.current.locationId === locationId
+      if (!isFilterActive || seq < requestSeq.current) return
+
       if (mode === 'skeleton') handleLoad(err, 'analytics')
       else handleLoadQuiet(err, 'analytics')
     } finally {
-      if (mode === 'skeleton' && seq === requestSeq.current) setLoading(false)
+      // Clear loading state on both success and error, ensuring silent refreshes cannot leave loading stuck
+      if (activeSkeletonSeq.current !== null && seq >= activeSkeletonSeq.current) {
+        activeSkeletonSeq.current = null
+        setLoading(false)
+      }
     }
   }, [tenantId, range, selectedLocationId, handleLoad, handleLoadQuiet, setDenied])
 
@@ -194,8 +215,15 @@ export function AnalyticsView() {
     const blank = () => rows.push([])
     const money = (n: number) => n.toFixed(2)
 
+    const selectedLoc = (analytics.locations ?? []).find((l) => l.id === selectedLocationId)
+
     push('The Salad sales report')
     push('Restaurant', data.tenant.name)
+    if (selectedLoc) {
+      push('Location', selectedLoc.name)
+    } else {
+      push('Location', 'All Locations')
+    }
     push('From', analytics.range?.from ?? '')
     push('To', analytics.range?.to ?? '')
     push('Timezone', analytics.range?.timezone ?? 'Asia/Kolkata')
@@ -257,13 +285,14 @@ export function AnalyticsView() {
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }))
     const link = document.createElement('a')
     link.href = url
-    link.download = `the-salad-report_${analytics.range?.from ?? 'from'}_to_${analytics.range?.to ?? 'to'}.csv`
+    const locSlug = selectedLoc ? `${selectedLoc.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}_` : ''
+    link.download = `the-salad-report_${locSlug}${analytics.range?.from ?? 'from'}_to_${analytics.range?.to ?? 'to'}.csv`
     document.body.appendChild(link)
     link.click()
     link.remove()
     URL.revokeObjectURL(url)
     toast.success('Report downloaded', {
-      description: `${analytics.totalOrders} orders · ${sym}${money(analytics.totalRevenue)}`,
+      description: `${analytics.totalOrders} orders · ${sym}${money(analytics.totalRevenue)}${selectedLoc ? ` · ${selectedLoc.name}` : ''}`,
     })
   }
 
