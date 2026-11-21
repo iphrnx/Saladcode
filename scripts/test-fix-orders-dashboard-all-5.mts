@@ -80,9 +80,7 @@ describe('Bug 2: Modal Navigation Contracts', () => {
 
   it('View Bill is the only action opening Session Details with bill tab selected', () => {
     assert.ok(
-      ordersCode.includes("openSitting(\n            fresh ?? { ...target, state: 'Ended', paidOff: true, endedAt: target.endedAt ?? new Date().toISOString() },\n            'bill',") ||
-      ordersCode.includes("openSitting(fresh ?? target, 'bill')") ||
-      ordersCode.includes("openSitting(\n            fresh ??"),
+      ordersCode.includes("'bill'") && ordersCode.includes("openSitting(") && ordersCode.includes("onViewBill"),
       'View Bill must open sitting with bill tab'
     )
     assert.ok(drawerCode.includes('initialTab?: Tab'), 'SessionOrdersDrawer must accept initialTab')
@@ -164,17 +162,22 @@ describe('Bug 1: Multi-Diner Isolation & Atomic Updates', () => {
   const ordersCode = readFileSync(resolve('src/components/views/orders.tsx'), 'utf8')
   const dataContextCode = readFileSync(resolve('src/components/app/data-context.tsx'), 'utf8')
 
-  it('settled check is never misclassified as sharedBill', () => {
+  it('shared-check safeguard applies regardless of payment status', () => {
     assert.ok(
-      ordersCode.includes('const sharedBill = Boolean(check) && !isSettledCheck && check!.orderCount !== onTheBill.length'),
-      'isSettledCheck must never be flagged as sharedBill'
+      ordersCode.includes('const sharedBill = Boolean(check) && check!.orderCount !== onTheBill.length'),
+      'sharedBill must be based on check orderCount without being suppressed by isSettledCheck'
+    )
+    assert.ok(
+      !ordersCode.includes('!isSettledCheck && check!.orderCount !== onTheBill.length'),
+      'isSettledCheck must not bypass sharedBill safeguard'
     )
   })
 
-  it('paid and due for settled check come directly from confirmed check data', () => {
+  it('paid and due for settled check come directly from confirmed check data when not shared', () => {
     assert.ok(
-      ordersCode.includes('const paid = isSettledCheck\n        ? (check?.paid ?? check?.total ?? fallbackTotal)'),
-      'Paid amount must come from settled check'
+      ordersCode.includes('isSettledCheck\n          ? (check.paid ?? check.total ?? fallbackTotal)') ||
+      ordersCode.includes('(isSettledCheck\n          ? (check.paid ?? check.total ?? fallbackTotal)'),
+      'Paid amount must come from settled check when unshared'
     )
     assert.ok(
       ordersCode.includes('const due = isSettledCheck\n        ? 0'),

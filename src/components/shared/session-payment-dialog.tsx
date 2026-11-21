@@ -42,6 +42,7 @@ export function SessionPaymentDialog({
   tableId,
   checkId,
   sessionId,
+  sittingKey,
   tableName,
   tableHint,
   currencySymbol = '₹',
@@ -55,6 +56,7 @@ export function SessionPaymentDialog({
   tableId: string | null
   checkId: string | null
   sessionId?: string | null
+  sittingKey?: string | null
   tableName: string | null
   /** "Main Hall · Dine In" — the sitting's own description. */
   tableHint?: string
@@ -64,9 +66,9 @@ export function SessionPaymentDialog({
   /** Fired after a successful settle, so the board can refresh. */
   onPaid?: (settled?: any) => void
   /** "View Session Details" on the receipt screen. */
-  onViewSession?: () => void
+  onViewSession?: (originKey?: string | null) => void
   /** "View Bill" on the receipt — opens the printable bill. */
-  onViewBill?: () => void
+  onViewBill?: (originKey?: string | null) => void
   /** When the sitting began. The check's own `opened_at` is the fallback, so
    *  the duration on the closing screen is never invented. */
   startedAt?: string | null
@@ -97,6 +99,10 @@ export function SessionPaymentDialog({
   /** One key per attempt: a retry after a dropped connection settles the same
    *  payment rather than taking the money twice. */
   const keyRef = useRef<string>('')
+  const onPaidRef = useRef(onPaid)
+  useEffect(() => {
+    onPaidRef.current = onPaid
+  })
 
   const load = useCallback(async () => {
     if (!tableId && !checkId && !sessionId) return
@@ -177,32 +183,13 @@ export function SessionPaymentDialog({
         const settledClosedAt = body?.closedAt ? new Date(body.closedAt) : new Date()
         setPaidAt(settledClosedAt)
         setStage('done')
-        onPaid?.({
-          checkId: checkId ?? '',
-          sessionId: sessionId ?? null,
-          tableId: tableId ?? null,
-          invoiceNumber: invNum,
-          total,
-          paid: Number(body?.totals?.paid ?? total),
-          outstanding: 0,
-          subtotal,
-          discount,
-          tax: totalTax,
-          serviceCharge,
-          serviceRate,
-          cgst,
-          sgst,
-          closedAt: settledClosedAt.toISOString(),
-          paymentMethod: body?.paymentMethod ?? method,
-          orderCount: live.length,
-        })
       }
     } catch {
       setLoadError("Couldn't load the bill")
     } finally {
       setLoading(false)
     }
-  }, [tableId, checkId, sessionId, tableHint, onPaid, method])
+  }, [tableId, checkId, sessionId, tableHint])
 
   useEffect(() => {
     if (!open) {
@@ -229,7 +216,9 @@ export function SessionPaymentDialog({
     let cgst = settledPayload?.cgst !== undefined ? Number(settledPayload.cgst) : undefined
     let sgst = settledPayload?.sgst !== undefined ? Number(settledPayload.sgst) : undefined
     let serviceCharge = settledPayload?.serviceCharge !== undefined ? Number(settledPayload.serviceCharge) : undefined
-    let serviceRate = settledPayload?.serviceRate !== undefined ? Number(settledPayload.serviceRate) : undefined
+    let serviceRate = settledPayload?.serviceRate !== undefined
+      ? Number(settledPayload.serviceRate)
+      : (settledPayload?.totals?.serviceRate !== undefined ? Number(settledPayload.totals.serviceRate) : undefined)
     let roundOff = settledPayload?.roundOff !== undefined ? Number(settledPayload.roundOff) : undefined
     let total = settledPayload?.total !== undefined ? Number(settledPayload.total) : undefined
     let paid = settledPayload?.paid !== undefined ? Number(settledPayload.paid) : undefined
@@ -257,7 +246,9 @@ export function SessionPaymentDialog({
           discount = Number(body?.totals?.discount ?? discount ?? 0)
           totalTax = Number(body?.totals?.tax ?? totalTax ?? 0)
           serviceCharge = Number(body?.totals?.serviceCharge ?? serviceCharge ?? 0)
-          serviceRate = Number(body?.totals?.serviceRate ?? body?.serviceRate ?? serviceRate ?? 0)
+          if (serviceRate === undefined && (body?.totals?.serviceRate !== undefined || body?.serviceRate !== undefined)) {
+            serviceRate = Number(body?.totals?.serviceRate ?? body?.serviceRate)
+          }
           roundOff = Number(body?.totals?.roundOff ?? body?.roundOff ?? roundOff ?? 0)
           total = Number(body?.totals?.total ?? total ?? 0)
           paid = Number(body?.totals?.paid ?? paid ?? total)
@@ -284,6 +275,11 @@ export function SessionPaymentDialog({
     discount = discount ?? Number(totals?.discount ?? 0)
     totalTax = totalTax ?? Number(totals?.tax ?? 0)
     serviceCharge = serviceCharge ?? Number(totals?.serviceCharge ?? 0)
+    const effectiveServiceRate = serviceRate !== undefined
+      ? serviceRate
+      : (totals?.serviceRate !== undefined
+        ? totals.serviceRate
+        : (subtotal > 0 && serviceCharge > 0 ? Math.round((serviceCharge / subtotal) * 100) : 0))
     total = total ?? Number(totals?.total ?? 0)
     paid = paid ?? (total > 0 ? total : Number(totals?.total ?? 0))
     const gstTotalPaise = Math.round(totalTax * 100)
@@ -306,7 +302,7 @@ export function SessionPaymentDialog({
       discount,
       tax: totalTax,
       serviceCharge,
-      serviceRate: serviceRate ?? 0,
+      serviceRate: effectiveServiceRate,
       roundOff: roundOff ?? 0,
       total,
       outstanding: 0,
@@ -331,7 +327,7 @@ export function SessionPaymentDialog({
       discount,
       tax: totalTax,
       serviceCharge,
-      serviceRate: serviceRate ?? 0,
+      serviceRate: effectiveServiceRate,
       cgst,
       sgst,
       closedAt: settledAt.toISOString(),
@@ -339,7 +335,7 @@ export function SessionPaymentDialog({
       orderCount,
     }
 
-    onPaid?.(settledData)
+    onPaidRef.current?.(settledData)
 
     try {
       if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
@@ -954,7 +950,7 @@ export function SessionPaymentDialog({
           {stage === 'done' && (
             <div className="grid grid-cols-2 gap-3">
               <Button
-                onClick={() => onViewBill?.()}
+                onClick={() => onViewBill?.(sittingKey)}
                 className="h-11 gap-2 whitespace-nowrap rounded-xl bg-primary px-3 text-[14px] font-semibold text-primary-foreground shadow-sm shadow-primary/25 hover:bg-primary/90 cursor-pointer"
               >
                 <ReceiptText className="size-4" />
