@@ -225,6 +225,7 @@ export interface CheckSummary {
   /** Before tax: item prices less discount, as the server sums them. */
   subtotal?: number
   tax?: number
+  serviceCharge?: number
   /** After tax and service charge. */
   total: number
   paid: number
@@ -461,6 +462,8 @@ interface AppContextValue {
   sessionRevision: number
   /** Authoritative per-table-check totals, keyed by check id. */
   checks: Record<string, CheckSummary>
+  /** Apply confirmed totals to a check in one update. */
+  updateCheck: (checkId: string, patch: Partial<CheckSummary>) => void
   /**
    * The sittings, keyed by session id.
    *
@@ -496,6 +499,20 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const [checks, setChecks] = useState<Record<string, CheckSummary>>({})
   /** The sittings themselves, keyed by session id — start, status, end. */
   const [tableSessions, setTableSessions] = useState<Record<string, TableSitting>>({})
+
+  const updateCheck = useCallback((checkId: string, patch: Partial<CheckSummary>) => {
+    if (!checkId) return
+    setChecks((prev) => {
+      const existing = prev[checkId]
+      return {
+        ...prev,
+        [checkId]: {
+          ...(existing ?? { orderCount: 1, subtotal: 0, tax: 0, total: 0, paid: 0, outstanding: 0, status: 'OPEN', invoiceNumber: null }),
+          ...patch,
+        },
+      }
+    })
+  }, [])
   // Seeded from the loaded data so an order fetched on first load is not
   // announced as new afterwards.
   useEffect(() => {
@@ -960,92 +977,18 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       // never fires for it. The staff function broadcasts it on this same topic
       // instead; without listening, the POS board kept showing a table whose
       // diner had already closed the menu until the page was reloaded.
-      .on('broadcast', { event: 'SESSION_ENDED' }, (msg: any) => {
+      .on('broadcast', { event: 'SESSION_ENDED' }, () => {
         if (isCancelled) return
-        const sessId = msg?.payload?.sessionId || msg?.payload?.order?.sessionId
-        if (sessId) {
-          setTableSessions((prev) => ({
-            ...prev,
-            [sessId]: {
-              ...(prev[sessId] ?? { id: sessId, tableId: msg?.payload?.tableId, startedAt: new Date().toISOString() }),
-              status: 'ENDED',
-              endedAt: msg?.payload?.endedAt ?? new Date().toISOString(),
-            },
-          }))
-          try {
-            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-              const bc = new BroadcastChannel('the_salad_orders_sync')
-              bc.postMessage({
-                type: 'SESSION_ENDED',
-                sessionId: sessId,
-                tableId: msg?.payload?.tableId,
-                status: 'ENDED',
-              })
-              bc.close()
-            }
-          } catch {}
-        }
         setSessionRevision((n) => n + 1)
         void runDeltaSync()
       })
-      .on('broadcast', { event: 'SESSION_UPDATED' }, (msg: any) => {
+      .on('broadcast', { event: 'SESSION_UPDATED' }, () => {
         if (isCancelled) return
-        const sessId = msg?.payload?.sessionId || msg?.payload?.order?.sessionId
-        const st = msg?.payload?.status || msg?.payload?.order?.status
-        if (sessId && st === 'ENDED') {
-          setTableSessions((prev) => ({
-            ...prev,
-            [sessId]: {
-              ...(prev[sessId] ?? { id: sessId, tableId: msg?.payload?.tableId, startedAt: new Date().toISOString() }),
-              status: 'ENDED',
-              endedAt: msg?.payload?.endedAt ?? new Date().toISOString(),
-            },
-          }))
-          try {
-            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-              const bc = new BroadcastChannel('the_salad_orders_sync')
-              bc.postMessage({
-                type: 'SESSION_ENDED',
-                sessionId: sessId,
-                tableId: msg?.payload?.tableId,
-                status: 'ENDED',
-              })
-              bc.close()
-            }
-          } catch {}
-        }
         setSessionRevision((n) => n + 1)
         void runDeltaSync()
       })
-      .on('broadcast', { event: 'CHECK_UPDATED' }, (msg: any) => {
+      .on('broadcast', { event: 'CHECK_UPDATED' }, () => {
         if (isCancelled) return
-        const chkId = msg?.payload?.checkId
-        const sessId = msg?.payload?.sessionId || msg?.payload?.order?.sessionId
-        if (chkId && (msg?.payload?.reason === 'FINALISED' || msg?.payload?.status === 'PAID')) {
-          setChecks((prev) => ({
-            ...prev,
-            [chkId]: {
-              ...(prev[chkId] ?? { orderCount: 1, subtotal: 0, tax: 0, total: 0, paid: 0, outstanding: 0 }),
-              status: 'PAID',
-              outstanding: 0,
-              invoiceNumber: msg?.payload?.invoiceNumber ?? prev[chkId]?.invoiceNumber ?? null,
-            },
-          }))
-          try {
-            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-              const bc = new BroadcastChannel('the_salad_orders_sync')
-              bc.postMessage({
-                type: 'CHECK_UPDATED',
-                checkId: chkId,
-                sessionId: sessId,
-                tableId: msg?.payload?.tableId,
-                status: 'PAID',
-                reason: 'FINALISED',
-              })
-              bc.close()
-            }
-          } catch {}
-        }
         setSessionRevision((n) => n + 1)
         void runDeltaSync()
       })
@@ -1128,6 +1071,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     sessionRevision,
     checks,
     tableSessions,
+    updateCheck,
   }), [
     data,
     loading,
@@ -1141,6 +1085,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     sessionRevision,
     checks,
     tableSessions,
+    updateCheck,
   ])
 
   return (

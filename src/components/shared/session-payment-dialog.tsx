@@ -8,6 +8,7 @@ import { formatCurrency } from '@/lib/constants'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { BillSummary, BillSummarySkeleton } from '@/components/shared/bill-summary'
 
 function UpiLogo({ className }: { className?: string }) {
   return (
@@ -61,7 +62,7 @@ export function SessionPaymentDialog({
   open: boolean
   onOpenChange: (v: boolean) => void
   /** Fired after a successful settle, so the board can refresh. */
-  onPaid?: () => void
+  onPaid?: (settled?: any) => void
   /** "View Session Details" on the receipt screen. */
   onViewSession?: () => void
   /** "View Bill" on the receipt — opens the printable bill. */
@@ -173,16 +174,35 @@ export function SessionPaymentDialog({
         body?.check?.status === 'PAID' ||
         (invNum && Number(body?.totals?.outstanding ?? 0) === 0 && Number(body?.totals?.total ?? 0) > 0)
       ) {
-        setPaidAt(body?.closedAt ? new Date(body.closedAt) : new Date())
+        const settledClosedAt = body?.closedAt ? new Date(body.closedAt) : new Date()
+        setPaidAt(settledClosedAt)
         setStage('done')
-        onPaid?.()
+        onPaid?.({
+          checkId: checkId ?? '',
+          sessionId: sessionId ?? null,
+          tableId: tableId ?? null,
+          invoiceNumber: invNum,
+          total,
+          paid: Number(body?.totals?.paid ?? total),
+          outstanding: 0,
+          subtotal,
+          discount,
+          tax: totalTax,
+          serviceCharge,
+          serviceRate,
+          cgst,
+          sgst,
+          closedAt: settledClosedAt.toISOString(),
+          paymentMethod: body?.paymentMethod ?? method,
+          orderCount: live.length,
+        })
       }
     } catch {
       setLoadError("Couldn't load the bill")
     } finally {
       setLoading(false)
     }
-  }, [tableId, checkId, sessionId, tableHint, onPaid])
+  }, [tableId, checkId, sessionId, tableHint, onPaid, method])
 
   useEffect(() => {
     if (!open) {
@@ -201,6 +221,168 @@ export function SessionPaymentDialog({
     keyRef.current = crypto.randomUUID()
     void load()
   }, [open, load])
+
+  const completeSettlement = async (settledPayload: any, chosenMethod: Method) => {
+    let subtotal = settledPayload?.subtotal !== undefined ? Number(settledPayload.subtotal) : undefined
+    let discount = settledPayload?.discount !== undefined ? Number(settledPayload.discount) : undefined
+    let totalTax = settledPayload?.tax !== undefined ? Number(settledPayload.tax) : undefined
+    let cgst = settledPayload?.cgst !== undefined ? Number(settledPayload.cgst) : undefined
+    let sgst = settledPayload?.sgst !== undefined ? Number(settledPayload.sgst) : undefined
+    let serviceCharge = settledPayload?.serviceCharge !== undefined ? Number(settledPayload.serviceCharge) : undefined
+    let serviceRate = settledPayload?.serviceRate !== undefined ? Number(settledPayload.serviceRate) : undefined
+    let roundOff = settledPayload?.roundOff !== undefined ? Number(settledPayload.roundOff) : undefined
+    let total = settledPayload?.total !== undefined ? Number(settledPayload.total) : undefined
+    let paid = settledPayload?.paid !== undefined ? Number(settledPayload.paid) : undefined
+    let invoice = settledPayload?.invoiceNumber ?? settledPayload?.check?.invoiceNumber ?? invoiceNumber ?? null
+    let closedAtStr = settledPayload?.closedAt ?? null
+    let finalMethod = settledPayload?.paymentMethod ?? chosenMethod
+
+    if (
+      subtotal === undefined ||
+      total === undefined ||
+      paid === undefined ||
+      cgst === undefined ||
+      sgst === undefined ||
+      serviceCharge === undefined
+    ) {
+      try {
+        const q = new URLSearchParams()
+        if (sessionId) q.set('sessionId', sessionId)
+        if (checkId) q.set('checkId', checkId)
+        if (tableId) q.set('tableId', tableId)
+        const checkRes = await edgeFetch(`/api/bill/check?${q.toString()}`)
+        if (checkRes.ok) {
+          const body = await checkRes.json()
+          subtotal = Number(body?.totals?.subtotal ?? subtotal ?? 0)
+          discount = Number(body?.totals?.discount ?? discount ?? 0)
+          totalTax = Number(body?.totals?.tax ?? totalTax ?? 0)
+          serviceCharge = Number(body?.totals?.serviceCharge ?? serviceCharge ?? 0)
+          serviceRate = Number(body?.totals?.serviceRate ?? body?.serviceRate ?? serviceRate ?? 0)
+          roundOff = Number(body?.totals?.roundOff ?? body?.roundOff ?? roundOff ?? 0)
+          total = Number(body?.totals?.total ?? total ?? 0)
+          paid = Number(body?.totals?.paid ?? paid ?? total)
+          invoice = invoice || body?.invoiceNumber || body?.check?.invoice_number || null
+          closedAtStr = closedAtStr || body?.closedAt || null
+          if (body?.paymentMethod) finalMethod = body.paymentMethod
+          const live = (body?.orders ?? []).filter((o: any) => o.status !== 'CANCELLED')
+          setItems(
+            live.reduce(
+              (n: number, o: any) =>
+                n + (o.items ?? []).reduce((q: number, i: any) => q + Number(i.quantity ?? 0), 0),
+              0,
+            ),
+          )
+          setOrderCount(live.length)
+          setOrdersList(live)
+        }
+      } catch {
+        // Fallback to loaded totals
+      }
+    }
+
+    subtotal = subtotal ?? Number(totals?.subtotal ?? 0)
+    discount = discount ?? Number(totals?.discount ?? 0)
+    totalTax = totalTax ?? Number(totals?.tax ?? 0)
+    serviceCharge = serviceCharge ?? Number(totals?.serviceCharge ?? 0)
+    total = total ?? Number(totals?.total ?? 0)
+    paid = paid ?? (total > 0 ? total : Number(totals?.total ?? 0))
+    const gstTotalPaise = Math.round(totalTax * 100)
+    const cgstPaise = Math.ceil(gstTotalPaise / 2)
+    const sgstPaise = gstTotalPaise - cgstPaise
+    cgst = cgst ?? +(cgstPaise / 100).toFixed(2)
+    sgst = sgst ?? +(sgstPaise / 100).toFixed(2)
+    const taxable = Math.max(0, subtotal - discount)
+    const taxRate = taxable > 0 ? +((totalTax / taxable) * 100).toFixed(1) : 5
+
+    setBreakup({
+      cgstRate: +(taxRate / 2).toFixed(1),
+      sgstRate: +(taxRate / 2).toFixed(1),
+      cgst,
+      sgst,
+    })
+
+    setTotals({
+      subtotal,
+      discount,
+      tax: totalTax,
+      serviceCharge,
+      serviceRate: serviceRate ?? 0,
+      roundOff: roundOff ?? 0,
+      total,
+      outstanding: 0,
+    })
+
+    setInvoiceNumber(invoice)
+    const settledAt = closedAtStr ? new Date(closedAtStr) : new Date()
+    setPaidAt(settledAt)
+    setBillClosedAt(settledAt)
+    setMethod(finalMethod as Method)
+    setStage('done')
+
+    const settledData = {
+      checkId: checkId ?? '',
+      sessionId: sessionId ?? null,
+      tableId: tableId ?? null,
+      invoiceNumber: invoice,
+      total,
+      paid,
+      outstanding: 0,
+      subtotal,
+      discount,
+      tax: totalTax,
+      serviceCharge,
+      serviceRate: serviceRate ?? 0,
+      cgst,
+      sgst,
+      closedAt: settledAt.toISOString(),
+      paymentMethod: finalMethod,
+      orderCount,
+    }
+
+    onPaid?.(settledData)
+
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        const bc = new BroadcastChannel('the_salad_orders_sync')
+        bc.postMessage({
+          type: 'CHECK_UPDATED',
+          checkId,
+          tableId,
+          sessionId,
+          status: 'PAID',
+          invoiceNumber: invoice,
+          reason: 'FINALISED',
+          total,
+          paid,
+          subtotal,
+          tax: totalTax,
+          serviceCharge,
+          orderCount,
+        })
+        if (sessionId) {
+          bc.postMessage({
+            type: 'SESSION_ENDED',
+            checkId,
+            tableId,
+            sessionId,
+            status: 'ENDED',
+            endedAt: settledAt.toISOString(),
+            invoiceNumber: invoice,
+          })
+          bc.postMessage({
+            type: 'SESSION_UPDATED',
+            checkId,
+            tableId,
+            sessionId,
+            status: 'ENDED',
+            endedAt: settledAt.toISOString(),
+            invoiceNumber: invoice,
+          })
+        }
+        bc.close()
+      }
+    } catch {}
+  }
 
   /**
    * Take the money and close the bill.
@@ -227,26 +409,7 @@ export function SessionPaymentDialog({
         })
         if (settleRes.ok) {
           const settled = await settleRes.json().catch(() => null)
-          setInvoiceNumber(
-            settled?.invoiceNumber ?? settled?.check?.invoiceNumber ?? invoiceNumber ?? null,
-          )
-          const settledAt = settled?.closedAt ? new Date(settled.closedAt) : new Date()
-          setPaidAt(settledAt)
-          setBillClosedAt(settledAt)
-          setStage('done')
-          onPaid?.()
-          try {
-            if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-              const bc = new BroadcastChannel('the_salad_orders_sync')
-              const inv = settled?.invoiceNumber ?? settled?.check?.invoiceNumber ?? invoiceNumber ?? null
-              bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, status: 'PAID', invoiceNumber: inv, reason: 'FINALISED' })
-              if (sessionId) {
-                bc.postMessage({ type: 'SESSION_ENDED', checkId, tableId, sessionId, status: 'ENDED', endedAt: settledAt.toISOString(), invoiceNumber: inv })
-              }
-              bc.close()
-            }
-          } catch {}
-          void load()
+          await completeSettlement(settled, method)
           return
         }
       }
@@ -274,24 +437,7 @@ export function SessionPaymentDialog({
         }
 
         const settled = await cashRes.json().catch(() => null)
-        const invNum = settled?.invoiceNumber ?? settled?.check?.invoiceNumber ?? null
-        setInvoiceNumber(invNum)
-        const settledAt = settled?.closedAt ? new Date(settled.closedAt) : new Date()
-        setPaidAt(settledAt)
-        setBillClosedAt(settledAt)
-        setStage('done')
-        onPaid?.()
-        try {
-          if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-            const bc = new BroadcastChannel('the_salad_orders_sync')
-            bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, status: 'PAID', invoiceNumber: invNum, reason: 'FINALISED' })
-            if (sessionId) {
-              bc.postMessage({ type: 'SESSION_ENDED', checkId, tableId, sessionId, status: 'ENDED', endedAt: settledAt.toISOString(), invoiceNumber: invNum })
-            }
-            bc.close()
-          }
-        } catch {}
-        void load()
+        await completeSettlement(settled, 'CASH')
         return
       }
 
@@ -347,26 +493,7 @@ export function SessionPaymentDialog({
       }
 
       const settled = await settleRes.json().catch(() => null)
-      setInvoiceNumber(
-        settled?.invoiceNumber ?? settled?.check?.invoiceNumber ?? settled?.invoice?.number ?? null,
-      )
-      const settledAt = settled?.closedAt ? new Date(settled.closedAt) : new Date()
-      setPaidAt(settledAt)
-      setBillClosedAt(settledAt)
-      setStage('done')
-      onPaid?.()
-      try {
-        if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-          const bc = new BroadcastChannel('the_salad_orders_sync')
-          const inv = settled?.invoiceNumber ?? settled?.check?.invoiceNumber ?? settled?.invoice?.number ?? null
-          bc.postMessage({ type: 'CHECK_UPDATED', checkId, tableId, sessionId, status: 'PAID', invoiceNumber: inv, reason: 'FINALISED' })
-          if (sessionId) {
-            bc.postMessage({ type: 'SESSION_ENDED', checkId, tableId, sessionId, status: 'ENDED', endedAt: settledAt.toISOString(), invoiceNumber: inv })
-          }
-          bc.close()
-        }
-      } catch {}
-      void load()
+      await completeSettlement(settled, method)
     } catch (e) {
       setError(describeFailure(e, 'the payment').message)
       setFailedAt(new Date())
@@ -420,6 +547,10 @@ export function SessionPaymentDialog({
     return chips
   }, [amountToPay, currencySymbol])
 
+  const handleClose = useCallback(() => {
+    onOpenChange(false)
+  }, [onOpenChange])
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
@@ -434,7 +565,7 @@ export function SessionPaymentDialog({
         <div className="relative shrink-0 border-b border-border/40 px-4 pt-4 pb-3 sm:px-6">
           <button
             type="button"
-            onClick={() => onOpenChange(false)}
+            onClick={handleClose}
             aria-label="Close"
             className="absolute right-4 top-4 z-10 grid size-9 place-items-center rounded-full border border-border/80 bg-card text-foreground shadow-sm transition-colors hover:bg-secondary cursor-pointer"
           >
@@ -506,27 +637,7 @@ export function SessionPaymentDialog({
 
               {/* Bill Summary */}
               {loading ? (
-                <div className="mt-3.5 space-y-3 rounded-2xl border border-border/70 bg-card p-3.5 sm:p-4">
-                  <div className="flex items-center justify-between pb-2 border-b border-border/40">
-                    <div className="h-4 w-28 bg-muted animate-pulse rounded" />
-                    <div className="h-3 w-24 bg-muted animate-pulse rounded" />
-                  </div>
-                  <div className="space-y-2.5 pt-1">
-                    <div className="flex justify-between">
-                      <div className="h-3.5 w-16 bg-muted animate-pulse rounded" />
-                      <div className="h-3.5 w-14 bg-muted animate-pulse rounded" />
-                    </div>
-                    <div className="flex justify-between">
-                      <div className="h-3.5 w-20 bg-muted animate-pulse rounded" />
-                      <div className="h-3.5 w-12 bg-muted animate-pulse rounded" />
-                    </div>
-                    <div className="flex justify-between">
-                      <div className="h-3.5 w-20 bg-muted animate-pulse rounded" />
-                      <div className="h-3.5 w-12 bg-muted animate-pulse rounded" />
-                    </div>
-                  </div>
-                  <div className="h-10 w-full bg-muted/60 animate-pulse rounded-xl mt-3" />
-                </div>
+                <BillSummarySkeleton />
               ) : loadError ? (
                 <div className="mt-3.5 flex flex-col items-center justify-center rounded-2xl border border-destructive/20 bg-destructive/5 p-5 text-center">
                   <div className="grid size-10 place-items-center rounded-full bg-destructive/10 text-destructive mb-2.5">
@@ -550,78 +661,30 @@ export function SessionPaymentDialog({
                   </Button>
                 </div>
               ) : !totals ? (
-                <div className="mt-3.5 space-y-3 rounded-2xl border border-border/70 bg-card p-3.5 sm:p-4">
-                  <div className="flex items-center justify-between pb-2 border-b border-border/40">
-                    <div className="h-4 w-28 bg-muted animate-pulse rounded" />
-                    <div className="h-3 w-24 bg-muted animate-pulse rounded" />
-                  </div>
-                  <div className="space-y-2.5 pt-1">
-                    <div className="flex justify-between">
-                      <div className="h-3.5 w-16 bg-muted animate-pulse rounded" />
-                      <div className="h-3.5 w-14 bg-muted animate-pulse rounded" />
-                    </div>
-                    <div className="flex justify-between">
-                      <div className="h-3.5 w-20 bg-muted animate-pulse rounded" />
-                      <div className="h-3.5 w-12 bg-muted animate-pulse rounded" />
-                    </div>
-                    <div className="flex justify-between">
-                      <div className="h-3.5 w-20 bg-muted animate-pulse rounded" />
-                      <div className="h-3.5 w-12 bg-muted animate-pulse rounded" />
-                    </div>
-                  </div>
-                  <div className="h-10 w-full bg-muted/60 animate-pulse rounded-xl mt-3" />
-                </div>
+                <BillSummarySkeleton />
               ) : (
-                <div className="mt-3.5 rounded-2xl border border-border/70 bg-card p-3.5 shadow-xs sm:p-4">
-                  <div className="flex items-center justify-between gap-2 border-b border-border/50 pb-2.5">
-                    <p className="flex items-center gap-1.5 text-[14.5px] font-bold text-foreground sm:text-[15px]">
-                      <Layers className="size-4 text-primary" />
-                      Bill Summary
-                    </p>
-                    <span className="shrink-0 text-[11.5px] font-medium text-muted-foreground sm:text-[12px]">
-                      ({orderCount} Order{orderCount === 1 ? '' : 's'} · {items} Item{items === 1 ? '' : 's'})
-                    </span>
-                  </div>
-
-                  <div className="mt-2.5 space-y-2 text-[13px]">
-                    <Row label="Subtotal" value={money(totals.subtotal)} />
-                    {totals.discount !== undefined && totals.discount > 0 && (
-                      <Row label="Discount" value={`−${money(totals.discount)}`} />
-                    )}
-                    {breakup ? (
-                      <>
-                        <Row label={`CGST (${fmtPct(breakup.cgstRate)}%)`} value={money(breakup.cgst)} />
-                        <Row label={`SGST (${fmtPct(breakup.sgstRate)}%)`} value={money(breakup.sgst)} />
-                      </>
-                    ) : (
-                      <Row label="GST" value={money(totals.tax)} />
-                    )}
-                    {totals.serviceCharge !== undefined && totals.serviceCharge > 0 && (
-                      <Row
-                        label={`Service Charge (${totals.serviceRate ? `${totals.serviceRate}%` : '2%'})`}
-                        value={money(totals.serviceCharge)}
-                      />
-                    )}
-                    {totals.roundOff !== undefined && totals.roundOff !== 0 && (
-                      <Row
-                        label="Round Off"
-                        value={`${totals.roundOff > 0 ? '+' : ''}${money(totals.roundOff)}`}
-                      />
-                    )}
-                  </div>
-                  <div className="mt-3 flex items-center justify-between rounded-xl bg-primary/10 px-3.5 py-2.5 border border-primary/20">
-                    <span className="text-[14.5px] font-bold text-foreground sm:text-[15px]">
-                      {isFullyPaid ? 'Amount Due' : totals.outstanding < totals.total ? 'Amount Due' : 'Total Amount'}
-                    </span>
-                    <span className="text-[18px] font-extrabold tabular-nums text-foreground sm:text-[19px]">
-                      {money(amountToPay)}
-                    </span>
-                  </div>
-                </div>
+                <BillSummary
+                  mode="pay"
+                  currencySymbol={currencySymbol}
+                  orderCount={orderCount}
+                  itemCount={items}
+                  subtotal={totals.subtotal}
+                  discount={totals.discount}
+                  tax={totals.tax}
+                  serviceCharge={totals.serviceCharge}
+                  serviceRate={totals.serviceRate}
+                  roundOff={totals.roundOff}
+                  total={totals.total}
+                  due={amountToPay}
+                  cgstRate={breakup?.cgstRate}
+                  sgstRate={breakup?.sgstRate}
+                  cgst={breakup?.cgst}
+                  sgst={breakup?.sgst}
+                />
               )}
 
               {/* Payment Methods */}
-              {!loadError && (
+              {!loading && !loadError && (
                 !isFullyPaid ? (
                 <>
                   <p className="mt-3.5 flex items-center gap-1.5 text-[14px] font-bold text-foreground sm:text-[14.5px]">
@@ -795,7 +858,7 @@ export function SessionPaymentDialog({
                   <div className="flex items-center gap-2">
                     <ReceiptText className="size-4 text-emerald-700 dark:text-emerald-400" />
                     <span className="text-xs font-bold text-emerald-800 dark:text-emerald-300 uppercase tracking-wider">
-                      Invoice
+                      Invoice Number
                     </span>
                   </div>
                   <span className="font-mono text-sm font-extrabold text-emerald-900 dark:text-emerald-200">
@@ -833,48 +896,26 @@ export function SessionPaymentDialog({
               </div>
 
               {/* Bill Summary in Payment Successful */}
-              <div className="mt-2.5 rounded-2xl border border-border/60 bg-card p-3 shadow-[0_1px_3px_rgba(15,23,42,0.04)]">
-                <div className="flex items-center justify-between gap-2 border-b border-border/50 pb-2">
-                  <p className="flex items-center gap-1.5 text-[14px] font-bold text-foreground">
-                    <Layers className="size-4 text-primary" />
-                    Bill Summary
-                  </p>
-                  <span className="shrink-0 text-[11.5px] font-medium text-muted-foreground">
-                    {orderCount} Order{orderCount === 1 ? '' : 's'} · {items} Item{items === 1 ? '' : 's'}
-                  </span>
-                </div>
-                <div className="mt-2 space-y-1.5 text-[12.5px] sm:text-[13px]">
-                  <Row label="Subtotal" value={money(totals?.subtotal ?? 0)} />
-                  {totals?.discount !== undefined && totals.discount > 0 && (
-                    <Row label="Discount" value={`−${money(totals.discount)}`} />
-                  )}
-                  {breakup ? (
-                    <>
-                      <Row label={`CGST (${fmtPct(breakup.cgstRate)}%)`} value={money(breakup.cgst)} />
-                      <Row label={`SGST (${fmtPct(breakup.sgstRate)}%)`} value={money(breakup.sgst)} />
-                    </>
-                  ) : (
-                    <Row label="GST" value={money(totals?.tax ?? 0)} />
-                  )}
-                  {totals?.serviceCharge !== undefined && totals.serviceCharge > 0 && (
-                    <Row
-                      label={`Service Charge (${totals.serviceRate ? `${totals.serviceRate}%` : '2%'})`}
-                      value={money(totals.serviceCharge)}
-                    />
-                  )}
-                  {totals?.roundOff !== undefined && totals.roundOff !== 0 && (
-                    <Row
-                      label="Round Off"
-                      value={`${totals.roundOff > 0 ? '+' : ''}${money(totals.roundOff)}`}
-                    />
-                  )}
-                </div>
-                <div className="mt-2.5 flex items-center justify-between rounded-xl bg-primary/10 px-3.5 py-2">
-                  <span className="text-[14.5px] font-bold text-foreground">Total Paid</span>
-                  <span className="text-[17px] font-extrabold tabular-nums text-foreground">
-                    {paidText}
-                  </span>
-                </div>
+              <div className="mt-2.5">
+                <BillSummary
+                  mode="done"
+                  currencySymbol={currencySymbol}
+                  orderCount={orderCount}
+                  itemCount={items}
+                  subtotal={totals?.subtotal ?? 0}
+                  discount={totals?.discount}
+                  tax={totals?.tax ?? 0}
+                  serviceCharge={totals?.serviceCharge}
+                  serviceRate={totals?.serviceRate}
+                  roundOff={totals?.roundOff}
+                  total={totals?.total ?? 0}
+                  paid={totals?.total ?? 0}
+                  cgstRate={breakup?.cgstRate}
+                  sgstRate={breakup?.sgstRate}
+                  cgst={breakup?.cgst}
+                  sgst={breakup?.sgst}
+                />
+                <span className="sr-only">Total Paid {paidText}</span>
               </div>
             </div>
           )}
@@ -888,14 +929,16 @@ export function SessionPaymentDialog({
               disabled={busy || loading || !totals || Boolean(loadError)}
               className="h-12 w-full rounded-2xl bg-primary hover:bg-primary/90 text-[15px] font-bold text-primary-foreground shadow-md shadow-primary/25 transition-all cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {busy ? (
+              {busy || loading ? (
                 <Loader2 className="mr-2 size-5 animate-spin" />
               ) : (
                 <span className="grid size-5.5 place-items-center rounded-full bg-white/20 text-white">
                   <Check className="size-3.5" strokeWidth={3.5} />
                 </span>
               )}
-              {isFullyPaid ? (
+              {loading ? (
+                'Calculating bill...'
+              ) : isFullyPaid ? (
                 'Close Bill'
               ) : (
                 <>
@@ -919,10 +962,7 @@ export function SessionPaymentDialog({
               </Button>
               <Button
                 variant="outline"
-                onClick={() => {
-                  if (onViewSession) onViewSession()
-                  else onOpenChange(false)
-                }}
+                onClick={handleClose}
                 className="h-11 gap-2 whitespace-nowrap rounded-xl border border-border bg-card px-3 text-[14px] font-semibold text-foreground hover:bg-secondary cursor-pointer"
               >
                 Done

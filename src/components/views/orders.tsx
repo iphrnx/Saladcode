@@ -227,7 +227,7 @@ function shortDuration(startedAt: string, endedAt: string | null, now: number): 
 
 export function OrdersView() {
   const t = useT()
-  const { data, addOrUpdateOrder, removeOrder, checks, tableSessions, refresh } = useApp()
+  const { data, addOrUpdateOrder, removeOrder, checks, tableSessions, refresh, updateCheck } = useApp()
   /**
    * Dish photos, by menu item id.
    *
@@ -426,11 +426,14 @@ export function OrdersView() {
        * own total, and must not claim to know how much of the shared money was
        * paid for it.
        */
-      const sharedBill = Boolean(check) && check!.orderCount !== onTheBill.length
+      const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber)
+      const sharedBill = Boolean(check) && !isSettledCheck && check!.orderCount !== onTheBill.length
       const total = !check || sharedBill ? fallbackTotal : check.total
-      const paid = !check || sharedBill
-        ? +onTheBill.reduce((n, o) => n + (o.paymentStatus === 'PAID' ? o.total : 0), 0).toFixed(2)
-        : check.paid
+      const paid = isSettledCheck
+        ? (check?.paid ?? check?.total ?? fallbackTotal)
+        : (!check || sharedBill
+          ? +onTheBill.reduce((n, o) => n + (o.paymentStatus === 'PAID' ? o.total : 0), 0).toFixed(2)
+          : check.paid)
       // Pre-tax and tax, from the same source as the total. When the check is
       // this sitting's own these are the server's sums; when it is shared (or
       // absent) they are this sitting's own orders, so the three figures still
@@ -444,13 +447,16 @@ export function OrdersView() {
       // Whatever the total carries beyond food and tax is service charge. Shown
       // separately so the three figures on the card add up to the fourth, which
       // is the whole point of labelling them.
-      const service = +Math.max(0, total - subtotal - tax).toFixed(2)
-      const due = !check || sharedBill
-        ? +Math.max(0, total - paid).toFixed(2)
-        : Math.max(0, check.outstanding)
+      const service = check?.serviceCharge !== undefined
+        ? check.serviceCharge
+        : +Math.max(0, total - subtotal - tax).toFixed(2)
+      const due = isSettledCheck
+        ? 0
+        : (!check || sharedBill
+          ? +Math.max(0, total - paid).toFixed(2)
+          : Math.max(0, check.outstanding))
       const allOrdersCompleted = rows.every((o) => ['COMPLETED', 'CANCELLED'].includes(o.status))
       const allOrdersPaid = rows.every((o) => o.paymentStatus === 'PAID')
-      const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber) || Boolean((latest as any).invoiceNumber)
 
       // A sitting with a row is Active or Ended because the server says so. One
       // without a row (an order written before sessions existed, or a takeaway)
@@ -582,7 +588,10 @@ export function OrdersView() {
     }
   }, [])
 
-  const openSitting = useCallback((sitting: Sitting | null) => {
+  const [drawerTab, setDrawerTab] = useState<'orders' | 'bill' | 'activity'>('orders')
+
+  const openSitting = useCallback((sitting: Sitting | null, initialTab: 'orders' | 'bill' | 'activity' = 'orders') => {
+    setDrawerTab(initialTab)
     if (!sitting) {
       setOrdersSittingKey(null)
       setFallbackSitting(null)
@@ -1566,6 +1575,7 @@ export function OrdersView() {
       {ordersSitting && (
         <SessionOrdersDrawer
           open
+          initialTab={drawerTab}
           onOpenChange={(v) => {
             if (!v) openSitting(null)
           }}
@@ -1698,29 +1708,33 @@ export function OrdersView() {
         startedAt={paySitting?.startedAt ?? null}
         open={paySitting !== null}
         onOpenChange={(v) => !v && setPaySitting(null)}
-        onPaid={() => void refresh()}
+        onPaid={(settled) => {
+          if (settled?.checkId) {
+            updateCheck(settled.checkId, {
+              status: 'PAID',
+              total: settled.total,
+              paid: settled.paid,
+              outstanding: 0,
+              subtotal: settled.subtotal,
+              tax: settled.tax,
+              serviceCharge: settled.serviceCharge,
+              invoiceNumber: settled.invoiceNumber,
+              orderCount: settled.orderCount,
+            })
+          }
+          void refresh()
+        }}
         onViewBill={() => {
           const target = paySitting
           if (!target) return
           setPaySitting(null)
-          setBillDoc({
-            checkId: target.checkId,
-            orderId: target.latest.id,
-            table: target.tableName
-              ? {
-                  name: target.tableName,
-                  seats: target.seats ?? 0,
-                  area: target.area ?? '',
-                }
-              : target.tableId
-                ? {
-                    name: 'Table',
-                    seats: target.seats ?? 0,
-                    area: target.area ?? '',
-                  }
-                : null,
-            autoPrint: false,
-          })
+          const fresh = sittings.find((s) =>
+            target.checkId ? s.checkId === target.checkId : s.key === target.key,
+          )
+          openSitting(
+            fresh ?? { ...target, state: 'Ended', paidOff: true, endedAt: target.endedAt ?? new Date().toISOString() },
+            'bill',
+          )
         }}
         onViewSession={() => {
           // "Session Details" is the sitting's own order book, the one its card
@@ -1736,6 +1750,7 @@ export function OrdersView() {
           )
           openSitting(
             fresh ?? { ...target, state: 'Ended', paidOff: true, endedAt: target.endedAt ?? new Date().toISOString() },
+            'orders',
           )
         }}
       />
@@ -2190,7 +2205,7 @@ function SittingCard({
   const onlyPendingActivation = sitting.orders.every((order) => order.status === 'PENDING_ACTIVATION')
   const hasBill = check ? check.orderCount > 0 : !sitting.awaiting
   const awaiting = !hasBill
-  const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber) || Boolean((sitting.latest as any).invoiceNumber)
+  const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber)
   const allOrdersCompleted = sitting.orders.every((order) => ['COMPLETED', 'CANCELLED'].includes(order.status))
   const allOrdersPaid = sitting.orders.every((order) => order.paymentStatus === 'PAID')
   const paidOff = Boolean(
@@ -2222,7 +2237,7 @@ function SittingCard({
         data-order-card
         data-session-card={sitting.sessionId ?? undefined}
         className={cn(
-          'w-full overflow-hidden rounded-2xl border p-3 sm:p-3.5',
+          'w-full self-start overflow-hidden rounded-2xl border p-3 sm:p-3.5',
           'border-border/80 bg-card shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md cursor-pointer',
         )}
         onClick={() => onOpenOrders(sitting)}
@@ -2243,9 +2258,15 @@ function SittingCard({
                 {paidAmount}
               </span>
             </div>
-            <p className="mt-1 text-[11px] sm:text-xs text-muted-foreground truncate">
-              {sitting.orders.length} order{sitting.orders.length === 1 ? '' : 's'} · {sitting.qtyCount} item{sitting.qtyCount === 1 ? '' : 's'} · {sittingDuration(sitting.startedAt, sitting.endedAt, now)}
-            </p>
+            <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+              <span className="inline-flex items-center rounded-md bg-secondary/80 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                Session Ended
+              </span>
+              <span className="text-muted-foreground text-xs">·</span>
+              <p className="text-[11px] sm:text-xs text-muted-foreground truncate">
+                {sitting.orders.length} order{sitting.orders.length === 1 ? '' : 's'} · {sitting.qtyCount} item{sitting.qtyCount === 1 ? '' : 's'} · {sittingDuration(sitting.startedAt, sitting.endedAt, now)}
+              </p>
+            </div>
           </div>
 
           <div className="flex items-center gap-2 shrink-0" onClick={(e) => e.stopPropagation()}>
@@ -2316,7 +2337,10 @@ function SittingCard({
     <Card
       data-order-card
       data-session-card={sitting.sessionId ?? undefined}
-      className="group relative flex min-h-[550px] w-full min-w-0 flex-col rounded-2xl border border-border/80 bg-card p-3 sm:p-3.5 shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md"
+      className={cn(
+        'group relative flex w-full min-w-0 flex-col rounded-2xl border border-border/80 bg-card p-3 sm:p-3.5 shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md',
+        paidOff ? 'self-start' : 'min-h-[550px]',
+      )}
     >
       <div className="flex items-center gap-2.5 px-0.5 py-0.5">
         <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-secondary text-foreground dark:bg-secondary/80 border border-border/40">
@@ -2392,7 +2416,10 @@ function SittingCard({
         role="region"
         aria-label={`Orders for ${cardName}`}
         tabIndex={0}
-        className="mt-2.5 flex-1 space-y-1.5 px-0.5 py-0.5 max-h-[min(56vh,30rem)] overflow-y-auto"
+        className={cn(
+          'mt-2.5 space-y-1.5 px-0.5 py-0.5 max-h-[min(56vh,30rem)] overflow-y-auto',
+          paidOff ? 'min-h-0' : 'flex-1',
+        )}
       >
         {sitting.orders.map((order) => (
           <OrderRow
@@ -2409,7 +2436,7 @@ function SittingCard({
         ))}
       </div>
 
-      <div className="mt-auto pt-2.5">
+      <div className={cn('pt-2.5', paidOff ? 'mt-2.5' : 'mt-auto')}>
         <dl aria-label={sitting.sharedBill ? "Shared table check" : "Bill totals"} className="grid grid-cols-3 divide-x divide-border/50 rounded-xl border border-border/50 bg-secondary/35 py-2">
           <Figure label="Total" amount={billTotal} currencySymbol={currencySymbol} />
           <Figure label="Due" amount={billDue} currencySymbol={currencySymbol} tone={billDue ? 'due' : undefined} />

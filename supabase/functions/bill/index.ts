@@ -283,25 +283,31 @@ function dinerDocument(
   table: { name: string; seats?: number; area?: string } | null = null,
   fssai: string | null = null,
 ) {
-  const total = +orders.reduce((s: number, o: any) => s + Number(o.total), 0).toFixed(2);
-  const tax = +orders.reduce((s: number, o: any) => s + Number(o.tax), 0).toFixed(2);
-  const subtotal = +orders.reduce((s: number, o: any) => s + Number(o.items_total), 0).toFixed(2);
-  const discount = +orders.reduce((s: number, o: any) => s + Number(o.discount), 0).toFixed(2);
-  const serviceCharge = +orders.reduce((s: number, o: any) => s + Number(o.service_charge), 0).toFixed(2);
+  const isPaidCheck = check.status === "PAID" && check.total != null && Number(check.total) > 0;
+  const total = isPaidCheck ? Number(check.total) : +orders.reduce((s: number, o: any) => s + Number(o.total), 0).toFixed(2);
+  const tax = isPaidCheck && check.tax != null ? Number(check.tax) : +orders.reduce((s: number, o: any) => s + Number(o.tax), 0).toFixed(2);
+  const subtotal = isPaidCheck && check.subtotal != null ? Number(check.subtotal) : +orders.reduce((s: number, o: any) => s + Number(o.items_total), 0).toFixed(2);
+  const discount = isPaidCheck && check.discount != null ? Number(check.discount) : +orders.reduce((s: number, o: any) => s + Number(o.discount), 0).toFixed(2);
+  const serviceCharge = isPaidCheck && check.service_charge != null ? Number(check.service_charge) : +orders.reduce((s: number, o: any) => s + Number(o.service_charge), 0).toFixed(2);
   // Only succeeded money counts as paid; a voided payment is money that went
   // back, and it is reported separately rather than silently netted off.
-  const paid = +payments
-    .filter((p: any) => p.status === "SUCCEEDED")
-    .reduce((s: number, p: any) => s + Number(p.amount), 0)
-    .toFixed(2);
+  const paid = isPaidCheck && check.paid_total != null
+    ? Number(check.paid_total)
+    : +payments
+        .filter((p: any) => p.status === "SUCCEEDED")
+        .reduce((s: number, p: any) => s + Number(p.amount), 0)
+        .toFixed(2);
   const refundedTotal = +payments
     .filter((p: any) => p.status === "VOID")
     .reduce((s: number, p: any) => s + Number(p.amount), 0)
     .toFixed(2);
 
   const taxRate = Number(tenant?.tax_rate ?? 0);
-  const cgstAmount = +(tax / 2).toFixed(2);
-  const sgstAmount = +(tax - cgstAmount).toFixed(2);
+  const gstTotalPaise = Math.round(tax * 100);
+  const cgstPaise = Math.ceil(gstTotalPaise / 2);
+  const sgstPaise = gstTotalPaise - cgstPaise;
+  const cgstAmount = +(cgstPaise / 100).toFixed(2);
+  const sgstAmount = +(sgstPaise / 100).toFixed(2);
 
   const items = orders.flatMap((o: any) =>
     (o.items ?? []).map((it: any) => ({
@@ -436,17 +442,20 @@ async function getCheck(req: Request): Promise<Response> {
 
   const { check, orders, payments, gstin } = data;
   const live = orders.filter((o: any) => o.status !== "CANCELLED");
-  const total = +live.reduce((s: number, o: any) => s + Number(o.total), 0).toFixed(2);
-  const tax = +live.reduce((s: number, o: any) => s + Number(o.tax), 0).toFixed(2);
-  const subtotal = +live.reduce((s: number, o: any) => s + Number(o.items_total), 0).toFixed(2);
-  const discount = +live.reduce((s: number, o: any) => s + Number(o.discount), 0).toFixed(2);
-  const serviceCharge = +live.reduce((s: number, o: any) => s + Number(o.service_charge), 0).toFixed(2);
+  const isPaidCheck = check.status === "PAID" && check.total != null && Number(check.total) > 0;
+  const total = isPaidCheck ? Number(check.total) : +live.reduce((s: number, o: any) => s + Number(o.total), 0).toFixed(2);
+  const tax = isPaidCheck && check.tax != null ? Number(check.tax) : +live.reduce((s: number, o: any) => s + Number(o.tax), 0).toFixed(2);
+  const subtotal = isPaidCheck && check.subtotal != null ? Number(check.subtotal) : +live.reduce((s: number, o: any) => s + Number(o.items_total), 0).toFixed(2);
+  const discount = isPaidCheck && check.discount != null ? Number(check.discount) : +live.reduce((s: number, o: any) => s + Number(o.discount), 0).toFixed(2);
+  const serviceCharge = isPaidCheck && check.service_charge != null ? Number(check.service_charge) : +live.reduce((s: number, o: any) => s + Number(o.service_charge), 0).toFixed(2);
   // Only succeeded money is paid; a voided payment is money that went back,
   // and it is reported separately rather than silently netted off.
-  const paid = +payments
-    .filter((p: any) => p.status === "SUCCEEDED")
-    .reduce((s: number, p: any) => s + Number(p.amount), 0)
-    .toFixed(2);
+  const paid = isPaidCheck && check.paid_total != null
+    ? Number(check.paid_total)
+    : +payments
+        .filter((p: any) => p.status === "SUCCEEDED")
+        .reduce((s: number, p: any) => s + Number(p.amount), 0)
+        .toFixed(2);
   const refundedTotal = +payments
     .filter((p: any) => p.status === "VOID")
     .reduce((s: number, p: any) => s + Number(p.amount), 0)
@@ -818,6 +827,21 @@ async function finalize(req: Request): Promise<Response> {
     return json(req, { error: message || "Could not close the bill." }, 500);
   }
 
+  const live = data.orders.filter((o: any) => o.status !== "CANCELLED");
+  const subtotal = +live.reduce((s: number, o: any) => s + Number(o.items_total), 0).toFixed(2);
+  const discount = +live.reduce((s: number, o: any) => s + Number(o.discount), 0).toFixed(2);
+  const tax = +live.reduce((s: number, o: any) => s + Number(o.tax), 0).toFixed(2);
+  const serviceCharge = +live.reduce((s: number, o: any) => s + Number(o.service_charge), 0).toFixed(2);
+  const total = Number((result as any)?.total ?? +live.reduce((s: number, o: any) => s + Number(o.total), 0).toFixed(2));
+  const paid = Number((result as any)?.paid ?? total);
+  const gstTotalPaise = Math.round(tax * 100);
+  const cgstPaise = Math.ceil(gstTotalPaise / 2);
+  const sgstPaise = gstTotalPaise - cgstPaise;
+  const cgst = +(cgstPaise / 100).toFixed(2);
+  const sgst = +(sgstPaise / 100).toFixed(2);
+  const lastPayment = data.payments.length ? data.payments[data.payments.length - 1] : null;
+  const paymentMethod = lastPayment?.method ?? "CASH";
+
   await auditMoney(
     req,
     g.session,
@@ -826,7 +850,19 @@ async function finalize(req: Request): Promise<Response> {
     `check ${data.check.id} invoiced ${(result as any)?.invoiceNumber ?? ""}`,
   );
   await broadcastCheck(g.session.tenantId, data.check.id, "FINALISED");
-  return json(req, result);
+  return json(req, {
+    ...(result as any),
+    subtotal,
+    discount,
+    tax,
+    cgst,
+    sgst,
+    serviceCharge,
+    total,
+    paid,
+    outstanding: 0,
+    paymentMethod,
+  });
 }
 
 /**
@@ -884,7 +920,20 @@ async function settleCash(req: Request): Promise<Response> {
   const sessId = data.check.session_id ?? (result as any)?.endedSessionId ?? null;
   const invNum = (result as any)?.invoiceNumber ?? "";
 
-  // settle_check_cash_tx atomic transaction already records CHECK_SETTLED_CASH in security_logs with total and invoice.
+  const live = data.orders.filter((o: any) => o.status !== "CANCELLED");
+  const subtotal = +live.reduce((s: number, o: any) => s + Number(o.items_total), 0).toFixed(2);
+  const discount = +live.reduce((s: number, o: any) => s + Number(o.discount), 0).toFixed(2);
+  const tax = +live.reduce((s: number, o: any) => s + Number(o.tax), 0).toFixed(2);
+  const serviceCharge = +live.reduce((s: number, o: any) => s + Number(o.service_charge), 0).toFixed(2);
+  const total = Number((result as any)?.total ?? +live.reduce((s: number, o: any) => s + Number(o.total), 0).toFixed(2));
+  const paid = Number((result as any)?.paid ?? total);
+  const gstTotalPaise = Math.round(tax * 100);
+  const cgstPaise = Math.ceil(gstTotalPaise / 2);
+  const sgstPaise = gstTotalPaise - cgstPaise;
+  const cgst = +(cgstPaise / 100).toFixed(2);
+  const sgst = +(sgstPaise / 100).toFixed(2);
+
+  await auditMoney(req, g.session, "CHECK_SETTLED_CASH", tid, `Check ${chkId} settled in cash: ${invNum}`);
 
   // Broadcast to Staff (Owner, Manager, Cashier dashboards)
   await publishToStaff(tid, "CHECK_UPDATED", {
@@ -894,8 +943,21 @@ async function settleCash(req: Request): Promise<Response> {
     status: "PAID",
     reason: "FINALISED",
     invoiceNumber: invNum,
+    total,
+    paid,
+    subtotal,
+    tax,
+    serviceCharge,
+    orderCount: live.length,
   });
   if (sessId) {
+    await publishToStaff(tid, "SESSION_UPDATED", {
+      tableId: tblId,
+      sessionId: sessId,
+      status: "ENDED",
+      endedAt: new Date().toISOString(),
+      invoiceNumber: invNum,
+    });
     await publishToStaff(tid, "SESSION_ENDED", {
       tableId: tblId,
       sessionId: sessId,
@@ -904,19 +966,24 @@ async function settleCash(req: Request): Promise<Response> {
       invoiceNumber: invNum,
       order: { sessionId: sessId, status: "ENDED" },
     });
-    await publishToStaff(tid, "SESSION_UPDATED", {
-      tableId: tblId,
-      sessionId: sessId,
-      status: "ENDED",
-      endedAt: new Date().toISOString(),
-      invoiceNumber: invNum,
-    });
   }
 
   // Broadcast to Diner
   await broadcastCheck(tid, chkId, "FINALISED");
 
-  return json(req, result, 200);
+  return json(req, {
+    ...(result as any),
+    subtotal,
+    discount,
+    tax,
+    cgst,
+    sgst,
+    serviceCharge,
+    total,
+    paid,
+    outstanding: 0,
+    paymentMethod: "CASH",
+  }, 200);
 }
 
 async function get(req: Request, orderId: string | null): Promise<Response> {
