@@ -427,8 +427,13 @@ export function OrdersView() {
        * paid for it.
        */
       const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber)
-      const sharedBill = Boolean(check) && check!.orderCount !== onTheBill.length
+      const sharedBill = Boolean(check) && !isSettledCheck && check!.orderCount !== onTheBill.length
       const total = !check || sharedBill ? fallbackTotal : check.total
+      const paid = isSettledCheck
+        ? (check?.paid ?? check?.total ?? fallbackTotal)
+        : (!check || sharedBill
+          ? +onTheBill.reduce((n, o) => n + (o.paymentStatus === 'PAID' ? o.total : 0), 0).toFixed(2)
+          : check.paid)
       // Pre-tax and tax, from the same source as the total. When the check is
       // this sitting's own these are the server's sums; when it is shared (or
       // absent) they are this sitting's own orders, so the three figures still
@@ -437,33 +442,21 @@ export function OrdersView() {
         .reduce((n, o) => n + o.itemsTotal - o.discount, 0)
         .toFixed(2)
       const localTax = +onTheBill.reduce((n, o) => n + o.tax, 0).toFixed(2)
-      const localService = +onTheBill.reduce((n, o) => n + (o.serviceCharge ?? 0), 0).toFixed(2)
       const subtotal = !check || sharedBill ? localSubtotal : (check.subtotal ?? localSubtotal)
       const tax = !check || sharedBill ? localTax : (check.tax ?? localTax)
       // Whatever the total carries beyond food and tax is service charge. Shown
       // separately so the three figures on the card add up to the fourth, which
       // is the whole point of labelling them.
-      const service = !check || sharedBill
-        ? localService
-        : (check.serviceCharge !== undefined
-          ? check.serviceCharge
-          : (localService > 0 ? localService : +Math.max(0, total - subtotal - tax).toFixed(2)))
-      const allOrdersCompleted = rows.every((o) => ['COMPLETED', 'CANCELLED'].includes(o.status))
-      const allOrdersPaid = rows.every((o) => o.paymentStatus === 'PAID')
-      const paid = !check || sharedBill
-        ? (isSettledCheck
-          ? fallbackTotal
-          : (allOrdersPaid
-            ? fallbackTotal
-            : +onTheBill.reduce((n, o) => n + (o.paymentStatus === 'PAID' ? o.total : 0), 0).toFixed(2)))
-        : (isSettledCheck
-          ? (check.paid ?? check.total ?? fallbackTotal)
-          : check.paid)
+      const service = check?.serviceCharge !== undefined
+        ? check.serviceCharge
+        : +Math.max(0, total - subtotal - tax).toFixed(2)
       const due = isSettledCheck
         ? 0
         : (!check || sharedBill
           ? +Math.max(0, total - paid).toFixed(2)
           : Math.max(0, check.outstanding))
+      const allOrdersCompleted = rows.every((o) => ['COMPLETED', 'CANCELLED'].includes(o.status))
+      const allOrdersPaid = rows.every((o) => o.paymentStatus === 'PAID')
 
       // A sitting with a row is Active or Ended because the server says so. One
       // without a row (an order written before sessions existed, or a takeaway)
@@ -607,26 +600,6 @@ export function OrdersView() {
       setOrdersSittingKey(sitting.key)
     }
   }, [])
-
-  const handlePaid = useCallback(
-    (settled?: any) => {
-      if (settled?.checkId) {
-        updateCheck(settled.checkId, {
-          status: 'PAID',
-          total: settled.total,
-          paid: settled.paid,
-          outstanding: 0,
-          subtotal: settled.subtotal,
-          tax: settled.tax,
-          serviceCharge: settled.serviceCharge,
-          invoiceNumber: settled.invoiceNumber,
-          orderCount: settled.orderCount,
-        })
-      }
-      void refresh()
-    },
-    [updateCheck, refresh],
-  )
 
   /**
    * Which cards the filters leave on screen.
@@ -1719,7 +1692,6 @@ export function OrdersView() {
         tableId={paySitting?.tableId ?? null}
         checkId={paySitting?.checkId ?? null}
         sessionId={paySitting?.sessionId ?? null}
-        sittingKey={paySitting?.key ?? null}
         tableName={
           paySitting?.tableName
             ? (paySitting.sessionLabel ? `${paySitting.tableName} · ${paySitting.sessionLabel}` : paySitting.tableName)
@@ -1736,39 +1708,48 @@ export function OrdersView() {
         startedAt={paySitting?.startedAt ?? null}
         open={paySitting !== null}
         onOpenChange={(v) => !v && setPaySitting(null)}
-        onPaid={handlePaid}
-        onViewBill={(originKey) => {
+        onPaid={(settled) => {
+          if (settled?.checkId) {
+            updateCheck(settled.checkId, {
+              status: 'PAID',
+              total: settled.total,
+              paid: settled.paid,
+              outstanding: 0,
+              subtotal: settled.subtotal,
+              tax: settled.tax,
+              serviceCharge: settled.serviceCharge,
+              invoiceNumber: settled.invoiceNumber,
+              orderCount: settled.orderCount,
+            })
+          }
+          void refresh()
+        }}
+        onViewBill={() => {
           const target = paySitting
-          if (!target && !originKey) return
+          if (!target) return
           setPaySitting(null)
-          const keyToFind = originKey ?? target?.key
-          const fresh = sittings.find((s) => s.key === keyToFind)
-          const chosen = fresh ?? target
-          if (!chosen) return
+          const fresh = sittings.find((s) =>
+            target.checkId ? s.checkId === target.checkId : s.key === target.key,
+          )
           openSitting(
-            chosen.state === 'Ended'
-              ? chosen
-              : { ...chosen, state: 'Ended', paidOff: true, endedAt: chosen.endedAt ?? new Date().toISOString() },
+            fresh ?? { ...target, state: 'Ended', paidOff: true, endedAt: target.endedAt ?? new Date().toISOString() },
             'bill',
           )
         }}
-        onViewSession={(originKey) => {
+        onViewSession={() => {
           // "Session Details" is the sitting's own order book, the one its card
           // opens — not the printable bill. The fresher copy from the board is
           // preferred, because settling just moved its orders to Completed; the
           // snapshot this sheet was opened with is the fallback if the sitting
           // has already left the filtered board.
           const target = paySitting
-          if (!target && !originKey) return
+          if (!target) return
           setPaySitting(null)
-          const keyToFind = originKey ?? target?.key
-          const fresh = sittings.find((s) => s.key === keyToFind)
-          const chosen = fresh ?? target
-          if (!chosen) return
+          const fresh = sittings.find((s) =>
+            target.checkId ? s.checkId === target.checkId : s.key === target.key,
+          )
           openSitting(
-            chosen.state === 'Ended'
-              ? chosen
-              : { ...chosen, state: 'Ended', paidOff: true, endedAt: chosen.endedAt ?? new Date().toISOString() },
+            fresh ?? { ...target, state: 'Ended', paidOff: true, endedAt: target.endedAt ?? new Date().toISOString() },
             'orders',
           )
         }}

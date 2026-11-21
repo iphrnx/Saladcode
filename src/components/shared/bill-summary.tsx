@@ -70,9 +70,7 @@ export function BillSummary({
   const effectiveCgst = cgst ?? +(derivedCgstPaise / 100).toFixed(2)
   const effectiveSgst = sgst ?? +(derivedSgstPaise / 100).toFixed(2)
 
-  const effectiveServiceRate = (serviceRate !== undefined && serviceRate > 0)
-    ? serviceRate
-    : (subtotal > 0 && serviceCharge > 0 ? Math.round((serviceCharge / subtotal) * 100) : (serviceRate ?? 0))
+  const effectiveServiceRate = serviceRate ?? (subtotal > 0 && serviceCharge > 0 ? Math.round((serviceCharge / subtotal) * 100) : 0)
   const isFullyPaid = due <= 0
 
   const hasOrdersInfo = (orderCount !== undefined && orderCount > 0) || (itemCount !== undefined && itemCount > 0)
