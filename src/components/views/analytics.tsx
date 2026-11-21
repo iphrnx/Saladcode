@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
-  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LabelList,
 } from 'recharts'
 import { useApp, type AppData } from '@/components/app/data-context'
 import { edgeFetch } from '@/lib/edge'
@@ -19,11 +19,11 @@ import { Calendar } from '@/components/ui/calendar'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import type { DateRange } from 'react-day-picker'
 import { format, startOfMonth, subDays } from 'date-fns'
-import { Separator } from '@/components/ui/separator'
 import {
-  TrendingUp, IndianRupee, ShoppingBag, ClipboardList, CalendarDays,
+  IndianRupee, ShoppingBag, ClipboardList, CalendarDays,
   ArrowUpRight, ArrowDownRight, Download, Clock, Utensils, Trophy,
   CalendarIcon, ChevronDown, MapPin, Layers, Sparkles,
+  CreditCard, Smartphone, Banknote, Receipt,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -33,12 +33,21 @@ interface TypeBreak { type: string; count: number; revenue: number }
 interface TopTable { name: string; orders: number; revenue: number }
 interface CatBreak { name: string; value: number }
 interface LocationOption { id: string; name: string; isPrimary: boolean }
+interface PaymentMethodSummary {
+  cash: { amount: number; count: number }
+  upi: { amount: number; count: number }
+  card: { amount: number; count: number }
+  total: number
+}
 
 interface AnalyticsPayload {
   range?: { from: string; to: string; days: number; timezone: string }
   totalRevenue: number
   totalOrders: number
   avgOrder: number
+  netSales?: number
+  taxCollected?: number
+  serviceChargeCollected?: number
   todaysRevenue: number
   todaysOrders: number
   revenueChange: number
@@ -49,6 +58,7 @@ interface AnalyticsPayload {
   hourly: number[]
   advanced?: boolean
   categoryBreakdown: CatBreak[]
+  paymentMethods?: PaymentMethodSummary
   locations?: LocationOption[]
   multiLocationEnabled?: boolean
 }
@@ -70,7 +80,7 @@ function ChartTooltip({ active, payload, label, currencySymbol = '₹' }: any) {
       {label != null && <p className="font-semibold text-foreground mb-1.5">{label}</p>}
       <div className="space-y-1">
         {payload.map((p: any, i: number) => {
-          const isCurrency = p.dataKey === 'revenue' || p.name?.toLowerCase().includes('revenue') || p.name?.toLowerCase().includes('avg')
+          const isCurrency = p.dataKey === 'revenue' || p.dataKey === 'value' || p.name?.toLowerCase().includes('revenue') || p.name?.toLowerCase().includes('avg')
           const prefix = isCurrency ? currencySymbol : ''
           const formattedVal = isCurrency ? (Number(p.value) || 0).toFixed(2) : String(p.value ?? 0)
           return (
@@ -113,21 +123,21 @@ export function AnalyticsView() {
   const [rangeOpen, setRangeOpen] = useState(false)
   const [selectedLocationId, setSelectedLocationId] = useState<string>('')
   const [locationOpen, setLocationOpen] = useState(false)
-  const { scrollRef, collapsed } = useScrollCollapse()
+  const { scrollRef } = useScrollCollapse()
   const isCompact = useMediaQuery('(max-width: 1023px)')
 
   const tenantId = data?.tenant?.id
   const requestSeq = useRef(0)
   const lastOrderBook = useRef<AppData['orders'] | null>(null)
-  const lastBgRefreshAt = useRef(0)
   const bgTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const fetchAnalytics = useCallback(async (mode: 'skeleton' | 'silent') => {
     if (!tenantId) return
     const seq = ++requestSeq.current
     if (mode === 'skeleton') {
-      setLoading(true)
-      lastBgRefreshAt.current = Date.now()
+      void Promise.resolve().then(() => {
+        if (seq === requestSeq.current) setLoading(true)
+      })
     }
     try {
       const from = range.from ? format(range.from, 'yyyy-MM-dd') : ''
@@ -148,12 +158,14 @@ export function AnalyticsView() {
     } finally {
       if (mode === 'skeleton' && seq === requestSeq.current) setLoading(false)
     }
-  }, [tenantId, range, selectedLocationId, handleLoad, handleLoadQuiet])
+  }, [tenantId, range, selectedLocationId, handleLoad, handleLoadQuiet, setDenied])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial load fetches analytics with skeleton
     fetchAnalytics('skeleton')
   }, [fetchAnalytics])
 
+  // Realtime instant refresh on order changes / payments / settlements
   useEffect(() => {
     const orders = data?.orders
     if (!orders) return
@@ -163,17 +175,12 @@ export function AnalyticsView() {
     }
     if (orders === lastOrderBook.current) return
     lastOrderBook.current = orders
-    const wait = Math.max(0, 30_000 - (Date.now() - lastBgRefreshAt.current))
-    if (wait === 0) {
-      lastBgRefreshAt.current = Date.now()
+
+    // Immediate debounced refresh (350ms) to prevent stale data and eliminate 30s lag
+    if (bgTimer.current) clearTimeout(bgTimer.current)
+    bgTimer.current = setTimeout(() => {
       fetchAnalytics('silent')
-    } else if (!bgTimer.current) {
-      bgTimer.current = setTimeout(() => {
-        bgTimer.current = null
-        lastBgRefreshAt.current = Date.now()
-        fetchAnalytics('silent')
-      }, wait)
-    }
+    }, 350)
   }, [data?.orders, fetchAnalytics])
 
   useEffect(() => () => {
@@ -191,17 +198,32 @@ export function AnalyticsView() {
     push('Restaurant', data.tenant.name)
     push('From', analytics.range?.from ?? '')
     push('To', analytics.range?.to ?? '')
-    push('Timezone', analytics.range?.timezone ?? '')
+    push('Timezone', analytics.range?.timezone ?? 'Asia/Kolkata')
+    push('Basis', 'Gross settled collections (actual payment settlement timestamps)')
     push('Generated', new Date().toLocaleString())
     blank()
 
-    push('Summary')
+    push('Financial Summary')
     push('Metric', `Amount (${sym})`)
-    push('Total revenue', money(analytics.totalRevenue))
-    push('Completed orders', analytics.totalOrders)
-    push('Average order', money(analytics.avgOrder))
-    push(`Revenue on ${analytics.range?.to ?? 'today'}`, money(analytics.todaysRevenue))
+    push('Gross Collected', money(analytics.totalRevenue))
+    push('Net Food & Beverage Sales', money(analytics.netSales ?? (analytics.totalRevenue - (analytics.taxCollected ?? 0))))
+    push('Tax Collected (GST)', money(analytics.taxCollected ?? 0))
+    if (analytics.serviceChargeCollected) {
+      push('Service Charge Collected', money(analytics.serviceChargeCollected))
+    }
+    push('Completed Orders', analytics.totalOrders)
+    push('Average Order Value', money(analytics.avgOrder))
     blank()
+
+    if (analytics.paymentMethods) {
+      push('Payment Method Breakdown')
+      push('Method', 'Transactions', `Amount (${sym})`)
+      push('Cash', analytics.paymentMethods.cash.count, money(analytics.paymentMethods.cash.amount))
+      push('UPI', analytics.paymentMethods.upi.count, money(analytics.paymentMethods.upi.amount))
+      push('Card', analytics.paymentMethods.card.count, money(analytics.paymentMethods.card.amount))
+      push('Total Reconciled', analytics.paymentMethods.cash.count + analytics.paymentMethods.upi.count + analytics.paymentMethods.card.count, money(analytics.paymentMethods.total))
+      blank()
+    }
 
     push('Daily revenue')
     push('Date', 'Day', `Revenue (${sym})`, 'Orders')
@@ -257,6 +279,11 @@ export function AnalyticsView() {
       : format(range.from, 'd MMM yyyy')
     : 'Select dates'
 
+  const isSingleDay = Boolean(
+    (analytics?.range?.days === 1) ||
+    (range.from && range.to && format(range.from, 'yyyy-MM-dd') === format(range.to, 'yyyy-MM-dd'))
+  )
+
   const typeTotal = (analytics?.typeBreakdown ?? []).reduce((s, t) => s + t.revenue, 0) || 1
   const locations = analytics?.locations ?? []
   const hasMultipleLocations = locations.length > 1
@@ -269,42 +296,33 @@ export function AnalyticsView() {
     displayHour: h === 0 ? '12 AM' : h === 12 ? '12 PM' : h > 12 ? `${h - 12} PM` : `${h} AM`,
   }))
   const peakHour = hourlyData.reduce((prev, curr) => (curr.orders > prev.orders ? curr : prev), { hour: '—', orders: 0, displayHour: '—' })
+  const hasHourlyData = hourlyData.some((d) => d.orders > 0)
+
+  // Payment method totals & percentages
+  const pm = analytics?.paymentMethods
+  const pmTotal = (pm?.cash.amount ?? 0) + (pm?.upi.amount ?? 0) + (pm?.card.amount ?? 0) || 1
+
+  // Category totals for inline percentages
+  const catTotal = (analytics?.categoryBreakdown ?? []).reduce((s, c) => s + c.value, 0) || 1
 
   return (
     <div className="h-full flex flex-col bg-background">
-      {/* Header (collapsible on scroll) */}
-      <header
-        className={cn(
-          'px-3.5 md:px-6 border-b border-border/60 transition-all duration-200 ease-out bg-card/40 backdrop-blur-md sticky top-0 z-20',
-          collapsed ? 'py-2' : 'pt-3 md:pt-5 pb-3',
-        )}
-      >
-        <div className="flex items-center justify-between gap-3 flex-wrap">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <h2
-                className={cn(
-                  'font-bold tracking-tight transition-all duration-200 ease-out truncate',
-                  collapsed ? 'text-base md:text-lg' : 'text-lg md:text-2xl',
-                )}
-              >
-                Analytics
-              </h2>
-              <span className="hidden sm:inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-semibold text-primary">
-                <Sparkles className="size-3" /> Live
-              </span>
-            </div>
-            <p
-              className={cn(
-                'text-xs text-muted-foreground transition-all duration-200 ease-out truncate',
-                collapsed ? 'max-h-0 opacity-0 overflow-hidden mt-0' : 'max-h-6 opacity-100 mt-0.5',
-              )}
-            >
-              Performance insights & revenue metrics · {data.tenant.name}
-            </p>
+      {/* Sticky Header: Compact filter row without duplicate page title */}
+      <header className="px-3.5 md:px-6 py-2.5 border-b border-border/60 bg-card/50 backdrop-blur-md sticky top-0 z-20">
+        <div className="flex items-center justify-between gap-2.5 flex-wrap">
+          {/* Subtle subtitle identifying revenue definition */}
+          <div className="flex items-center gap-2 text-xs text-muted-foreground min-w-0">
+            <span className="inline-flex items-center gap-1 font-semibold text-foreground">
+              <Sparkles className="size-3.5 text-primary" />
+              <span>Settlement Analytics</span>
+            </span>
+            <span className="hidden sm:inline opacity-40">·</span>
+            <span className="truncate hidden sm:inline text-[11px] text-muted-foreground">
+              Gross settled revenue · {analytics?.range?.timezone || 'Asia/Kolkata'}
+            </span>
           </div>
 
-          <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap ml-auto">
             {/* Multi-location selector (when multiple locations exist) */}
             {hasMultipleLocations && (
               <Popover open={locationOpen} onOpenChange={setLocationOpen}>
@@ -346,7 +364,7 @@ export function AnalyticsView() {
               </Popover>
             )}
 
-            {/* Date range picker */}
+            {/* Date range picker with non-clipped 2-row layout on mobile */}
             <Popover open={rangeOpen} onOpenChange={setRangeOpen}>
               <PopoverTrigger asChild>
                 <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs font-normal border-border/70 bg-card">
@@ -361,12 +379,13 @@ export function AnalyticsView() {
                 className="w-auto max-w-[calc(100vw-2rem)] p-0"
               >
                 <div className="flex max-h-[75vh] flex-col lg:flex-row">
+                  {/* Presets: clean 3x2 grid on mobile prevents clipping of 'Last 30 days' */}
                   <div
                     className={cn(
-                      'flex shrink-0 gap-1 border-border p-2',
+                      'shrink-0 p-2 border-border',
                       isCompact
-                        ? 'flex-row overflow-x-auto scrollbar-thin whitespace-nowrap border-b'
-                        : 'flex-wrap lg:w-[136px] lg:flex-col lg:flex-nowrap lg:border-b-0 lg:border-r',
+                        ? 'grid grid-cols-3 gap-1 border-b'
+                        : 'flex flex-col w-[136px] gap-1 border-b-0 border-r',
                     )}
                   >
                     {RANGE_PRESETS.map((preset) => (
@@ -377,7 +396,7 @@ export function AnalyticsView() {
                           setRange(preset.build())
                           setRangeOpen(false)
                         }}
-                        className="rounded-md px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-secondary"
+                        className="rounded-md px-2 py-1.5 text-center lg:text-left text-xs transition-colors hover:bg-secondary font-medium"
                       >
                         {preset.label}
                       </button>
@@ -419,7 +438,7 @@ export function AnalyticsView() {
             icon={IndianRupee}
             label="Total Revenue"
             value={loading ? '—' : `${sym}${(analytics?.totalRevenue ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-            sub={`${analytics?.range?.days ?? 0} ${(analytics?.range?.days ?? 0) === 1 ? 'day' : 'days'} period`}
+            sub={`Gross settled (${analytics?.range?.days ?? 0}d period)`}
             accent="coral"
           />
           <KpiCard
@@ -433,17 +452,28 @@ export function AnalyticsView() {
             icon={ShoppingBag}
             label="Avg Order Value"
             value={loading ? '—' : `${sym}${(analytics?.avgOrder ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-            sub="Per completed ticket"
+            sub="Per settled ticket"
             accent="amber"
           />
-          <KpiCard
-            icon={CalendarDays}
-            label="Today's Sales"
-            value={loading ? '—' : `${sym}${(analytics?.todaysRevenue ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-            sub={`${analytics?.todaysOrders ?? 0} orders today`}
-            change={analytics?.revenueChange}
-            accent="blue"
-          />
+          {/* Single-day displays Net Sales vs Tax Collected to eliminate duplicate KPI */}
+          {isSingleDay ? (
+            <KpiCard
+              icon={Receipt}
+              label="Net Sales"
+              value={loading ? '—' : `${sym}${(analytics?.netSales ?? Math.max(0, (analytics?.totalRevenue ?? 0) - (analytics?.taxCollected ?? 0))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              sub={`${sym}${(analytics?.taxCollected ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} GST / tax`}
+              accent="blue"
+            />
+          ) : (
+            <KpiCard
+              icon={CalendarDays}
+              label="Today's Sales"
+              value={loading ? '—' : `${sym}${(analytics?.todaysRevenue ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              sub={`${analytics?.todaysOrders ?? 0} orders today`}
+              change={analytics?.revenueChange}
+              accent="blue"
+            />
+          )}
         </div>
 
         {/* Row 2: Revenue Trend (2 cols) + Order Types Donut (1 col) */}
@@ -452,11 +482,11 @@ export function AnalyticsView() {
             <div className="flex items-center justify-between mb-3">
               <div>
                 <h3 className="text-sm font-bold tracking-tight">Revenue Trend</h3>
-                <p className="text-[11px] text-muted-foreground">Daily sales progression · {rangeLabel}</p>
+                <p className="text-[11px] text-muted-foreground">Daily settled revenue · {rangeLabel}</p>
               </div>
               <div className="flex items-center gap-2 text-[11px] font-medium text-muted-foreground">
                 <span className="inline-block size-2 rounded-full bg-primary" />
-                <span>Revenue ({sym})</span>
+                <span>Settled ({sym})</span>
               </div>
             </div>
             {loading ? (
@@ -552,7 +582,7 @@ export function AnalyticsView() {
             <div className="flex items-center justify-between mb-3">
               <div>
                 <h3 className="text-sm font-bold tracking-tight">Sales by Hour</h3>
-                <p className="text-[11px] text-muted-foreground">Order volume distribution across the day ({analytics?.range?.timezone || 'Local'})</p>
+                <p className="text-[11px] text-muted-foreground">Order volume distribution across the day ({analytics?.range?.timezone || 'Asia/Kolkata'})</p>
               </div>
               {peakHour.orders > 0 && (
                 <div className="flex items-center gap-1.5 rounded-md bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
@@ -563,6 +593,11 @@ export function AnalyticsView() {
             </div>
             {loading ? (
               <ChartSkeleton className="h-[200px]" />
+            ) : !hasHourlyData ? (
+              <div className="flex flex-col h-[200px] items-center justify-center text-xs text-muted-foreground gap-2">
+                <Clock className="size-6 opacity-40 text-muted-foreground" />
+                <span>No order activity recorded for this period</span>
+              </div>
             ) : (
               <div className="h-[200px]">
                 <ResponsiveContainer width="100%" height="100%">
@@ -583,7 +618,7 @@ export function AnalyticsView() {
               <div className="flex items-center justify-between mb-2">
                 <div>
                   <h3 className="text-sm font-bold tracking-tight">Top Tables</h3>
-                  <p className="text-[11px] text-muted-foreground">Highest performing tables</p>
+                  <p className="text-[11px] text-muted-foreground">Highest performing dine-in tables</p>
                 </div>
                 <Trophy className="size-4 text-amber-500" />
               </div>
@@ -649,51 +684,165 @@ export function AnalyticsView() {
             ) : (
               <div className="h-[210px]">
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={analytics?.topItems ?? []} layout="vertical" margin={{ top: 0, right: 12, bottom: 0, left: 30 }}>
+                  <BarChart data={analytics?.topItems ?? []} layout="vertical" margin={{ top: 0, right: 48, bottom: 0, left: 24 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" horizontal={false} />
                     <XAxis type="number" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} />
                     <YAxis type="category" dataKey="name" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} width={85} />
                     <Tooltip content={<ChartTooltip currencySymbol={sym} />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
-                    <Bar dataKey="qty" name="Qty Sold" fill={CORAL} radius={[0, 4, 4, 0]} barSize={14} />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-          </Card>
-
-          <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm">
-            <div className="flex items-center justify-between mb-3">
-              <div>
-                <h3 className="text-sm font-bold tracking-tight">Revenue by Category</h3>
-                <p className="text-[11px] text-muted-foreground">Category contribution to gross revenue</p>
-              </div>
-              <Layers className="size-4 text-muted-foreground" />
-            </div>
-            {loading ? (
-              <ChartSkeleton className="h-[210px]" />
-            ) : (analytics?.categoryBreakdown ?? []).length === 0 ? (
-              <div className="flex h-[210px] items-center justify-center text-xs text-muted-foreground">
-                No category data available
-              </div>
-            ) : (
-              <div className="h-[210px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={analytics?.categoryBreakdown ?? []} margin={{ top: 0, right: 8, bottom: 0, left: -16 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false} />
-                    <XAxis dataKey="name" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} />
-                    <YAxis tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${sym}${v >= 1000 ? `${(v/1000).toFixed(1)}k` : v}`} />
-                    <Tooltip content={<ChartTooltip currencySymbol={sym} />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
-                    <Bar dataKey="value" name="Revenue" radius={[4, 4, 0, 0]} barSize={22}>
-                      {(analytics?.categoryBreakdown ?? []).map((_, i) => (
-                        <Cell key={i} fill={COLORS[i % COLORS.length]} />
-                      ))}
+                    <Bar dataKey="qty" name="Qty Sold" fill={CORAL} radius={[0, 4, 4, 0]} barSize={14}>
+                      <LabelList
+                        dataKey="qty"
+                        position="right"
+                        formatter={(v: any) => `${v} sold`}
+                        className="text-[10px] font-semibold fill-muted-foreground"
+                      />
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
               </div>
             )}
           </Card>
+
+          <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm flex flex-col justify-between">
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <h3 className="text-sm font-bold tracking-tight">Revenue by Category</h3>
+                  <p className="text-[11px] text-muted-foreground">Category contribution to gross revenue</p>
+                </div>
+                <Layers className="size-4 text-muted-foreground" />
+              </div>
+              {loading ? (
+                <ChartSkeleton className="h-[140px]" />
+              ) : (analytics?.categoryBreakdown ?? []).length === 0 ? (
+                <div className="flex h-[140px] items-center justify-center text-xs text-muted-foreground">
+                  No category data available
+                </div>
+              ) : (
+                <div className="h-[140px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={analytics?.categoryBreakdown ?? []} margin={{ top: 0, right: 8, bottom: 0, left: -16 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false} />
+                      <XAxis dataKey="name" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} />
+                      <YAxis tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${sym}${v >= 1000 ? `${(v/1000).toFixed(1)}k` : v}`} />
+                      <Tooltip content={<ChartTooltip currencySymbol={sym} />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
+                      <Bar dataKey="value" name="Revenue" radius={[4, 4, 0, 0]} barSize={22}>
+                        {(analytics?.categoryBreakdown ?? []).map((_, i) => (
+                          <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+            </div>
+
+            {/* Inline Category Legend & Values ensuring small categories remain 100% readable */}
+            {(analytics?.categoryBreakdown ?? []).length > 0 && (
+              <div className="space-y-1 pt-2.5 mt-2 border-t border-border/40">
+                {(analytics?.categoryBreakdown ?? []).slice(0, 4).map((c, i) => {
+                  const pct = catTotal ? ((c.value / catTotal) * 100).toFixed(1) : '0.0'
+                  return (
+                    <div key={c.name} className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <span className="inline-block size-2 shrink-0 rounded-full" style={{ background: COLORS[i % COLORS.length] }} />
+                        <span className="text-muted-foreground truncate max-w-[140px]">{c.name}</span>
+                      </div>
+                      <div className="flex items-center gap-2 font-medium tabular-nums">
+                        <span className="text-muted-foreground text-[11px]">{pct}%</span>
+                        <span className="text-foreground">{sym}{c.value.toFixed(2)}</span>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </Card>
         </div>
+
+        {/* Row 5: Payment Method Analytics (Reconciled with Settled Transactions) */}
+        <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="text-sm font-bold tracking-tight">Payment Method Breakdown</h3>
+              <p className="text-[11px] text-muted-foreground">Actual settled transactions reconciled against payment ledger</p>
+            </div>
+            <CreditCard className="size-4 text-muted-foreground" />
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <PaymentCard
+              icon={Banknote}
+              method="Cash"
+              amount={pm?.cash.amount ?? 0}
+              count={pm?.cash.count ?? 0}
+              total={pmTotal}
+              currencySymbol={sym}
+              color="emerald"
+            />
+            <PaymentCard
+              icon={Smartphone}
+              method="UPI / QR"
+              amount={pm?.upi.amount ?? 0}
+              count={pm?.upi.count ?? 0}
+              total={pmTotal}
+              currencySymbol={sym}
+              color="blue"
+            />
+            <PaymentCard
+              icon={CreditCard}
+              method="Card / POS"
+              amount={pm?.card.amount ?? 0}
+              count={pm?.card.count ?? 0}
+              total={pmTotal}
+              currencySymbol={sym}
+              color="purple"
+            />
+          </div>
+        </Card>
+      </div>
+    </div>
+  )
+}
+
+function PaymentCard({
+  icon: Icon,
+  method,
+  amount,
+  count,
+  total,
+  currencySymbol,
+  color,
+}: {
+  icon: any
+  method: string
+  amount: number
+  count: number
+  total: number
+  currencySymbol: string
+  color: 'emerald' | 'blue' | 'purple'
+}) {
+  const pct = total > 0 ? ((amount / total) * 100).toFixed(1) : '0.0'
+  const colorMap = {
+    emerald: 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20',
+    blue: 'text-blue-500 bg-blue-500/10 border-blue-500/20',
+    purple: 'text-purple-500 bg-purple-500/10 border-purple-500/20',
+  }
+
+  return (
+    <div className="flex items-center justify-between p-3 rounded-lg bg-secondary/25 border border-border/50 text-xs">
+      <div className="flex items-center gap-2.5 min-w-0">
+        <div className={cn('size-8 rounded-lg flex items-center justify-center border shrink-0', colorMap[color])}>
+          <Icon className="size-4" />
+        </div>
+        <div className="min-w-0">
+          <p className="font-semibold text-foreground truncate">{method}</p>
+          <p className="text-[10px] text-muted-foreground">{count} {count === 1 ? 'transaction' : 'transactions'}</p>
+        </div>
+      </div>
+      <div className="text-right tabular-nums">
+        <p className="font-bold text-foreground text-sm">{currencySymbol}{amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+        <p className="text-[10px] text-muted-foreground font-medium">{pct}% of settled</p>
       </div>
     </div>
   )
@@ -720,7 +869,12 @@ function KpiCard({
     amber: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
     blue: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
   }
-  const up = (change ?? 0) >= 0
+
+  // Growth indicator logic: neutral grey 0.0% or — when growth is zero or no baseline. Never green upward arrow for 0%.
+  const hasValidChange = change !== undefined && change !== null && !Number.isNaN(change)
+  const isZero = hasValidChange && Math.abs(change) < 0.05
+  const isPositive = hasValidChange && change >= 0.05
+  const isNegative = hasValidChange && change <= -0.05
 
   return (
     <Card className="rounded-xl border border-border/70 bg-card p-3.5 shadow-sm transition-all hover:border-border">
@@ -728,11 +882,20 @@ function KpiCard({
         <div className={cn('size-8 rounded-lg flex items-center justify-center border', accents[accent])}>
           <Icon className="size-4" />
         </div>
-        {change !== undefined && (
-          <span className={cn('inline-flex items-center gap-0.5 text-[11px] font-semibold px-1.5 py-0.5 rounded', up ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400')}>
-            {up ? <ArrowUpRight className="size-3" /> : <ArrowDownRight className="size-3" />}
-            {Math.abs(change).toFixed(1)}%
-          </span>
+        {hasValidChange && (
+          isZero ? (
+            <span className="text-[11px] font-medium text-muted-foreground px-1.5 py-0.5 rounded bg-secondary/50">
+              0.0%
+            </span>
+          ) : (
+            <span className={cn(
+              'inline-flex items-center gap-0.5 text-[11px] font-semibold px-1.5 py-0.5 rounded',
+              isPositive ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'
+            )}>
+              {isPositive ? <ArrowUpRight className="size-3" /> : <ArrowDownRight className="size-3" />}
+              {Math.abs(change).toFixed(1)}%
+            </span>
+          )
         )}
       </div>
       <p className="text-[11px] font-medium text-muted-foreground">{label}</p>
