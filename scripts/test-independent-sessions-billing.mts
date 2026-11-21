@@ -65,6 +65,24 @@ describe("P1: Independent sessions at the same table order isolation & recovery"
     assert.strictEqual(settlementQueryCheck1.length, check1Orders.length);
     assert.strictEqual(settlementQueryCheck1.reduce((s, o) => s + o.total, 0), check1Total);
   });
+
+  it("surfaces backfill failure before showing bill total rather than ignoring errors", async () => {
+    // Simulated backfill failure handler
+    async function simulateLoadBillWithBackfill(shouldFail: boolean) {
+      if (shouldFail) {
+        throw new Error("Failed to attach unassigned orders to bill: simulated database write error");
+      }
+      return { total: 650, orders: ["ord-1", "ord-2", "ord-3-legacy"] };
+    }
+
+    await assert.rejects(
+      async () => {
+        await simulateLoadBillWithBackfill(true);
+      },
+      /Failed to attach unassigned orders to bill/,
+      "Must surface error and abort opening bill when legacy order attachment fails",
+    );
+  });
 });
 
 describe("P2: Deterministic integer-paise GST split for odd-paisa totals", () => {

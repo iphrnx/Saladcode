@@ -163,6 +163,11 @@ check(
   "Edge bill function explicitly recovers unassigned legacy orders with is('check_id', null)",
   billEdgeSrc.includes('.is("check_id", null)'),
 );
+check(
+  "Edge bill function surfaces any backfill failure rather than ignoring write errors",
+  billEdgeSrc.includes("throw new Error(`Failed to attach unassigned orders to bill:") &&
+    billEdgeSrc.includes("Could not load bill:"),
+);
 
 // 9. Verification of fully paid bill behavior
 check(

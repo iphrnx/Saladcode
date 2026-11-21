@@ -133,18 +133,49 @@ async function checkForTenant(
   return await loadCheck(tenantId, open);
 }
 
+/**
+ * Controlled backfill: attach unassigned legacy orders for this session to the check.
+ * Surfaces any failure so that bills and settlements are never computed with missing orders.
+ */
+async function backfillSessionOrders(
+  db: any,
+  tenantId: string,
+  checkId: string,
+  sessionId: string,
+): Promise<void> {
+  const { data: unassigned, error: checkErr } = await db
+    .from("orders")
+    .select("id")
+    .eq("tenant_id", tenantId)
+    .eq("table_session_id", sessionId)
+    .is("check_id", null)
+    .neq("status", "CANCELLED");
+
+  if (checkErr) {
+    throw new Error(`Failed to verify unassigned session orders: ${checkErr.message}`);
+  }
+
+  if (unassigned && unassigned.length > 0) {
+    const { error: updateErr } = await db
+      .from("orders")
+      .update({ check_id: checkId })
+      .eq("tenant_id", tenantId)
+      .eq("table_session_id", sessionId)
+      .is("check_id", null);
+
+    if (updateErr) {
+      throw new Error(`Failed to attach unassigned orders to bill: ${updateErr.message}`);
+    }
+  }
+}
+
 /** Everything a bill needs, for one check that has already been resolved. */
 async function loadCheck(tenantId: string, open: any) {
   const db = admin();
-  // Explicitly recover unassigned legacy orders belonging to this session so
-  // billing and settlement remain scoped to the exact same orders.
+  // Controlled backfill: if unassigned legacy orders exist in this session,
+  // attach them to the open check and strictly surface any failure before computing totals.
   if (open.id && open.session_id && open.status === "OPEN") {
-    await db
-      .from("orders")
-      .update({ check_id: open.id })
-      .eq("tenant_id", tenantId)
-      .eq("table_session_id", open.session_id)
-      .is("check_id", null);
+    await backfillSessionOrders(db, tenantId, open.id, open.session_id);
   }
 
   let orderQuery = db
@@ -395,7 +426,12 @@ async function getCheck(req: Request): Promise<Response> {
     checkId = null;
   }
 
-  const data = await checkForTenant(tenantId, sessionId, tableId, checkId);
+  let data;
+  try {
+    data = await checkForTenant(tenantId, sessionId, tableId, checkId);
+  } catch (err) {
+    return json(req, { error: `Could not load bill: ${(err as Error).message}` }, 500);
+  }
   if (!data) return json(req, { error: "No bill for that table yet." }, 404);
 
   const { check, orders, payments, gstin } = data;
@@ -496,12 +532,17 @@ async function recordPayment(req: Request): Promise<Response> {
   if (!g.ok) return g.response;
 
   const b = await req.json().catch(() => ({} as any));
-  const data = await checkForTenant(
-    g.session.tenantId,
-    b.sessionId ? String(b.sessionId) : null,
-    b.tableId ? String(b.tableId) : null,
-    b.checkId ? String(b.checkId) : null,
-  );
+  let data;
+  try {
+    data = await checkForTenant(
+      g.session.tenantId,
+      b.sessionId ? String(b.sessionId) : null,
+      b.tableId ? String(b.tableId) : null,
+      b.checkId ? String(b.checkId) : null,
+    );
+  } catch (err) {
+    return json(req, { error: `Could not prepare payment: ${(err as Error).message}` }, 500);
+  }
   if (!data) return json(req, { error: "No open bill for that table." }, 404);
 
   const amount = Number(b.amount);
@@ -737,12 +778,17 @@ async function finalize(req: Request): Promise<Response> {
   if (!g.ok) return g.response;
 
   const b = await req.json().catch(() => ({} as any));
-  const data = await checkForTenant(
-    g.session.tenantId,
-    b.sessionId ? String(b.sessionId) : null,
-    b.tableId ? String(b.tableId) : null,
-    b.checkId ? String(b.checkId) : null,
-  );
+  let data;
+  try {
+    data = await checkForTenant(
+      g.session.tenantId,
+      b.sessionId ? String(b.sessionId) : null,
+      b.tableId ? String(b.tableId) : null,
+      b.checkId ? String(b.checkId) : null,
+    );
+  } catch (err) {
+    return json(req, { error: `Could not prepare payment: ${(err as Error).message}` }, 500);
+  }
   if (!data) return json(req, { error: "No open bill for that table." }, 404);
 
   const { data: result, error } = await admin().rpc("finalize_table_check", {
@@ -798,12 +844,17 @@ async function settleCash(req: Request): Promise<Response> {
   if (!g.ok) return g.response;
 
   const b = await req.json().catch(() => ({} as any));
-  const data = await checkForTenant(
-    g.session.tenantId,
-    b.sessionId ? String(b.sessionId) : null,
-    b.tableId ? String(b.tableId) : null,
-    b.checkId ? String(b.checkId) : null,
-  );
+  let data;
+  try {
+    data = await checkForTenant(
+      g.session.tenantId,
+      b.sessionId ? String(b.sessionId) : null,
+      b.tableId ? String(b.tableId) : null,
+      b.checkId ? String(b.checkId) : null,
+    );
+  } catch (err) {
+    return json(req, { error: `Could not prepare payment: ${(err as Error).message}` }, 500);
+  }
   if (!data) return json(req, { error: "No open bill for that table." }, 404);
 
   const { data: result, error } = await admin().rpc("settle_check_cash_tx", {
