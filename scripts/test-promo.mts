@@ -112,9 +112,16 @@ console.log("\n── rule cases ──");
   check("declines: inactive", [r.applied, r.reason], [false, "This promo code is no longer active"]);
 }
 {
-  const db = fakeDb([promo({ valid_to: "2026-10-20T11:59:00Z" })]);
+  // Valid until yesterday (expired)
+  const db = fakeDb([promo({ valid_to: "2026-10-19" })]);
   const r = await evaluatePromo(db, "t1", "FLAT50", 1000, { now: NOW });
   check("declines: expired", [r.applied, r.reason], [false, "This promo code has expired"]);
+}
+{
+  // Valid until today (IST): remains active through 23:59:59.999 IST
+  const db = fakeDb([promo({ valid_to: "2026-10-20" })]);
+  const r = await evaluatePromo(db, "t1", "FLAT50", 1000, { now: NOW });
+  check("applies: valid until today remains active through end of day", [r.applied, r.discount], [true, 50]);
 }
 {
   const db = fakeDb([promo({ valid_from: "2026-11-01T00:00:00Z" })]);

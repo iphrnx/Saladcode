@@ -1,25 +1,150 @@
 // deno-lint-ignore-file no-explicit-any
 /**
- * Promo evaluation — the single authority on whether a promo code applies.
+ * Promo evaluation and status determination — the single authority across
+ * the Admin Panel, Create/Edit modal, POS checkout, and Supabase backend.
  *
- * Three engines used to decide this independently, and they disagreed:
- *
- *   - the POS client checked case, expiry, usage limit and minimum order, and
- *     showed the cashier a discounted total;
- *   - the orders edge function checked only `active` and the minimum order, and
- *     matched codes case-sensitively;
- *   - the database function place_order() had the full rule set.
- *
- * So a cashier could apply a code, watch the total drop, and have the server
- * create the order at full price with nothing said about it. Everything now
- * comes from here: the edge function uses it to decide and to explain, and the
- * POS asks it before showing a discount.
- *
- * The rule set mirrors the database function place_order() exactly, including
- * the `max_discount` cap applying to fixed-amount codes as well as
- * percentages. The diner RPC path and the staff edge-function path must never
- * disagree about money.
+ * All dates are evaluated as calendar dates in Asia/Kolkata (IST).
+ * valid_until is inclusive for the entire selected date through 23:59:59.999 IST.
  */
+
+export type PromoStatus = 'expired' | 'exhausted' | 'paused' | 'scheduled' | 'active';
+
+const istFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'Asia/Kolkata',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+/**
+ * Return the calendar date in Asia/Kolkata as a deterministic YYYY-MM-DD string.
+ * Uses Intl.DateTimeFormat with formatToParts to avoid implicit timezone shifts.
+ */
+export function getISTDateString(date: Date = new Date()): string {
+  const parts = istFormatter.formatToParts(date);
+  let year = '';
+  let month = '';
+  let day = '';
+  for (const part of parts) {
+    if (part.type === 'year') year = part.value;
+    else if (part.type === 'month') month = part.value;
+    else if (part.type === 'day') day = part.value;
+  }
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Convert string, number, or Date input to a deterministic YYYY-MM-DD date string in IST.
+ * Date-only strings ('YYYY-MM-DD') are preserved as-is.
+ */
+export function toISTDateString(val: string | number | Date | null | undefined): string | null {
+  if (val === null || val === undefined) return null;
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (!trimmed) return null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      return trimmed;
+    }
+    const d = new Date(trimmed);
+    if (isNaN(d.getTime())) return null;
+    return getISTDateString(d);
+  }
+  if (typeof val === 'number') {
+    const d = new Date(val);
+    if (isNaN(d.getTime())) return null;
+    return getISTDateString(d);
+  }
+  if (val instanceof Date) {
+    if (isNaN(val.getTime())) return null;
+    return getISTDateString(val);
+  }
+  return null;
+}
+
+/** 00:00:00.000 IST for the given YYYY-MM-DD date. */
+export function istStartOfDayISO(dateStr: string): string {
+  return `${dateStr}T00:00:00.000+05:30`;
+}
+
+/** 23:59:59.999 IST for the given YYYY-MM-DD date. */
+export function istEndOfDayISO(dateStr: string): string {
+  return `${dateStr}T23:59:59.999+05:30`;
+}
+
+/**
+ * Normalize promo code input: uppercase and alphanumeric with underscores/hyphens.
+ */
+export function normalizePromoCode(code: string | null | undefined): string {
+  return (code ?? '').toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+}
+
+/**
+ * Pure, reusable status logic with strict priority:
+ * 1. expired — valid_until exists and today is later than valid_until.
+ * 2. exhausted — usage_limit != null && redemptions >= usage_limit (usage_limit > 0).
+ * 3. paused — is_active === false.
+ * 4. scheduled — valid_from exists and today is earlier than valid_from.
+ * 5. active — otherwise.
+ *
+ * Accepts both camelCase and snake_case properties for compatibility across UI & DB.
+ */
+export function getPromoStatus(
+  promo: {
+    valid_to?: string | Date | null;
+    valid_until?: string | Date | null;
+    validTo?: string | Date | null;
+    validUntil?: string | Date | null;
+    valid_from?: string | Date | null;
+    validFrom?: string | Date | null;
+    usage_limit?: number | string | null;
+    usageLimit?: number | string | null;
+    used_count?: number | string | null;
+    usedCount?: number | string | null;
+    redemptions?: number | string | null;
+    active?: boolean | null;
+    is_active?: boolean | null;
+    isActive?: boolean | null;
+  } | null | undefined,
+  todayIST?: string,
+): PromoStatus {
+  if (!promo) return 'expired';
+
+  const today = todayIST ?? getISTDateString();
+
+  // 1. expired — valid_until exists and today is later than valid_until
+  const validUntilStr = toISTDateString(
+    promo.valid_until ?? promo.validUntil ?? promo.valid_to ?? promo.validTo,
+  );
+  if (validUntilStr && today > validUntilStr) {
+    return 'expired';
+  }
+
+  // 2. exhausted — usage_limit != null && redemptions >= usage_limit
+  const rawLimit = promo.usage_limit ?? promo.usageLimit;
+  const rawRedemptions = promo.redemptions ?? promo.used_count ?? promo.usedCount;
+  if (rawLimit !== null && rawLimit !== undefined && rawLimit !== '') {
+    const limit = Number(rawLimit);
+    const redemptions = Number(rawRedemptions ?? 0);
+    if (limit > 0 && redemptions >= limit) {
+      return 'exhausted';
+    }
+  }
+
+  // 3. paused — is_active === false
+  const isActive = promo.is_active ?? promo.isActive ?? promo.active;
+  if (isActive === false) {
+    return 'paused';
+  }
+
+  // 4. scheduled — valid_from exists and today is earlier than valid_from
+  const validFromStr = toISTDateString(promo.valid_from ?? promo.validFrom);
+  if (validFromStr && today < validFromStr) {
+    return 'scheduled';
+  }
+
+  // 5. active — otherwise
+  return 'active';
+}
 
 export type PromoEvaluation = {
   /** True only when every rule passed and a discount may be applied. */
@@ -62,8 +187,7 @@ export type EvaluatePromoOptions = {
 /**
  * Decide whether `rawCode` applies to an order worth `itemsTotal`.
  *
- * Throws only on a database error. A promo that does not qualify is a normal
- * outcome, not an error — it comes back with `applied: false` and a reason.
+ * Uses deterministic IST calendar comparisons and the shared getPromoStatus logic.
  */
 export async function evaluatePromo(
   db: any,
@@ -74,6 +198,7 @@ export async function evaluatePromo(
 ): Promise<PromoEvaluation> {
   const symbol = opts.currencySymbol ?? "₹";
   const now = opts.now ?? new Date();
+  const todayIST = getISTDateString(now);
   const code = (rawCode ?? "").trim();
 
   if (!code) {
@@ -81,7 +206,6 @@ export async function evaluatePromo(
   }
 
   // Escape LIKE wildcards so a code containing % or _ matches literally
-  // instead of becoming a pattern that matches other codes.
   const pattern = code.replace(/[\\%_]/g, (m) => `\\${m}`);
 
   const { data: candidates, error } = await db
@@ -93,9 +217,6 @@ export async function evaluatePromo(
 
   if (error) throw new Error(error.message);
 
-  // ILIKE is case-insensitive, but the stored code is the authority on what the
-  // customer said out loud. Compare exactly before trusting a row, and pick
-  // deterministically if two codes differ only in case.
   const promo =
     (candidates ?? []).find((p: any) => p.code.trim().toUpperCase() === code.toUpperCase()) ?? null;
 
@@ -111,19 +232,11 @@ export async function evaluatePromo(
     promo,
   });
 
-  if (!promo.active) return declined(REASON.inactive);
-
-  if (promo.valid_from && new Date(promo.valid_from).getTime() > now.getTime()) {
-    return declined(REASON.notYetValid);
-  }
-
-  if (promo.valid_to && new Date(promo.valid_to).getTime() <= now.getTime()) {
-    return declined(REASON.expired);
-  }
-
-  if (promo.usage_limit > 0 && (promo.used_count ?? 0) >= promo.usage_limit) {
-    return declined(REASON.usageLimit);
-  }
+  const status = getPromoStatus(promo, todayIST);
+  if (status === 'paused') return declined(REASON.inactive);
+  if (status === 'scheduled') return declined(REASON.notYetValid);
+  if (status === 'expired') return declined(REASON.expired);
+  if (status === 'exhausted') return declined(REASON.usageLimit);
 
   if (itemsTotal < promo.min_order) {
     return declined(
@@ -134,16 +247,18 @@ export async function evaluatePromo(
     );
   }
 
-  // Mirrors place_order(): max_discount caps fixed-amount codes too, and the
-  // discount can never exceed the order.
+  // For percentage promotions: discount = subtotal * (value / 100), capped at max_discount.
+  // For flat promotions: discount = value (capped at max_discount if specified).
+  // In all cases: discount is capped at itemsTotal and >= 0.
   let discount = promo.type === "PERCENTAGE" ? (itemsTotal * promo.value) / 100 : promo.value;
-  if (promo.max_discount > 0) discount = Math.min(discount, promo.max_discount);
-  discount = Math.min(discount, itemsTotal);
+  const maxDiscount = Number(promo.max_discount ?? promo.maxDiscount ?? 0);
+  if (maxDiscount > 0) discount = Math.min(discount, maxDiscount);
+  discount = Math.min(itemsTotal, Math.max(0, discount));
 
   return {
     applied: true,
     reason: null,
-    discount: Math.max(0, discount),
+    discount: +discount.toFixed(2),
     code: promo.code,
     promo,
   };
