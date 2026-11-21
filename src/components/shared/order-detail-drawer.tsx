@@ -1,9 +1,10 @@
 'use client'
 
 import { useState } from 'react'
-import { Check, ChefHat, FilePenLine, Info, Loader2, ReceiptText, Utensils, XCircle } from 'lucide-react'
+import { Check, ChefHat, CreditCard, FilePenLine, Info, Loader2, ReceiptText, Utensils, XCircle } from 'lucide-react'
 import type { Order } from '@/components/app/data-context'
 import { StatusBadge } from '@/components/shared/badges'
+import { formatCurrency } from '@/lib/constants'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import {
   AlertDialog,
@@ -55,6 +56,7 @@ export function OrderDetailDrawer({
   onUpdate,
   onCancel,
   onBack,
+  onGoToPayment,
 }: {
   order: Order | null
   open: boolean
@@ -76,14 +78,14 @@ export function OrderDetailDrawer({
   onCancel?: (reason: string) => Promise<void> | void
   /** Back arrow — returns to the sitting's other orders. */
   onBack?: () => void
+  onGoToPayment?: () => void
 }) {
   const [confirmCancelOpen, setConfirmCancelOpen] = useState(false)
   const [cancelReason, setCancelReason] = useState('')
   const [selectedPreset, setSelectedPreset] = useState<string | null>(null)
 
   if (!order) return null
-  const money = (n: number) =>
-    `${currencySymbol}${Number(n ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  const money = (n: number) => formatCurrency(n, currencySymbol)
 
   const cancelled = order.status === 'CANCELLED'
   const done = order.status === 'COMPLETED'
@@ -111,16 +113,16 @@ export function OrderDetailDrawer({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent showCloseButton={false} className="flex max-h-[92dvh] w-full max-w-[460px] flex-col gap-0 overflow-hidden rounded-t-3xl border-0 p-0 sm:rounded-3xl">
+      <DialogContent showCloseButton={false} className="flex max-h-[90dvh] w-full max-w-[460px] flex-col gap-0 overflow-hidden rounded-t-3xl border-0 p-0 sm:rounded-3xl">
         <DialogTitle className="sr-only">Order #{order.orderNumber} details</DialogTitle>
 
         {/* Header */}
-        <div className="flex shrink-0 items-center gap-2 px-4 pb-2 pt-4">
+        <div className="flex shrink-0 items-center gap-2 px-4 pb-2 pt-4 border-b border-border/40">
           {onBack && (
             <button
               onClick={onBack}
               aria-label="Back"
-              className="grid size-9 shrink-0 place-items-center rounded-full bg-primary/[0.08] text-foreground transition-colors hover:bg-primary/15"
+              className="grid size-9 shrink-0 place-items-center rounded-full bg-primary/[0.08] text-foreground transition-colors hover:bg-primary/15 cursor-pointer"
             >
               <span className="text-[17px] leading-none">‹</span>
             </button>
@@ -129,13 +131,13 @@ export function OrderDetailDrawer({
           <button
             onClick={() => onOpenChange(false)}
             aria-label="Close"
-            className="ml-auto grid size-9 shrink-0 place-items-center rounded-full bg-secondary text-muted-foreground transition-colors hover:text-foreground"
+            className="ml-auto grid size-9 shrink-0 place-items-center rounded-full bg-secondary text-muted-foreground transition-colors hover:text-foreground cursor-pointer"
           >
             ✕
           </button>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain scrollbar-thin px-4 pb-3">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain scrollbar-thin px-4 py-3 pb-6">
           {/* The order, and its journey */}
           <div className="rounded-2xl border border-border p-3">
             <div className="flex items-start gap-2.5">
@@ -219,10 +221,13 @@ export function OrderDetailDrawer({
                   <Dish src={dishImages[it.menuItemId]} />
                   <div className="min-w-0 flex-1 leading-tight">
                     <p className="truncate text-[13px] font-semibold">{it.name}</p>
-                    <p className="truncate text-[11.5px] text-muted-foreground">
-                      {it.portion || 'Regular'}
-                      {it.notes && <span className="italic"> · {it.notes}</span>}
-                    </p>
+                    {(it.portion || it.notes) && (
+                      <p className="truncate text-[11.5px] text-muted-foreground">
+                        {it.portion}
+                        {it.portion && it.notes && <span> · </span>}
+                        {it.notes && <span className="italic">{it.notes}</span>}
+                      </p>
+                    )}
                   </div>
                   <span className="shrink-0 text-[12px] tabular-nums text-muted-foreground">
                     ×{it.quantity}
@@ -260,14 +265,16 @@ export function OrderDetailDrawer({
             </div>
           </div>
 
-          <p className="mt-3 flex items-start gap-1.5 rounded-xl bg-primary/[0.06] px-3 py-2 text-[11.5px] leading-snug text-muted-foreground">
-            <Info className="mt-px size-3.5 shrink-0 text-primary" />
-            Payment is done at table level (all orders combined).
-          </p>
+          {!isServed && !done && !cancelled && (
+            <p className="mt-3 flex items-start gap-1.5 rounded-xl bg-primary/[0.06] px-3 py-2 text-[11.5px] leading-snug text-muted-foreground">
+              <Info className="mt-px size-3.5 shrink-0 text-primary" />
+              Payment handled at session level.
+            </p>
+          )}
         </div>
 
         {/* Fixed foot: Accept/Reject for held QR orders, kitchen progression, or terminal status */}
-        <div className="flex shrink-0 items-center gap-2 border-t border-border px-4 py-3">
+        <div className="flex shrink-0 items-center gap-2 border-t border-border px-4 py-3 bg-card">
           {isHeld ? (
             canAccept ? (
               <>
@@ -308,10 +315,15 @@ export function OrderDetailDrawer({
                   }}
                   disabled={cancelling || busy}
                   title={!canCancel ? 'Only Owner, Manager, and Cashier can cancel orders' : undefined}
-                  className="flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl border border-border bg-card text-[13.5px] font-semibold text-destructive transition-colors hover:border-destructive/30 hover:bg-destructive/10 cursor-pointer"
+                  className={cn(
+                    'flex h-11 items-center justify-center gap-1.5 rounded-xl border border-border bg-card font-semibold text-destructive transition-colors hover:border-destructive/30 hover:bg-destructive/10 cursor-pointer',
+                    order.status === 'PENDING'
+                      ? 'flex-1 text-[13.5px]'
+                      : 'shrink-0 px-3 text-[12px] border-destructive/25'
+                  )}
                 >
-                  <XCircle className="size-4" />
-                  Cancel Order
+                  <XCircle className="size-3.5" />
+                  {order.status === 'PENDING' ? 'Cancel Order' : 'Cancel'}
                 </button>
               )}
               <button
@@ -334,10 +346,21 @@ export function OrderDetailDrawer({
           ) : !done && !cancelled ? (
             /* Served state — order is served to diners; Cancel Order button is completely removed */
             <div className="flex w-full flex-col gap-2">
-              <div className="flex w-full items-center justify-center gap-2 rounded-xl bg-secondary/60 py-2.5 text-[12px] text-muted-foreground">
-                <Check className="size-3.5 shrink-0 text-emerald-600" />
-                <span>Order served · Payment handled at table level</span>
-              </div>
+              {onGoToPayment ? (
+                <button
+                  type="button"
+                  onClick={onGoToPayment}
+                  className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-primary text-[14px] font-bold text-primary-foreground shadow-sm hover:bg-primary/90 transition-colors cursor-pointer"
+                >
+                  <CreditCard className="size-4" />
+                  Go to Payment →
+                </button>
+              ) : (
+                <div className="flex w-full items-center justify-center gap-2 rounded-xl bg-secondary/60 py-2.5 text-[12px] text-muted-foreground">
+                  <Check className="size-3.5 shrink-0 text-emerald-600" />
+                  <span>Order served · Payment handled at session level</span>
+                </div>
+              )}
             </div>
           ) : (
             /* Finalized state — order is Completed or Cancelled */
@@ -349,8 +372,8 @@ export function OrderDetailDrawer({
               )}
               <span>
                 {cancelled
-                  ? 'This order was cancelled'
-                  : 'Order completed · Payment handled at table level'}
+                  ? 'Order cancelled'
+                  : 'Order completed · Settled at session level'}
               </span>
             </div>
           )}
@@ -363,7 +386,7 @@ export function OrderDetailDrawer({
                 Cancel Order #{order.orderNumber}?
               </AlertDialogTitle>
               <AlertDialogDescription className="text-[13px] text-muted-foreground">
-                This will cancel the order and its kitchen tickets. It will be excluded from the table&apos;s bill.
+                This will cancel the order and its kitchen tickets. It will be excluded from the session&apos;s bill.
               </AlertDialogDescription>
             </AlertDialogHeader>
 

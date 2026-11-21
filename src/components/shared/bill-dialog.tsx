@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, Fragment } from 'react'
 import { cn } from '@/lib/utils'
+import { formatCurrency } from '@/lib/constants'
 import { edgeFetch } from '@/lib/edge'
 import { Button } from '@/components/ui/button'
 import {
@@ -62,6 +63,8 @@ interface BillData {
   taxableAmount: number
   taxBreakup: { rate: number; cgstRate: number; sgstRate: number; cgstAmount: number; sgstAmount: number; totalTax: number }
   serviceCharge: number
+  serviceRate?: number
+  roundOff?: number
   grandTotal: number
   /** Consolidated table bill only — what has been taken, and what is left. */
   paidTotal?: number
@@ -187,8 +190,14 @@ function buildPrintHtml(bill: BillData): string {
     )
   }
   if (bill.serviceCharge > 0) {
+    const sRate = bill.serviceRate ? ` (${bill.serviceRate}%)` : ''
     totalRows.push(
-      `<div class="row"><span>Service charge</span><span class="num val">${money(bill.serviceCharge)}</span></div>`,
+      `<div class="row"><span>Service Charge${sRate}</span><span class="num val">${money(bill.serviceCharge)}</span></div>`,
+    )
+  }
+  if (bill.roundOff && bill.roundOff !== 0) {
+    totalRows.push(
+      `<div class="row muted"><span>Round Off</span><span class="num val">${bill.roundOff > 0 ? '+' : ''}${money(bill.roundOff)}</span></div>`,
     )
   }
 
@@ -349,11 +358,16 @@ function parseBillPayload(doc: any, tableHint?: { name: string; seats?: number; 
   const grandTotal = chk?.total ?? doc.totals?.total ?? +activeOrders.reduce((s: number, o: any) => s + Number(o.total || 0), 0).toFixed(2)
   const paid = chk?.paid ?? doc.totals?.paid ?? (primary?.paymentStatus === 'PAID' ? grandTotal : 0)
 
-  const taxRate = Number(doc.taxBreakup?.rate ?? tenant.taxRate ?? 8)
+  const taxRate = Number(doc.taxBreakup?.rate ?? tenant.taxRate ?? 5)
+  const gstTotalPaise = Math.round(tax * 100)
+  const cgstPaise = Math.ceil(gstTotalPaise / 2)
+  const sgstPaise = gstTotalPaise - cgstPaise
   const cgstRate = Number(doc.taxBreakup?.cgstRate ?? (taxRate / 2))
   const sgstRate = Number(doc.taxBreakup?.sgstRate ?? (taxRate / 2))
-  const cgstAmount = Number(doc.taxBreakup?.cgstAmount ?? +(tax / 2).toFixed(2))
-  const sgstAmount = Number(doc.taxBreakup?.sgstAmount ?? +(tax - cgstAmount).toFixed(2))
+  const cgstAmount = Number(doc.taxBreakup?.cgstAmount ?? +(cgstPaise / 100).toFixed(2))
+  const sgstAmount = Number(doc.taxBreakup?.sgstAmount ?? +(sgstPaise / 100).toFixed(2))
+  const serviceRate = Number(doc.serviceRate ?? doc.totals?.serviceRate ?? tenant.serviceCharge ?? 0)
+  const roundOff = Number(doc.roundOff ?? doc.totals?.roundOff ?? 0)
 
   const billNumber = chk?.invoiceNumber ?? doc.invoiceNumber ?? `BILL-${String(primary?.orderNumber || '000001').padStart(6, '0')}`
 
@@ -394,6 +408,8 @@ function parseBillPayload(doc: any, tableHint?: { name: string; seats?: number; 
       totalTax: tax,
     },
     serviceCharge,
+    serviceRate,
+    roundOff,
     grandTotal,
     paidTotal: paid,
     refundedTotal: 0,
@@ -578,6 +594,16 @@ export function BillDialog({
           </div>
         )}
 
+        {!sessionToken && bill && (!bill.restaurant.gstin || !bill.restaurant.fssai) && (
+          <div className="print:hidden mx-5 mt-3 text-[10px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">
+            {!bill.restaurant.gstin && !bill.restaurant.fssai
+              ? 'GSTIN and FSSAI are not set for this restaurant.'
+              : `${!bill.restaurant.gstin ? 'GSTIN' : 'FSSAI'} is not set for this restaurant.`}{' '}
+            Add {!bill.restaurant.gstin && !bill.restaurant.fssai ? 'them' : 'it'} under{' '}
+            <span className="font-medium">Settings → Restaurant Profile</span> so {!bill.restaurant.gstin && !bill.restaurant.fssai ? 'they appear' : 'it appears'} on bills.
+          </div>
+        )}
+
         {bill && (
           <div className="px-5 py-4">
             {/* Header */}
@@ -603,21 +629,6 @@ export function BillDialog({
               {bill.restaurant.gstin && <span className="inline-block bg-gray-100 px-2 py-0.5 rounded mr-1">GSTIN: {bill.restaurant.gstin}</span>}
               {bill.restaurant.fssai && <span className="inline-block bg-gray-100 px-2 py-0.5 rounded">FSSAI: {bill.restaurant.fssai}</span>}
             </div>
-
-            {/* A GST invoice is not valid without these, so a missing one is said
-                out loud here rather than left as a silent gap the owner never
-                notices. Deliberately not part of the printed document, and not
-                shown to a diner viewing their own bill — it is an operator hint,
-                not something a customer should read. */}
-            {!sessionToken && (!bill.restaurant.gstin || !bill.restaurant.fssai) && (
-              <div className="text-[10px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5 mb-3">
-                {!bill.restaurant.gstin && !bill.restaurant.fssai
-                  ? 'GSTIN and FSSAI are not set for this restaurant.'
-                  : `${!bill.restaurant.gstin ? 'GSTIN' : 'FSSAI'} is not set for this restaurant.`}{' '}
-                Add {!bill.restaurant.gstin && !bill.restaurant.fssai ? 'them' : 'it'} under{' '}
-                <span className="font-medium">Settings → Restaurant Profile</span> so {!bill.restaurant.gstin && !bill.restaurant.fssai ? 'they appear' : 'it appears'} on bills.
-              </div>
-            )}
 
             <div className="border-t border-dashed border-gray-300 my-3" />
 
@@ -719,27 +730,30 @@ export function BillDialog({
 
             {/* Totals */}
             <div className="text-xs space-y-1">
-              <div className="flex justify-between"><span className="text-gray-500">Subtotal</span><span>{bill.restaurant.currencySymbol}{bill.subtotal.toFixed(2)}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">Subtotal</span><span>{formatCurrency(bill.subtotal, bill.restaurant.currencySymbol)}</span></div>
               {bill.discount > 0 && (
-                <div className="flex justify-between text-[#f97316]"><span>Discount {bill.promoCode ? `(${bill.promoCode})` : ''}</span><span>-{bill.restaurant.currencySymbol}{bill.discount.toFixed(2)}</span></div>
+                <div className="flex justify-between text-[#f97316]"><span>Discount {bill.promoCode ? `(${bill.promoCode})` : ''}</span><span>-{formatCurrency(bill.discount, bill.restaurant.currencySymbol)}</span></div>
               )}
-              <div className="flex justify-between"><span className="text-gray-500">Taxable Amount</span><span>{bill.restaurant.currencySymbol}{bill.taxableAmount.toFixed(2)}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">Taxable Amount</span><span>{formatCurrency(bill.taxableAmount, bill.restaurant.currencySymbol)}</span></div>
               {/* GST breakup */}
               {bill.taxBreakup.totalTax > 0 && (
                 <>
-                  <div className="flex justify-between text-[11px] text-gray-400"><span>CGST ({bill.taxBreakup.cgstRate}%)</span><span>{bill.restaurant.currencySymbol}{bill.taxBreakup.cgstAmount.toFixed(2)}</span></div>
-                  <div className="flex justify-between text-[11px] text-gray-400"><span>SGST ({bill.taxBreakup.sgstRate}%)</span><span>{bill.restaurant.currencySymbol}{bill.taxBreakup.sgstAmount.toFixed(2)}</span></div>
+                  <div className="flex justify-between text-[11px] text-gray-400"><span>CGST ({bill.taxBreakup.cgstRate}%)</span><span>{formatCurrency(bill.taxBreakup.cgstAmount, bill.restaurant.currencySymbol)}</span></div>
+                  <div className="flex justify-between text-[11px] text-gray-400"><span>SGST ({bill.taxBreakup.sgstRate}%)</span><span>{formatCurrency(bill.taxBreakup.sgstAmount, bill.restaurant.currencySymbol)}</span></div>
                 </>
               )}
               {bill.serviceCharge > 0 && (
-                <div className="flex justify-between"><span className="text-gray-500">Service Charge</span><span>{bill.restaurant.currencySymbol}{bill.serviceCharge.toFixed(2)}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Service Charge ({bill.serviceRate ? `${bill.serviceRate}%` : '2%'})</span><span>{formatCurrency(bill.serviceCharge, bill.restaurant.currencySymbol)}</span></div>
+              )}
+              {bill.roundOff !== undefined && bill.roundOff !== 0 && (
+                <div className="flex justify-between text-[11px] text-gray-400"><span>Round Off</span><span>{bill.roundOff > 0 ? '+' : ''}{formatCurrency(bill.roundOff, bill.restaurant.currencySymbol)}</span></div>
               )}
             </div>
 
             <div className="border-t border-gray-400 mt-2 pt-2">
               <div className="flex justify-between items-center">
                 <span className="font-bold text-sm">Grand Total</span>
-                <span className="font-bold text-lg text-[#f97316]">{bill.restaurant.currencySymbol}{bill.grandTotal.toFixed(2)}</span>
+                <span className="font-bold text-lg text-[#f97316]">{formatCurrency(bill.grandTotal, bill.restaurant.currencySymbol)}</span>
               </div>
             </div>
 

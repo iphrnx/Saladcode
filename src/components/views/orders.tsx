@@ -206,11 +206,11 @@ function sittingDuration(startedAt: string, endedAt: string | null, now: number)
   const start = new Date(startedAt).getTime()
   const end = endedAt ? new Date(endedAt).getTime() : now
   const mins = Math.max(0, Math.floor((end - start) / 60000))
-  if (mins < 1) return '<1 min'
-  if (mins < 60) return `${mins} min`
+  if (mins < 1) return '<1m'
+  if (mins < 60) return `${mins}m`
   const hours = Math.floor(mins / 60)
   const rest = mins % 60
-  return rest ? `${hours} hr ${rest} min` : `${hours} hr`
+  return rest ? `${hours}h ${rest}m` : `${hours}h`
 }
 
 /** Compact elapsed label for the 4-cell session strip ("12m", "25m", "1h 5m"). */
@@ -1141,13 +1141,7 @@ export function OrdersView() {
                     : setBillDoc({
                         checkId: ticket.order.checkId ?? null,
                         orderId: ticket.order.id,
-                        table: ordTable?.name
-                          ? {
-                              name: ordTable.name,
-                              seats: ordTable.seats ?? 0,
-                              area: ordTable.area ?? '',
-                            }
-                          : null,
+                        table: null,
                         autoPrint: false,
                       })
                 }}
@@ -1557,6 +1551,14 @@ export function OrdersView() {
             openSitting(sitting)
           }
         }}
+        onGoToPayment={() => {
+          if (!detailOrder) return
+          const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder.id))
+          openOrderDetail(null)
+          if (sitting) {
+            setPaySitting(sitting)
+          }
+        }}
       />
 
       {/* The sitting's order book. Opened from its card, or from any of its
@@ -1567,7 +1569,11 @@ export function OrdersView() {
           onOpenChange={(v) => {
             if (!v) openSitting(null)
           }}
-          tableName={ordersSitting.tableName ?? `Order #${ordersSitting.latest.orderNumber}`}
+          tableName={
+            ordersSitting.tableName
+              ? (ordersSitting.sessionLabel ? `${ordersSitting.tableName} · ${ordersSitting.sessionLabel}` : ordersSitting.tableName)
+              : `Order #${ordersSitting.latest.orderNumber}`
+          }
           area={ordersSitting.area}
           seats={ordersSitting.seats}
           orderType={ordersSitting.orderType}
@@ -1676,10 +1682,14 @@ export function OrdersView() {
         tableId={paySitting?.tableId ?? null}
         checkId={paySitting?.checkId ?? null}
         sessionId={paySitting?.sessionId ?? null}
-        tableName={paySitting?.tableName ?? null}
+        tableName={
+          paySitting?.tableName
+            ? (paySitting.sessionLabel ? `${paySitting.tableName} · ${paySitting.sessionLabel}` : paySitting.tableName)
+            : null
+        }
         tableHint={
           paySitting
-            ? [paySitting.area || 'Main Hall', paySitting.seats ? `${paySitting.seats} Seats` : null, ORDER_TYPE_LABEL[paySitting.orderType] ?? paySitting.orderType]
+            ? [paySitting.area || 'Main Hall', ORDER_TYPE_LABEL[paySitting.orderType] ?? paySitting.orderType]
                 .filter(Boolean)
                 .join(' · ')
             : undefined
@@ -1749,6 +1759,16 @@ const ORDER_TYPE_LABEL: Record<string, string> = {
   DINE_IN: 'Dine In',
   TAKEAWAY: 'Takeaway',
   DELIVERY: 'Delivery',
+}
+
+function formatPaymentMethod(m?: string | null): string {
+  if (!m) return 'Cash'
+  const upper = m.toUpperCase()
+  if (upper === 'CASH') return 'Cash'
+  if (upper === 'CARD') return 'Card'
+  if (upper === 'UPI') return 'UPI'
+  if (upper === 'WALLET') return 'Wallet'
+  return m
 }
 
 /** Money, in the restaurant's currency, grouped the Indian way. */
@@ -2191,158 +2211,63 @@ function SittingCard({
   if (currentExpansion !== expansion) setExpansion(currentExpansion)
 
   if (isSettledEnded) {
-    const labelName = sitting.tableName ?? `Order #${sitting.latest.orderNumber}`
-    const subLabel = sitting.tableName
-      ? [sitting.area || 'Main Hall', sitting.seats ? `${sitting.seats} Seats` : null, ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType]
-          .filter(Boolean)
-          .join(' · ')
-      : ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType
-    const endedTime = sitting.endedAt
-      ? timeOf(sitting.endedAt)
-      : (check as any)?.closedAt
-        ? timeOf((check as any).closedAt)
-        : '—'
+    const labelName = sitting.tableName
+      ? (sitting.sessionLabel ? `${sitting.tableName} · ${sitting.sessionLabel}` : sitting.tableName)
+      : `Order #${sitting.latest.orderNumber}`
+    const paymentMethod = formatPaymentMethod((check as any)?.payments?.[0]?.method || (check as any)?.paymentMethod || sitting.latest.paymentMethod || 'Cash')
+    const paidAmount = money(currencySymbol, check?.paid ?? sitting.total)
 
     return (
       <Card
         data-order-card
         data-session-card={sitting.sessionId ?? undefined}
         className={cn(
-          'flex min-h-[550px] w-full flex-col overflow-hidden rounded-2xl border p-3 sm:p-3.5',
-          'border-border/80 bg-card shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md',
+          'w-full overflow-hidden rounded-2xl border p-3 sm:p-3.5',
+          'border-border/80 bg-card shadow-xs transition-all duration-200 hover:border-primary/40 hover:shadow-md cursor-pointer',
         )}
+        onClick={() => onOpenOrders(sitting)}
       >
-        {/* Cloche Hero */}
-        <div className="flex shrink-0 flex-col items-center py-1 text-center">
-          <div className="relative grid size-18 place-items-center">
-            <span aria-hidden className="absolute inset-0 rounded-full bg-orange-500/[0.08] ring-1 ring-orange-500/15" />
-            <span aria-hidden className="absolute inset-1 rounded-full bg-primary/[0.12] blur-[10px]" />
-            <svg
-              viewBox="0 0 84 68"
-              fill="none"
-              aria-hidden="true"
-              className="relative h-13 w-17 drop-shadow-[0_3px_8px_rgba(249,115,22,0.28)]"
-            >
-              <defs>
-                <linearGradient id={`cloche-${sitting.key}`} x1="22" y1="14" x2="62" y2="50" gradientUnits="userSpaceOnUse">
-                  <stop offset="0%" stopColor="#FBBF24" />
-                  <stop offset="50%" stopColor="#F97316" />
-                  <stop offset="100%" stopColor="#EA580C" />
-                </linearGradient>
-              </defs>
-              <path d="M18 19L11 12M13 31H5M66 19L73 12M71 31H79" stroke="#F97316" strokeWidth="2.8" strokeLinecap="round" />
-              <circle cx="42" cy="14" r="3.6" fill="#F97316" />
-              <path d="M15 47C15 30.5 27 19 42 19C57 19 69 30.5 69 47H15Z" fill={`url(#cloche-${sitting.key})`} />
-              <path d="M23.5 40C25 31 31 25.5 38.5 24" stroke="white" strokeOpacity="0.45" strokeWidth="2.4" strokeLinecap="round" />
-              <rect x="10" y="47" width="64" height="5" rx="2.5" fill="#f97316" />
-            </svg>
-            <span className="absolute bottom-0 right-0 grid size-5.5 place-items-center rounded-full bg-emerald-600 text-white shadow-sm ring-2 ring-card">
-              <Check className="size-3" strokeWidth={3.5} />
-            </span>
-          </div>
-          <h3 className="mt-1.5 text-base font-bold leading-tight tracking-tight text-foreground sm:text-lg">
-            Session Ended
-          </h3>
-          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
-            {labelName} has been closed and settled.
-          </p>
-        </div>
-
-        {/* Table + Paid Badge */}
-        <div className="mt-2 flex shrink-0 items-center gap-2 rounded-xl border border-border/60 bg-card px-2.5 py-1.5 shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
-          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary text-foreground border border-border/40">
-            {sitting.tableName ? <LayoutGrid className="size-4" /> : <ShoppingBag className="size-4" />}
-          </span>
+        <div className="flex items-center justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <p className="truncate text-sm font-bold leading-tight text-foreground">{labelName}</p>
-            <p className="truncate text-[10.5px] text-muted-foreground">{subLabel}</p>
-          </div>
-          <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10.5px] font-semibold text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
-            <Check className="size-2.5" strokeWidth={3.6} />
-            Paid
-          </span>
-        </div>
-
-        {/* Started at / Ended at / Duration */}
-        <div className="mt-1.5 grid shrink-0 grid-cols-3 divide-x divide-border/50 rounded-xl border border-border/50 bg-secondary/35 py-1">
-          <div className="flex min-w-0 items-center justify-center gap-1 px-1">
-            <CalendarDays className="size-3 shrink-0 text-muted-foreground/70" strokeWidth={2} />
-            <div className="min-w-0">
-              <p className="truncate text-[9px] leading-tight text-muted-foreground">Started at</p>
-              <p className="truncate text-[10.5px] font-bold leading-tight tabular-nums text-foreground">{started.time}</p>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-bold text-foreground text-sm sm:text-[14.5px] truncate">
+                {labelName}
+              </span>
+              <span className="text-muted-foreground text-xs shrink-0">·</span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10.5px] font-semibold text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 shrink-0">
+                <Check className="size-2.5" strokeWidth={3.6} />
+                Paid via {paymentMethod}
+              </span>
+              <span className="text-muted-foreground text-xs shrink-0">·</span>
+              <span className="text-xs sm:text-[13px] font-extrabold tabular-nums text-foreground shrink-0">
+                {paidAmount}
+              </span>
             </div>
-          </div>
-          <div className="flex min-w-0 items-center justify-center gap-1 px-1">
-            <Power className="size-3 shrink-0 text-muted-foreground/70" strokeWidth={2} />
-            <div className="min-w-0">
-              <p className="truncate text-[9px] leading-tight text-muted-foreground">Ended at</p>
-              <p className="truncate text-[10.5px] font-bold leading-tight tabular-nums text-foreground">{endedTime}</p>
-            </div>
-          </div>
-          <div className="flex min-w-0 items-center justify-center gap-1 px-1">
-            <Timer className="size-3 shrink-0 text-muted-foreground/70" strokeWidth={2} />
-            <div className="min-w-0">
-              <p className="truncate text-[9px] leading-tight text-muted-foreground">Duration</p>
-              <p className="truncate text-[10.5px] font-bold leading-tight tabular-nums text-foreground">
-                {sittingDuration(sitting.startedAt, sitting.endedAt, now)}
-              </p>
-            </div>
-          </div>
-        </div>
-
-        {/* Bill Summary */}
-        <div className="mt-1.5 flex flex-col rounded-xl border border-border/60 bg-card p-2.5 shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
-          <div className="flex items-center justify-between gap-2">
-            <p className="flex items-center gap-1.5 text-xs font-bold text-foreground">
-              <Layers className="size-3.5 text-muted-foreground" />
-              Bill Summary
+            <p className="mt-1 text-[11px] sm:text-xs text-muted-foreground truncate">
+              {sitting.orders.length} order{sitting.orders.length === 1 ? '' : 's'} · {sitting.qtyCount} item{sitting.qtyCount === 1 ? '' : 's'} · {sittingDuration(sitting.startedAt, sitting.endedAt, now)}
             </p>
-            <span className="shrink-0 text-[10.5px] font-medium text-muted-foreground">
-              {sitting.orders.length} Order{sitting.orders.length === 1 ? '' : 's'} · {sitting.qtyCount} Item{sitting.qtyCount === 1 ? '' : 's'}
-            </span>
-          </div>
-          <div className="mt-1 divide-y divide-border/30 border-t border-border/40 pt-0.5 text-[11px]">
-            <div className="flex items-baseline justify-between py-0.5">
-              <span className="text-muted-foreground">Subtotal</span>
-              <span className="font-semibold tabular-nums text-foreground">{money(currencySymbol, check?.subtotal ?? sitting.subtotal)}</span>
-            </div>
-            <div className="flex items-baseline justify-between py-0.5">
-              <span className="text-muted-foreground">Tax</span>
-              <span className="font-semibold tabular-nums text-foreground">{money(currencySymbol, check?.tax ?? sitting.tax)}</span>
-            </div>
-            {sitting.service > 0 && (
-              <div className="flex items-baseline justify-between py-0.5">
-                <span className="text-muted-foreground">Service</span>
-                <span className="font-semibold tabular-nums text-foreground">{money(currencySymbol, sitting.service)}</span>
-              </div>
-            )}
           </div>
 
-          <div className="mt-1.5 flex items-center justify-between rounded-lg bg-secondary/50 px-2.5 py-1 border border-border/40 dark:bg-secondary/40">
-            <span className="text-xs font-semibold text-foreground">Total Paid</span>
-            <span className="text-sm font-extrabold tabular-nums text-foreground">
-              {money(currencySymbol, check?.paid ?? sitting.total)}
-            </span>
+          <div className="flex items-center gap-2 shrink-0" onClick={(e) => e.stopPropagation()}>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => onBill(sitting, false)}
+              className="h-8 gap-1 rounded-lg px-2.5 text-xs font-semibold cursor-pointer"
+            >
+              <ReceiptText className="size-3.5" />
+              <span>Bill</span>
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => onOpenOrders(sitting)}
+              className="h-8 gap-1 rounded-lg px-2.5 text-xs font-semibold cursor-pointer"
+            >
+              <Info className="size-3.5 text-muted-foreground" />
+              <span>Details</span>
+            </Button>
           </div>
-        </div>
-
-        {/* Footer Actions: View Bill + Session Details */}
-        <div className="mt-auto pt-2.5 grid shrink-0 grid-cols-2 gap-2">
-          <Button
-            onClick={() => onBill(sitting, false)}
-            className="h-10 gap-1.5 whitespace-nowrap rounded-xl bg-primary px-2 text-xs font-semibold text-primary-foreground shadow-sm shadow-primary/25 hover:bg-primary/90"
-          >
-            <ReceiptText className="size-3.5 shrink-0" />
-            View Bill
-          </Button>
-          <Button
-            variant="outline"
-            onClick={() => onOpenOrders(sitting)}
-            className="h-10 gap-1.5 whitespace-nowrap rounded-xl border border-border bg-card px-2 text-xs font-semibold text-foreground hover:bg-secondary"
-          >
-            <Info className="size-3.5 shrink-0 text-muted-foreground" />
-            Session Details
-          </Button>
         </div>
       </Card>
     )
@@ -2491,11 +2416,11 @@ function SittingCard({
           <Figure label="Paid" amount={billPaid} currencySymbol={currencySymbol} tone="paid" />
         </dl>
 
-        <div className="mt-2.5 grid grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)] gap-2">
+        <div className="mt-2.5 grid grid-cols-[auto_1fr] gap-2">
           <div
             data-serve-chip
             className={cn(
-              'flex h-10 items-center justify-center gap-1.5 rounded-xl px-2.5 text-center text-xs font-semibold whitespace-nowrap transition-colors duration-200',
+              'flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-xl px-3 text-center text-xs font-semibold whitespace-nowrap transition-colors duration-200',
               sitting.allServed
                 ? 'border border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300'
                 : 'border border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300',
@@ -2521,7 +2446,7 @@ function SittingCard({
               else if (canPay) onPay(sitting.latest)
             }}
             className={cn(
-              'h-10 gap-1 rounded-xl px-2.5 text-center text-xs font-bold whitespace-nowrap transition-all duration-200',
+              'h-10 w-full gap-1 rounded-xl px-2.5 text-center text-xs font-bold whitespace-nowrap transition-all duration-200',
               active && canPay
                 ? 'bg-primary text-primary-foreground shadow-sm shadow-primary/25 hover:bg-primary/90 cursor-pointer'
                 : active

@@ -8,7 +8,11 @@
  */
 
 export function formatCurrency(amount: number, symbol = '₹'): string {
-  return `${symbol}${amount.toFixed(2)}`
+  const n = Number(Number.isFinite(amount) ? amount : 0).toLocaleString('en-IN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })
+  return `${symbol}${n}`
 }
 
 export function timeAgo(date: Date | string | undefined | null): string | null {
