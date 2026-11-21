@@ -14,6 +14,7 @@ import {
   getISTDateString,
   getPromoStatus,
   normalizePromoCode,
+  normalizePromoType,
   toISTDateString,
   type PromoStatus,
 } from '@/lib/promo'
@@ -159,7 +160,7 @@ export function PromosView() {
     setForm({
       code: p.code,
       description: p.description || '',
-      type: p.type,
+      type: normalizePromoType(p.type) ?? 'PERCENTAGE',
       value: String(p.value ?? ''),
       minOrder: String(p.minOrder ?? 0),
       maxDiscount: String(p.maxDiscount ?? 0),
@@ -175,8 +176,8 @@ export function PromosView() {
   const setField = <K extends keyof PromoFormState>(key: K, value: PromoFormState[K]) => {
     setForm((f) => {
       const next = { ...f, [key]: value }
-      // If switching from PERCENTAGE to FIXED, reset maxDiscount to 0 to prevent stale hidden fields
-      if (key === 'type' && value === 'FIXED') {
+      // If switching from PERCENTAGE to FLAT, reset maxDiscount to 0 to prevent stale hidden fields
+      if (key === 'type' && (value === 'FLAT' || value === 'FIXED')) {
         next.maxDiscount = '0'
       }
       return next
@@ -240,13 +241,14 @@ export function PromosView() {
       return
     }
 
+    const normalizedType = normalizePromoType(form.type) ?? 'PERCENTAGE'
     const body = {
       code: normalizedCode,
       description: form.description.trim() || null,
-      type: form.type,
+      type: normalizedType,
       value,
       minOrder: Math.max(0, parseFloat(form.minOrder) || 0),
-      maxDiscount: form.type === 'PERCENTAGE' ? Math.max(0, parseFloat(form.maxDiscount) || 0) : 0,
+      maxDiscount: normalizedType === 'PERCENTAGE' ? Math.max(0, parseFloat(form.maxDiscount) || 0) : 0,
       usageLimit: Math.max(0, parseInt(form.usageLimit, 10) || 0),
       validFrom,
       validTo,
@@ -517,8 +519,8 @@ export function PromosView() {
                     <SelectItem value="PERCENTAGE">
                       <Percent className="h-3.5 w-3.5 mr-1 inline" /> Percentage
                     </SelectItem>
-                    <SelectItem value="FIXED">
-                      <IndianRupee className="h-3.5 w-3.5 mr-1 inline" /> Fixed amount
+                    <SelectItem value="FLAT">
+                      <IndianRupee className="h-3.5 w-3.5 mr-1 inline" /> Flat amount
                     </SelectItem>
                   </SelectContent>
                 </Select>
@@ -860,7 +862,8 @@ function PromoCard({
   onToggle: () => void
 }) {
   const status: PromoStatus = getPromoStatus(promo)
-  const isPercentage = promo.type === 'PERCENTAGE'
+  const normalizedType = normalizePromoType(promo.type) ?? promo.type
+  const isPercentage = normalizedType === 'PERCENTAGE'
   const usagePct =
     promo.usageLimit > 0 ? Math.min(100, Math.round((promo.usedCount / promo.usageLimit) * 100)) : 0
   const displayValue = isPercentage ? `${promo.value}%` : `${currency}${promo.value.toFixed(2)}`
@@ -907,7 +910,7 @@ function PromoCard({
               className={cn('text-[10px] uppercase', !isPercentage && 'bg-secondary text-secondary-foreground')}
             >
               {isPercentage ? <Percent className="h-3 w-3" /> : <IndianRupee className="h-3 w-3" />}
-              {promo.type}
+              {normalizedType}
             </Badge>
             <span className="text-sm font-semibold text-primary">{displayValue}</span>
             {status === 'expired' && (

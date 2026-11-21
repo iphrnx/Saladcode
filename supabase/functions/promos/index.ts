@@ -8,6 +8,7 @@ import {
   istEndOfDayISO,
   istStartOfDayISO,
   normalizePromoCode,
+  normalizePromoType,
   toISTDateString,
 } from "../_shared/promo.ts";
 import { body, json, preflight, subPath } from "../_shared/http.ts";
@@ -27,7 +28,7 @@ function mapPromo(p: any) {
     tenantId: p.tenant_id,
     code: p.code,
     description: p.description,
-    type: p.type,
+    type: normalizePromoType(p.type) ?? "PERCENTAGE",
     value: Number(p.value),
     minOrder: Number(p.min_order),
     maxDiscount: Number(p.max_discount),
@@ -137,7 +138,11 @@ async function create(req: Request): Promise<Response> {
     return json(req, { error: `A promo code with code "${code}" already exists` }, 409);
   }
 
-  const type = b.type === "FIXED" ? "FIXED" : "PERCENTAGE";
+  const type = normalizePromoType(b.type);
+  if (!type) {
+    return json(req, { error: "Invalid discount type. Must be PERCENTAGE or FLAT." }, 400);
+  }
+
   const value = Number(b.value);
   if (isNaN(value) || value <= 0) {
     return json(req, { error: "Value must be a positive number" }, 400);
@@ -238,8 +243,12 @@ async function update(req: Request, id: string | null): Promise<Response> {
   }
 
   if (b.type !== undefined) {
-    const newType = b.type === "FIXED" ? "FIXED" : "PERCENTAGE";
-    if (newType !== current.type) {
+    const newType = normalizePromoType(b.type);
+    if (!newType) {
+      return json(req, { error: "Invalid discount type. Must be PERCENTAGE or FLAT." }, 400);
+    }
+    const currentNormalized = normalizePromoType(current.type) ?? current.type;
+    if (newType !== currentNormalized) {
       if (redemptions > 0) {
         return json(req, { error: "Cannot modify discount type once it has been redeemed" }, 400);
       }
@@ -247,7 +256,7 @@ async function update(req: Request, id: string | null): Promise<Response> {
     }
   }
 
-  const effectiveType = data.type ?? current.type;
+  const effectiveType = data.type ?? normalizePromoType(current.type) ?? current.type;
 
   if (b.value !== undefined) {
     const val = Number(b.value);
@@ -281,21 +290,44 @@ async function update(req: Request, id: string | null): Promise<Response> {
     data.usage_limit = Math.max(0, parseInt(String(b.usageLimit), 10) || 0);
   }
 
-  const effValidFrom = b.validFrom !== undefined ? toISTDateString(b.validFrom) : toISTDateString(current.valid_from);
-  const effValidTo = b.validTo !== undefined ? toISTDateString(b.validTo) : toISTDateString(current.valid_to);
+  const todayIST = getISTDateString();
+  let effValidFrom: string | null = toISTDateString(current.valid_from);
+  let effValidTo: string | null = toISTDateString(current.valid_to);
+
+  // Clearing Valid From (null or empty string) means Immediate:
+  // Store current timestamp because valid_from is NOT NULL in database.
+  // When omitted (undefined), preserve current stored value.
+  if (b.validFrom !== undefined) {
+    if (b.validFrom === null || b.validFrom === "") {
+      data.valid_from = new Date().toISOString();
+      effValidFrom = todayIST;
+    } else {
+      const parsedFrom = toISTDateString(b.validFrom);
+      if (parsedFrom) {
+        data.valid_from = istStartOfDayISO(parsedFrom);
+        effValidFrom = parsedFrom;
+      }
+    }
+  }
+
+  // Clearing Valid Until (null or empty string) removes expiry.
+  if (b.validTo !== undefined) {
+    if (b.validTo === null || b.validTo === "") {
+      data.valid_to = null;
+      effValidTo = null;
+    } else {
+      const parsedTo = toISTDateString(b.validTo);
+      if (parsedTo) {
+        data.valid_to = istEndOfDayISO(parsedTo);
+        effValidTo = parsedTo;
+      }
+    }
+  }
 
   if (effValidFrom && effValidTo && effValidTo < effValidFrom) {
     return json(req, { error: "Valid Until cannot be earlier than Valid From" }, 400);
   }
 
-  if (b.validFrom !== undefined) {
-    data.valid_from = effValidFrom ? istStartOfDayISO(effValidFrom) : null;
-  }
-  if (b.validTo !== undefined) {
-    data.valid_to = effValidTo ? istEndOfDayISO(effValidTo) : null;
-  }
-
-  const todayIST = getISTDateString();
   const effActive = b.active !== undefined ? b.active : current.active;
 
   // Permit date correction without allowing an already-expired promo to be enabled through an invalid save
@@ -307,13 +339,21 @@ async function update(req: Request, id: string | null): Promise<Response> {
     data.active = b.active;
   }
 
-  const { data: promo, error } = await admin()
+  // Enforce code/type immutability atomically:
+  // When changing normalized code or type, update conditionally on used_count = 0.
+  const isChangingCodeOrType = data.code !== undefined || data.type !== undefined;
+
+  let query = admin()
     .from("promo_codes")
     .update(data)
     .eq("id", promoId)
-    .eq("tenant_id", tenantId)
-    .select()
-    .single();
+    .eq("tenant_id", tenantId);
+
+  if (isChangingCodeOrType) {
+    query = query.eq("used_count", 0);
+  }
+
+  const { data: promo, error } = await query.select().maybeSingle();
 
   if (error) {
     if (error.code === "23505") {
@@ -321,6 +361,18 @@ async function update(req: Request, id: string | null): Promise<Response> {
     }
     return json(req, { error: error.message }, 500);
   }
+
+  if (!promo) {
+    if (isChangingCodeOrType) {
+      return json(
+        req,
+        { error: "Cannot modify code or type: promo has been redeemed concurrently." },
+        409,
+      );
+    }
+    return json(req, { error: "Promo code not found" }, 404);
+  }
+
   return json(req, mapPromo(promo));
 }
 

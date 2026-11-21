@@ -144,9 +144,19 @@ console.log("\n── rule cases ──");
   check("fixed code: max_discount caps it too (matches place_order)", [r.applied, r.discount], [true, 20]);
 }
 {
+  const db = fakeDb([promo({ type: "FLAT", value: 50, max_discount: 20 })]);
+  const r = await evaluatePromo(db, "t1", "FLAT50", 1000, { now: NOW });
+  check("flat code: canonical FLAT behaves identically to FIXED alias", [r.applied, r.discount], [true, 20]);
+}
+{
   const db = fakeDb([promo({ type: "FIXED", value: 50, max_discount: 0 })]);
   const r = await evaluatePromo(db, "t1", "FLAT50", 1000, { now: NOW });
   check("fixed code: no cap when max_discount is 0", [r.applied, r.discount], [true, 50]);
+}
+{
+  const db = fakeDb([promo({ type: "FLAT", value: 50, max_discount: 0 })]);
+  const r = await evaluatePromo(db, "t1", "FLAT50", 1000, { now: NOW });
+  check("flat code: no cap when max_discount is 0", [r.applied, r.discount], [true, 50]);
 }
 {
   const db = fakeDb([promo({ type: "PERCENTAGE", value: 100, max_discount: 0 })]);

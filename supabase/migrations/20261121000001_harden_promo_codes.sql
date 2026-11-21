@@ -1,5 +1,6 @@
 -- Migration: 20261121000001_harden_promo_codes.sql
 -- Description: Harden promo codes expiry and concurrency with IST timezone safety
+-- Rebuilt strictly from canonical 20261118000002 definition, preserving order_items.name, portions, and checks.
 
 create or replace function public.create_order_tx(
   p_order jsonb,
@@ -192,44 +193,41 @@ begin
      where order_id = v_order_id;
   end if;
 
-  -- 5. Insert order items
+  -- 5. Insert order items with TEXT portion_id and JSONB portions resolution
   for v_item in select value from jsonb_array_elements(p_items) loop
-    select id, price, portions into v_menu
+    select id, tenant_id, available, price, name, portions into v_menu
       from public.menu_items
      where id = (v_item->>'menu_item_id')::uuid;
 
-    v_portion_id := nullif(v_item->>'portion_id', '');
-    v_portion_name := null;
-    v_item_price := coalesce((v_item->>'price')::numeric, v_menu.price);
+    v_portion_id := nullif(trim(v_item->>'portion_id'), '');
+    v_portion_name := nullif(trim(v_item->>'portion'), '');
+    v_portion_price := null;
 
-    if v_portion_id is not null and v_menu.portions is not null and jsonb_typeof(v_menu.portions) = 'array' then
-      for v_portion_elem in select value from jsonb_array_elements(v_menu.portions) loop
-        if v_portion_elem->>'id' = v_portion_id then
-          v_portion_name := v_portion_elem->>'name';
-          v_portion_price := (v_portion_elem->>'price')::numeric;
-          if v_portion_price is not null and v_portion_price > 0 then
-            v_item_price := v_portion_price;
+    -- If portion specified, match against v_menu.portions jsonb array
+    if v_portion_id is not null or v_portion_name is not null then
+      if v_menu.portions is not null and jsonb_typeof(v_menu.portions) = 'array' then
+        for v_portion_elem in select value from jsonb_array_elements(v_menu.portions) loop
+          if (v_portion_id is not null and lower(coalesce(v_portion_elem->>'id', '')) = lower(v_portion_id))
+             or (v_portion_name is not null and lower(coalesce(v_portion_elem->>'name', '')) = lower(v_portion_name)) then
+            v_portion_name := coalesce(v_portion_elem->>'name', v_portion_name);
+            v_portion_price := (v_portion_elem->>'price')::numeric;
+            v_portion_id := coalesce(v_portion_elem->>'id', v_portion_id);
+            exit;
           end if;
-          exit;
-        end if;
-      end loop;
+        end loop;
+      end if;
     end if;
 
-    v_qty := coalesce((v_item->>'quantity')::integer, 1);
+    v_item_price := coalesce(v_portion_price, (v_item->>'price')::numeric, v_menu.price);
+    v_qty := greatest(1, coalesce((v_item->>'quantity')::integer, 1));
 
     insert into public.order_items (
-      order_id,
-      menu_item_id,
-      portion_id,
-      portion,
-      price,
-      quantity,
-      notes,
-      status,
-      kot_number
+      order_id, menu_item_id, name, portion_id, portion,
+      price, quantity, notes, status, kot_number
     ) values (
       v_order_id,
-      (v_item->>'menu_item_id')::uuid,
+      v_menu.id,
+      coalesce(v_item->>'name', v_menu.name),
       v_portion_id,
       v_portion_name,
       v_item_price,

@@ -8,6 +8,20 @@
  */
 
 export type PromoStatus = 'expired' | 'exhausted' | 'paused' | 'scheduled' | 'active';
+export type PromoType = 'PERCENTAGE' | 'FLAT';
+
+/**
+ * Canonical promo type normalization.
+ * Accepts 'FLAT' (canonical) and 'FIXED' (compatibility alias).
+ * Returns 'PERCENTAGE', 'FLAT', or null if invalid.
+ */
+export function normalizePromoType(type: unknown): PromoType | null {
+  if (typeof type !== 'string') return null;
+  const upper = type.trim().toUpperCase();
+  if (upper === 'PERCENTAGE') return 'PERCENTAGE';
+  if (upper === 'FLAT' || upper === 'FIXED') return 'FLAT';
+  return null;
+}
 
 const istFormatter = new Intl.DateTimeFormat('en-US', {
   timeZone: 'Asia/Kolkata',
@@ -250,7 +264,7 @@ export async function evaluatePromo(
   // For percentage promotions: discount = subtotal * (value / 100), capped at max_discount.
   // For flat promotions: discount = value (capped at max_discount if specified).
   // In all cases: discount is capped at itemsTotal and >= 0.
-  let discount = promo.type === "PERCENTAGE" ? (itemsTotal * promo.value) / 100 : promo.value;
+  let discount = normalizePromoType(promo.type) === "PERCENTAGE" ? (itemsTotal * promo.value) / 100 : promo.value;
   const maxDiscount = Number(promo.max_discount ?? promo.maxDiscount ?? 0);
   if (maxDiscount > 0) discount = Math.min(discount, maxDiscount);
   discount = Math.min(itemsTotal, Math.max(0, discount));
