@@ -2126,7 +2126,7 @@ async function sync(req: Request): Promise<Response> {
     missingSessionsResult,
   ] = await Promise.all([
     checkIds.length
-      ? db.from("table_checks").select("id, status, invoice_number, closed_at, subtotal, tax, total, paid_total").in("id", checkIds).eq("tenant_id", tenantId)
+      ? db.from("table_checks").select("id, status, invoice_number, closed_at, subtotal, tax, service_charge, total, paid_total").in("id", checkIds).eq("tenant_id", tenantId)
       : Promise.resolve({ data: [] }),
     checkIds.length
       ? db.from("orders").select("check_id, total, items_total, discount, tax").in("check_id", checkIds)
@@ -2149,6 +2149,7 @@ async function sync(req: Request): Promise<Response> {
     total: number;
     paid: number;
     outstanding: number;
+    serviceCharge?: number;
     status: string;
     invoiceNumber: string | null;
     closedAt: string | null;
@@ -2164,6 +2165,7 @@ async function sync(req: Request): Promise<Response> {
         orderCount: 0,
         subtotal: 0,
         tax: 0,
+        serviceCharge: Number(c.service_charge ?? 0),
         total: 0,
         paid: Number(c.paid_total ?? 0),
         outstanding: 0,
@@ -2186,7 +2188,11 @@ async function sync(req: Request): Promise<Response> {
       if (entry.orderCount === 0 || entry.status === "PAID") {
         entry.subtotal = Number(c.subtotal ?? 0);
         entry.tax = Number(c.tax ?? 0);
+        entry.serviceCharge = Number(c.service_charge ?? 0);
         entry.total = Number(c.total ?? 0);
+        if (entry.status === "PAID" && (!entry.paid || entry.paid === 0)) {
+          entry.paid = Number(c.paid_total || c.total || 0);
+        }
       }
     }
     for (const p of checkPayments) {

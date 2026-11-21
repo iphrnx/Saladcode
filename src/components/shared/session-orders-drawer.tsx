@@ -63,6 +63,7 @@ export function SessionOrdersDrawer({
   onCompletePay,
   onPrintBill,
   onDownloadBill,
+  initialTab,
 }: {
   open: boolean
   onOpenChange: (v: boolean) => void
@@ -97,8 +98,9 @@ export function SessionOrdersDrawer({
   onDownloadBill?: () => void
   activity: { id: string; label: string; at: string }[]
   focusOrderId?: string | null
+  initialTab?: Tab
 }) {
-  const [tab, setTab] = useState<Tab>('orders')
+  const [tab, setTab] = useState<Tab>(initialTab || 'orders')
   const [openOrders, setOpenOrders] = useState<string[]>(() =>
     focusOrderId ? [focusOrderId] : orders.length === 1 ? [orders[0].id] : [],
   )
@@ -107,11 +109,13 @@ export function SessionOrdersDrawer({
 
   const [wasOpen, setWasOpen] = useState(open)
   const [lastFocus, setLastFocus] = useState<string | null>(focusOrderId)
-  if (open !== wasOpen || focusOrderId !== lastFocus) {
+  const [lastInitialTab, setLastInitialTab] = useState<Tab | undefined>(initialTab)
+  if (open !== wasOpen || focusOrderId !== lastFocus || initialTab !== lastInitialTab) {
     setWasOpen(open)
     setLastFocus(focusOrderId)
+    setLastInitialTab(initialTab)
     if (open) {
-      setTab('orders')
+      setTab(initialTab || 'orders')
       setOpenOrders(focusOrderId ? [focusOrderId] : orders.length === 1 ? [orders[0].id] : [])
     }
   }
