@@ -554,33 +554,8 @@ async function recordPayment(req: Request): Promise<Response> {
   }
   if (!data) return json(req, { error: "No open bill for that table." }, 404);
 
-  const live = data.orders.filter((o: any) => o.status !== "CANCELLED");
-  const computedTotal = +live.reduce((s: number, o: any) => s + Number(o.total), 0).toFixed(2);
-  const checkTotal = Number(data.check.total) > 0 ? Number(data.check.total) : computedTotal;
-  const currentPaid = Number(data.check.paid_total || 0);
-  const outstanding = +Math.max(0, checkTotal - currentPaid).toFixed(2);
-
-  // App supports full settlement only: enforce full settlement and reject underpayment
-  if (b.amount !== undefined && b.amount !== null) {
-    const requestedAmount = Number(b.amount);
-    if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) {
-      return json(req, { error: "Enter an amount greater than zero." }, 400);
-    }
-    if (outstanding > 0 && requestedAmount < outstanding - 0.005) {
-      return json(
-        req,
-        {
-          error: "Partial payment is not supported. Full settlement is required.",
-          code: "partial_payment_not_supported",
-          outstanding,
-        },
-        400,
-      );
-    }
-  }
-
-  const amount = b.amount !== undefined && b.amount !== null ? Number(b.amount) : outstanding;
-  if (!Number.isFinite(amount) || amount <= 0) {
+  const amount = b.amount !== undefined && b.amount !== null ? Number(b.amount) : null;
+  if (amount !== null && (!Number.isFinite(amount) || amount <= 0)) {
     return json(req, { error: "Enter an amount greater than zero." }, 400);
   }
 
@@ -593,6 +568,7 @@ async function recordPayment(req: Request): Promise<Response> {
   };
   const method = METHOD_ALIASES[String(b.method ?? "CASH").toUpperCase()] ?? "CASH";
 
+  // Use the RPC as the atomic authority for row lock, balance validation, and settlement
   const { data: result, error } = await admin().rpc("record_check_payment", {
     p_tenant: g.session.tenantId,
     p_check: data.check.id,
@@ -605,9 +581,33 @@ async function recordPayment(req: Request): Promise<Response> {
 
   if (error) {
     const message = String(error.message ?? "");
-    if (message.includes("OVERPAYMENT:")) {
-      const [, outstanding] = message.split("OVERPAYMENT:")[1].split(":");
+    if (message.includes("UNDERPAYMENT:")) {
+      const parts = message.split("UNDERPAYMENT:")[1]?.split(":") ?? [];
+      const outstandingDue = parts[1] ?? parts[0] ?? "";
       return json(
+        req,
+        {
+          error: "Partial payment is not supported. Full settlement is required.",
+          code: "partial_payment_not_supported",
+          outstanding: Number(outstandingDue) || undefined,
+        },
+        400,
+      );
+    }
+    if (message.includes("OVERPAYMENT:")) {
+      const parts = message.split("OVERPAYMENT:")[1]?.split(":") ?? [];
+      const outstandingDue = parts[1] ?? parts[0] ?? "";
+      return json(
+        req,
+        { error: `${outstandingDue} is still due on this table — check the amount.`, code: "overpayment" },
+        409,
+      );
+    }
+    if (message.includes("CHECK_PAID") || message.includes("ALREADY_SETTLED")) {
+      return json(req, { ok: true, already: true, deduplicated: true, message: "This bill is already settled." }, 200);
+    }
+    return json(req, { error: message || "Could not record the payment." }, 500);
+  }
         req,
         { error: `${outstanding} is still due on this table — check the amount.`, code: "overpayment" },
         409,

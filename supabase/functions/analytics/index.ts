@@ -89,14 +89,15 @@ serve(async (req: Request) => {
   const tenantId = g.session.tenantId;
   const db = admin();
 
-  // Tenant settings for timezone
-  const { data: tenantSettings } = await db
+  // 2. Restore tenant timezone lookup via settings.key = 'timezone' and settings.value
+  const { data: tzRow } = await db
     .from("settings")
-    .select("timezone")
+    .select("value")
     .eq("tenant_id", tenantId)
+    .eq("key", "timezone")
     .maybeSingle();
 
-  const timeZone = tenantSettings?.timezone || "Asia/Kolkata";
+  const timeZone = tzRow?.value || "Asia/Kolkata";
 
   const url = new URL(req.url);
   const todayStr = zonedDateStr(new Date(), timeZone);
@@ -117,9 +118,8 @@ serve(async (req: Request) => {
   const selectedLocationId = url.searchParams.get("location_id") || url.searchParams.get("locationId") || null;
 
   /* -------------------------------------------------------------------------- */
-  /* Pre-load metadata for location resolution, tables, staff, and categories    */
+  /* Pre-load tables and categories for menu items mapping                      */
   /* -------------------------------------------------------------------------- */
-  // 1. Tables for tenant (persisted table location for Dine-in)
   const { data: allTenantTables } = await db
     .from("tables")
     .select("id, name, location_id")
@@ -129,19 +129,6 @@ serve(async (req: Request) => {
     tableMap.set(t.id, t);
   }
 
-  // 2. Staff for tenant: supported columns are id, location_id, name, employee_id
-  const { data: tenantStaff } = await db
-    .from("staff")
-    .select("id, location_id")
-    .eq("tenant_id", tenantId);
-  const staffLocMap = new Map<string, string>();
-  for (const s of tenantStaff ?? []) {
-    if (s.location_id) {
-      staffLocMap.set(s.id, s.location_id);
-    }
-  }
-
-  // 3. Menu categories
   const { data: menuRows } = await db
     .from("menu_items")
     .select("id, category:categories(name)")
@@ -154,143 +141,196 @@ serve(async (req: Request) => {
   }
 
   /* -------------------------------------------------------------------------- */
-  /* Location Resolver: verifies persisted location data tied to transaction    */
+  /* Durable Location Resolver                                                  */
   /* -------------------------------------------------------------------------- */
-  const checkMap = new Map<string, any>();
-
-  function resolveLocation(entity: {
-    location_id?: string | null;
-    table_id?: string | null;
-    check_id?: string | null;
-    staff_id?: string | null;
-    served_by_id?: string | null;
-  }): string | null {
-    // 1. Direct location on entity
+  function resolveEntityLocation(
+    entity: {
+      location_id?: string | null;
+      table_id?: string | null;
+      check_id?: string | null;
+    },
+    checkLookup?: Map<string, any>
+  ): string | null {
+    // 1. Direct location on entity (persisted transaction data)
     if (entity.location_id) return entity.location_id;
-    // 2. From table (Dine-in)
+    // 2. From table (Dine-in physically anchored to a location)
     if (entity.table_id && tableMap.has(entity.table_id)) {
       const loc = tableMap.get(entity.table_id)?.location_id;
       if (loc) return loc;
     }
     // 3. From associated check
-    if (entity.check_id && checkMap.has(entity.check_id)) {
-      const chk = checkMap.get(entity.check_id);
+    if (entity.check_id && checkLookup && checkLookup.has(entity.check_id)) {
+      const chk = checkLookup.get(entity.check_id);
       if (chk.location_id) return chk.location_id;
       if (chk.table_id && tableMap.has(chk.table_id)) {
         const loc = tableMap.get(chk.table_id)?.location_id;
         if (loc) return loc;
       }
     }
-    // 4. From staff tied to transaction (Takeaway/Delivery)
-    const staffId = entity.staff_id || entity.served_by_id;
-    if (staffId && staffLocMap.has(staffId)) {
-      return staffLocMap.get(staffId) ?? null;
-    }
-    // 5. Unverifiable historical location data: left unassigned (do not guess)
+    // 4. Unverifiable historical location data: left unassigned (never guessed)
     return null;
   }
 
-  function matchesSelectedLocation(entity: any): boolean {
-    if (!selectedLocationId) return true;
-    const resolved = resolveLocation(entity);
-    return resolved === selectedLocationId;
+  /* -------------------------------------------------------------------------- */
+  /* Reusable Reconciliation Engine: Counts each settlement once                */
+  /* -------------------------------------------------------------------------- */
+  interface ReconciledEvent {
+    checkId: string | null;
+    orderId?: string;
+    amount: number;
+    settledAt: Date;
+    method: "CASH" | "UPI" | "CARD" | "OTHER";
+    locationId: string | null;
+    isLedger: boolean;
   }
 
-  /* -------------------------------------------------------------------------- */
-  /* 1. Database Settlement Queries with Deterministic Pagination               */
-  /* -------------------------------------------------------------------------- */
-  // A. Authoritative Settlement Payments (check_payments) within [rangeStart, rangeEnd)
-  let paymentRows: any[] = [];
-  try {
-    paymentRows = await fetchAllPages(async (from, to) => {
+  async function getReconciledEventsForWindow(
+    winStart: Date,
+    winEnd: Date
+  ): Promise<{ events: ReconciledEvent[]; checkMap: Map<string, any>; orders: any[] }> {
+    // A. Query payments recorded in or near the window
+    const payments = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("check_payments")
-        .select("id, check_id, amount, method, status, staff_id, created_at")
+        .select("id, check_id, amount, method, status, staff_id, location_id, created_at")
         .eq("tenant_id", tenantId)
         .eq("status", "SUCCEEDED")
-        .gte("created_at", rangeStart.toISOString())
-        .lt("created_at", rangeEnd.toISOString())
+        .gte("created_at", winStart.toISOString())
+        .lt("created_at", winEnd.toISOString())
         .order("created_at", { ascending: true })
         .order("id", { ascending: true })
         .range(from, to);
     });
-  } catch (err: any) {
-    return json(req, { error: err.message }, 500);
-  }
 
-  // Pre-load checks linked to payments
-  const paymentCheckIds = Array.from(
-    new Set(paymentRows.map((p) => p.check_id).filter(Boolean))
-  );
-
-  // B. Table checks closed within [rangeStart, rangeEnd)
-  let rangeChecks: any[] = [];
-  try {
-    rangeChecks = await fetchAllPages(async (from, to) => {
+    // B. Query checks closed in or near the window
+    const checks = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("table_checks")
-        .select("id, table_id, session_id, order_type, status, subtotal, discount, tax, service_charge, total, paid_total, closed_at, invoice_date, created_at")
+        .select("id, table_id, session_id, order_type, status, subtotal, discount, tax, service_charge, total, paid_total, closed_at, invoice_date, location_id, created_at")
         .eq("tenant_id", tenantId)
         .eq("status", "PAID")
-        .gte("closed_at", rangeStart.toISOString())
-        .lt("closed_at", rangeEnd.toISOString())
+        .gte("closed_at", winStart.toISOString())
+        .lt("closed_at", winEnd.toISOString())
         .order("closed_at", { ascending: true })
         .order("id", { ascending: true })
         .range(from, to);
     });
-  } catch (err: any) {
-    return json(req, { error: err.message }, 500);
-  }
 
-  for (const c of rangeChecks) checkMap.set(c.id, c);
+    const localCheckMap = new Map<string, any>();
+    for (const c of checks) localCheckMap.set(c.id, c);
 
-  // Pre-load any checks linked to payments that were not closed in the same window
-  const missingCheckIds = paymentCheckIds.filter((cid) => !checkMap.has(cid));
-  if (missingCheckIds.length > 0) {
-    for (let i = 0; i < missingCheckIds.length; i += 100) {
-      const chunk = missingCheckIds.slice(i, i + 100);
-      const { data: extraChecks } = await db
-        .from("table_checks")
-        .select("id, table_id, session_id, order_type, status, subtotal, discount, tax, service_charge, total, paid_total, closed_at, invoice_date, created_at")
-        .eq("tenant_id", tenantId)
-        .in("id", chunk);
-      for (const c of extraChecks ?? []) checkMap.set(c.id, c);
+    // Identify all candidate checks
+    const candidateCheckIds = Array.from(
+      new Set([...payments.map((p) => p.check_id), ...checks.map((c) => c.id)].filter(Boolean))
+    );
+
+    // Fetch missing check metadata if needed
+    const missingCheckIds = candidateCheckIds.filter((cid) => !localCheckMap.has(cid));
+    if (missingCheckIds.length > 0) {
+      for (let i = 0; i < missingCheckIds.length; i += 100) {
+        const chunk = missingCheckIds.slice(i, i + 100);
+        const { data: extraChecks } = await db
+          .from("table_checks")
+          .select("id, table_id, session_id, order_type, status, subtotal, discount, tax, service_charge, total, paid_total, closed_at, invoice_date, location_id, created_at")
+          .eq("tenant_id", tenantId)
+          .in("id", chunk);
+        for (const c of extraChecks ?? []) localCheckMap.set(c.id, c);
+      }
     }
-  }
 
-  // C. Settled Orders filtered by verified settlement timestamps directly in DB
-  let paidAtOrders: any[] = [];
-  try {
-    paidAtOrders = await fetchAllPages(async (from, to) => {
+    // Determine ledger ownership across each candidate check's FULL payment history
+    const allHistoryLedgerPaymentsByCheck = new Map<string, any[]>();
+    if (candidateCheckIds.length > 0) {
+      for (let i = 0; i < candidateCheckIds.length; i += 100) {
+        const chunk = candidateCheckIds.slice(i, i + 100);
+        const { data: historyPayments } = await db
+          .from("check_payments")
+          .select("id, check_id, amount, method, status, staff_id, location_id, created_at")
+          .eq("tenant_id", tenantId)
+          .eq("status", "SUCCEEDED")
+          .in("check_id", chunk)
+          .order("created_at", { ascending: true });
+
+        for (const p of historyPayments ?? []) {
+          if (!allHistoryLedgerPaymentsByCheck.has(p.check_id)) {
+            allHistoryLedgerPaymentsByCheck.set(p.check_id, []);
+          }
+          allHistoryLedgerPaymentsByCheck.get(p.check_id)!.push(p);
+        }
+      }
+    }
+
+    // Determine authoritative settlement event per check
+    const candidateEvents: ReconciledEvent[] = [];
+    for (const cid of candidateCheckIds) {
+      const chk = localCheckMap.get(cid);
+      const historyPayments = allHistoryLedgerPaymentsByCheck.get(cid);
+
+      if (historyPayments && historyPayments.length > 0) {
+        // Authoritative Ledger-backed settlement: take the final full-settlement payment record
+        const finalPayment = historyPayments[historyPayments.length - 1];
+        const rawMethod = String(finalPayment.method || "").toUpperCase();
+        const method: "CASH" | "UPI" | "CARD" | "OTHER" =
+          rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
+
+        const locId = finalPayment.location_id || chk?.location_id || (chk?.table_id ? tableMap.get(chk.table_id)?.location_id : null) || null;
+
+        candidateEvents.push({
+          checkId: cid,
+          amount: Number(finalPayment.amount || 0),
+          settledAt: new Date(finalPayment.created_at),
+          method,
+          locationId: locId,
+          isLedger: true,
+        });
+      } else if (chk && chk.status === "PAID") {
+        // Authoritative Legacy settlement fallback (no ledger settlement exists anywhere across history)
+        const amt = Number(chk.paid_total > 0 ? chk.paid_total : chk.total || 0);
+        if (amt > 0) {
+          const settleTime = chk.closed_at
+            ? new Date(chk.closed_at)
+            : (chk.invoice_date ? new Date(chk.invoice_date) : new Date(chk.created_at));
+
+          const locId = chk.location_id || (chk.table_id ? tableMap.get(chk.table_id)?.location_id : null) || null;
+
+          candidateEvents.push({
+            checkId: cid,
+            amount: amt,
+            settledAt: settleTime,
+            method: "OTHER",
+            locationId: locId,
+            isLedger: false,
+          });
+        }
+      }
+    }
+
+    // C. Query settled orders in the window
+    const paidAtOrders = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("orders")
-        .select("id, order_number, order_type, table_id, table_session_id, check_id, status, payment_status, items_total, discount, tax, service_charge, total, paid_at, completed_at, created_at, served_by_id, payment_method, items:order_items(id, menu_item_id, name, price, quantity)")
+        .select("id, order_number, order_type, table_id, table_session_id, check_id, status, payment_status, items_total, discount, tax, service_charge, total, paid_at, completed_at, created_at, served_by_id, payment_method, location_id, items:order_items(id, menu_item_id, name, price, quantity)")
         .eq("tenant_id", tenantId)
         .neq("status", "CANCELLED")
         .neq("status", "REJECTED")
         .neq("payment_status", "REFUNDED")
         .neq("payment_status", "refunded")
-        .gte("paid_at", rangeStart.toISOString())
-        .lt("paid_at", rangeEnd.toISOString())
+        .gte("paid_at", winStart.toISOString())
+        .lt("paid_at", winEnd.toISOString())
         .order("paid_at", { ascending: true })
         .order("id", { ascending: true })
         .range(from, to);
     });
-  } catch (err: any) {
-    return json(req, { error: err.message }, 500);
-  }
 
-  // Also include orders linked to closed checks in range where paid_at was null
-  let extraCheckOrders: any[] = [];
-  const rangeCheckIds = rangeChecks.map((c) => c.id);
-  if (rangeCheckIds.length > 0) {
-    try {
-      for (let i = 0; i < rangeCheckIds.length; i += 100) {
-        const chunk = rangeCheckIds.slice(i, i + 100);
-        const chunkOrders = await fetchAllPages(async (from, to) => {
+    // Also include orders linked to closed checks where paid_at was null
+    let extraOrders: any[] = [];
+    if (candidateCheckIds.length > 0) {
+      for (let i = 0; i < candidateCheckIds.length; i += 100) {
+        const chunk = candidateCheckIds.slice(i, i + 100);
+        const chunkOrders = await fetchAllPages<any>(async (from, to) => {
           return await db
             .from("orders")
-            .select("id, order_number, order_type, table_id, table_session_id, check_id, status, payment_status, items_total, discount, tax, service_charge, total, paid_at, completed_at, created_at, served_by_id, payment_method, items:order_items(id, menu_item_id, name, price, quantity)")
+            .select("id, order_number, order_type, table_id, table_session_id, check_id, status, payment_status, items_total, discount, tax, service_charge, total, paid_at, completed_at, created_at, served_by_id, payment_method, location_id, items:order_items(id, menu_item_id, name, price, quantity)")
             .eq("tenant_id", tenantId)
             .neq("status", "CANCELLED")
             .neq("status", "REJECTED")
@@ -302,138 +342,78 @@ serve(async (req: Request) => {
             .order("id", { ascending: true })
             .range(from, to);
         });
-        extraCheckOrders.push(...chunkOrders);
-      }
-    } catch (err: any) {
-      return json(req, { error: err.message }, 500);
-    }
-  }
-
-  const orderMap = new Map<string, any>();
-  for (const o of paidAtOrders) orderMap.set(o.id, o);
-  for (const o of extraCheckOrders) {
-    if (!orderMap.has(o.id)) orderMap.set(o.id, o);
-  }
-  const allRangeOrders = Array.from(orderMap.values());
-
-  /* -------------------------------------------------------------------------- */
-  /* 2. Determine Authoritative Settlement Source and Reconcile Full Settlements */
-  /* -------------------------------------------------------------------------- */
-  // Checks with authoritative ledger settlements across history
-  const checksWithLedger = new Set<string>();
-  // To avoid duplicate ledger entries if multiple records exist, take the authoritative full-settlement payment per check
-  const authoritativeLedgerPaymentByCheck = new Map<string, any>();
-  for (const p of paymentRows) {
-    if (p.check_id) {
-      checksWithLedger.add(p.check_id);
-      if (!authoritativeLedgerPaymentByCheck.has(p.check_id)) {
-        authoritativeLedgerPaymentByCheck.set(p.check_id, p);
+        extraOrders.push(...chunkOrders);
       }
     }
-  }
 
-  interface ReconciledRevenueEvent {
-    id: string;
-    amount: number;
-    settledAt: Date;
-    method: "CASH" | "UPI" | "CARD" | "OTHER";
-    locationId: string | null;
-  }
-  const reconciledEvents: ReconciledRevenueEvent[] = [];
-
-  // A. Ledger-backed full settlements
-  for (const p of paymentRows) {
-    const rawMethod = String(p.method || "").toUpperCase();
-    const method: "CASH" | "UPI" | "CARD" | "OTHER" =
-      rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
-
-    const settleTime = new Date(p.created_at);
-    // Apply date filter after determining authoritative source
-    if (settleTime >= rangeStart && settleTime < rangeEnd) {
-      reconciledEvents.push({
-        id: p.id,
-        amount: Number(p.amount || 0),
-        settledAt: settleTime,
-        method,
-        locationId: resolveLocation(p),
-      });
+    const orderMap = new Map<string, any>();
+    for (const o of paidAtOrders) orderMap.set(o.id, o);
+    for (const o of extraOrders) {
+      if (!orderMap.has(o.id)) orderMap.set(o.id, o);
     }
-  }
+    const allWindowOrders = Array.from(orderMap.values());
 
-  // B. Legacy checks without ledger payments across history
-  for (const c of rangeChecks) {
-    if (!checksWithLedger.has(c.id)) {
-      const checkAmt = Number(c.paid_total > 0 ? c.paid_total : c.total || 0);
-      if (checkAmt > 0) {
-        const settleTime = c.closed_at
-          ? new Date(c.closed_at)
-          : (c.invoice_date ? new Date(c.invoice_date) : new Date(c.created_at));
-
-        if (settleTime >= rangeStart && settleTime < rangeEnd) {
-          reconciledEvents.push({
-            id: c.id,
-            amount: checkAmt,
-            settledAt: settleTime,
-            method: "OTHER", // Accurate classification for legacy records lacking method
-            locationId: resolveLocation(c),
-          });
-        }
-      }
-    }
-  }
-
-  // C. Standalone qualifying orders without checks
-  for (const o of allRangeOrders) {
-    if (!o.check_id) {
-      let settleTime = o.paid_at ? new Date(o.paid_at) : new Date(o.completed_at || o.created_at);
-      if (settleTime >= rangeStart && settleTime < rangeEnd) {
+    // Standalone orders (no check)
+    for (const o of allWindowOrders) {
+      if (!o.check_id) {
+        const settleTime = o.paid_at ? new Date(o.paid_at) : new Date(o.completed_at || o.created_at);
         const rawMethod = String(o.payment_method || "").toUpperCase();
         const method: "CASH" | "UPI" | "CARD" | "OTHER" =
           rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
 
-        reconciledEvents.push({
-          id: o.id,
+        candidateEvents.push({
+          checkId: null,
+          orderId: o.id,
           amount: Number(o.total || 0),
           settledAt: settleTime,
           method,
-          locationId: resolveLocation(o),
+          locationId: resolveEntityLocation(o, localCheckMap),
+          isLedger: false,
         });
       }
     }
+
+    // Apply the window date filter to the single authoritative settlement timestamp
+    const windowEvents = candidateEvents.filter(
+      (e) => e.settledAt >= winStart && e.settledAt < winEnd
+    );
+
+    return { events: windowEvents, checkMap: localCheckMap, orders: allWindowOrders };
   }
 
   /* -------------------------------------------------------------------------- */
-  /* 3. Location Filter Application across All Metrics                          */
+  /* Reconcile Main Reporting Window                                            */
   /* -------------------------------------------------------------------------- */
-  const filteredEvents = reconciledEvents.filter((e) => {
+  const { events: mainEvents, checkMap: mainCheckMap, orders: mainOrders } =
+    await getReconciledEventsForWindow(rangeStart, rangeEnd);
+
+  // Apply location filter uniformly
+  const filteredEvents = mainEvents.filter((e) => {
     if (!selectedLocationId) return true;
     return e.locationId === selectedLocationId;
   });
 
   const qualifyingOrders: any[] = [];
-  for (const o of allRangeOrders) {
-    if (!matchesSelectedLocation(o)) continue;
+  for (const o of mainOrders) {
+    const locId = resolveEntityLocation(o, mainCheckMap);
+    if (selectedLocationId && locId !== selectedLocationId) continue;
 
+    // Check if order belongs to a check that settled in this window
     let settlementTime: Date | null = null;
-    const isPaidStatus = o.payment_status === "PAID" || o.payment_status === "paid";
-    const isCompletedStatus = o.status === "COMPLETED";
-
-    if (o.paid_at) {
+    if (o.check_id) {
+      // Find the check's authoritative settlement event
+      const chkEvent = mainEvents.find((e) => e.checkId === o.check_id);
+      if (chkEvent) settlementTime = chkEvent.settledAt;
+    } else if (o.paid_at) {
       settlementTime = new Date(o.paid_at);
-    } else if (o.check_id && checkMap.has(o.check_id)) {
-      const chk = checkMap.get(o.check_id);
-      if (chk.closed_at) settlementTime = new Date(chk.closed_at);
-      else if (chk.invoice_date) settlementTime = new Date(chk.invoice_date);
-    } else if (o.completed_at && (isPaidStatus || isCompletedStatus)) {
+    } else if (o.completed_at) {
       settlementTime = new Date(o.completed_at);
-    } else if ((isPaidStatus || isCompletedStatus) && o.created_at) {
-      settlementTime = new Date(o.created_at);
     }
 
     if (!settlementTime || isNaN(settlementTime.getTime())) continue;
     if (settlementTime < rangeStart || settlementTime >= rangeEnd) continue;
 
-    const chk = o.check_id ? checkMap.get(o.check_id) : null;
+    const chk = o.check_id ? mainCheckMap.get(o.check_id) : null;
     const effectiveTableId = o.table_id || chk?.table_id || null;
     const resolvedTable = effectiveTableId ? tableMap.get(effectiveTableId) : null;
 
@@ -490,7 +470,7 @@ serve(async (req: Request) => {
   }
 
   /* -------------------------------------------------------------------------- */
-  /* 4. Daily Revenue Aggregation (Asia/Kolkata timezone boundaries)           */
+  /* Daily Revenue Aggregation (Asia/Kolkata timezone boundaries)               */
   /* -------------------------------------------------------------------------- */
   const dailyRevenue: { date: string; label: string; revenue: number; orders: number }[] = [];
   for (let t = rangeStart.getTime(); t < rangeEnd.getTime(); t += DAY_MS) {
@@ -527,7 +507,7 @@ serve(async (req: Request) => {
   const serviceChargeCollected = qualifyingOrders.reduce((s: number, o: any) => s + o.serviceCharge, 0);
 
   /* -------------------------------------------------------------------------- */
-  /* 5. Top Items Sold                                                          */
+  /* Top Items, Types, Tables, Hourly, Categories                               */
   /* -------------------------------------------------------------------------- */
   const itemCounts: Record<string, { name: string; qty: number; revenue: number }> = {};
   for (const o of qualifyingOrders) {
@@ -543,9 +523,6 @@ serve(async (req: Request) => {
     .slice(0, 6)
     .map((t) => ({ ...t, revenue: +t.revenue.toFixed(2) }));
 
-  /* -------------------------------------------------------------------------- */
-  /* 6. Order Type Breakdown (DINE_IN, TAKEAWAY, DELIVERY)                      */
-  /* -------------------------------------------------------------------------- */
   const typeMap: Record<string, { count: number; revenue: number }> = {};
   for (const o of qualifyingOrders) {
     const t = o.orderType;
@@ -561,9 +538,6 @@ serve(async (req: Request) => {
       revenue: +v.revenue.toFixed(2),
     }));
 
-  /* -------------------------------------------------------------------------- */
-  /* 7. Top Tables Performance                                                  */
-  /* -------------------------------------------------------------------------- */
   const tablePerf: Record<string, { name: string; orders: number; revenue: number }> = {};
   for (const o of qualifyingOrders) {
     if (!o.tableId) continue;
@@ -577,18 +551,12 @@ serve(async (req: Request) => {
     .slice(0, 6)
     .map((t) => ({ ...t, revenue: +t.revenue.toFixed(2) }));
 
-  /* -------------------------------------------------------------------------- */
-  /* 8. Sales by Hour (0-23 in Asia/Kolkata)                                    */
-  /* -------------------------------------------------------------------------- */
   const hourly: number[] = new Array(24).fill(0);
   for (const o of qualifyingOrders) {
     const h = zonedHour(o.settledAt, timeZone);
     if (h >= 0 && h < 24) hourly[h]++;
   }
 
-  /* -------------------------------------------------------------------------- */
-  /* 9. Revenue by Category                                                     */
-  /* -------------------------------------------------------------------------- */
   const catRevenue: Record<string, number> = {};
   for (const o of qualifyingOrders) {
     for (const it of o.items) {
@@ -601,52 +569,28 @@ serve(async (req: Request) => {
     .sort((a, b) => b.value - a.value);
 
   /* -------------------------------------------------------------------------- */
-  /* 10. Today vs Yesterday (queried independently of historical report range)  */
+  /* Independent Today & Yesterday Queries (Run through identical reconciliation)*/
   /* -------------------------------------------------------------------------- */
   const todayStart = zonedStart(todayStr, timeZone);
   const tomorrowStart = new Date(todayStart.getTime() + DAY_MS);
   const yesterdayStart = new Date(todayStart.getTime() - DAY_MS);
 
-  // Independent query for Today's full settlement payments
-  const { data: todayDbPayments } = await db
-    .from("check_payments")
-    .select("id, check_id, amount, method, status, staff_id, created_at")
-    .eq("tenant_id", tenantId)
-    .eq("status", "SUCCEEDED")
-    .gte("created_at", todayStart.toISOString())
-    .lt("created_at", tomorrowStart.toISOString());
+  // Today's independent reconciliation
+  const { events: todayEvents } = await getReconciledEventsForWindow(todayStart, tomorrowStart);
+  const filteredTodayEvents = todayEvents.filter((e) => {
+    if (!selectedLocationId) return true;
+    return e.locationId === selectedLocationId;
+  });
+  const todaysRevenue = +(filteredTodayEvents.reduce((s, e) => s + e.amount, 0)).toFixed(2);
+  const todaysOrders = filteredTodayEvents.length;
 
-  const filteredTodayPayments = (todayDbPayments ?? []).filter((p: any) => matchesSelectedLocation(p));
-  let todaysRevenue = +(filteredTodayPayments.reduce((s: number, p: any) => s + Number(p.amount || 0), 0)).toFixed(2);
-
-  // Independent query for Today's completed orders
-  const { data: todayDbOrders } = await db
-    .from("orders")
-    .select("id, table_id, check_id, served_by_id, total, status, payment_status, paid_at")
-    .eq("tenant_id", tenantId)
-    .neq("status", "CANCELLED")
-    .neq("status", "REJECTED")
-    .gte("paid_at", todayStart.toISOString())
-    .lt("paid_at", tomorrowStart.toISOString());
-
-  const filteredTodayOrders = (todayDbOrders ?? []).filter((o: any) => matchesSelectedLocation(o));
-  const todaysOrders = filteredTodayOrders.length;
-
-  if (todaysRevenue === 0 && filteredTodayOrders.length > 0) {
-    todaysRevenue = +(filteredTodayOrders.reduce((s: number, o: any) => s + Number(o.total || 0), 0)).toFixed(2);
-  }
-
-  // Independent query for Yesterday's full settlement payments
-  const { data: yestDbPayments } = await db
-    .from("check_payments")
-    .select("id, check_id, amount, method, status, staff_id, created_at")
-    .eq("tenant_id", tenantId)
-    .eq("status", "SUCCEEDED")
-    .gte("created_at", yesterdayStart.toISOString())
-    .lt("created_at", todayStart.toISOString());
-
-  const filteredYestPayments = (yestDbPayments ?? []).filter((p: any) => matchesSelectedLocation(p));
-  let yestRevenue = +(filteredYestPayments.reduce((s: number, p: any) => s + Number(p.amount || 0), 0)).toFixed(2);
+  // Yesterday's independent reconciliation
+  const { events: yestEvents } = await getReconciledEventsForWindow(yesterdayStart, todayStart);
+  const filteredYestEvents = yestEvents.filter((e) => {
+    if (!selectedLocationId) return true;
+    return e.locationId === selectedLocationId;
+  });
+  const yestRevenue = +(filteredYestEvents.reduce((s, e) => s + e.amount, 0)).toFixed(2);
 
   let revenueChange = 0;
   if (yestRevenue > 0) {
@@ -654,7 +598,7 @@ serve(async (req: Request) => {
   }
 
   /* -------------------------------------------------------------------------- */
-  /* 11. Plan Entitlements & Locations                                          */
+  /* Plan Entitlements & Locations                                              */
   /* -------------------------------------------------------------------------- */
   const plan = await resolvePlan(tenantId);
   const isAdvanced = !plan.isRestricted && (plan.isPaid || plan.isTrial);
