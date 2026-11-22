@@ -576,6 +576,8 @@ async function priceAndCommitOnce(
       msg.includes("AMBIGUOUS_TABLE_SESSION") ||
       msg.includes("TABLE_REQUIRED_FOR_DINE_IN") ||
       msg.includes("INVALID_STATUS") ||
+      msg.includes("LOCATION_NOT_FOUND") ||
+      msg.includes("LOCATION_CONFLICT") ||
       code === "P0001" ||
       code === "22P02" ||
       code === "23502" ||
@@ -589,6 +591,10 @@ async function priceAndCommitOnce(
           ? "Multiple active sessions found for this table. Please select the specific session card."
           : msg.includes("TABLE_REQUIRED_FOR_DINE_IN")
           ? "A table must be selected for Dine-in orders."
+          : msg.includes("LOCATION_NOT_FOUND")
+          ? "The specified location is not valid for this restaurant."
+          : msg.includes("LOCATION_CONFLICT")
+          ? "Order location conflicts with the existing table or check location."
           : msg || "Invalid order details.";
       return { ok: false, error: clientMsg, status: 400 };
     }

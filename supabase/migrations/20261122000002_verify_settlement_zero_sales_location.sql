@@ -17,7 +17,9 @@
 --      preventing staff transfers from altering sale attribution.
 -- ============================================================================
 
--- 1. Update public.create_order_tx to persist verified location for new sales
+-- 1. Update public.create_order_tx to persist and validate sale location
+-- Starts from 20261118000002 contract, preserving top-level order_id, order_number, check_id, table_session_id,
+-- atomic promo validation/redemption, portion handling, diner session isolation, and service_role-only access.
 create or replace function public.create_order_tx(
   p_order jsonb,
   p_items jsonb,
@@ -28,87 +30,95 @@ create or replace function public.create_order_tx(
 returns jsonb
 language plpgsql
 security definer
-set search_path to 'public', 'extensions', 'pg_temp'
-as $function$
+set search_path = public, extensions, pg_temp
+as $$
 declare
-  v_tenant uuid;
-  v_table uuid;
-  v_session uuid;
-  v_check uuid;
-  v_order_type text;
+  v_tenant uuid := (p_order->>'tenant_id')::uuid;
+  v_table uuid := nullif(p_order->>'table_id', '')::uuid;
+  v_session uuid := nullif(p_order->>'table_session_id', '')::uuid;
+  v_order_type text := coalesce(p_order->>'order_type', 'DINE_IN');
+  v_idempotency_key uuid := null;
   v_order_id uuid;
+  v_order_num integer;
+  v_existing_order record;
   v_item jsonb;
-  v_menu_item public.menu_items;
-  v_portion jsonb;
+  v_menu record;
+  v_portion_elem jsonb;
   v_portion_id text;
-  v_price numeric(10, 2);
-  v_existing_id uuid;
-  v_existing_status text;
-  v_existing_order jsonb;
+  v_portion_name text;
+  v_portion_price numeric(10, 2);
+  v_item_price numeric(10, 2);
+  v_qty integer;
+  v_kot_num integer;
+  v_check uuid;
+  v_check_totals record;
+  v_input_location uuid := nullif(p_order->>'location_id', '')::uuid;
+  v_table_location uuid := null;
+  v_check_location uuid := null;
   v_location uuid := null;
 begin
-  v_tenant := (p_order->>'tenant_id')::uuid;
-  v_table := nullif(p_order->>'table_id', '')::uuid;
-  v_session := nullif(p_order->>'table_session_id', '')::uuid;
-  v_order_type := coalesce(nullif(p_order->>'order_type', ''), 'DINE_IN');
-
-  if v_tenant is null then
-    raise exception 'TENANT_REQUIRED' using errcode = 'P0001';
+  if p_status not in ('PENDING', 'PENDING_ACTIVATION') then
+    raise exception 'INVALID_STATUS:%', p_status using errcode = 'P0001';
   end if;
 
-  -- Concurrency-safe idempotency check
-  if p_idempotency_key is not null then
-    select id, status into v_existing_id, v_existing_status
+  if p_idempotency_key is not null and p_idempotency_key ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    v_idempotency_key := p_idempotency_key::uuid;
+  end if;
+
+  -- 1. Idempotency pre-check
+  if v_idempotency_key is not null then
+    select id, order_number, check_id, table_session_id
+      into v_existing_order
       from public.orders
-     where tenant_id = v_tenant and idempotency_key = p_idempotency_key
-     limit 1;
-
-    if v_existing_id is not null then
-      select jsonb_build_object(
-        'id', o.id,
-        'order_number', o.order_number,
-        'status', o.status,
-        'payment_status', o.payment_status,
-        'items_total', o.items_total,
-        'discount', o.discount,
-        'tax', o.tax,
-        'service_charge', o.service_charge,
-        'total', o.total,
-        'table_id', o.table_id,
-        'table_session_id', o.table_session_id,
-        'check_id', o.check_id,
-        'order_type', o.order_type,
-        'customer_name', o.customer_name,
-        'customer_phone', o.customer_phone,
-        'notes', o.notes,
-        'promo_code', o.promo_code,
-        'location_id', o.location_id,
-        'created_at', o.created_at,
-        'items', (
-          select jsonb_agg(jsonb_build_object(
-            'id', oi.id,
-            'menu_item_id', oi.menu_item_id,
-            'name', oi.name,
-            'price', oi.price,
-            'quantity', oi.quantity,
-            'portion_id', oi.portion_id,
-            'portion_name', oi.portion_name,
-            'notes', oi.notes
-          ))
-          from public.order_items oi
-          where oi.order_id = o.id
-        )
-      ) into v_existing_order
-      from public.orders o
-      where o.id = v_existing_id;
-
-      return jsonb_build_object('ok', true, 'deduplicated', true, 'order', v_existing_order);
+     where idempotency_key = v_idempotency_key
+       and tenant_id = v_tenant;
+    if v_existing_order.id is not null then
+      return jsonb_build_object(
+        'order_id', v_existing_order.id,
+        'order_number', v_existing_order.order_number,
+        'check_id', v_existing_order.check_id,
+        'table_session_id', v_existing_order.table_session_id,
+        'deduplicated', true
+      );
     end if;
   end if;
 
-  -- Resolve session and check based on order_type
+  -- Validate menu items availability
+  for v_item in select value from jsonb_array_elements(p_items) loop
+    select id, tenant_id, available into v_menu
+      from public.menu_items where id = (v_item->>'menu_item_id')::uuid;
+    if v_menu is null or v_menu.tenant_id <> v_tenant or v_menu.available = false then
+      raise exception 'ITEM_UNAVAILABLE:%', v_item->>'menu_item_id' using errcode = 'P0001';
+    end if;
+  end loop;
+
+  -- Validate requested location belongs to authenticated tenant and is active
+  if v_input_location is not null then
+    if not exists (
+      select 1 from public.locations
+       where id = v_input_location and tenant_id = v_tenant and active
+    ) then
+      raise exception 'LOCATION_NOT_FOUND' using errcode = 'P0001';
+    end if;
+  end if;
+
+  -- 2. Session and Check resolution based on order_type
   if v_order_type = 'DINE_IN' then
     if v_table is not null then
+      -- Resolve verified table location for Dine-in
+      select location_id into v_table_location
+        from public.tables
+       where id = v_table and tenant_id = v_tenant;
+
+      if v_table_location is not null then
+        if v_input_location is not null and v_input_location <> v_table_location then
+          raise exception 'LOCATION_CONFLICT' using errcode = 'P0001';
+        end if;
+        v_location := v_table_location;
+      else
+        v_location := v_input_location;
+      end if;
+
       if v_session is not null then
         select id into v_session
           from public.table_sessions
@@ -127,8 +137,10 @@ begin
       raise exception 'TABLE_REQUIRED_FOR_DINE_IN' using errcode = 'P0001';
     end if;
   elsif v_order_type in ('TAKEAWAY', 'DELIVERY') then
-    v_table := null;
+    v_table := null; -- No physical table
+    v_location := v_input_location;
     if v_session is not null then
+      -- Explicitly joining an active takeaway/delivery session
       select id into v_session
         from public.table_sessions
        where id = v_session
@@ -140,6 +152,7 @@ begin
       end if;
       v_check := public.open_session_check(v_tenant, null, v_session, v_order_type);
     else
+      -- Brand-new independent Takeaway or Delivery session created atomically
       insert into public.table_sessions (
         tenant_id, table_id, order_type, status, activation_status,
         token, customer_name, customer_phone, notes, activated_at
@@ -159,138 +172,189 @@ begin
     v_table := null;
     v_session := null;
     v_check := null;
+    v_location := v_input_location;
   end if;
 
-  -- Resolve sale location on creation
-  if v_table is not null then
-    select location_id into v_location
-      from public.tables
-     where id = v_table;
+  -- 3. Preserve existing check location and reject conflicting input
+  if v_check is not null then
+    select location_id into v_check_location
+      from public.table_checks
+     where id = v_check;
+
+    if v_check_location is not null then
+      if v_location is not null and v_location <> v_check_location then
+        raise exception 'LOCATION_CONFLICT' using errcode = 'P0001';
+      end if;
+      v_location := v_check_location;
+    elsif v_location is not null then
+      update public.table_checks
+         set location_id = v_location,
+             updated_at = now()
+       where id = v_check and location_id is null;
+    end if;
   end if;
 
-  if v_location is null and nullif(p_order->>'location_id', '') is not null then
-    v_location := (p_order->>'location_id')::uuid;
+  -- 4. Insert order with persisted location
+  begin
+    insert into public.orders (
+      tenant_id, table_id, table_session_id, order_type, status,
+      items_total, discount, tax, service_charge, total,
+      promo_code_id, promo_code, customer_name, customer_phone, notes,
+      served_by_id, idempotency_key, check_id, location_id
+    ) values (
+      v_tenant,
+      v_table,
+      v_session,
+      v_order_type,
+      p_status,
+      coalesce((p_order->>'items_total')::numeric, 0),
+      coalesce((p_order->>'discount')::numeric, 0),
+      coalesce((p_order->>'tax')::numeric, 0),
+      coalesce((p_order->>'service_charge')::numeric, 0),
+      coalesce((p_order->>'total')::numeric, 0),
+      nullif(p_order->>'promo_code_id', '')::uuid,
+      nullif(p_order->>'promo_code', ''),
+      nullif(p_order->>'customer_name', ''),
+      nullif(p_order->>'customer_phone', ''),
+      nullif(p_order->>'notes', ''),
+      nullif(p_order->>'served_by_id', '')::uuid,
+      v_idempotency_key,
+      v_check,
+      v_location
+    )
+    returning id, order_number into v_order_id, v_order_num;
+  exception
+    when unique_violation then
+      if v_idempotency_key is not null then
+        select id, order_number, check_id, table_session_id
+          into v_existing_order
+          from public.orders
+         where idempotency_key = v_idempotency_key
+           and tenant_id = v_tenant;
+        if v_existing_order.id is not null then
+          return jsonb_build_object(
+            'order_id', v_existing_order.id,
+            'order_number', v_existing_order.order_number,
+            'check_id', v_existing_order.check_id,
+            'table_session_id', v_existing_order.table_session_id,
+            'deduplicated', true
+          );
+        end if;
+      end if;
+      raise;
+  end;
+
+  -- 5. Sequential KOT scoped by check (session)
+  if v_check is not null then
+    select coalesce(max(oi.kot_number), 0) + 1 into v_kot_num
+      from public.order_items oi
+      join public.orders o on o.id = oi.order_id
+     where o.check_id = v_check;
+  elsif v_session is not null then
+    select coalesce(max(oi.kot_number), 0) + 1 into v_kot_num
+      from public.order_items oi
+      join public.orders o on o.id = oi.order_id
+     where o.table_session_id = v_session;
+  else
+    select coalesce(max(kot_number), 0) + 1 into v_kot_num
+      from public.order_items
+     where order_id = v_order_id;
   end if;
 
-  if v_location is null and nullif(p_order->>'served_by_id', '') is not null then
-    select location_id into v_location
-      from public.staff
-     where id = (p_order->>'served_by_id')::uuid and tenant_id = v_tenant;
-  end if;
-
-  -- Insert order with durable location
-  insert into public.orders (
-    tenant_id, table_id, table_session_id, order_type, status,
-    items_total, discount, tax, service_charge, total,
-    promo_code_id, promo_code, customer_name, customer_phone, notes,
-    served_by_id, idempotency_key, check_id, location_id
-  ) values (
-    v_tenant,
-    v_table,
-    v_session,
-    v_order_type,
-    p_status,
-    coalesce((p_order->>'items_total')::numeric, 0),
-    coalesce((p_order->>'discount')::numeric, 0),
-    coalesce((p_order->>'tax')::numeric, 0),
-    coalesce((p_order->>'service_charge')::numeric, 0),
-    coalesce((p_order->>'total')::numeric, 0),
-    nullif(p_order->>'promo_code_id', '')::uuid,
-    nullif(p_order->>'promo_code', ''),
-    nullif(p_order->>'customer_name', ''),
-    nullif(p_order->>'customer_phone', ''),
-    nullif(p_order->>'notes', ''),
-    nullif(p_order->>'served_by_id', '')::uuid,
-    p_idempotency_key,
-    v_check,
-    v_location
-  )
-  returning id into v_order_id;
-
-  -- Persist location on check if not yet assigned
-  if v_check is not null and v_location is not null then
-    update public.table_checks
-       set location_id = coalesce(location_id, v_location)
-     where id = v_check and location_id is null;
-  end if;
-
-  -- Insert line items
-  for v_item in select * from jsonb_array_elements(p_items)
-  loop
-    select * into v_menu_item
+  -- 6. Insert order items with TEXT portion_id and JSONB portions resolution
+  for v_item in select value from jsonb_array_elements(p_items) loop
+    select id, tenant_id, available, price, name, portions into v_menu
       from public.menu_items
-     where id = (v_item->>'menu_item_id')::uuid
-       and tenant_id = v_tenant;
+     where id = (v_item->>'menu_item_id')::uuid;
 
-    if not found then
-      raise exception 'ITEM_UNAVAILABLE:%', v_item->>'menu_item_id' using errcode = 'P0001';
+    v_portion_id := nullif(trim(v_item->>'portion_id'), '');
+    v_portion_name := nullif(trim(v_item->>'portion'), '');
+    v_portion_price := null;
+
+    -- If portion specified, match against v_menu.portions jsonb array
+    if v_portion_id is not null or v_portion_name is not null then
+      if v_menu.portions is not null and jsonb_typeof(v_menu.portions) = 'array' then
+        for v_portion_elem in select value from jsonb_array_elements(v_menu.portions) loop
+          if (v_portion_id is not null and lower(coalesce(v_portion_elem->>'id', '')) = lower(v_portion_id))
+             or (v_portion_name is not null and lower(coalesce(v_portion_elem->>'name', '')) = lower(v_portion_name)) then
+            v_portion_name := coalesce(v_portion_elem->>'name', v_portion_name);
+            v_portion_price := (v_portion_elem->>'price')::numeric;
+            v_portion_id := coalesce(v_portion_elem->>'id', v_portion_id);
+            exit;
+          end if;
+        end loop;
+      end if;
     end if;
 
-    if not v_menu_item.available then
-      raise exception 'ITEM_UNAVAILABLE:%', v_menu_item.name using errcode = 'P0001';
-    end if;
-
-    v_portion_id := nullif(v_item->>'portion_id', '');
-    v_price := coalesce((v_item->>'price')::numeric, v_menu_item.price);
+    v_item_price := coalesce(v_portion_price, (v_item->>'price')::numeric, v_menu.price);
+    v_qty := greatest(1, coalesce((v_item->>'quantity')::integer, 1));
 
     insert into public.order_items (
-      order_id, menu_item_id, name, price, quantity,
-      portion_id, portion_name, notes
+      order_id, menu_item_id, name, portion_id, portion,
+      price, quantity, notes, status, kot_number
     ) values (
       v_order_id,
-      v_menu_item.id,
-      v_menu_item.name,
-      v_price,
-      coalesce((v_item->>'quantity')::integer, 1),
+      v_menu.id,
+      coalesce(v_item->>'name', v_menu.name),
       v_portion_id,
-      nullif(v_item->>'portion_name', ''),
-      nullif(v_item->>'notes', '')
+      v_portion_name,
+      v_item_price,
+      v_qty,
+      nullif(v_item->>'notes', ''),
+      p_status,
+      v_kot_num
     );
   end loop;
 
-  -- Return complete order record
-  select jsonb_build_object(
-    'id', o.id,
-    'order_number', o.order_number,
-    'status', o.status,
-    'payment_status', o.payment_status,
-    'items_total', o.items_total,
-    'discount', o.discount,
-    'tax', o.tax,
-    'service_charge', o.service_charge,
-    'total', o.total,
-    'table_id', o.table_id,
-    'table_session_id', o.table_session_id,
-    'check_id', o.check_id,
-    'order_type', o.order_type,
-    'customer_name', o.customer_name,
-    'customer_phone', o.customer_phone,
-    'notes', o.notes,
-    'promo_code', o.promo_code,
-    'location_id', o.location_id,
-    'created_at', o.created_at,
-    'items', (
-      select jsonb_agg(jsonb_build_object(
-        'id', oi.id,
-        'menu_item_id', oi.menu_item_id,
-        'name', oi.name,
-        'price', oi.price,
-        'quantity', oi.quantity,
-        'portion_id', oi.portion_id,
-        'portion_name', oi.portion_name,
-        'notes', oi.notes
-      ))
-      from public.order_items oi
-      where oi.order_id = o.id
-    )
-  ) into v_existing_order
-  from public.orders o
-  where o.id = v_order_id;
+  -- 7. Update running totals on table_checks if attached
+  if v_check is not null then
+    select
+      coalesce(sum(items_total), 0) as subtotal,
+      coalesce(sum(discount), 0)    as discount,
+      coalesce(sum(tax), 0)         as tax,
+      coalesce(sum(service_charge), 0) as service_charge,
+      coalesce(sum(total), 0)       as total
+    into v_check_totals
+      from public.orders
+     where check_id = v_check
+       and status not in ('CANCELLED', 'PENDING_ACTIVATION');
 
-  return jsonb_build_object('ok', true, 'deduplicated', false, 'order', v_existing_order);
-end $function$;
+    update public.table_checks
+       set subtotal = v_check_totals.subtotal,
+           discount = v_check_totals.discount,
+           tax = v_check_totals.tax,
+           service_charge = v_check_totals.service_charge,
+           total = v_check_totals.total,
+           updated_at = now()
+     where id = v_check;
+  end if;
 
-grant execute on function public.create_order_tx(jsonb, jsonb, uuid, text, text) to authenticated, anon, service_role;
+  -- 8. Atomic promo usage increment
+  if p_promo_code_id is not null then
+    update public.promo_codes
+       set used_count = used_count + 1
+     where id = p_promo_code_id
+       and tenant_id = v_tenant and active
+       and (usage_limit = 0 or used_count < usage_limit)
+       and valid_from <= now()
+       and (valid_to is null or valid_to >= now());
+    if not found then
+      raise exception 'PROMO_REJECTED: Promo code is invalid, expired, or usage limit reached' using errcode = 'P0001';
+    end if;
+  end if;
+
+  return jsonb_build_object(
+    'order_id', v_order_id,
+    'order_number', v_order_num,
+    'check_id', v_check,
+    'table_session_id', v_session
+  );
+end;
+$$;
+
+-- Explicitly revoke execute from PUBLIC, anon, and authenticated; grant only to service_role
+revoke execute on function public.create_order_tx(jsonb, jsonb, uuid, text, text) from public, anon, authenticated;
+grant execute on function public.create_order_tx(jsonb, jsonb, uuid, text, text) to service_role;
 
 -- 2. Update public.finalize_table_check
 -- Handles valid ₹0 sales with billable orders, issues single invoice, completes orders,
