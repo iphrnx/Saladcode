@@ -358,6 +358,7 @@ async function priceAndCreateOrder(
     notes?: string | null;
     promoCode?: string | null;
     servedById?: string | null;
+    locationId?: string | null;
     /** PENDING (default) or PENDING_ACTIVATION while the table awaits approval. */
     status?: "PENDING" | "PENDING_ACTIVATION";
   },
@@ -393,6 +394,8 @@ async function priceAndCommitOnce(
     notes?: string | null;
     promoCode?: string | null;
     servedById?: string | null;
+    locationId?: string | null;
+    status?: "PENDING" | "PENDING_ACTIVATION";
   },
   idempotencyKey: string | null,
 ): Promise<
@@ -519,6 +522,7 @@ async function priceAndCommitOnce(
       customer_phone: customerPhone || null,
       notes: notes || null,
       served_by_id: servedById ?? null,
+      location_id: args.locationId ?? null,
     },
     p_items: itemData,
     p_promo_code_id: promoCodeId ?? null,
@@ -949,6 +953,27 @@ async function create(req: Request): Promise<Response> {
       if (user) validServedById = user.id;
     }
 
+    // Resolve location for sale creation (Dine-in, Takeaway, Delivery)
+    let locationId: string | null = b.locationId || b.location_id || null;
+    if (!locationId && validServedById) {
+      const { data: st } = await db
+        .from("staff")
+        .select("location_id")
+        .eq("id", validServedById)
+        .eq("tenant_id", tenantId)
+        .maybeSingle();
+      if (st?.location_id) locationId = st.location_id;
+    }
+    if (!locationId && g.session?.subjectId) {
+      const { data: st } = await db
+        .from("staff")
+        .select("location_id")
+        .eq("id", g.session.subjectId)
+        .eq("tenant_id", tenantId)
+        .maybeSingle();
+      if (st?.location_id) locationId = st.location_id;
+    }
+
     const created = await priceAndCreateOrder(db, {
       tenantId,
       tableId,
@@ -960,6 +985,7 @@ async function create(req: Request): Promise<Response> {
       notes,
       promoCode,
       servedById: validServedById,
+      locationId,
     }, idempotencyKey);
 
     if (!created.ok) return json(req, { error: created.error }, created.status);

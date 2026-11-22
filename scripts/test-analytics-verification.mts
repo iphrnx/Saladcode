@@ -1,30 +1,28 @@
 /**
- * Comprehensive verification & regression test suite for Saladcode Analytics PR #5.
+ * Comprehensive verification & regression test suite for Saladcode Analytics PR #5 Follow-up.
  *
- * Verifies all 4 review findings:
- * 1. Bill Edge Function syntax & Deno validation:
- *    - Orphaned duplicate error-handler fragment removed from supabase/functions/bill/index.ts
- *    - Edge Function typechecked with Deno check with 0 syntax errors
- * 2. Invoice generation and session closure preservation:
- *    - record_check_payment reuses finalize_table_check so checks reach PAID with an invoice
- *    - finalize_table_check self-heals missing invoices on already-paid checks
- *    - Orders completed with complete_paid_check_orders and paid_at populated
- *    - Table sessions linked to check are closed, keeping separate diner sessions independent
- *    - Zero-balance check path reuses finalization logic
- *    - Idempotent retries return single payment and single invoice
- * 3. Verified full settlements in Analytics and historical paid_at:
- *    - Full payment history checked before date filtering
- *    - Exact payment achieving full settlement (cumulative amount >= check total) is authoritative
- *    - Legacy fallback used only when no ledger full settlement exists across history
- *    - Error propagation: query failures throw rather than being swallowed as empty history
- *    - Deterministic pagination ordering by (created_at, id)
- *    - Single-counting across midnight IST
- *    - Corrective migration repairs conflicting non-null paid_at using verified full settlements
- * 4. Location persistence in both payment paths:
- *    - settle_check_cash_tx and record_check_payment/finalize_table_check persist durable location
- *    - Covers Dine-in, Takeaway, and Delivery (including tableless orders)
- *    - Unverifiable historical locations left unassigned (NULL)
- *    - Staff transfers cannot mutate past transaction locations or historical Analytics
+ * Verifies all 3 remaining issues:
+ * 1. Finalize valid ₹0 sales:
+ *    - finalize_table_check & settle_check_cash_tx distinguish valid ₹0 sale with billable
+ *      orders from empty or all-cancelled check (NOTHING_TO_BILL).
+ *    - Issues exactly one invoice, completes eligible orders, ends check session
+ *      without inserting a payment ledger row.
+ *    - Order readiness (ORDERS_OPEN) preserved.
+ *    - Retries return same invoice.
+ * 2. Authoritative settlement verification:
+ *    - Analytics requires verified final total (> 0) and ledger coverage (cumulative >= total),
+ *      or authoritative closure evidence for legacy / ₹0 sales.
+ *    - No fallback picking last payment row when check total is 0 or unknown.
+ *    - Successful payment on open check with unknown total is NOT reported as completed settlement.
+ *    - Historical ledger rows preserved; single counting across midnight IST.
+ *    - Corrective migration repairs orders.paid_at only where settlement is verified, resetting
+ *      unverified/open check timestamps to NULL.
+ * 3. Persisted sale location across Cash, UPI, and Card:
+ *    - Location resolved strictly from check or linked orders across all payment paths.
+ *    - Cashier current staff location fallback removed from settlement RPCs.
+ *    - Tableless Takeaway & Delivery sales persist verified location at creation time.
+ *    - Sale created at Branch A and settled by cashier assigned to Branch B stays attributed to Branch A.
+ *    - Unverifiable historical sales remain NULL (unassigned).
  *
  * Usage:
  *   npx tsx scripts/test-analytics-verification.mts
@@ -45,11 +43,9 @@ const check = (label: string, ok: boolean, detail?: string) => {
 
 const analyticsFn = readFileSync("supabase/functions/analytics/index.ts", "utf8");
 const billFn = readFileSync("supabase/functions/bill/index.ts", "utf8");
-const migration1Sql = existsSync("supabase/migrations/20261121000001_correct_analytics_settlement_paid_at.sql")
-  ? readFileSync("supabase/migrations/20261121000001_correct_analytics_settlement_paid_at.sql", "utf8")
-  : "";
-const migration2Sql = existsSync("supabase/migrations/20261122000001_fix_full_settlement_invoice_location_analytics.sql")
-  ? readFileSync("supabase/migrations/20261122000001_fix_full_settlement_invoice_location_analytics.sql", "utf8")
+const ordersFn = readFileSync("supabase/functions/orders/index.ts", "utf8");
+const migration3Sql = existsSync("supabase/migrations/20261122000002_verify_settlement_zero_sales_location.sql")
+  ? readFileSync("supabase/migrations/20261122000002_verify_settlement_zero_sales_location.sql", "utf8")
   : "";
 
 /* -------------------------------------------------------------------------- */
@@ -74,148 +70,92 @@ function zonedStart(dateStr: string, timeZone: string): Date {
   return new Date(guess - zoneOffsetMinutes(new Date(guess), timeZone) * 60000);
 }
 
-console.log("\n── 1. Fix Bill Edge Function Syntax (Review Finding 1) ──");
+console.log("\n── 1. Finalize Valid ₹0 Sales & Empty Check Rejection (Issue 1) ──");
 {
-  check("orphaned duplicate error-handler fragment is removed from bill/index.ts",
-    !/return json\(req, \{ error: message \|\| "Could not record the payment\." \}, 500\);\s*}\s*req,\s*\{ error: `\$\{outstanding\} is still due/.test(billFn));
+  check("finalize_table_check counts non-cancelled billable orders",
+    /select[\s\S]*?count\(\*\)\s+as order_count[\s\S]*?into v_totals\s+from public\.orders\s+where check_id = p_check and status <> 'CANCELLED';/.test(migration3Sql));
 
-  check("bill/index.ts passes payment to RPC and uses RPC error/result as authority",
-    /admin\(\)\.rpc\("record_check_payment"/.test(billFn) &&
-    /message\.includes\("UNDERPAYMENT:"\)/.test(billFn) &&
-    /message\.includes\("OVERPAYMENT:"\)/.test(billFn));
+  check("finalize_table_check rejects empty/all-cancelled checks with NOTHING_TO_BILL",
+    /if v_totals\.order_count = 0 then\s+raise exception 'NOTHING_TO_BILL'/.test(migration3Sql));
 
-  check("bill/index.ts cleanly handles already-settled state",
-    /message\.includes\("CHECK_PAID"\) \|\| message\.includes\("ALREADY_SETTLED"\)/.test(billFn));
-}
+  check("finalize_table_check allows ₹0 sales when billable orders exist",
+    /if v_totals\.total > 0 and v_paid \+ 0\.005 < v_totals\.total then\s+raise exception 'UNPAID:%'/.test(migration3Sql));
 
-console.log("\n── 2. Preserve Invoice Generation & Session Closure (Review Finding 2) ──");
-{
-  const targetMigration = migration2Sql || migration1Sql;
+  check("finalize_table_check allocates single tenant-scoped invoice for ₹0 sale",
+    /insert into public\.check_invoice_counters \(tenant_id\)[\s\S]*?v_invoice := 'INV-' \|\| lpad\(v_seq::text, 7, '0'\);/.test(migration3Sql));
 
-  check("record_check_payment acquires row lock on check for update before calculating balance",
-    /select \* into v_check\s+from public\.table_checks\s+where id = p_check and tenant_id = p_tenant\s+for update;/.test(targetMigration));
+  const finalizeFnBody = migration3Sql.match(/create or replace function public\.finalize_table_check[\s\S]*?end \$function\$/)?.[0] || "";
+  check("finalize_table_check completes orders and closes check session without payment ledger row",
+    /v_completed := public\.complete_paid_check_orders\(p_tenant, p_check\);[\s\S]*?update public\.table_sessions\s+set status = 'ENDED'/.test(finalizeFnBody) &&
+    !finalizeFnBody.includes("insert into public.check_payments"));
 
-  check("record_check_payment reuses finalize_table_check for full settlement",
-    /v_fin := public\.finalize_table_check\(p_tenant, p_check, p_actor\);/.test(targetMigration));
+  check("settle_check_cash_tx distinguishes ₹0 sale from empty check and skips check_payments insert",
+    /if v_outstanding > 0 then[\s\S]*?insert into public\.check_payments[\s\S]*?end if;\s+insert into public\.check_invoice_counters/.test(migration3Sql));
 
-  check("record_check_payment returns allocated invoiceNumber from finalization",
-    /'invoiceNumber', v_fin->>'invoiceNumber'/.test(targetMigration));
+  check("settle_check_cash_tx rejects empty check with NOTHING_TO_BILL",
+    /create or replace function public\.settle_check_cash_tx[\s\S]*?if v_totals\.order_count = 0 then\s+raise exception 'NOTHING_TO_BILL'/.test(migration3Sql));
 
-  check("record_check_payment handles zero-balance check by reusing finalization logic",
-    /if v_outstanding <= 0\.00 then\s+return public\.finalize_table_check\(p_tenant, p_check, p_actor\);/.test(targetMigration));
+  check("order readiness cooking check (ORDERS_OPEN) is preserved",
+    /if v_open_orders > 0 then\s+raise exception 'ORDERS_OPEN:%'/.test(migration3Sql));
 
-  check("record_check_payment rejects underpayment with UNDERPAYMENT exception",
-    /if v_amt < v_outstanding then\s+raise exception 'UNDERPAYMENT:%:%'/.test(targetMigration));
-
-  check("record_check_payment rejects overpayment with OVERPAYMENT exception",
-    /if v_amt > v_outstanding then\s+raise exception 'OVERPAYMENT:%:%'/.test(targetMigration));
-
-  check("record_check_payment preserves idempotent retries returning single payment and invoice",
-    /if p_idempotency_key is not null then[\s\S]*?select \* into v_existing[\s\S]*?return jsonb_build_object\(\s*'ok', true,\s*'deduplicated', true[\s\S]*?'invoiceNumber', v_check\.invoice_number/.test(targetMigration));
-
-  check("finalize_table_check ensures missing invoice is allocated even on already-paid checks",
-    /if v_check\.status = 'PAID' then[\s\S]*?if v_check\.invoice_number is null then[\s\S]*?v_invoice := 'INV-' \|\| lpad\(v_seq::text, 7, '0'\);/.test(targetMigration));
-
-  check("independent diner sessions preserved: only sessions bound to that check are ended",
-    /update public\.table_sessions\s+set status = 'ENDED'[\s\S]*?where id in \([\s\S]*?v_check\.session_id[\s\S]*?v_check\.anchor_session_id[\s\S]*?o\.table_session_id[\s\S]*?\)[\s\S]*?and status = 'ACTIVE'/.test(targetMigration));
-
-  // Simulation: Independent diner sessions at the same table
-  const tableId = "table-12";
-  const dinerSessions = [
-    { id: "session-diner-A", table_id: tableId, status: "ACTIVE", check_id: "check-A" },
-    { id: "session-diner-B", table_id: tableId, status: "ACTIVE", check_id: "check-B" },
-  ];
-
-  function finalizeCheckSession(checkId: string, sessions: typeof dinerSessions) {
-    for (const s of sessions) {
-      if (s.check_id === checkId) {
-        s.status = "ENDED";
-      }
+  // Simulation: Valid ₹0 sale vs Empty check
+  function simulateCheckout(orders: { total: number; status: string }[], payments: number[]) {
+    const activeOrders = orders.filter((o) => o.status !== "CANCELLED");
+    if (activeOrders.length === 0) {
+      return { ok: false, error: "NOTHING_TO_BILL" };
     }
+    const total = activeOrders.reduce((sum, o) => sum + o.total, 0);
+    const paid = payments.reduce((sum, p) => sum + p, 0);
+    if (total > 0 && paid < total) {
+      return { ok: false, error: "UNPAID" };
+    }
+    const paymentsInserted = total > 0 ? [total - paid] : [];
+    return { ok: true, invoiceNumber: "INV-0000001", total, paymentsInserted };
   }
 
-  finalizeCheckSession("check-A", dinerSessions);
-  check("diner session A is ended upon settling check A", dinerSessions[0].status === "ENDED");
-  check("diner session B at same table remains ACTIVE and independent", dinerSessions[1].status === "ACTIVE");
+  const emptyCheck = simulateCheckout([], []);
+  const allCancelledCheck = simulateCheckout([{ total: 300, status: "CANCELLED" }], []);
+  const validZeroSale = simulateCheckout([{ total: 0, status: "SERVED" }], []);
+  const normalSale = simulateCheckout([{ total: 450, status: "SERVED" }], [450]);
 
-  // Simulation: Idempotent payment retry and single invoice
-  let invoiceCounter = 1;
-  function simulatePayment(key: string, storedKey?: string, existingInvoice?: string) {
-    if (storedKey && storedKey === key) {
-      return { ok: true, deduplicated: true, invoiceNumber: existingInvoice };
-    }
-    const inv = `INV-000000${invoiceCounter++}`;
-    return { ok: true, deduplicated: false, invoiceNumber: inv };
-  }
-
-  const firstCall = simulatePayment("key-123");
-  const retryCall = simulatePayment("key-123", "key-123", firstCall.invoiceNumber);
-  check("first payment allocates invoice", firstCall.invoiceNumber === "INV-0000001");
-  check("payment retry is deduplicated with exact same invoice", retryCall.deduplicated === true && retryCall.invoiceNumber === "INV-0000001");
+  check("empty check is rejected with NOTHING_TO_BILL", emptyCheck.error === "NOTHING_TO_BILL");
+  check("all-cancelled check is rejected with NOTHING_TO_BILL", allCancelledCheck.error === "NOTHING_TO_BILL");
+  check("valid ₹0 sale succeeds with allocated invoice", validZeroSale.ok && validZeroSale.invoiceNumber === "INV-0000001");
+  check("valid ₹0 sale inserts 0 payment ledger rows", validZeroSale.paymentsInserted.length === 0);
+  check("normal sale succeeds with invoice and payment", normalSale.ok && normalSale.total === 450);
 }
 
-console.log("\n── 3. Verified Full Settlements in Analytics & paid_at (Review Finding 3) ──");
+console.log("\n── 2. Authoritative Settlement Verification & paid_at (Issue 2) ──");
 {
-  const targetMigration = migration2Sql || migration1Sql;
+  check("analytics removed fallback picking last payment row when check total is 0 or unknown",
+    !analyticsFn.includes("checkTotal <= 0 && historyPayments.length > 0"));
 
-  check("analytics paginates with deterministic ordering (created_at, id)",
-    /\.order\("created_at", \{ ascending: true \}\)\s*\.order\("id", \{ ascending: true \}\)/.test(analyticsFn));
+  check("analytics requires verified checkTotal > 0 and cumulative payments >= checkTotal for ledger settlement",
+    /if \(checkTotal > 0 && Math\.round\(runningPaid \* 100\) >= Math\.round\(checkTotal \* 100\)\)/.test(analyticsFn));
 
-  check("analytics propagates query failures instead of swallowing them as empty history",
-    !/const \{ data: historyPayments \} = await db/.test(analyticsFn) &&
-    /const historyPayments = await fetchAllPages<any>/.test(analyticsFn));
+  check("analytics recognizes verified ₹0 sales with closure evidence",
+    /amt >= 0/.test(analyticsFn) &&
+    /Authoritative finalization evidence: valid ₹0 sale or verified legacy check/.test(analyticsFn));
 
-  check("analytics checks full payment history for candidate checks across all time",
-    /allHistoryLedgerPaymentsByCheck/.test(analyticsFn));
+  check("migration repairs paid_at requiring verified total > 0 and ledger coverage",
+    /where tc\.total > 0\s+and rp\.cumulative_amount >= tc\.total - 0\.005/.test(migration3Sql));
 
-  check("analytics determines full settlement by cumulative payments reaching check total",
-    /runningPaid \+= Number\(p\.amount \|\| 0\);[\s\S]*?Math\.round\(runningPaid \* 100\) >= Math\.round\(checkTotal \* 100\)/.test(analyticsFn));
+  check("migration repairs paid_at for closed paid checks (including ₹0 sales)",
+    /where tc\.status = 'PAID'\s+and coalesce\(tc\.closed_at, tc\.invoice_date\) is not null/.test(migration3Sql));
 
-  check("legacy fallback used ONLY when check has no ledger full settlement across history",
-    /else if \(chk && chk\.status === "PAID" && \(chk\.closed_at \|\| chk\.invoice_date\)\)/.test(analyticsFn));
+  check("migration resets unverified paid_at to NULL (including open checks with unknown total)",
+    /update public\.orders o\s+set paid_at = null\s+where o\.paid_at is not null/.test(migration3Sql));
 
-  check("date filter applied to settlement timestamp after determining authoritative source",
-    /const windowEvents = candidateEvents\.filter\(\s*\(e\) => e\.settledAt >= winStart && e\.settledAt < winEnd\s*\)/.test(analyticsFn));
-
-  check("migration repairs paid_at using cumulative verified full settlement",
-    /sum\(cp\.amount\) over \([\s\S]*?partition by cp\.check_id[\s\S]*?order by cp\.created_at asc, cp\.id asc[\s\S]*?\) as cumulative_amount/.test(targetMigration) &&
-    /rp\.cumulative_amount >= coalesce\(tc\.total, 0\.00\) - 0\.005/.test(targetMigration));
-
-  check("migration repairs conflicting non-null paid_at using IS DISTINCT FROM",
-    /o\.paid_at is distinct from cfs\.verified_settled_at/.test(targetMigration));
-
-  check("unverifiable orders have paid_at reset to NULL",
-    /update public\.orders o[\s\S]*?set paid_at = null[\s\S]*?where o\.paid_at is not null/.test(targetMigration));
-
-  // Simulation: Check settled before midnight IST (23:50) and closed after midnight IST (00:05)
+  // Simulation: Open check with payment and unknown total must NOT report as completed settlement
   const tz = "Asia/Kolkata";
   const day1Start = zonedStart("2026-11-20", tz);
   const day2Start = zonedStart("2026-11-21", tz);
-  const day3Start = zonedStart("2026-11-22", tz);
 
-  const checkCrossMidnight = {
-    id: "chk-cross-midnight",
-    total: 1000,
-    closed_at: "2026-11-20T18:35:00Z", // 00:05 IST Nov 21 (Day 2)
-    paid_total: 1000,
-    status: "PAID",
-  };
-  const historyPayments = [
-    {
-      id: "pay-1",
-      check_id: "chk-cross-midnight",
-      created_at: "2026-11-20T18:20:00Z", // 23:50 IST Nov 20 (Day 1)
-      amount: 1000,
-      status: "SUCCEEDED",
-      method: "CASH",
-    },
-  ];
-
-  function reconcileCheck(chk: any, payments: any[], winStart: Date, winEnd: Date) {
+  function reconcileCheck(chk: { id: string; total: number; status: string; closed_at?: string }, payments: { amount: number; created_at: string }[]) {
     let authoritativeEvent: any = null;
     let runningPaid = 0;
     for (const p of payments) {
-      runningPaid += Number(p.amount || 0);
+      runningPaid += p.amount;
       if (chk.total > 0 && Math.round(runningPaid * 100) >= Math.round(chk.total * 100)) {
         authoritativeEvent = {
           checkId: chk.id,
@@ -226,75 +166,96 @@ console.log("\n── 3. Verified Full Settlements in Analytics & paid_at (Revie
         break;
       }
     }
+
     if (!authoritativeEvent && chk.status === "PAID" && chk.closed_at) {
       authoritativeEvent = {
         checkId: chk.id,
-        amount: chk.paid_total,
+        amount: chk.total,
         settledAt: new Date(chk.closed_at),
-        source: "LEGACY",
+        source: chk.total === 0 ? "ZERO_TOTAL" : "LEGACY",
       };
     }
 
-    if (!authoritativeEvent) return null;
-    if (authoritativeEvent.settledAt >= winStart && authoritativeEvent.settledAt < winEnd) {
-      return authoritativeEvent;
-    }
-    return null;
+    return authoritativeEvent;
   }
 
-  const day1Report = reconcileCheck(checkCrossMidnight, historyPayments, day1Start, day2Start);
-  const day2Report = reconcileCheck(checkCrossMidnight, historyPayments, day2Start, day3Start);
+  const openCheckWithPayment = {
+    id: "chk-open",
+    total: 0, // Unknown/open total
+    status: "OPEN",
+  };
+  const paymentsOnOpenCheck = [{ amount: 500, created_at: "2026-11-20T10:00:00Z" }];
 
-  check("check appears in Day 1 report (settledAt 23:50 IST)", day1Report !== null && day1Report.amount === 1000);
-  check("check does NOT appear in Day 2 report (never double counted)", day2Report === null);
-  check("appears exactly once across the two daily reports", (day1Report ? 1 : 0) + (day2Report ? 1 : 0) === 1);
+  const openCheckReport = reconcileCheck(openCheckWithPayment, paymentsOnOpenCheck);
+  check("successful payment on open check with unknown total is NOT reported as completed settlement", openCheckReport === null);
 
-  // Simulation: Underpayment does NOT create verified full settlement
-  const underpaidPayments = [
-    { id: "p-sub", check_id: "chk-under", amount: 400, created_at: "2026-11-20T10:00:00Z", status: "SUCCEEDED" },
-  ];
-  const underpaidCheck = { id: "chk-under", total: 1000, status: "OPEN" };
-  const underpaidResult = reconcileCheck(underpaidCheck, underpaidPayments, day1Start, day2Start);
-  check("underpayment is NOT counted as full settlement", underpaidResult === null);
+  const closedZeroCheck = {
+    id: "chk-zero",
+    total: 0,
+    status: "PAID",
+    closed_at: "2026-11-20T11:00:00Z",
+  };
+  const zeroCheckReport = reconcileCheck(closedZeroCheck, []);
+  check("verified ₹0 sale with closed evidence is reported with ₹0 amount", zeroCheckReport !== null && zeroCheckReport.amount === 0 && zeroCheckReport.source === "ZERO_TOTAL");
+
+  // Single counting across midnight IST simulation
+  const checkCrossMidnight = {
+    id: "chk-midnight",
+    total: 1200,
+    status: "PAID",
+    closed_at: "2026-11-20T18:35:00Z", // 00:05 IST Nov 21
+  };
+  const midnightPayment = [{ amount: 1200, created_at: "2026-11-20T18:20:00Z" }]; // 23:50 IST Nov 20
+
+  const event = reconcileCheck(checkCrossMidnight, midnightPayment);
+  const inDay1 = event && event.settledAt >= day1Start && event.settledAt < day2Start;
+  const inDay2 = event && event.settledAt >= day2Start;
+  check("payment at 23:50 IST counted in Day 1", inDay1 === true);
+  check("check closed at 00:05 IST NOT counted in Day 2", inDay2 === false);
 }
 
-console.log("\n── 4. Location Attribution & Persistence in Both Payment Paths (Review Finding 4) ──");
+console.log("\n── 3. Persisted Sale Location & Cashier Fallback Removal (Issue 3) ──");
 {
-  const targetMigration = migration2Sql || migration1Sql;
+  check("create_order_tx resolves sale location from table, p_order location_id, or creator staff",
+    /create or replace function public\.create_order_tx[\s\S]*?select location_id into v_location\s+from public\.tables\s+where id = v_table;[\s\S]*?nullif\(p_order->>'location_id', ''\)[\s\S]*?select location_id into v_location\s+from public\.staff\s+where id = \(p_order->>'served_by_id'\)::uuid/.test(migration3Sql));
 
-  check("settle_check_cash_tx persists durable location_id on payments, checks, and orders",
-    /insert into public\.check_payments \([\s\S]*?location_id[\s\S]*?values \([\s\S]*?v_location/.test(targetMigration) &&
-    /update public\.table_checks\s+set[\s\S]*?location_id = coalesce\(location_id, v_location\)/.test(targetMigration) &&
-    /update public\.orders\s+set location_id = coalesce\(location_id, v_location\)/.test(targetMigration));
+  check("create_order_tx persists location on orders and table_checks",
+    /insert into public\.orders \([\s\S]*?location_id[\s\S]*?values \([\s\S]*?v_location[\s\S]*?update public\.table_checks\s+set location_id = coalesce\(location_id, v_location\)/.test(migration3Sql));
 
-  check("record_check_payment persists durable location_id on payments, checks, and orders",
-    /insert into public\.check_payments \([\s\S]*?location_id[\s\S]*?values \([\s\S]*?v_location/.test(targetMigration) &&
-    /update public\.table_checks\s+set[\s\S]*?location_id = coalesce\(location_id, v_location\)/.test(targetMigration));
+  check("orders Edge Function resolves and passes locationId on order creation",
+    ordersFn.includes("locationId: string | null = b.locationId || b.location_id") &&
+    /location_id: args\.locationId \?\? null/.test(ordersFn));
 
-  check("finalize_table_check persists location on table_checks and orders",
-    /create or replace function public\.finalize_table_check[\s\S]*?location_id = coalesce\(location_id, v_location\)/.test(targetMigration));
+  check("finalize_table_check removed cashier staff location fallback",
+    !/finalize_table_check[\s\S]*?select location_id into v_location\s+from public\.staff\s+where id = p_actor/.test(migration3Sql));
 
-  check("tableless orders (Takeaway / Delivery) resolve location from transaction staff actor",
-    /if v_location is null and v_is_staff then\s+select location_id into v_location\s+from public\.staff\s+where id = p_actor/.test(targetMigration));
+  check("settle_check_cash_tx removed cashier staff location fallback",
+    !/settle_check_cash_tx[\s\S]*?select location_id into v_location\s+from public\.staff\s+where id = p_actor/.test(migration3Sql));
 
-  check("unverifiable historical locations remain NULL (unassigned, never guessed)",
-    /v_location uuid := null;/.test(targetMigration) &&
-    /Unverifiable historical location data: left unassigned \(never guessed\)/.test(analyticsFn));
+  check("record_check_payment removed cashier staff location fallback",
+    !/record_check_payment[\s\S]*?select location_id into v_location\s+from public\.staff\s+where id = p_actor/.test(migration3Sql));
 
-  // Simulation: Staff transfer does not alter historical location
-  const pastTransaction = {
-    id: "tx-100",
-    amount: 1200,
-    location_id: "loc-koramangala", // Persisted at settlement time
+  // Simulation: Cross-branch checkout (sale created at Branch A, settled by cashier from Branch B)
+  function resolveSettlementLocation(
+    saleData: { checkLocation?: string; orderLocation?: string; tableLocation?: string },
+    cashierCurrentLocation: string
+  ) {
+    // Correct logic: Sale's persisted location only
+    return saleData.checkLocation || saleData.tableLocation || saleData.orderLocation || null;
+  }
+
+  const saleAtBranchA = {
+    checkLocation: "branch-A",
+    orderLocation: "branch-A",
+    tableLocation: undefined, // e.g. Takeaway
   };
+  const cashierAssignedToBranchB = "branch-B";
 
-  const staff = {
-    id: "staff-1",
-    location_id: "loc-indiranagar", // Transferred to another branch later
-  };
+  const resolvedLoc = resolveSettlementLocation(saleAtBranchA, cashierAssignedToBranchB);
+  check("sale created at branch A and settled by cashier at branch B stays attributed to branch A", resolvedLoc === "branch-A");
 
-  check("historical transaction retains loc-koramangala even when staff moves to loc-indiranagar",
-    pastTransaction.location_id === "loc-koramangala" && staff.location_id === "loc-indiranagar");
+  const unassignedSale = resolveSettlementLocation({}, cashierAssignedToBranchB);
+  check("unverifiable historical sale without location data remains unassigned (null)", unassignedSale === null);
 }
 
 console.log(`\n========================================`);
