@@ -176,8 +176,8 @@ export function PromosView() {
   const setField = <K extends keyof PromoFormState>(key: K, value: PromoFormState[K]) => {
     setForm((f) => {
       const next = { ...f, [key]: value }
-      // If switching from PERCENTAGE to FLAT, reset maxDiscount to 0 to prevent stale hidden fields
-      if (key === 'type' && (value === 'FLAT' || value === 'FIXED')) {
+      // If switching from PERCENTAGE to FLAT, reset maxDiscount to 0 to prevent stale hidden fields on create
+      if (key === 'type' && (value === 'FLAT' || value === 'FIXED') && !editing) {
         next.maxDiscount = '0'
       }
       return next
@@ -248,7 +248,9 @@ export function PromosView() {
       type: normalizedType,
       value,
       minOrder: Math.max(0, parseFloat(form.minOrder) || 0),
-      maxDiscount: normalizedType === 'PERCENTAGE' ? Math.max(0, parseFloat(form.maxDiscount) || 0) : 0,
+      maxDiscount: normalizedType === 'PERCENTAGE'
+        ? Math.max(0, parseFloat(form.maxDiscount) || 0)
+        : (editing && Number(editing.maxDiscount) > 0 ? Number(editing.maxDiscount) : 0),
       usageLimit: Math.max(0, parseInt(form.usageLimit, 10) || 0),
       validFrom,
       validTo,

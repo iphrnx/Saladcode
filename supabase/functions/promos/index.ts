@@ -282,8 +282,17 @@ async function update(req: Request, id: string | null): Promise<Response> {
       data.max_discount = Math.max(0, Number(b.maxDiscount) || 0);
     }
   } else {
-    // For flat discounts, max_discount is reset to 0 to prevent stale hidden fields
-    data.max_discount = 0;
+    // Preserve caps on legacy flat promos:
+    // If a positive maxDiscount is provided, save it.
+    // If explicitly changing type to FLAT from PERCENTAGE, reset cap to 0.
+    // When editing unrelated fields or toggling active status on a flat promo,
+    // preserve the stored max_discount. Never let hidden fields or active toggles overwrite a legacy cap with 0.
+    if (b.maxDiscount !== undefined && Number(b.maxDiscount) > 0) {
+      data.max_discount = Number(b.maxDiscount);
+    } else if (b.maxDiscount !== undefined && data.type === "FLAT") {
+      data.max_discount = 0;
+    }
+    // Otherwise, do not set data.max_discount so current.max_discount is safely preserved
   }
 
   if (b.usageLimit !== undefined) {

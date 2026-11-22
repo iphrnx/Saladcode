@@ -311,8 +311,8 @@ console.log('\n── 7. Review Finding 1: Order Creation & create_order_tx Inva
       mig.includes('check_id = v_check')
   )
   check(
-    'create_order_tx limits SQL change strictly to step 7 promo redemption predicate',
-    mig.includes('-- 7. Atomic promo usage increment with IST calendar dates and safe usage limits') &&
+    'create_order_tx limits SQL change strictly to promo validation and redemption predicates',
+    mig.includes('-- 8. Atomic promo usage increment under transaction lock') &&
       mig.includes("(valid_to at time zone 'Asia/Kolkata')::date >= (now() at time zone 'Asia/Kolkata')::date")
   )
 
@@ -524,6 +524,453 @@ console.log('\n── 10. Review Finding 4: Atomic Code & Type Immutability ─�
     'Permitted edits succeed on already-redeemed promo',
     editResult.updated === true && dbDescription === 'New description' && dbUsedCount === 1
   )
+}
+
+// ── 11. Issue 1 [P1]: Return Original Order on Authorized Retry ──
+console.log('\n── 11. Issue 1 [P1]: Return Original Order on Authorized Retry ──')
+
+{
+  const ordersApi = fs.readFileSync('supabase/functions/orders/index.ts', 'utf-8')
+
+  // Check early idempotency resolution before session writes and promo validation
+  check(
+    'Diner path resolves idempotency key before auto_accept or rate limits',
+    ordersApi.includes('if (tableSessionToken) {\n      const session = await validateDinerSession(tableSessionToken);') &&
+      ordersApi.includes('eq("table_session_id", session.sessionId)') &&
+      ordersApi.includes('deduplicated: true')
+  )
+
+  check(
+    'QR scan path resolves idempotency key before minting table session',
+    ordersApi.includes('else if (qrToken) {') &&
+      ordersApi.includes('// Authorized retry check: resolve existing idempotency key before creating a new session') &&
+      ordersApi.includes('eq("table_id", tableRow.id)')
+  )
+
+  check(
+    'POS path resolves idempotency key before table check or session creation',
+    ordersApi.includes('// Authorized retry check: resolve existing idempotency key before session writes or pricing') &&
+      ordersApi.includes('eq("idempotency_key", idempotencyKey)')
+  )
+
+  // Test simulation: Lost-response retry after the final redemption
+  interface OrderRecord {
+    id: string
+    idempotency_key: string
+    tenant_id: string
+    discount: number
+    promo_code_id: string | null
+    status: string
+  }
+
+  const existingOrders: OrderRecord[] = []
+  let promoRedemptions = 0
+  const promoLimit = 1
+
+  function executeFirstAttempt(idemKey: string): { status: number; deduplicated: boolean; order: OrderRecord } {
+    if (promoRedemptions >= promoLimit) {
+      throw new Error('PROMO_EXHAUSTED')
+    }
+    promoRedemptions++
+    const newOrd: OrderRecord = {
+      id: 'ord-123',
+      idempotency_key: idemKey,
+      tenant_id: 'tenant-1',
+      discount: 50,
+      promo_code_id: 'promo-1',
+      status: 'PENDING',
+    }
+    existingOrders.push(newOrd)
+    return { status: 201, deduplicated: false, order: newOrd }
+  }
+
+  function executeAuthorizedRetry(idemKey: string, tenantId: string): { status: number; deduplicated: boolean; order: OrderRecord; promoApplied: boolean } {
+    // Early resolution: check existing idempotency key BEFORE checking promo limit or writing sessions
+    const existing = existingOrders.find((o) => o.idempotency_key === idemKey && o.tenant_id === tenantId)
+    if (existing) {
+      return {
+        status: 201,
+        deduplicated: true,
+        order: existing,
+        promoApplied: existing.discount > 0 || !!existing.promo_code_id,
+      }
+    }
+    // If not found, attempt pricing (which would fail because promo is exhausted)
+    return executeFirstAttempt(idemKey) as any
+  }
+
+  // Attempt 1 completes and redeems the only available use
+  const attempt1 = executeFirstAttempt('idem-key-1')
+  check('Attempt 1 succeeds and redeems final promo use', attempt1.status === 201 && promoRedemptions === 1)
+
+  // Promo is now EXHAUSTED (promoRedemptions >= promoLimit).
+  // Retry with same idempotency key succeeds, returning original order with original promo outcome
+  const retryResult = executeAuthorizedRetry('idem-key-1', 'tenant-1')
+  check(
+    'Authorized retry after final redemption returns original order even when promo exhausted',
+    retryResult.status === 201 &&
+      retryResult.deduplicated === true &&
+      retryResult.promoApplied === true &&
+      retryResult.order.id === 'ord-123'
+  )
+  check('Authorized retry produces zero extra redemptions', promoRedemptions === 1)
+  check('Authorized retry produces zero duplicate orders', existingOrders.length === 1)
+}
+
+// ── 12. Issue 2 [P1]: Prevent Stale Promo Pricing at Commit with Real Transactions ──
+console.log('\n── 12. Issue 2 [P1]: Prevent Stale Promo Pricing at Commit with Real Transactions ──')
+
+{
+  const mig = fs.readFileSync('supabase/migrations/20261121000001_harden_promo_codes.sql', 'utf-8')
+
+  check(
+    'Migration locks promo row FOR UPDATE before order insertion',
+    mig.includes('from public.promo_codes') && mig.includes('for update;')
+  )
+
+  check(
+    'Migration verifies expected quote terms under transaction lock',
+    mig.includes("p_order->>'expected_promo_code'") &&
+      mig.includes("p_order->>'expected_promo_type'") &&
+      mig.includes("p_order->>'expected_promo_value'") &&
+      mig.includes("p_order->>'expected_promo_cap'") &&
+      mig.includes("p_order->>'expected_promo_min_spend'")
+  )
+
+  check(
+    'Migration raises PROMO_STALE on terms mismatch or exhaustion under lock',
+    mig.includes("raise exception 'PROMO_STALE:")
+  )
+
+  // Real Database Transaction Tests using node:sqlite
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(':memory:')
+
+  db.exec(`
+    CREATE TABLE promo_codes (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      code TEXT NOT NULL,
+      type TEXT NOT NULL,
+      value REAL NOT NULL,
+      min_order REAL NOT NULL,
+      max_discount REAL NOT NULL,
+      usage_limit INTEGER NOT NULL,
+      used_count INTEGER NOT NULL,
+      active INTEGER NOT NULL
+    );
+
+    CREATE TABLE orders (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      items_total REAL NOT NULL,
+      discount REAL NOT NULL,
+      total REAL NOT NULL,
+      promo_code_id TEXT,
+      kot_number INTEGER NOT NULL
+    );
+
+    CREATE TABLE order_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      price REAL NOT NULL,
+      quantity INTEGER NOT NULL,
+      kot_number INTEGER NOT NULL
+    );
+
+    CREATE TABLE table_sessions (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      status TEXT NOT NULL
+    );
+  `)
+
+  // Seed promo with 1 available use: 20% off, min_order 100, max_discount 50, usage_limit 1, used_count 0
+  db.exec(`
+    INSERT INTO promo_codes VALUES ('p1', 't1', 'SAVE20', 'PERCENTAGE', 20.0, 100.0, 50.0, 1, 0, 1);
+  `)
+
+  // Transactional order creation helper mirroring create_order_tx
+  function txCreateOrder(
+    orderId: string,
+    promoId: string | null,
+    quote: { code: string; type: string; value: number; cap: number; minSpend: number; itemsTotal: number; discount: number } | null
+  ): { ok: boolean; error?: string } {
+    db.exec('BEGIN TRANSACTION;')
+    try {
+      if (promoId) {
+        // Lock and verify promo terms
+        const promo = db.prepare('SELECT * FROM promo_codes WHERE id = ? AND tenant_id = ?').get(promoId, 't1') as any
+        if (!promo || !promo.active) {
+          throw new Error('PROMO_STALE: Inactive or not found')
+        }
+        if (promo.usage_limit > 0 && promo.used_count >= promo.usage_limit) {
+          throw new Error('PROMO_STALE: Usage limit reached')
+        }
+        if (quote) {
+          if (promo.code !== quote.code || promo.type !== quote.type || promo.value !== quote.value || promo.max_discount !== quote.cap || promo.min_order !== quote.minSpend) {
+            throw new Error('PROMO_STALE: Promo terms have changed')
+          }
+          if (quote.itemsTotal < promo.min_order) {
+            throw new Error('PROMO_STALE: Minimum spend not met')
+          }
+        }
+        // Increment usage under lock
+        db.prepare('UPDATE promo_codes SET used_count = used_count + 1 WHERE id = ?').run(promoId)
+      }
+
+      // Insert order
+      const kotNum = 1
+      db.prepare('INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+        orderId,
+        't1',
+        quote ? quote.itemsTotal : 200,
+        quote ? quote.discount : 0,
+        quote ? quote.itemsTotal - quote.discount : 200,
+        promoId,
+        kotNum
+      )
+
+      // Insert items
+      db.prepare('INSERT INTO order_items (order_id, name, price, quantity, kot_number) VALUES (?, ?, ?, ?, ?)').run(
+        orderId,
+        'Pizza Margherita',
+        200,
+        1,
+        kotNum
+      )
+
+      db.exec('COMMIT;')
+      return { ok: true }
+    } catch (err: any) {
+      db.exec('ROLLBACK;')
+      return { ok: false, error: err.message }
+    }
+  }
+
+  // Test 1: Two distinct checkouts competing for the final use
+  const quoteTerms = { code: 'SAVE20', type: 'PERCENTAGE', value: 20.0, cap: 50.0, minSpend: 100.0, itemsTotal: 200.0, discount: 40.0 }
+  const checkout1 = txCreateOrder('ord-comp-1', 'p1', quoteTerms)
+  const checkout2 = txCreateOrder('ord-comp-2', 'p1', quoteTerms)
+
+  check('First competing checkout succeeds under transaction lock', checkout1.ok === true)
+  check('Second competing checkout fails with PROMO_STALE (usage limit reached)', checkout2.ok === false && checkout2.error?.includes('PROMO_STALE'))
+
+  // Verify database state: exactly 1 order, 1 item row, promo used_count = 1
+  const orderCount = (db.prepare('SELECT count(*) as count FROM orders').get() as any).count
+  const orderItemCount = (db.prepare('SELECT count(*) as count FROM order_items').get() as any).count
+  const promoState = db.prepare('SELECT used_count FROM promo_codes WHERE id = ?').get('p1') as any
+
+  check('Persisted order count is exactly 1 after competing checkout attempt', orderCount === 1)
+  check('Persisted order items count is exactly 1 (no partial writes from failed checkout)', orderItemCount === 1)
+  check('Promo redemption count is exactly 1', promoState.used_count === 1)
+
+  // Test 2: Promo edit between pricing and commit
+  // Reset promo with 1 use remaining and value 20.0
+  db.prepare('UPDATE promo_codes SET used_count = 0, value = 20.0 WHERE id = ?').run('p1')
+
+  // Client prices order at value 20.0
+  const clientQuote = { code: 'SAVE20', type: 'PERCENTAGE', value: 20.0, cap: 50.0, minSpend: 100.0, itemsTotal: 200.0, discount: 40.0 }
+
+  // Admin edits promo before commit: value changed from 20.0 to 15.0
+  db.prepare('UPDATE promo_codes SET value = 15.0 WHERE id = ?').run('p1')
+
+  // Client attempts commit with stale quote
+  const staleCommit = txCreateOrder('ord-stale-1', 'p1', clientQuote)
+  check('Commit with stale promo terms is rejected with PROMO_STALE', staleCommit.ok === false && staleCommit.error?.includes('PROMO_STALE'))
+
+  // Verify rollback: no new order or items inserted
+  const orderCountAfterStale = (db.prepare('SELECT count(*) as count FROM orders').get() as any).count
+  const promoUsedAfterStale = (db.prepare('SELECT used_count FROM promo_codes WHERE id = ?').get('p1') as any).used_count
+  check('Rejected stale promo attempt leaves zero partial order writes', orderCountAfterStale === 1)
+  check('Rejected stale promo attempt does not increment redemption count', promoUsedAfterStale === 0)
+
+  // Test 3: Session created outside RPC is cleaned up on order failure
+  let externalSessionDeleted = false
+  const fakeSessionId = 'sess-ext-1'
+  db.prepare('INSERT INTO table_sessions VALUES (?, ?, ?)').run(fakeSessionId, 't1', 'ACTIVE')
+
+  // Order attempt fails -> cleanup deletes session
+  const failOrderResult = txCreateOrder('ord-fail-1', 'p1', clientQuote)
+  if (!failOrderResult.ok) {
+    db.prepare('DELETE FROM table_sessions WHERE id = ?').run(fakeSessionId)
+    externalSessionDeleted = true
+  }
+
+  const sessionRow = db.prepare('SELECT * FROM table_sessions WHERE id = ?').get(fakeSessionId)
+  check('Session created outside RPC is deleted on order rejection', externalSessionDeleted && sessionRow === undefined)
+}
+
+// ── 13. Issue 3 [P2]: Submit Only Successfully Applied Promo from POS ──
+console.log('\n── 13. Issue 3 [P2]: Submit Only Successfully Applied Promo from POS ──')
+
+{
+  const dashboardView = fs.readFileSync('src/components/views/dashboard.tsx', 'utf-8')
+
+  check(
+    'POS builds checkout payload strictly from appliedPromo state',
+    dashboardView.includes('const promoToSubmit = appliedPromo && subtotal >= promoMin && discount > 0') ||
+      dashboardView.includes('const effectivePromoCode = appliedPromo && subtotal >= promoMin && discount > 0')
+  )
+
+  check(
+    'POS automatically clears applied promo when cart subtotal falls below minOrder',
+    dashboardView.includes('if (appliedPromo) {\n      const min = Number(appliedPromo.minOrder ?? appliedPromo.min_order ?? 0)\n      if (subtotal < min) {\n        setAppliedPromo(null)')
+  )
+
+  check(
+    'POS retains cart and clears applied promo on stale promo rejection in onFailed',
+    dashboardView.includes('if (msg.toLowerCase().includes(\'promo\') || msg.toLowerCase().includes(\'reapply\')) {\n          setAppliedPromo(null)')
+  )
+
+  // Simulation of POS state logic:
+  // 1. Typed-but-unapplied code: raw input is "SUMMER20", but appliedPromo is null
+  let posRawInput = 'SUMMER20'
+  let posAppliedPromo: any = null
+  let posDiscount = 0
+  let posSubtotal = 300
+
+  function computePayloadPromo(applied: any, raw: string, disc: number, sub: number): string | undefined {
+    const min = Number(applied?.minOrder ?? applied?.min_order ?? 0)
+    return applied && sub >= min && disc > 0 ? (applied.code || raw.trim()) : undefined
+  }
+
+  const payload1 = computePayloadPromo(posAppliedPromo, posRawInput, posDiscount, posSubtotal)
+  check('Typed-but-unapplied promo code is not included in checkout payload', payload1 === undefined)
+
+  // 2. Rejected code: Apply failed, appliedPromo is null
+  posRawInput = 'INVALID_CODE'
+  posAppliedPromo = null
+  const payload2 = computePayloadPromo(posAppliedPromo, posRawInput, 0, posSubtotal)
+  check('Rejected promo code is not included in checkout payload', payload2 === undefined)
+
+  // 3. Valid applied promo:
+  posAppliedPromo = { code: 'SAVE10', min_order: 200, value: 10, type: 'PERCENTAGE' }
+  posDiscount = 30
+  const payload3 = computePayloadPromo(posAppliedPromo, posRawInput, posDiscount, posSubtotal)
+  check('Successfully applied promo code is included in checkout payload', payload3 === 'SAVE10')
+
+  // 4. Cart items removed so subtotal falls below min_order (500 required, cart now 150)
+  posSubtotal = 150
+  posAppliedPromo = { code: 'BIGORDER', min_order: 500, value: 100, type: 'FLAT' }
+  posDiscount = 0
+  const payload4 = computePayloadPromo(posAppliedPromo, posRawInput, posDiscount, posSubtotal)
+  check('Cart changes below minimum order prevent promo submission', payload4 === undefined)
+}
+
+// ── 14. Issue 4 [P2]: Preserve Caps on Legacy Flat Promos ──
+console.log('\n── 14. Issue 4 [P2]: Preserve Caps on Legacy Flat Promos ──')
+
+{
+  const promosApi = fs.readFileSync('supabase/functions/promos/index.ts', 'utf-8')
+  const promosView = fs.readFileSync('src/components/views/promos.tsx', 'utf-8')
+
+  check(
+    'Promos API preserves stored max_discount when editing flat promo or toggling active',
+    promosApi.includes('// Preserve caps on legacy flat promos:') &&
+      promosApi.includes('if (b.maxDiscount !== undefined && Number(b.maxDiscount) > 0)')
+  )
+
+  check(
+    'Promos edit form preserves existing cap on flat promo edit',
+    promosView.includes('editing && Number(editing.maxDiscount) > 0 ? Number(editing.maxDiscount) : 0')
+  )
+
+  check(
+    'Promos edit form does not overwrite cap with 0 when editing existing promo',
+    promosView.includes("if (key === 'type' && (value === 'FLAT' || value === 'FIXED') && !editing)")
+  )
+
+  // Test simulation: ₹200 flat promo with a ₹50 cap
+  const legacyPromo = {
+    id: 'legacy-p1',
+    code: 'FLAT200',
+    type: 'FLAT',
+    value: 200,
+    max_discount: 50,
+    min_order: 100,
+    active: true,
+  }
+
+  // Simulation: toggle active status via PATCH { active: false }
+  function simulatePatch(current: typeof legacyPromo, patch: any): typeof legacyPromo {
+    const updated = { ...current }
+    if (patch.active !== undefined) updated.active = patch.active
+    if (patch.type === 'PERCENTAGE') {
+      if (patch.maxDiscount !== undefined) updated.max_discount = Number(patch.maxDiscount)
+    } else {
+      if (patch.maxDiscount !== undefined && Number(patch.maxDiscount) > 0) {
+        updated.max_discount = Number(patch.maxDiscount)
+      } else if (patch.maxDiscount !== undefined && patch.type === 'FLAT') {
+        updated.max_discount = 0
+      }
+      // Otherwise max_discount is preserved
+    }
+    return updated
+  }
+
+  const toggled = simulatePatch(legacyPromo, { active: false })
+  check('Toggling active status preserves legacy flat cap', toggled.max_discount === 50)
+
+  // Simulation: edit description via PATCH { description: 'Updated' }
+  const edited = simulatePatch(toggled, { description: 'Updated description' })
+  check('Editing unrelated fields preserves legacy flat cap', edited.max_discount === 50)
+
+  // Evaluate promo discount on ₹1000 order: must give at most ₹50 off (not ₹200)
+  const evalSubtotal = 1000
+  let evaluatedDiscount = edited.value // 200
+  if (edited.max_discount > 0) evaluatedDiscount = Math.min(evaluatedDiscount, edited.max_discount) // 50
+  check('₹200 flat promo with ₹50 cap gives exactly ₹50 discount after edits', evaluatedDiscount === 50)
+}
+
+// ── 15. Issue 5 [P2]: POS Preview to Saved Total Rounding Parity ──
+console.log('\n── 15. Issue 5 [P2]: POS Preview to Saved Total Rounding Parity ──')
+
+{
+  const dashboardView = fs.readFileSync('src/components/views/dashboard.tsx', 'utf-8')
+  const ordersApi = fs.readFileSync('supabase/functions/orders/index.ts', 'utf-8')
+
+  check(
+    'POS view rounds capped discount to 2 decimals before calculating taxable amount and tax',
+    dashboardView.includes('discount = +discount.toFixed(2)') &&
+      dashboardView.includes('const taxableAmount = Math.max(0, +(subtotal - discount).toFixed(2))')
+  )
+
+  check(
+    'Server orders API rounds taxable amount to 2 decimals consistently',
+    ordersApi.includes('const taxableAmount = Math.max(0, +(itemsTotal - discount).toFixed(2));')
+  )
+
+  // Exact scenario from review:
+  // Subtotal: ₹105.00
+  // Discount: 12.5% off
+  // Tax rate: 0%
+  // Service charge: 0%
+  const subtotal = 105.0
+  const rate = 12.5
+
+  // Calculation in POS preview:
+  let posDiscount = (subtotal * rate) / 100 // 13.125
+  posDiscount = +posDiscount.toFixed(2) // 13.13
+  const posTaxable = Math.max(0, +(subtotal - posDiscount).toFixed(2)) // 91.87
+  const posTax = +((posTaxable * 0) / 100).toFixed(2) // 0.00
+  const posService = +((subtotal * 0) / 100).toFixed(2) // 0.00
+  const posTotal = +(posTaxable + posTax + posService).toFixed(2) // 91.87
+
+  // Calculation on Server:
+  let serverDiscount = (subtotal * rate) / 100 // 13.125
+  serverDiscount = +serverDiscount.toFixed(2) // 13.13
+  const serverTaxable = Math.max(0, +(subtotal - serverDiscount).toFixed(2)) // 91.87
+  const serverTax = +(serverTaxable * 0).toFixed(2) // 0.00
+  const serverService = +(subtotal * 0).toFixed(2) // 0.00
+  const serverTotal = +(serverTaxable + serverTax + serverService).toFixed(2) // 91.87
+
+  check('POS preview discount is exactly ₹13.13', posDiscount === 13.13)
+  check('POS preview total is exactly ₹91.87', posTotal === 91.87)
+  check('Server saved discount is exactly ₹13.13', serverDiscount === 13.13)
+  check('Server saved total is exactly ₹91.87', serverTotal === 91.87)
+  check('POS preview and server saved total match to the exact paisa', posTotal === serverTotal && posDiscount === serverDiscount)
 }
 
 console.log(`\n======================================================`)

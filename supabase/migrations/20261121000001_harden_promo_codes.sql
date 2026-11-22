@@ -23,6 +23,7 @@ declare
   v_order_id uuid;
   v_order_num integer;
   v_existing_order record;
+  v_locked_promo record;
   v_item jsonb;
   v_menu record;
   v_portion_elem jsonb;
@@ -70,7 +71,72 @@ begin
     end if;
   end loop;
 
-  -- 2. Session and Check resolution based on order_type
+  -- 2. Promo pre-lock & quote consistency check under transaction lock
+  if p_promo_code_id is not null then
+    select id, tenant_id, code, type, value, min_order, max_discount, usage_limit, used_count, valid_from, valid_to, active
+      into v_locked_promo
+      from public.promo_codes
+     where id = p_promo_code_id
+       and tenant_id = v_tenant
+       for update;
+
+    if v_locked_promo.id is null then
+      raise exception 'PROMO_STALE: Promo code not found for this restaurant. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+
+    if not v_locked_promo.active then
+      raise exception 'PROMO_STALE: Promo code is paused or inactive. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+
+    if (v_locked_promo.valid_from is not null and (v_locked_promo.valid_from at time zone 'Asia/Kolkata')::date > (now() at time zone 'Asia/Kolkata')::date) then
+      raise exception 'PROMO_STALE: Promo code is not active yet. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+
+    if (v_locked_promo.valid_to is not null and (v_locked_promo.valid_to at time zone 'Asia/Kolkata')::date < (now() at time zone 'Asia/Kolkata')::date) then
+      raise exception 'PROMO_STALE: Promo code has expired. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+
+    if (v_locked_promo.usage_limit > 0 and v_locked_promo.used_count >= v_locked_promo.usage_limit) then
+      raise exception 'PROMO_STALE: Promo code usage limit has been reached. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+
+    -- Verify terms match the quote used to price the order
+    if p_order->>'expected_promo_code' is not null or p_order->>'promo_code' is not null then
+      if upper(trim(v_locked_promo.code)) <> upper(trim(coalesce(p_order->>'expected_promo_code', p_order->>'promo_code'))) then
+        raise exception 'PROMO_STALE: Promo code terms have changed. Please reapply the promo code.' using errcode = 'P0001';
+      end if;
+    end if;
+
+    if p_order->>'expected_promo_type' is not null then
+      if upper(trim(v_locked_promo.type)) <> upper(trim(p_order->>'expected_promo_type')) then
+        raise exception 'PROMO_STALE: Promo discount type has changed. Please reapply the promo code.' using errcode = 'P0001';
+      end if;
+    end if;
+
+    if p_order->>'expected_promo_value' is not null then
+      if v_locked_promo.value <> (p_order->>'expected_promo_value')::numeric then
+        raise exception 'PROMO_STALE: Promo discount value has changed. Please reapply the promo code.' using errcode = 'P0001';
+      end if;
+    end if;
+
+    if p_order->>'expected_promo_cap' is not null then
+      if coalesce(v_locked_promo.max_discount, 0) <> coalesce((p_order->>'expected_promo_cap')::numeric, 0) then
+        raise exception 'PROMO_STALE: Promo max discount cap has changed. Please reapply the promo code.' using errcode = 'P0001';
+      end if;
+    end if;
+
+    if p_order->>'expected_promo_min_spend' is not null then
+      if coalesce(v_locked_promo.min_order, 0) <> coalesce((p_order->>'expected_promo_min_spend')::numeric, 0) then
+        raise exception 'PROMO_STALE: Promo minimum order requirement has changed. Please reapply the promo code.' using errcode = 'P0001';
+      end if;
+    end if;
+
+    if coalesce((p_order->>'items_total')::numeric, 0) < coalesce(v_locked_promo.min_order, 0) then
+      raise exception 'PROMO_STALE: Order subtotal does not meet the minimum requirement. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+  end if;
+
+  -- 3. Session and Check resolution based on order_type
   if v_order_type = 'DINE_IN' then
     if v_table is not null then
       if v_session is not null then
@@ -261,18 +327,18 @@ begin
      where id = v_check;
   end if;
 
-  -- 7. Atomic promo usage increment with IST calendar dates and safe usage limits
+  -- 8. Atomic promo usage increment under transaction lock
   if p_promo_code_id is not null then
     update public.promo_codes
        set used_count = used_count + 1
-     where id = p_promo_code_id
+     where id = v_locked_promo.id
        and tenant_id = v_tenant
        and active
        and (usage_limit = 0 or usage_limit is null or used_count < usage_limit)
        and (valid_from is null or (valid_from at time zone 'Asia/Kolkata')::date <= (now() at time zone 'Asia/Kolkata')::date)
        and (valid_to is null or (valid_to at time zone 'Asia/Kolkata')::date >= (now() at time zone 'Asia/Kolkata')::date);
     if not found then
-      raise exception 'PROMO_REJECTED: Promo code is invalid, expired, or usage limit reached' using errcode = 'P0001';
+      raise exception 'PROMO_REJECTED: PROMO_STALE: Promo code is invalid, expired, or usage limit reached. Please reapply.' using errcode = 'P0001';
     end if;
   end if;
 

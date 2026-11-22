@@ -2,7 +2,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { guard } from "../_shared/auth.ts";
 import { admin } from "../_shared/db.ts";
-import { evaluatePromo } from "../_shared/promo.ts";
+import { evaluatePromo, normalizePromoType } from "../_shared/promo.ts";
 import { hasEffectivePermission, ORDER_STATUS_KEYS } from "../_shared/permissions.ts";
 import { body, json, preflight, subPath } from "../_shared/http.ts";
 import { resolveOrderUnitPrice } from "../_shared/portions.ts";
@@ -489,6 +489,7 @@ async function priceAndCommitOnce(
   let promoCodeStr: string | undefined = undefined;
   let promoApplied = false;
   let promoReason: string | null = null;
+  let evaluatedPromo: any = null;
 
   if (promoCode && promoCode.trim()) {
     // One authority on whether the code applies, and why not if it does not.
@@ -509,9 +510,10 @@ async function priceAndCommitOnce(
     promoCodeStr = promoEval.code ?? undefined;
     promoApplied = true;
     promoReason = null;
+    evaluatedPromo = promoEval.promo;
   }
 
-  const taxableAmount = Math.max(0, itemsTotal - discount);
+  const taxableAmount = Math.max(0, +(itemsTotal - discount).toFixed(2));
   const tax = +(taxableAmount * taxRate).toFixed(2);
   const serviceCharge = +(itemsTotal * serviceRate).toFixed(2);
   const total = +(taxableAmount + tax + serviceCharge).toFixed(2);
@@ -534,6 +536,11 @@ async function priceAndCommitOnce(
       total,
       promo_code_id: promoCodeId ?? null,
       promo_code: promoCodeStr,
+      expected_promo_code: evaluatedPromo?.code ?? promoCodeStr ?? null,
+      expected_promo_type: normalizePromoType(evaluatedPromo?.type) ?? evaluatedPromo?.type ?? null,
+      expected_promo_value: evaluatedPromo?.value ?? null,
+      expected_promo_cap: Number(evaluatedPromo?.max_discount ?? evaluatedPromo?.maxDiscount ?? 0),
+      expected_promo_min_spend: Number(evaluatedPromo?.min_order ?? evaluatedPromo?.minOrder ?? 0),
       customer_name: customerName || null,
       customer_phone: customerPhone || null,
       notes: notes || null,
@@ -554,8 +561,9 @@ async function priceAndCommitOnce(
     const code = String((txError as any).code ?? "");
     // The in-transaction guards rejected a line or the promo after pricing —
     // something changed in the few milliseconds since.
-    if (msg.includes("PROMO_REJECTED")) {
-      return { ok: false, error: "Promo code is invalid, expired, or usage limit reached", status: 409, retry: false };
+    if (msg.includes("PROMO_STALE") || msg.includes("PROMO_REJECTED")) {
+      const cleanMsg = msg.replace(/^.*PROMO_(STALE|REJECTED):\s*/, "") || "Promo code terms have changed, expired, or reached usage limit. Please reapply the promo code.";
+      return { ok: false, error: cleanMsg, status: 409, retry: false };
     }
     if (msg.includes("ITEM_UNAVAILABLE")) {
       return { ok: false, error: msg, status: 409, retry: true };
@@ -654,6 +662,7 @@ async function create(req: Request): Promise<Response> {
     const idempotencyKey = cleanIdempotencyKey(b.idempotencyKey);
 
     const db = admin();
+    let newlyCreatedSessionId: string | null = null;
 
     // ── 1. Public: customer order via scanned table QR code ────────────────
     // The same pricing path the POS uses, from the same code. This branch used
@@ -665,6 +674,34 @@ async function create(req: Request): Promise<Response> {
     if (tableSessionToken) {
       const session = await validateDinerSession(tableSessionToken);
       if (!session.ok) return json(req, { error: session.error }, session.status);
+
+      // Authorized retry check: resolve existing idempotency key before promo validation or session writes
+      if (idempotencyKey) {
+        const { data: existingOrder } = await db
+          .from("orders")
+          .select(ORDER_SELECT)
+          .eq("idempotency_key", idempotencyKey)
+          .eq("tenant_id", session.tenantId)
+          .eq("table_session_id", session.sessionId)
+          .maybeSingle();
+
+        if (existingOrder) {
+          const mapped = mapOrder(existingOrder);
+          return json(
+            req,
+            {
+              ...mapped,
+              sessionToken: tableSessionToken,
+              sessionId: session.sessionId,
+              pendingActivation: existingOrder.status === "PENDING_ACTIVATION",
+              promoApplied: existingOrder.discount > 0 || !!existingOrder.promo_code_id,
+              promoReason: null,
+              deduplicated: true,
+            },
+            201,
+          );
+        }
+      }
 
       // Ordering is the expensive anonymous write. Bounded per session: a
       // diner re-tapping because the button felt slow cannot flood the
@@ -717,6 +754,10 @@ async function create(req: Request): Promise<Response> {
       }, idempotencyKey);
 
       if (!created.ok) {
+        // Roll back the session created outside the RPC on rejection
+        if (newlyCreatedSessionId) {
+          await db.from("table_sessions").delete().eq("id", newlyCreatedSessionId).catch(() => {});
+        }
         return json(
           req,
           {
@@ -771,6 +812,40 @@ async function create(req: Request): Promise<Response> {
         return json(req, { error: "Invalid QR code or table is inactive." }, 404);
       }
 
+      // Authorized retry check: resolve existing idempotency key before creating a new session
+      if (idempotencyKey) {
+        const { data: existingOrder } = await db
+          .from("orders")
+          .select(ORDER_SELECT)
+          .eq("idempotency_key", idempotencyKey)
+          .eq("tenant_id", tableRow.tenant_id)
+          .eq("table_id", tableRow.id)
+          .maybeSingle();
+
+        if (existingOrder) {
+          const { data: sessRow } = await db
+            .from("table_sessions")
+            .select("token")
+            .eq("id", existingOrder.table_session_id)
+            .maybeSingle();
+
+          const mapped = mapOrder(existingOrder);
+          return json(
+            req,
+            {
+              ...mapped,
+              sessionToken: sessRow?.token || "",
+              sessionId: existingOrder.table_session_id,
+              pendingActivation: existingOrder.status === "PENDING_ACTIVATION",
+              promoApplied: existingOrder.discount > 0 || !!existingOrder.promo_code_id,
+              promoReason: null,
+              deduplicated: true,
+            },
+            201,
+          );
+        }
+      }
+
       const gate = await rateLimit(await bucketKey("order:qr", String(qrToken)), 30, 60);
       if (!gate.allowed) {
         return json(
@@ -809,6 +884,7 @@ async function create(req: Request): Promise<Response> {
       if (newSessionErr || !newSession) {
         return json(req, { error: "Could not create table session. Please try again." }, 500);
       }
+      newlyCreatedSessionId = newSession.id;
 
       const created = await priceAndCreateOrder(db, {
         tenantId: tableRow.tenant_id,
@@ -825,6 +901,10 @@ async function create(req: Request): Promise<Response> {
       }, idempotencyKey);
 
       if (!created.ok) {
+        // Roll back the session created outside the RPC on rejection
+        if (newlyCreatedSessionId) {
+          await db.from("table_sessions").delete().eq("id", newlyCreatedSessionId).catch(() => {});
+        }
         return json(
           req,
           {
@@ -867,6 +947,30 @@ async function create(req: Request): Promise<Response> {
     const g = await guard(req, { permission: "orders.create" });
     if (!g.ok) return g.response;
     const tenantId = g.session.tenantId;
+
+    // Authorized retry check: resolve existing idempotency key before session writes or pricing
+    if (idempotencyKey) {
+      const { data: existingOrder } = await db
+        .from("orders")
+        .select(ORDER_SELECT)
+        .eq("idempotency_key", idempotencyKey)
+        .eq("tenant_id", tenantId)
+        .maybeSingle();
+
+      if (existingOrder) {
+        const mapped = mapOrder(existingOrder);
+        return json(
+          req,
+          {
+            ...mapped,
+            promoApplied: existingOrder.discount > 0 || !!existingOrder.promo_code_id,
+            promoReason: null,
+            deduplicated: true,
+          },
+          201,
+        );
+      }
+    }
 
     let tableId: string | null = null;
     let tableSessionId: string | null = null;
@@ -935,6 +1039,7 @@ async function create(req: Request): Promise<Response> {
             .maybeSingle();
           if (newSession) {
             tableSessionId = newSession.id;
+            newlyCreatedSessionId = newSession.id;
           }
         }
       }
@@ -983,7 +1088,12 @@ async function create(req: Request): Promise<Response> {
       servedById: validServedById,
     }, idempotencyKey);
 
-    if (!created.ok) return json(req, { error: created.error }, created.status);
+    if (!created.ok) {
+      if (newlyCreatedSessionId) {
+        await db.from("table_sessions").delete().eq("id", newlyCreatedSessionId).catch(() => {});
+      }
+      return json(req, { error: created.error }, created.status);
+    }
 
     if (!created.deduplicated) {
       await publishOrderEvent({

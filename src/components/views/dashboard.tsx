@@ -337,6 +337,12 @@ export function DashboardView() {
         submittingRef.current = false
         const msg = cleanOrderErrorMessage(error)
         toast.error(`Order Failed: ${msg}`)
+        // If checkout rejected a stale or invalid promo, clear applied promo so cashier can reapply,
+        // while strictly retaining the cart.
+        if (msg.toLowerCase().includes('promo') || msg.toLowerCase().includes('reapply')) {
+          setAppliedPromo(null)
+          setPromoError(msg)
+        }
         q.retire(entry.key)
       },
       onChange: (entries) => {
@@ -443,10 +449,23 @@ export function DashboardView() {
     }
     discount = Math.min(subtotal, Math.max(0, discount)) // never go negative
   }
-  const taxableAmount = Math.max(0, subtotal - discount)
+  // Round the capped discount to two decimals before calculating taxable amount, tax, and final total
+  discount = +discount.toFixed(2)
+  const taxableAmount = Math.max(0, +(subtotal - discount).toFixed(2))
   const tax = +((taxableAmount) * taxRate / 100).toFixed(2)
   const service = +((subtotal) * serviceRate / 100).toFixed(2)
   const total = +(taxableAmount + tax + service).toFixed(2)
+
+  // If cart changes make an applied promo ineligible, clear it immediately
+  useEffect(() => {
+    if (appliedPromo) {
+      const min = Number(appliedPromo.minOrder ?? appliedPromo.min_order ?? 0)
+      if (subtotal < min) {
+        setAppliedPromo(null)
+        setPromoError(`Promo "${appliedPromo.code}" requires minimum order of ${tenant?.currencySymbol || '₹'}${min.toFixed(2)}`)
+      }
+    }
+  }, [subtotal, appliedPromo, tenant?.currencySymbol])
 
   // Validate the promo code against the server.
   //
@@ -1422,6 +1441,13 @@ export function DashboardView() {
       quantity: c.quantity,
       notes: c.notes,
     }))
+    // Build the checkout payload strictly from the validated applied promo state.
+    // Raw input and codes rejected by Apply have no effect on checkout.
+    const promoMin = Number(appliedPromo?.minOrder ?? appliedPromo?.min_order ?? 0)
+    const effectivePromoCode = appliedPromo && subtotal >= promoMin && discount > 0
+      ? (appliedPromo.code || promoCode.trim())
+      : undefined
+
     orderQueue(tenant.id, data.currentUser.id, {}).enqueue(
       'pos',
       {
@@ -1430,7 +1456,7 @@ export function DashboardView() {
         createNewSitting: !activeSessionId,
         orderType,
         items,
-        promoCode: promoCode || undefined,
+        promoCode: effectivePromoCode,
         customerName: orderType !== 'DINE_IN' ? (customerName.trim() || undefined) : undefined,
         customerPhone: orderType !== 'DINE_IN' ? (customerPhone.trim() || undefined) : undefined,
         servedById: data.currentUser.id,
