@@ -13,7 +13,7 @@ import { hasPermission, hasEffectivePermission } from '@/lib/permissions'
 import { sortTables } from '@/lib/table-order'
 import { cn } from '@/lib/utils'
 import { formatCurrency } from '@/lib/constants'
-import { normalizePortions, type MenuPortion } from '@/lib/portions'
+import { normalizePortions, normalizePortionKey, type MenuPortion } from '@/lib/portions'
 import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
 import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId } from '@/lib/pos-cart'
 import { Input } from '@/components/ui/input'
@@ -226,6 +226,7 @@ export function DashboardView() {
   const [lastOrder, setLastOrder] = useState<any>(null)
   const [cartOpen, setCartOpen] = useState(false)
   const [appliedPromo, setAppliedPromo] = useState<any | null>(null)
+  const [promoQuote, setPromoQuote] = useState<any | null>(null)
   const [promoError, setPromoError] = useState('')
   const [promoChecking, setPromoChecking] = useState(false)
   const [customerName, setCustomerName] = useState('')
@@ -239,6 +240,73 @@ export function DashboardView() {
   const [modalSearch, setModalSearch] = useState('')
   const [modalZoneFilter, setModalZoneFilter] = useState('all')
   const [tick, setTick] = useState(0)
+  const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [refreshingCart, setRefreshingCart] = useState(false)
+
+  const refreshCartPricing = useCallback(async (providedData?: any) => {
+    setRefreshingCart(true)
+    try {
+      const fresh = providedData !== undefined ? providedData : await refresh()
+      // If the response is null or lacks usable menu data, report a refresh failure before calling replaceCart()
+      if (!fresh || !Array.isArray(fresh.menuItems)) {
+        throw new Error('Could not load authoritative menu data. Please retry.')
+      }
+
+      const freshMenu = fresh.menuItems
+      const currentCart = useStore.getState().cart
+      let anyUnavailable = false
+      const updatedCart = currentCart.map((c) => {
+        const mi = freshMenu.find((m: any) => m.id === c.menuItemId)
+        if (!mi || mi.available === false) {
+          anyUnavailable = true
+          return {
+            ...c,
+            unavailable: true,
+            unavailableReason: !mi ? 'Item removed from menu' : 'Item is currently unavailable',
+          }
+        }
+        if (c.portionId || c.portion) {
+          const normPortions = normalizePortions(mi.portions)
+          const matchedPortion = normPortions.find(
+            (p: any) =>
+              (c.portionId && p.id === c.portionId) ||
+              normalizePortionKey(p.name) === normalizePortionKey(c.portion),
+          )
+          if (!matchedPortion) {
+            anyUnavailable = true
+            return {
+              ...c,
+              unavailable: true,
+              unavailableReason: `Portion "${c.portion || 'Selected'}" is no longer available`,
+            }
+          }
+          return {
+            ...c,
+            price: matchedPortion.price,
+            portionId: matchedPortion.id,
+            portion: matchedPortion.name,
+            unavailable: false,
+            unavailableReason: undefined,
+          }
+        }
+        return {
+          ...c,
+          price: mi.price,
+          unavailable: false,
+          unavailableReason: undefined,
+        }
+      })
+      replaceCart(updatedCart)
+      setRefreshError(null)
+      return { ok: true, anyUnavailable }
+    } catch (err: any) {
+      const errMsg = err?.message || 'Failed to refresh menu prices'
+      setRefreshError(errMsg)
+      return { ok: false, error: errMsg }
+    } finally {
+      setRefreshingCart(false)
+    }
+  }, [refresh, replaceCart])
 
   useEffect(() => {
     const timer = setInterval(() => setTick((t) => t + 1), 15000)
@@ -307,6 +375,7 @@ export function DashboardView() {
         subtractCartLines(entry.payload.items ?? [])
         setPromoCode('')
         setAppliedPromo(null)
+        setPromoQuote(null)
         setPromoError('')
         if (tenantId && userId) {
           clearPosSessionDraft(tenantId, userId, entry.payload.tableSessionId)
@@ -333,11 +402,65 @@ export function DashboardView() {
         refresh()
         setCartOpen(false)
       },
-      onFailed: (error, entry) => {
+      onFailed: async (error, entry, code) => {
         submittingRef.current = false
         const msg = cleanOrderErrorMessage(error)
-        toast.error(`Order Failed: ${msg}`)
+        const isPricingChanged =
+          code === 'ORDER_PRICING_CHANGED' ||
+          entry.errorCode === 'ORDER_PRICING_CHANGED' ||
+          msg.toLowerCase().includes('pricing has changed') ||
+          msg.toLowerCase().includes('totals and try again') ||
+          msg.toLowerCase().includes('terms have changed')
+
+        // Prevent automatic replay of the rejected payload
         q.retire(entry.key)
+
+        if (isPricingChanged) {
+          // Invalidate stale promo quote and require explicit re-application
+          setAppliedPromo(null)
+          setPromoQuote(null)
+          setPromoError('Pricing has changed. Please review the updated totals and reapply the promo code if desired.')
+
+          // Reopen cart sheet with updated totals
+          setCartOpen(true)
+
+          // Refresh affected cart lines from authoritative menu and portion prices
+          // and refresh tax and service-charge settings.
+          // Preserve quantities, selected portions, notes, customer details, and selected diner session.
+          const res = await refreshCartPricing()
+          if (!res.ok) {
+            toast.error('Pricing changed, but refreshing menu prices failed', {
+              description: 'Your cart has been preserved. Tap here to retry refreshing prices.',
+              action: {
+                label: 'Retry Refresh',
+                onClick: () => { void refreshCartPricing() },
+              },
+              duration: 8000,
+            })
+          } else if (res.anyUnavailable) {
+            toast.error('Pricing or availability changed', {
+              description: 'One or more items in your cart are no longer available. Please resolve them before checking out.',
+              duration: 8000,
+            })
+          } else {
+            toast.error('Pricing has changed since review', {
+              description: 'Cart totals have been updated to current menu prices. Please review and reapply the promo code.',
+              duration: 6000,
+            })
+          }
+          return
+        }
+
+        toast.error(`Order Failed: ${msg}`)
+        if (
+          msg.toLowerCase().includes('promo') ||
+          msg.toLowerCase().includes('reapply')
+        ) {
+          setAppliedPromo(null)
+          setPromoQuote(null)
+          setPromoError(msg)
+          setCartOpen(true)
+        }
       },
       onChange: (entries) => {
         setQueueEntries(entries)
@@ -428,17 +551,39 @@ export function DashboardView() {
   // matches the server's evaluatePromo() exactly, including max_discount
   // capping fixed-amount codes as well as percentages.
   let discount = 0
-  if (appliedPromo && subtotal >= appliedPromo.minOrder) {
-    discount = appliedPromo.type === 'PERCENTAGE'
-      ? (subtotal * appliedPromo.value) / 100
-      : appliedPromo.value
-    if (appliedPromo.maxDiscount > 0) discount = Math.min(discount, appliedPromo.maxDiscount)
-    discount = Math.min(discount, subtotal) // never go negative
+  const minOrder = Number(appliedPromo?.minOrder ?? appliedPromo?.min_order ?? 0)
+  if (appliedPromo && subtotal >= minOrder) {
+    const promoValue = Number(appliedPromo.value) || 0
+    const promoType = appliedPromo.type
+    const maxDiscount = Number(appliedPromo.maxDiscount ?? appliedPromo.max_discount ?? 0)
+
+    if (promoType === 'PERCENTAGE') {
+      discount = (subtotal * promoValue) / 100
+      if (maxDiscount > 0) discount = Math.min(discount, maxDiscount)
+    } else {
+      discount = promoValue
+      if (maxDiscount > 0) discount = Math.min(discount, maxDiscount)
+    }
+    discount = Math.min(subtotal, Math.max(0, discount)) // never go negative
   }
-  const taxableAmount = Math.max(0, subtotal - discount)
+  // Round the capped discount to two decimals before calculating taxable amount, tax, and final total
+  discount = +discount.toFixed(2)
+  const taxableAmount = Math.max(0, +(subtotal - discount).toFixed(2))
   const tax = +((taxableAmount) * taxRate / 100).toFixed(2)
   const service = +((subtotal) * serviceRate / 100).toFixed(2)
-  const total = +(subtotal - discount + tax + service).toFixed(2)
+  const total = +(taxableAmount + tax + service).toFixed(2)
+
+  // If cart changes make an applied promo ineligible, clear it immediately
+  useEffect(() => {
+    if (appliedPromo) {
+      const min = Number(appliedPromo.minOrder ?? appliedPromo.min_order ?? 0)
+      if (subtotal < min) {
+        setAppliedPromo(null)
+        setPromoQuote(null)
+        setPromoError(`Promo "${appliedPromo.code}" requires minimum order of ${tenant?.currencySymbol || '₹'}${min.toFixed(2)}`)
+      }
+    }
+  }, [subtotal, appliedPromo, tenant?.currencySymbol])
 
   // Validate the promo code against the server.
   //
@@ -452,6 +597,7 @@ export function DashboardView() {
     const code = promoCode.trim()
     if (!code) {
       setAppliedPromo(null)
+      setPromoQuote(null)
       return
     }
     setPromoChecking(true)
@@ -466,12 +612,14 @@ export function DashboardView() {
 
       if (!result.applied) {
         setAppliedPromo(null)
+        setPromoQuote(null)
         setPromoError(result.reason || tr('pos.promoInvalid'))
         toast.error(result.reason || tr('pos.promoInvalid'))
         return
       }
 
       setAppliedPromo(result.promo)
+      setPromoQuote(result.quote || null)
       setPromoCode(result.code || code)
       toast.success(`Promo "${result.code}" applied`, {
         description: result.promo.type === 'PERCENTAGE'
@@ -483,6 +631,7 @@ export function DashboardView() {
       // that lands here is a permission, server or network failure, so it must
       // not be reported as "Promo invalid".
       setAppliedPromo(null)
+      setPromoQuote(null)
       setPromoError(describeFailure(err, 'the promo code').message)
       handleAction(err, 'the promo code')
     } finally {
@@ -492,6 +641,7 @@ export function DashboardView() {
 
   const removePromo = () => {
     setAppliedPromo(null)
+    setPromoQuote(null)
     setPromoCode('')
     setPromoError('')
   }
@@ -1387,6 +1537,20 @@ export function DashboardView() {
       }
     }
 
+    // Block submission if refresh failed, is in flight, or cart has unavailable items
+    if (refreshError) {
+      toast.error('Menu price refresh failed. Please tap "Retry Refresh" before checkout.')
+      return
+    }
+    if (refreshingCart) {
+      toast.error('Menu prices are currently refreshing. Please wait a moment.')
+      return
+    }
+    if (cart.some((c) => c.unavailable)) {
+      toast.error('One or more items in your cart are no longer available. Please resolve or remove them before checkout.')
+      return
+    }
+
     // Validate that cart items exist and are available in current menu
     if (data?.menuItems && data.menuItems.length > 0) {
       const availableItemIds = new Set(
@@ -1414,6 +1578,22 @@ export function DashboardView() {
       quantity: c.quantity,
       notes: c.notes,
     }))
+    // Build the checkout payload strictly from the validated applied promo state.
+    // Raw input and codes rejected by Apply have no effect on checkout.
+    const promoMin = Number(appliedPromo?.minOrder ?? appliedPromo?.min_order ?? 0)
+    const effectivePromoCode = appliedPromo && subtotal >= promoMin && discount > 0
+      ? (appliedPromo.code || promoCode.trim())
+      : undefined
+    const effectivePromoQuote = effectivePromoCode ? (promoQuote || undefined) : undefined
+
+    const confirmedPricing = {
+      subtotal: +subtotal.toFixed(2),
+      discount: +discount.toFixed(2),
+      tax: +tax.toFixed(2),
+      serviceCharge: +service.toFixed(2),
+      total: +total.toFixed(2),
+    }
+
     orderQueue(tenant.id, data.currentUser.id, {}).enqueue(
       'pos',
       {
@@ -1422,7 +1602,9 @@ export function DashboardView() {
         createNewSitting: !activeSessionId,
         orderType,
         items,
-        promoCode: promoCode || undefined,
+        promoCode: effectivePromoCode,
+        promoQuote: effectivePromoQuote,
+        pricing: confirmedPricing,
         customerName: orderType !== 'DINE_IN' ? (customerName.trim() || undefined) : undefined,
         customerPhone: orderType !== 'DINE_IN' ? (customerPhone.trim() || undefined) : undefined,
         servedById: data.currentUser.id,
@@ -1759,6 +1941,9 @@ export function DashboardView() {
           forceNewSitting={forceNewSitting}
           onNewSitting={handleNewSitting}
           onCancelNewSitting={handleCancelNewSitting}
+          refreshError={refreshError}
+          refreshingCart={refreshingCart}
+          onRetryRefresh={() => { void refreshCartPricing() }}
         />
       </div>
 
@@ -1824,6 +2009,9 @@ export function DashboardView() {
             forceNewSitting={forceNewSitting}
             onNewSitting={handleNewSitting}
             onCancelNewSitting={handleCancelNewSitting}
+            refreshError={refreshError}
+            refreshingCart={refreshingCart}
+            onRetryRefresh={() => { void refreshCartPricing() }}
           />
         </SheetContent>
       </Sheet>
@@ -2103,6 +2291,9 @@ interface CartPanelProps {
   forceNewSitting?: boolean
   onNewSitting?: () => void
   onCancelNewSitting?: () => void
+  refreshError?: string | null
+  refreshingCart?: boolean
+  onRetryRefresh?: () => void
 }
 
 function CartPanel(p: CartPanelProps) {
@@ -2111,6 +2302,8 @@ function CartPanel(p: CartPanelProps) {
   const tableName = p.tables.find((t) => t.id === p.selectedTableId)?.name || 'Table'
   const isAmbiguousSitting = p.orderType === 'DINE_IN' && Boolean(p.selectedTableId) && p.liveSessions.length > 1 && !p.selectedSessionId && !p.forceNewSitting
   const cardMatch = (p.activeSessionCards || []).find((c: any) => c.sessionId === p.selectedSessionId)
+  const hasUnavailableLines = p.cart.some((c) => c.unavailable)
+  const hasRefreshError = Boolean(p.refreshError)
 
   const committedItems = useMemo(() => {
     if (!p.selectedSessionId) return []
@@ -2363,6 +2556,23 @@ function CartPanel(p: CartPanelProps) {
           )
         ) : (
           <div className="space-y-3 py-3">
+            {p.refreshError && (
+              <div className="rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-xs flex items-center justify-between gap-2 text-destructive mb-3">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className="shrink-0">⚠️</span>
+                  <span className="truncate">{p.refreshError}</span>
+                </div>
+                {p.onRetryRefresh && (
+                  <button
+                    onClick={p.onRetryRefresh}
+                    disabled={p.refreshingCart}
+                    className="shrink-0 font-semibold underline hover:opacity-80"
+                  >
+                    {p.refreshingCart ? 'Refreshing…' : 'Retry Refresh'}
+                  </button>
+                )}
+              </div>
+            )}
             <div className="flex items-center justify-between text-xs text-muted-foreground px-1">
               <span className="font-semibold text-foreground flex items-center gap-1.5">
                 {p.selectedSessionId && <Plus className="h-3.5 w-3.5 text-primary" />}
@@ -2372,7 +2582,13 @@ function CartPanel(p: CartPanelProps) {
             </div>
             <Separator />
             {p.cart.map((c) => (
-              <div key={`${c.menuItemId}::${c.portion ?? ''}`} className="rounded-xl bg-secondary/30 p-3">
+              <div
+                key={`${c.menuItemId}::${c.portionId ?? c.portion ?? ''}`}
+                className={cn(
+                  "rounded-xl p-3",
+                  c.unavailable ? "bg-destructive/10 border border-destructive/40" : "bg-secondary/30"
+                )}
+              >
                 <div className="flex items-start gap-3">
                   <div className="w-12 h-12 rounded-full overflow-hidden shrink-0 bg-secondary">
                     {c.image ? <img src={c.image} alt={c.name} className="w-full h-full object-cover" /> : <div className="w-full h-full flex items-center justify-center">🍽️</div>}
@@ -2390,6 +2606,12 @@ function CartPanel(p: CartPanelProps) {
                       <p className="text-sm font-semibold whitespace-nowrap">{p.currencySymbol}{(c.price * c.quantity).toFixed(2)}</p>
                     </div>
                     <p className="text-xs text-muted-foreground">{p.currencySymbol}{c.price.toFixed(2)} each</p>
+                    {c.unavailable && (
+                      <p className="text-xs font-semibold text-destructive mt-1 flex items-center gap-1">
+                        <span>⚠️</span>
+                        <span>{c.unavailableReason || 'Item or portion is no longer available. Please remove.'}</span>
+                      </p>
+                    )}
                   </div>
                 </div>
                 <div className="flex items-center gap-2 mt-2">
@@ -2475,9 +2697,22 @@ function CartPanel(p: CartPanelProps) {
         </div>
         <Button
           onClick={p.onSubmit}
-          disabled={p.submitting || p.cart.length === 0 || !p.canCheckout || isAmbiguousSitting || cardMatch?.isVerifyingPayment}
+          disabled={
+            p.submitting ||
+            p.cart.length === 0 ||
+            !p.canCheckout ||
+            isAmbiguousSitting ||
+            cardMatch?.isVerifyingPayment ||
+            hasUnavailableLines ||
+            hasRefreshError ||
+            p.refreshingCart
+          }
           title={
-            cardMatch?.isVerifyingPayment
+            hasRefreshError
+              ? "Menu price refresh failed. Please tap 'Retry Refresh' before checkout."
+              : hasUnavailableLines
+              ? "Please remove or resolve unavailable items before checkout"
+              : cardMatch?.isVerifyingPayment
               ? "Payment verification is pending for this session"
               : !p.canCheckout
               ? "You don't have permission to create orders"
@@ -2491,6 +2726,12 @@ function CartPanel(p: CartPanelProps) {
         >
           {p.submitting ? (
             <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> {p.selectedSessionId ? 'Updating order…' : 'Placing order…'}</>
+          ) : p.refreshingCart ? (
+            <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Refreshing menu prices…</>
+          ) : hasRefreshError ? (
+            <>Price Refresh Required</>
+          ) : hasUnavailableLines ? (
+            <>Resolve Unavailable Items</>
           ) : isAmbiguousSitting ? (
             <>Select Diner Session</>
           ) : p.selectedSessionId ? (

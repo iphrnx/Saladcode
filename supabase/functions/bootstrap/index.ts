@@ -13,6 +13,7 @@ import { listAuthSessions, listStaffSessions } from "../_shared/sessions.ts";
 import { cleanIp } from "../_shared/ip.ts";
 import { actorMaps, presentLog } from "../_shared/security-identity.ts";
 import { auditStats } from "../_shared/audit.ts";
+import { toISTDateString } from "../_shared/promo.ts";
 /**
  * /functions/v1/bootstrap  (GET, dashboard.view)
  *
@@ -205,7 +206,11 @@ Deno.serve(async (req: Request) => {
     const tables = toCamel(tablesRes.data ?? []);
     const orders = toCamel(ordersRes.data ?? []);
     const reservations = toCamel(reservationsRes.data ?? []);
-    const promos = toCamel(promosRes.data ?? []);
+    const promos = toCamel(promosRes.data ?? []).map((p: any) => ({
+      ...p,
+      validFrom: toISTDateString(p.validFrom),
+      validTo: toISTDateString(p.validTo),
+    }));
     // Clean legacy IPs (whole proxy chains) on read — see security/list.
     // The Security page renders this payload, so the actor is resolved here
     // with the same rules /security uses — a staff PIN action is named from the

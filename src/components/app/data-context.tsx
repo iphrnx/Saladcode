@@ -437,7 +437,7 @@ interface AppContextValue {
   error: ApiFailure | 'NO_TENANT' | null
   tenantId: string | null
   setTenantId: (id: string) => void
-  refresh: () => Promise<void>
+  refresh: () => Promise<any>
   addOrUpdateOrder: (order: Order, notify?: boolean, opts?: { force?: boolean }) => void
   removeOrder: (orderId: string) => void
   /**
@@ -563,7 +563,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       if (res.status === 404) {
         setError('NO_TENANT')
         setLoading(false)
-        return
+        return null
       }
       // Classified rather than collapsed: an expired session (401) needs a
       // sign-in, a refused one (403) needs the permission named, and a 500
@@ -574,8 +574,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       if (json.tableSessions) setTableSessions(json.tableSessions)
       if (json.checks) setChecks((prev) => ({ ...prev, ...json.checks }))
       lastSyncTimeRef.current = new Date().toISOString()
+      return json as AppData
     } catch (e) {
       setError(describeFailure(e, 'your restaurant'))
+      return null
     } finally {
       setLoading(false)
     }
