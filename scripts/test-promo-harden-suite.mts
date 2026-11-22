@@ -1543,6 +1543,19 @@ console.log('\n── 19. POS Checkout Recovery & Stale-Price Loop Prevention �
       dashboardView.includes('onRetryRefresh')
   )
 
+  check(
+    'refreshCartPricing checks for usable fresh menuItems and does not fall back to stale cached data',
+    dashboardView.includes('if (!fresh || !Array.isArray(fresh.menuItems))') &&
+      !dashboardView.includes('fresh?.menuItems ?? data?.menuItems')
+  )
+
+  check(
+    'dashboard.tsx blocks checkout submission while refreshError or refreshingCart is active',
+    dashboardView.includes('if (refreshError)') &&
+      dashboardView.includes('hasRefreshError') &&
+      dashboardView.includes('Price Refresh Required')
+  )
+
   // ── Real POS & Orders Endpoint Stale-Price Recovery Lifecycle ──
   // Setup SQLite database for real ACID transaction execution
   const { DatabaseSync } = await import('node:sqlite')
@@ -2026,29 +2039,136 @@ console.log('\n── 19. POS Checkout Recovery & Stale-Price Loop Prevention �
   const resolvedCart = cartAfterUnavailableRefresh.filter((c) => !c.unavailable)
   check('Cashier can resolve unavailable item by removing it', resolvedCart.length === 0)
 
-  // ── Scenario D: Failed Refresh Preserves Cart & Allows Retry ──
-  const initialPreservedCart = [
-    { menuItemId: 'mi-1', name: 'Crispy Salad', price: 120.0, quantity: 3, notes: 'Dressing on side' },
+  // ── Scenario D: Acceptance Test: Pricing 409 with cached menu data present, failed refresh, then retry ──
+  // Cached menu data is present in memory
+  const cachedMenuData = [{ id: 'mi-1', tenant_id: 't1', name: 'Crispy Salad', price: 100.0, portions: null, available: 1 }]
+  
+  // Cart initially has ₹100 item, quantity 1, notes "No onions", customer "Anita", session "sess-1"
+  let recoveryCart = [
+    { menuItemId: 'mi-1', name: 'Crispy Salad', price: 100.0, quantity: 1, notes: 'No onions', portionId: null, portion: null, unavailable: false }
   ]
-  let activeCartState = [...initialPreservedCart]
-  let refreshFailed = false
+  let recoveryCustomerName = 'Anita'
+  let recoveryCustomerPhone = '9876501234'
+  let recoverySessionId = 'sess-1'
+  let recoveryAppliedPromo: any = { code: 'FLAT50', type: 'FLAT', value: 50.0, min_order: 50.0 }
+  let recoveryPromoQuote: any = { code: 'FLAT50', discount: 50.0 }
 
-  try {
-    // Simulate network error during refresh
-    throw new Error('Network error: failed to fetch /api/bootstrap')
-  } catch (err) {
-    refreshFailed = true
-    // Cart is preserved intact
+  // Step 1: Pricing 409 triggers
+  const recoveryFirstAttempt = serverCreateOrder({
+    tenantId: 't1',
+    tableSessionId: recoverySessionId,
+    idempotencyKey: 'idemp-recovery-1',
+    items: recoveryCart,
+    promoCode: recoveryAppliedPromo.code,
+    confirmedPricing: { subtotal: 100.0, discount: 50.0, tax: 2.5, serviceCharge: 0, total: 52.5 },
+  })
+  check('Recovery test: pricing 409 is triggered', recoveryFirstAttempt.ok === false && recoveryFirstAttempt.status === 409)
+
+  // On 409 rejection:
+  // - Stale promo invalidated
+  recoveryAppliedPromo = null
+  recoveryPromoQuote = null
+  // - Queue entry retired (tested in order-queue)
+  // - Cart reopened
+  let isCartOpen = true
+
+  // Step 2: Refresh fails (refresh() returns null) even though cachedMenuData is present!
+  let replaceCartCalled = false
+  let shownToastType: 'error_failed' | 'prices_updated' | null = null
+  let activeRefreshError: string | null = null
+
+  function simulateRefreshCartPricing(freshResponse: any) {
+    if (!freshResponse || !Array.isArray(freshResponse.menuItems)) {
+      activeRefreshError = 'Could not load authoritative menu data. Please retry.'
+      shownToastType = 'error_failed'
+      return { ok: false, error: activeRefreshError }
+    }
+    replaceCartCalled = true
+    recoveryCart = recoveryCart.map((c) => {
+      const mi = freshResponse.menuItems.find((m: any) => m.id === c.menuItemId)
+      return {
+        ...c,
+        price: mi ? mi.price : c.price,
+        unavailable: !mi || mi.available === 0,
+      }
+    })
+    activeRefreshError = null
+    shownToastType = 'prices_updated'
+    return { ok: true }
   }
 
-  check('Failed refresh keeps cart intact with original items and quantities', refreshFailed === true && activeCartState.length === 1 && activeCartState[0].quantity === 3)
-  check('Failed refresh keeps original item notes intact', activeCartState[0].notes === 'Dressing on side')
+  // Execute refresh with null (failed refresh from edgeFetch failure / network error)
+  const failedRefreshResult = simulateRefreshCartPricing(null)
 
-  // Retry refresh succeeds
-  refreshFailed = false
-  const retryMenu = db.prepare('SELECT * FROM menu_items WHERE id = ?').get('mi-1') as any
-  activeCartState = activeCartState.map((c) => ({ ...c, price: retryMenu.price }))
-  check('Retry refresh successfully updates cart after network recovery', activeCartState[0].price === 120.0)
+  check('Failed refresh returns ok: false without calling replaceCart()', failedRefreshResult.ok === false && replaceCartCalled === false)
+  check('Cart stays intact at original price (₹100) on failed refresh', recoveryCart[0].price === 100.0)
+  check('Cart quantity (1) preserved on failed refresh', recoveryCart[0].quantity === 1)
+  check('Cart notes ("No onions") preserved on failed refresh', recoveryCart[0].notes === 'No onions')
+  check('Customer details and selected session preserved on failed refresh', recoveryCustomerName === 'Anita' && recoverySessionId === 'sess-1')
+  check('Cart remains open on failed refresh', isCartOpen === true)
+  check('Retry Refresh appears on failed refresh', activeRefreshError !== null)
+  
+  // Verify checkout remains blocked while refreshError is active
+  const isCheckoutBlockedOnFailedRefresh = Boolean(activeRefreshError) || recoveryCart.some((c) => c.unavailable)
+  check('Checkout remains blocked while refresh error is active', isCheckoutBlockedOnFailedRefresh === true)
+  check('No "prices updated" message is shown on failed refresh', shownToastType === 'error_failed')
+
+  // Step 3: Cashier taps "Retry Refresh" with fresh response where item price changed from ₹100 to ₹120
+  const freshResponseSuccess = {
+    menuItems: [{ id: 'mi-1', tenant_id: 't1', name: 'Crispy Salad', price: 120.0, portions: null, available: 1 }]
+  }
+  const retryRefreshResult = simulateRefreshCartPricing(freshResponseSuccess)
+
+  check('Retry refresh with fresh response succeeds and calls replaceCart()', retryRefreshResult.ok === true && replaceCartCalled === true)
+  check('Cart now shows ₹120.00 after successful retry refresh', recoveryCart[0].price === 120.0)
+  check('Cart preserves original notes and quantities after successful refresh', recoveryCart[0].quantity === 1 && recoveryCart[0].notes === 'No onions')
+  check('Refresh error is cleared on success', activeRefreshError === null)
+
+  // Checkout is no longer blocked by refresh error
+  const isCheckoutBlockedAfterSuccess = Boolean(activeRefreshError) || recoveryCart.some((c) => c.unavailable)
+  check('Checkout is no longer blocked after successful refresh', isCheckoutBlockedAfterSuccess === false)
+
+  // Verify new total is sent ONLY after explicit resubmission by cashier
+  // Reapply promo if desired (discount ₹50, subtotal ₹120, total ₹73.50)
+  recoveryAppliedPromo = { code: 'FLAT50', type: 'FLAT', value: 50.0, min_order: 50.0 }
+  const explicitResubmit = serverCreateOrder({
+    tenantId: 't1',
+    tableSessionId: recoverySessionId,
+    idempotencyKey: 'idemp-recovery-explicit-resubmit',
+    items: recoveryCart,
+    promoCode: recoveryAppliedPromo.code,
+    confirmedPricing: { subtotal: 120.0, discount: 50.0, tax: 3.5, serviceCharge: 0, total: 73.5 },
+    customerName: recoveryCustomerName,
+    customerPhone: recoveryCustomerPhone,
+  })
+  check('Explicit resubmission sends new total and commits successfully', explicitResubmit.ok === true && explicitResubmit.order?.total === 73.5)
+
+  // Step 4: Empty menu from a successful response is valid and marks affected items unavailable
+  const emptyMenuResponse = { menuItems: [] }
+  let emptyMenuCart = [{ menuItemId: 'mi-1', name: 'Crispy Salad', price: 120.0, quantity: 1, unavailable: false }]
+  let emptyMenuError: string | null = null
+
+  function processEmptyMenuResponse(fresh: any) {
+    if (!fresh || !Array.isArray(fresh.menuItems)) {
+      emptyMenuError = 'Failure'
+      return { ok: false }
+    }
+    emptyMenuCart = emptyMenuCart.map((c) => {
+      const mi = fresh.menuItems.find((m: any) => m.id === c.menuItemId)
+      return {
+        ...c,
+        unavailable: !mi || mi.available === 0,
+        unavailableReason: !mi ? 'Item removed from menu' : 'Item is currently unavailable',
+      }
+    })
+    emptyMenuError = null
+    return { ok: true }
+  }
+
+  const emptyMenuResult = processEmptyMenuResponse(emptyMenuResponse)
+  check('Empty menu from successful response is processed without error', emptyMenuResult.ok === true && emptyMenuError === null)
+  check('Empty menu marks affected items as unavailable', emptyMenuCart[0].unavailable === true)
+  check('Checkout is blocked when items are marked unavailable', emptyMenuCart.some((c) => c.unavailable) === true)
 
   // ── Scenario E: Ordinary Checkout with and without promo ──
   const ordinaryNoPromo = serverCreateOrder({

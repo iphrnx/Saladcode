@@ -245,12 +245,14 @@ export function DashboardView() {
 
   const refreshCartPricing = useCallback(async (providedData?: any) => {
     setRefreshingCart(true)
-    setRefreshError(null)
     try {
-      const fresh = providedData ?? (await refresh())
-      const freshMenu = fresh?.menuItems ?? data?.menuItems ?? []
-      if (!fresh && !data) throw new Error('Could not load menu data. Please retry.')
+      const fresh = providedData !== undefined ? providedData : await refresh()
+      // If the response is null or lacks usable menu data, report a refresh failure before calling replaceCart()
+      if (!fresh || !Array.isArray(fresh.menuItems)) {
+        throw new Error('Could not load authoritative menu data. Please retry.')
+      }
 
+      const freshMenu = fresh.menuItems
       const currentCart = useStore.getState().cart
       let anyUnavailable = false
       const updatedCart = currentCart.map((c) => {
@@ -295,6 +297,7 @@ export function DashboardView() {
         }
       })
       replaceCart(updatedCart)
+      setRefreshError(null)
       return { ok: true, anyUnavailable }
     } catch (err: any) {
       const errMsg = err?.message || 'Failed to refresh menu prices'
@@ -303,7 +306,7 @@ export function DashboardView() {
     } finally {
       setRefreshingCart(false)
     }
-  }, [data, refresh, replaceCart])
+  }, [refresh, replaceCart])
 
   useEffect(() => {
     const timer = setInterval(() => setTick((t) => t + 1), 15000)
@@ -1534,6 +1537,20 @@ export function DashboardView() {
       }
     }
 
+    // Block submission if refresh failed, is in flight, or cart has unavailable items
+    if (refreshError) {
+      toast.error('Menu price refresh failed. Please tap "Retry Refresh" before checkout.')
+      return
+    }
+    if (refreshingCart) {
+      toast.error('Menu prices are currently refreshing. Please wait a moment.')
+      return
+    }
+    if (cart.some((c) => c.unavailable)) {
+      toast.error('One or more items in your cart are no longer available. Please resolve or remove them before checkout.')
+      return
+    }
+
     // Validate that cart items exist and are available in current menu
     if (data?.menuItems && data.menuItems.length > 0) {
       const availableItemIds = new Set(
@@ -2286,6 +2303,7 @@ function CartPanel(p: CartPanelProps) {
   const isAmbiguousSitting = p.orderType === 'DINE_IN' && Boolean(p.selectedTableId) && p.liveSessions.length > 1 && !p.selectedSessionId && !p.forceNewSitting
   const cardMatch = (p.activeSessionCards || []).find((c: any) => c.sessionId === p.selectedSessionId)
   const hasUnavailableLines = p.cart.some((c) => c.unavailable)
+  const hasRefreshError = Boolean(p.refreshError)
 
   const committedItems = useMemo(() => {
     if (!p.selectedSessionId) return []
@@ -2679,9 +2697,20 @@ function CartPanel(p: CartPanelProps) {
         </div>
         <Button
           onClick={p.onSubmit}
-          disabled={p.submitting || p.cart.length === 0 || !p.canCheckout || isAmbiguousSitting || cardMatch?.isVerifyingPayment || hasUnavailableLines}
+          disabled={
+            p.submitting ||
+            p.cart.length === 0 ||
+            !p.canCheckout ||
+            isAmbiguousSitting ||
+            cardMatch?.isVerifyingPayment ||
+            hasUnavailableLines ||
+            hasRefreshError ||
+            p.refreshingCart
+          }
           title={
-            hasUnavailableLines
+            hasRefreshError
+              ? "Menu price refresh failed. Please tap 'Retry Refresh' before checkout."
+              : hasUnavailableLines
               ? "Please remove or resolve unavailable items before checkout"
               : cardMatch?.isVerifyingPayment
               ? "Payment verification is pending for this session"
@@ -2697,6 +2726,10 @@ function CartPanel(p: CartPanelProps) {
         >
           {p.submitting ? (
             <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> {p.selectedSessionId ? 'Updating order…' : 'Placing order…'}</>
+          ) : p.refreshingCart ? (
+            <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Refreshing menu prices…</>
+          ) : hasRefreshError ? (
+            <>Price Refresh Required</>
           ) : hasUnavailableLines ? (
             <>Resolve Unavailable Items</>
           ) : isAmbiguousSitting ? (
