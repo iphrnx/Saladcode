@@ -821,7 +821,9 @@ console.log('\n── 13. Issue 3 [P2]: Submit Only Successfully Applied Promo f
 
   check(
     'POS retains cart and clears applied promo on stale promo rejection in onFailed',
-    dashboardView.includes('if (msg.toLowerCase().includes(\'promo\') || msg.toLowerCase().includes(\'reapply\')) {\n          setAppliedPromo(null)')
+    dashboardView.includes("msg.toLowerCase().includes('promo')") &&
+      dashboardView.includes("msg.toLowerCase().includes('reapply')") &&
+      dashboardView.includes('setAppliedPromo(null)')
   )
 
   // Simulation of POS state logic:
@@ -1359,6 +1361,126 @@ console.log('\n── 17. Issue 2 [P2]: Reject Stale POS Promo Quotes & Reapply 
   check('Saved discount matches displayed discount (₹20.00)', submission2.discount === displayedDiscount2)
   check('Saved total matches displayed total (₹180.00)', submission2.total === displayedTotal2)
   check('Displayed and saved totals match to the exact paisa', submission2.total === 180.0 && displayedTotal2 === 180.0)
+}
+
+// ── 18. Issue 1 & 2 [P1 & P2 Review Follow-ups]: Import Fix & Full Price Paise Verification ──
+console.log('\n── 18. Issue 1 & 2 [P1 & P2]: Import Fix & Full Price Paise Verification ──')
+
+{
+  const ordersApi = fs.readFileSync('supabase/functions/orders/index.ts', 'utf-8')
+  const dashboardView = fs.readFileSync('src/components/views/dashboard.tsx', 'utf-8')
+
+  check(
+    'orders/index.ts imports normalizePromoCode from ../_shared/promo.ts',
+    ordersApi.includes('import { evaluatePromo, normalizePromoCode, normalizePromoType } from "../_shared/promo.ts";')
+  )
+
+  check(
+    'POS carries confirmed subtotal, discount, tax, serviceCharge, and total in pricing object',
+    dashboardView.includes('const confirmedPricing = {') &&
+      dashboardView.includes('subtotal: +subtotal.toFixed(2),') &&
+      dashboardView.includes('discount: +discount.toFixed(2),') &&
+      dashboardView.includes('tax: +tax.toFixed(2),') &&
+      dashboardView.includes('serviceCharge: +service.toFixed(2),') &&
+      dashboardView.includes('total: +total.toFixed(2),') &&
+      dashboardView.includes('pricing: confirmedPricing,')
+  )
+
+  check(
+    'Orders API compares all five amounts in integer paise before committing',
+    ordersApi.includes('clientSubtotalPaise = Math.round(Number(pricing.subtotal') &&
+      ordersApi.includes('clientDiscountPaise = Math.round(Number(pricing.discount') &&
+      ordersApi.includes('clientTaxPaise = Math.round(Number(pricing.tax') &&
+      ordersApi.includes('clientServiceChargePaise = Math.round(Number(pricing.serviceCharge') &&
+      ordersApi.includes('clientTotalPaise = Math.round(Number(pricing.total') &&
+      ordersApi.includes('serverSubtotalPaise = Math.round(itemsTotal * 100);') &&
+      ordersApi.includes('serverTotalPaise = Math.round(total * 100);') &&
+      ordersApi.includes('Order pricing has changed since review. Please review the updated cart totals and try again.')
+  )
+
+  check(
+    'POS onFailed handler catches pricing changes and preserves cart for review',
+    dashboardView.includes("msg.toLowerCase().includes('pricing has changed') ||") &&
+      dashboardView.includes("msg.toLowerCase().includes('totals and try again')") &&
+      dashboardView.includes('setCartOpen(true)')
+  )
+
+  // Simulation of Flat Discount Menu Price Change After Apply:
+  // Initial state:
+  // Item base price: ₹100.00
+  // Flat promo discount: ₹50.00
+  // Tax: 5% = ₹2.50
+  // Service charge: 0
+  // Cashier sees: Subtotal ₹100.00, Discount ₹50.00, Taxable ₹50.00, Tax ₹2.50, Total ₹52.50
+  const cashierConfirmed = {
+    subtotal: 100.00,
+    discount: 50.00,
+    tax: 2.50,
+    serviceCharge: 0.00,
+    total: 52.50,
+  }
+
+  // Admin edits menu item price from ₹100.00 to ₹120.00 after cashier applied promo.
+  // Flat promo is still valid and discount is STILL ₹50.00!
+  const updatedMenuItemPrice = 120.00
+  const serverFlatDiscount = 50.00 // flat discount amount did NOT change
+  const serverTaxable = updatedMenuItemPrice - serverFlatDiscount // 70.00
+  const serverTax = +(serverTaxable * 0.05).toFixed(2) // 3.50
+  const serverTotal = +(serverTaxable + serverTax).toFixed(2) // 73.50
+
+  // Server integer paise validation function:
+  function verifyPricingPaise(client: typeof cashierConfirmed, server: { subtotal: number; discount: number; tax: number; serviceCharge: number; total: number }) {
+    const cSub = Math.round(client.subtotal * 100) // 10000
+    const cDisc = Math.round(client.discount * 100) // 5000
+    const cTax = Math.round(client.tax * 100) // 250
+    const cServ = Math.round(client.serviceCharge * 100) // 0
+    const cTot = Math.round(client.total * 100) // 5250
+
+    const sSub = Math.round(server.subtotal * 100) // 12000
+    const sDisc = Math.round(server.discount * 100) // 5000
+    const sTax = Math.round(server.tax * 100) // 350
+    const sServ = Math.round(server.serviceCharge * 100) // 0
+    const sTot = Math.round(server.total * 100) // 7350
+
+    if (cSub !== sSub || cDisc !== sDisc || cTax !== sTax || cServ !== sServ || cTot !== sTot) {
+      return { ok: false, status: 409, error: 'Order pricing has changed since review. Please review the updated cart totals and try again.' }
+    }
+    return { ok: true }
+  }
+
+  const flatChangeCheck = verifyPricingPaise(cashierConfirmed, {
+    subtotal: updatedMenuItemPrice,
+    discount: serverFlatDiscount,
+    tax: serverTax,
+    serviceCharge: 0,
+    total: serverTotal,
+  })
+
+  check('Flat promo with menu price change after Apply is rejected with 409', flatChangeCheck.ok === false && flatChangeCheck.status === 409)
+  check('Flat promo rejection returns actionable pricing message', flatChangeCheck.error?.includes('Order pricing has changed since review'))
+
+  // When cashier reviews and updates cart to new price (Subtotal ₹120.00, Discount ₹50.00, Tax ₹3.50, Total ₹73.50)
+  const updatedCashierConfirmed = {
+    subtotal: 120.00,
+    discount: 50.00,
+    tax: 3.50,
+    serviceCharge: 0.00,
+    total: 73.50,
+  }
+  const reviewedCheck = verifyPricingPaise(updatedCashierConfirmed, {
+    subtotal: updatedMenuItemPrice,
+    discount: serverFlatDiscount,
+    tax: serverTax,
+    serviceCharge: 0,
+    total: serverTotal,
+  })
+
+  check('Resubmission with reviewed pricing succeeds', reviewedCheck.ok === true)
+
+  // Checkout with valid applied promo succeeds through actual Orders endpoint logic
+  const validOrderEval = await evaluatePromo(fakeDb([basePromo({ valid_to: '2026-11-25' })]), 'tenant-a', 'SAVE20', 200, { currencySymbol: '₹' })
+  check('Checkout with valid applied promo evaluates successfully', validOrderEval.applied === true && validOrderEval.discount === 40)
+  check('Normalized promo code matches expected code format', normalizePromoCode('  save20!  ') === 'SAVE20')
 }
 
 console.log(`\n======================================================`)

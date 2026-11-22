@@ -339,9 +339,14 @@ export function DashboardView() {
         submittingRef.current = false
         const msg = cleanOrderErrorMessage(error)
         toast.error(`Order Failed: ${msg}`)
-        // If checkout rejected a stale or invalid promo, clear applied promo so cashier can reapply,
+        // If checkout rejected a stale or invalid promo or pricing changed, clear applied promo so cashier can reapply,
         // while strictly retaining the cart.
-        if (msg.toLowerCase().includes('promo') || msg.toLowerCase().includes('reapply')) {
+        if (
+          msg.toLowerCase().includes('promo') ||
+          msg.toLowerCase().includes('reapply') ||
+          msg.toLowerCase().includes('pricing has changed') ||
+          msg.toLowerCase().includes('totals and try again')
+        ) {
           setAppliedPromo(null)
           setPromoQuote(null)
           setPromoError(msg)
@@ -1459,6 +1464,14 @@ export function DashboardView() {
       : undefined
     const effectivePromoQuote = effectivePromoCode ? (promoQuote || undefined) : undefined
 
+    const confirmedPricing = {
+      subtotal: +subtotal.toFixed(2),
+      discount: +discount.toFixed(2),
+      tax: +tax.toFixed(2),
+      serviceCharge: +service.toFixed(2),
+      total: +total.toFixed(2),
+    }
+
     orderQueue(tenant.id, data.currentUser.id, {}).enqueue(
       'pos',
       {
@@ -1469,6 +1482,7 @@ export function DashboardView() {
         items,
         promoCode: effectivePromoCode,
         promoQuote: effectivePromoQuote,
+        pricing: confirmedPricing,
         customerName: orderType !== 'DINE_IN' ? (customerName.trim() || undefined) : undefined,
         customerPhone: orderType !== 'DINE_IN' ? (customerPhone.trim() || undefined) : undefined,
         servedById: data.currentUser.id,

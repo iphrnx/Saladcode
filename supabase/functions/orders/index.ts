@@ -2,7 +2,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { guard } from "../_shared/auth.ts";
 import { admin } from "../_shared/db.ts";
-import { evaluatePromo, normalizePromoType } from "../_shared/promo.ts";
+import { evaluatePromo, normalizePromoCode, normalizePromoType } from "../_shared/promo.ts";
 import { hasEffectivePermission, ORDER_STATUS_KEYS } from "../_shared/permissions.ts";
 import { body, json, preflight, subPath } from "../_shared/http.ts";
 import { resolveOrderUnitPrice } from "../_shared/portions.ts";
@@ -360,6 +360,7 @@ async function priceAndCreateOrder(
     notes?: string | null;
     promoCode?: string | null;
     promoQuote?: any;
+    pricing?: any;
     servedById?: string | null;
     /** PENDING (default) or PENDING_ACTIVATION while the table awaits approval. */
     status?: "PENDING" | "PENDING_ACTIVATION";
@@ -398,6 +399,7 @@ async function priceAndCommitOnce(
     notes?: string | null;
     promoCode?: string | null;
     promoQuote?: any;
+    pricing?: any;
     servedById?: string | null;
     status?: "PENDING" | "PENDING_ACTIVATION";
   },
@@ -408,7 +410,7 @@ async function priceAndCommitOnce(
 > {
   const {
     tenantId, tableId, tableSessionId, items, orderType,
-    customerName, customerPhone, notes, promoCode, promoQuote, servedById,
+    customerName, customerPhone, notes, promoCode, promoQuote, pricing, servedById,
   } = args;
 
   // One read for every dish on the order rather than one per line. Malformed ids
@@ -576,6 +578,36 @@ async function priceAndCommitOnce(
   const serviceCharge = +(itemsTotal * serviceRate).toFixed(2);
   const total = +(taxableAmount + tax + serviceCharge).toFixed(2);
 
+  // Verify the full price the cashier saw in integer paise
+  if (pricing && (pricing.total !== undefined || pricing.subtotal !== undefined)) {
+    const clientSubtotalPaise = Math.round(Number(pricing.subtotal ?? pricing.itemsTotal ?? 0) * 100);
+    const clientDiscountPaise = Math.round(Number(pricing.discount ?? 0) * 100);
+    const clientTaxPaise = Math.round(Number(pricing.tax ?? 0) * 100);
+    const clientServiceChargePaise = Math.round(Number(pricing.serviceCharge ?? pricing.service_charge ?? 0) * 100);
+    const clientTotalPaise = Math.round(Number(pricing.total ?? 0) * 100);
+
+    const serverSubtotalPaise = Math.round(itemsTotal * 100);
+    const serverDiscountPaise = Math.round(discount * 100);
+    const serverTaxPaise = Math.round(tax * 100);
+    const serverServiceChargePaise = Math.round(serviceCharge * 100);
+    const serverTotalPaise = Math.round(total * 100);
+
+    if (
+      clientSubtotalPaise !== serverSubtotalPaise ||
+      clientDiscountPaise !== serverDiscountPaise ||
+      clientTaxPaise !== serverTaxPaise ||
+      clientServiceChargePaise !== serverServiceChargePaise ||
+      clientTotalPaise !== serverTotalPaise
+    ) {
+      return {
+        ok: false,
+        error: "Order pricing has changed since review. Please review the updated cart totals and try again.",
+        status: 409,
+        retry: false,
+      };
+    }
+  }
+
   // One transaction writes order, items and the promo usage increment (see
   // migration 0056): a failure anywhere rolls all three back together, so an
   // order can no longer exist without its items, and a promo use can no
@@ -724,6 +756,7 @@ async function create(req: Request): Promise<Response> {
       items,
       promoCode,
       promoQuote,
+      pricing,
       customerName,
       customerPhone,
       notes,
@@ -822,6 +855,7 @@ async function create(req: Request): Promise<Response> {
         notes,
         promoCode,
         promoQuote,
+        pricing,
         servedById: null,
         status: held ? "PENDING_ACTIVATION" : "PENDING",
       }, idempotencyKey);
@@ -954,6 +988,7 @@ async function create(req: Request): Promise<Response> {
         notes,
         promoCode,
         promoQuote,
+        pricing,
         servedById: null,
         status: held ? "PENDING_ACTIVATION" : "PENDING",
       }, idempotencyKey);
@@ -1143,6 +1178,7 @@ async function create(req: Request): Promise<Response> {
       notes,
       promoCode,
       promoQuote,
+      pricing,
       servedById: validServedById,
     }, idempotencyKey);
 
