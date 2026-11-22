@@ -90,17 +90,17 @@ console.log("\n── 2. Preserve existing order-creation contract (Finding 2) �
 
   check(
     "returns top-level order_id, order_number, check_id, table_session_id",
-    /return jsonb_build_object\(\s*'order_id', v_order_id,\s*'order_number', v_order_num,\s*'check_id', v_check,\s*'table_session_id', v_session\s*\);/.test(createOrderBody)
+    /return jsonb_build_object\(\s*'order_id', v_order_id,\s*'order_number', v_order_num,\s*'check_id', v_check,\s*'table_session_id', v_session(?:,\s*'session_token', v_session_token)?\s*\);/.test(createOrderBody)
   );
 
   check(
     "idempotent deduplication returns top-level fields with deduplicated: true",
-    /return jsonb_build_object\(\s*'order_id', v_existing_order\.id,\s*'order_number', v_existing_order\.order_number,\s*'check_id', v_existing_order\.check_id,\s*'table_session_id', v_existing_order\.table_session_id,\s*'deduplicated', true\s*\);/.test(createOrderBody)
+    /return jsonb_build_object\(\s*'order_id', v_existing_order\.id,\s*'order_number', v_existing_order\.order_number,\s*'check_id', v_existing_order\.check_id,\s*'table_session_id', v_existing_order\.table_session_id,(?:\s*'session_token', v_session_token,)?\s*'deduplicated', true\s*\);/.test(createOrderBody)
   );
 
   check(
     "atomic promo validation and usage increment preserved",
-    /if p_promo_code_id is not null then\s+update public\.promo_codes\s+set used_count = used_count \+ 1\s+where id = p_promo_code_id\s+and tenant_id = v_tenant and active\s+and \(usage_limit = 0 or used_count < usage_limit\)[\s\S]*?raise exception 'PROMO_REJECTED:/.test(createOrderBody)
+    /if p_promo_code_id is not null then\s+update public\.promo_codes\s+set used_count = used_count \+ 1\s+where id = (?:p_promo_code_id|v_locked_promo\.id)\s+and tenant_id = v_tenant\s+and active\s+and \(usage_limit = 0 (?:or usage_limit is null )?or used_count < usage_limit\)[\s\S]*?raise exception 'PROMO_REJECTED:/.test(createOrderBody)
   );
 
   check(

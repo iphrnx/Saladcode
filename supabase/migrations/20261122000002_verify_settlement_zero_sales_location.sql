@@ -18,8 +18,18 @@
 -- ============================================================================
 
 -- 1. Update public.create_order_tx to persist and validate sale location
--- Starts from 20261118000002 contract, preserving top-level order_id, order_number, check_id, table_session_id,
--- atomic promo validation/redemption, portion handling, diner session isolation, and service_role-only access.
+-- Starts from 20261121000001_harden_promo_codes.sql (PR #6) implementation, preserving:
+-- - atomic first-order QR session creation and token issuance
+-- - advisory-lock and unique-violation concurrent retry handling with session_token
+-- - stale promo quote validation under row lock (FOR UPDATE) with IST date boundaries
+-- - atomic promo usage increment
+-- - portion resolution and sequential KOT numbering
+-- - service_role-only execution privileges
+-- Adds PR #7 sale-location validation and persistence:
+-- - validates requested location belongs to tenant and is active
+-- - resolves verified table location for Dine-in and rejects conflicts
+-- - preserves existing check location and rejects conflicts
+-- - persists verified location on orders and table_checks
 create or replace function public.create_order_tx(
   p_order jsonb,
   p_items jsonb,
@@ -36,11 +46,13 @@ declare
   v_tenant uuid := (p_order->>'tenant_id')::uuid;
   v_table uuid := nullif(p_order->>'table_id', '')::uuid;
   v_session uuid := nullif(p_order->>'table_session_id', '')::uuid;
+  v_session_token text := null;
   v_order_type text := coalesce(p_order->>'order_type', 'DINE_IN');
   v_idempotency_key uuid := null;
   v_order_id uuid;
   v_order_num integer;
   v_existing_order record;
+  v_locked_promo record;
   v_item jsonb;
   v_menu record;
   v_portion_elem jsonb;
@@ -65,19 +77,26 @@ begin
     v_idempotency_key := p_idempotency_key::uuid;
   end if;
 
-  -- 1. Idempotency pre-check
+  -- 1. Idempotency pre-check & concurrency serialization
   if v_idempotency_key is not null then
+    perform pg_advisory_xact_lock(hashtext('idemp:' || v_tenant::text || ':' || v_idempotency_key::text));
+
     select id, order_number, check_id, table_session_id
       into v_existing_order
       from public.orders
      where idempotency_key = v_idempotency_key
        and tenant_id = v_tenant;
     if v_existing_order.id is not null then
+      select token into v_session_token
+        from public.table_sessions
+       where id = v_existing_order.table_session_id;
+
       return jsonb_build_object(
         'order_id', v_existing_order.id,
         'order_number', v_existing_order.order_number,
         'check_id', v_existing_order.check_id,
         'table_session_id', v_existing_order.table_session_id,
+        'session_token', v_session_token,
         'deduplicated', true
       );
     end if;
@@ -102,7 +121,72 @@ begin
     end if;
   end if;
 
-  -- 2. Session and Check resolution based on order_type
+  -- 2. Promo pre-lock & quote consistency check under transaction lock
+  if p_promo_code_id is not null then
+    select id, tenant_id, code, type, value, min_order, max_discount, usage_limit, used_count, valid_from, valid_to, active
+      into v_locked_promo
+      from public.promo_codes
+     where id = p_promo_code_id
+       and tenant_id = v_tenant
+       for update;
+
+    if v_locked_promo.id is null then
+      raise exception 'PROMO_STALE: Promo code not found for this restaurant. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+
+    if not v_locked_promo.active then
+      raise exception 'PROMO_STALE: Promo code is paused or inactive. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+
+    if (v_locked_promo.valid_from is not null and (v_locked_promo.valid_from at time zone 'Asia/Kolkata')::date > (now() at time zone 'Asia/Kolkata')::date) then
+      raise exception 'PROMO_STALE: Promo code is not active yet. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+
+    if (v_locked_promo.valid_to is not null and (v_locked_promo.valid_to at time zone 'Asia/Kolkata')::date < (now() at time zone 'Asia/Kolkata')::date) then
+      raise exception 'PROMO_STALE: Promo code has expired. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+
+    if (v_locked_promo.usage_limit > 0 and v_locked_promo.used_count >= v_locked_promo.usage_limit) then
+      raise exception 'PROMO_STALE: Promo code usage limit has been reached. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+
+    -- Verify terms match the quote used to price the order
+    if p_order->>'expected_promo_code' is not null or p_order->>'promo_code' is not null then
+      if upper(trim(v_locked_promo.code)) <> upper(trim(coalesce(p_order->>'expected_promo_code', p_order->>'promo_code'))) then
+        raise exception 'PROMO_STALE: Promo code terms have changed. Please reapply the promo code.' using errcode = 'P0001';
+      end if;
+    end if;
+
+    if p_order->>'expected_promo_type' is not null then
+      if upper(trim(v_locked_promo.type)) <> upper(trim(p_order->>'expected_promo_type')) then
+        raise exception 'PROMO_STALE: Promo discount type has changed. Please reapply the promo code.' using errcode = 'P0001';
+      end if;
+    end if;
+
+    if p_order->>'expected_promo_value' is not null then
+      if v_locked_promo.value <> (p_order->>'expected_promo_value')::numeric then
+        raise exception 'PROMO_STALE: Promo discount value has changed. Please reapply the promo code.' using errcode = 'P0001';
+      end if;
+    end if;
+
+    if p_order->>'expected_promo_cap' is not null then
+      if coalesce(v_locked_promo.max_discount, 0) <> coalesce((p_order->>'expected_promo_cap')::numeric, 0) then
+        raise exception 'PROMO_STALE: Promo max discount cap has changed. Please reapply the promo code.' using errcode = 'P0001';
+      end if;
+    end if;
+
+    if p_order->>'expected_promo_min_spend' is not null then
+      if coalesce(v_locked_promo.min_order, 0) <> coalesce((p_order->>'expected_promo_min_spend')::numeric, 0) then
+        raise exception 'PROMO_STALE: Promo minimum order requirement has changed. Please reapply the promo code.' using errcode = 'P0001';
+      end if;
+    end if;
+
+    if coalesce((p_order->>'items_total')::numeric, 0) < coalesce(v_locked_promo.min_order, 0) then
+      raise exception 'PROMO_STALE: Order subtotal does not meet the minimum requirement. Please reapply the promo code.' using errcode = 'P0001';
+    end if;
+  end if;
+
+  -- 3. Session and Check resolution based on order_type
   if v_order_type = 'DINE_IN' then
     if v_table is not null then
       -- Resolve verified table location for Dine-in
@@ -127,11 +211,32 @@ begin
           raise exception 'SESSION_INVALID_OR_ENDED' using errcode = 'P0001';
         end if;
         v_check := public.open_session_check(v_tenant, v_table, v_session, 'DINE_IN');
+        select token into v_session_token from public.table_sessions where id = v_session;
+      elsif (p_order->>'create_new_session')::boolean = true or p_order->>'session_token' is not null then
+        -- First-order QR scan or explicit new sitting: create session and check atomically in this transaction
+        insert into public.table_sessions (
+          tenant_id, table_id, order_type, status, activation_status,
+          token, customer_name, customer_phone, notes,
+          activated_at, activation_requested_at
+        ) values (
+          v_tenant, v_table, 'DINE_IN', 'ACTIVE',
+          case when p_status = 'PENDING_ACTIVATION' then 'PENDING' else 'ACTIVE' end,
+          coalesce(nullif(p_order->>'session_token', ''), encode(extensions.gen_random_bytes(24), 'hex')),
+          nullif(p_order->>'customer_name', ''),
+          nullif(p_order->>'customer_phone', ''),
+          nullif(p_order->>'notes', ''),
+          case when p_status = 'PENDING_ACTIVATION' then null else now() end,
+          case when p_status = 'PENDING_ACTIVATION' then now() else null end
+        )
+        returning id, token into v_session, v_session_token;
+
+        v_check := public.open_session_check(v_tenant, v_table, v_session, 'DINE_IN');
       else
         v_check := public.open_table_check(v_tenant, v_table, null);
         select coalesce(session_id, anchor_session_id) into v_session
           from public.table_checks
          where id = v_check;
+        select token into v_session_token from public.table_sessions where id = v_session;
       end if;
     else
       raise exception 'TABLE_REQUIRED_FOR_DINE_IN' using errcode = 'P0001';
@@ -151,6 +256,7 @@ begin
         raise exception 'SESSION_INVALID_OR_ENDED' using errcode = 'P0001';
       end if;
       v_check := public.open_session_check(v_tenant, null, v_session, v_order_type);
+      select token into v_session_token from public.table_sessions where id = v_session;
     else
       -- Brand-new independent Takeaway or Delivery session created atomically
       insert into public.table_sessions (
@@ -164,7 +270,7 @@ begin
         nullif(p_order->>'notes', ''),
         now()
       )
-      returning id into v_session;
+      returning id, token into v_session, v_session_token;
 
       v_check := public.open_session_check(v_tenant, null, v_session, v_order_type);
     end if;
@@ -175,7 +281,7 @@ begin
     v_location := v_input_location;
   end if;
 
-  -- 3. Preserve existing check location and reject conflicting input
+  -- 4. Preserve existing check location and reject conflicting input
   if v_check is not null then
     select location_id into v_check_location
       from public.table_checks
@@ -194,7 +300,7 @@ begin
     end if;
   end if;
 
-  -- 4. Insert order with persisted location
+  -- 5. Insert order with persisted location
   begin
     insert into public.orders (
       tenant_id, table_id, table_session_id, order_type, status,
@@ -232,11 +338,16 @@ begin
          where idempotency_key = v_idempotency_key
            and tenant_id = v_tenant;
         if v_existing_order.id is not null then
+          select token into v_session_token
+            from public.table_sessions
+           where id = v_existing_order.table_session_id;
+
           return jsonb_build_object(
             'order_id', v_existing_order.id,
             'order_number', v_existing_order.order_number,
             'check_id', v_existing_order.check_id,
             'table_session_id', v_existing_order.table_session_id,
+            'session_token', v_session_token,
             'deduplicated', true
           );
         end if;
@@ -244,7 +355,7 @@ begin
       raise;
   end;
 
-  -- 5. Sequential KOT scoped by check (session)
+  -- 6. Sequential KOT scoped by check (session)
   if v_check is not null then
     select coalesce(max(oi.kot_number), 0) + 1 into v_kot_num
       from public.order_items oi
@@ -261,7 +372,7 @@ begin
      where order_id = v_order_id;
   end if;
 
-  -- 6. Insert order items with TEXT portion_id and JSONB portions resolution
+  -- 7. Insert order items with TEXT portion_id and JSONB portions resolution
   for v_item in select value from jsonb_array_elements(p_items) loop
     select id, tenant_id, available, price, name, portions into v_menu
       from public.menu_items
@@ -306,7 +417,7 @@ begin
     );
   end loop;
 
-  -- 7. Update running totals on table_checks if attached
+  -- 8. Update running totals on table_checks if attached
   if v_check is not null then
     select
       coalesce(sum(items_total), 0) as subtotal,
@@ -329,25 +440,31 @@ begin
      where id = v_check;
   end if;
 
-  -- 8. Atomic promo usage increment
+  -- 9. Atomic promo usage increment under transaction lock
   if p_promo_code_id is not null then
     update public.promo_codes
        set used_count = used_count + 1
-     where id = p_promo_code_id
-       and tenant_id = v_tenant and active
-       and (usage_limit = 0 or used_count < usage_limit)
-       and valid_from <= now()
-       and (valid_to is null or valid_to >= now());
+     where id = v_locked_promo.id
+       and tenant_id = v_tenant
+       and active
+       and (usage_limit = 0 or usage_limit is null or used_count < usage_limit)
+       and (valid_from is null or (valid_from at time zone 'Asia/Kolkata')::date <= (now() at time zone 'Asia/Kolkata')::date)
+       and (valid_to is null or (valid_to at time zone 'Asia/Kolkata')::date >= (now() at time zone 'Asia/Kolkata')::date);
     if not found then
-      raise exception 'PROMO_REJECTED: Promo code is invalid, expired, or usage limit reached' using errcode = 'P0001';
+      raise exception 'PROMO_REJECTED: PROMO_STALE: Promo code is invalid, expired, or usage limit reached. Please reapply.' using errcode = 'P0001';
     end if;
+  end if;
+
+  if v_session_token is null and v_session is not null then
+    select token into v_session_token from public.table_sessions where id = v_session;
   end if;
 
   return jsonb_build_object(
     'order_id', v_order_id,
     'order_number', v_order_num,
     'check_id', v_check,
-    'table_session_id', v_session
+    'table_session_id', v_session,
+    'session_token', v_session_token
   );
 end;
 $$;
