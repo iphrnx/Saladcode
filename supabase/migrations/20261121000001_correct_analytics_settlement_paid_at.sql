@@ -65,26 +65,61 @@ update public.check_payments cp
 
 -- 2. Corrective historical paid_at repair:
 -- Repairs affected orders whose existing timestamp conflicts with verified final settlement.
--- Priority A: Authoritative final full-settlement ledger payments
-with final_payments as (
+-- Priority A: Authoritative verified full-settlement ledger records (cumulative payments reaching total)
+with ranked_payments as (
   select
-    o.id as order_id,
-    max(cp.created_at) as verified_settled_at
-  from public.orders o
-  join public.check_payments cp
-    on cp.check_id = o.check_id
-   and cp.tenant_id = o.tenant_id
+    cp.id as payment_id,
+    cp.check_id,
+    cp.amount,
+    cp.created_at,
+    sum(cp.amount) over (
+      partition by cp.check_id
+      order by cp.created_at asc, cp.id asc
+      rows between unbounded preceding and current row
+    ) as cumulative_amount
+  from public.check_payments cp
   where cp.status = 'SUCCEEDED'
-  group by o.id
+),
+check_full_settlement as (
+  select distinct on (rp.check_id)
+    rp.check_id,
+    rp.created_at as verified_settled_at
+  from ranked_payments rp
+  join public.table_checks tc on tc.id = rp.check_id
+  where rp.cumulative_amount >= coalesce(tc.total, 0.00) - 0.005
+  order by rp.check_id, rp.created_at asc, rp.payment_id asc
 )
 update public.orders o
-   set paid_at = fp.verified_settled_at
-  from final_payments fp
- where o.id = fp.order_id
-   and o.paid_at is distinct from fp.verified_settled_at;
+   set paid_at = cfs.verified_settled_at
+  from check_full_settlement cfs
+ where o.check_id = cfs.check_id
+   and o.paid_at is distinct from cfs.verified_settled_at;
 
 -- Priority B: Closed paid table checks where ledger payments are absent across history
-with verified_checks as (
+with ranked_payments as (
+  select
+    cp.id as payment_id,
+    cp.check_id,
+    cp.amount,
+    cp.created_at,
+    sum(cp.amount) over (
+      partition by cp.check_id
+      order by cp.created_at asc, cp.id asc
+      rows between unbounded preceding and current row
+    ) as cumulative_amount
+  from public.check_payments cp
+  where cp.status = 'SUCCEEDED'
+),
+check_full_settlement as (
+  select distinct on (rp.check_id)
+    rp.check_id,
+    rp.created_at as verified_settled_at
+  from ranked_payments rp
+  join public.table_checks tc on tc.id = rp.check_id
+  where rp.cumulative_amount >= coalesce(tc.total, 0.00) - 0.005
+  order by rp.check_id, rp.created_at asc, rp.payment_id asc
+),
+verified_checks as (
   select
     o.id as order_id,
     coalesce(tc.closed_at, tc.invoice_date) as verified_settled_at
@@ -95,8 +130,8 @@ with verified_checks as (
   where tc.status = 'PAID'
     and coalesce(tc.closed_at, tc.invoice_date) is not null
     and not exists (
-      select 1 from public.check_payments cp
-      where cp.check_id = tc.id and cp.status = 'SUCCEEDED'
+      select 1 from check_full_settlement cfs
+      where cfs.check_id = tc.id
     )
 )
 update public.orders o
@@ -146,6 +181,7 @@ declare
   v_profile_actor uuid := null;
   v_staff_actor uuid := null;
   v_location uuid := null;
+  v_fin jsonb;
 begin
   -- 1. Acquire row lock on the table check
   select * into v_check
@@ -161,13 +197,14 @@ begin
   if p_idempotency_key is not null then
     select * into v_existing
       from public.check_payments
-     where check_id = p_check and idempotency_key = p_idempotency_key;
+     where check_id = p_check and idempotency_key = p_idempotency_key and status = 'SUCCEEDED';
     if found then
       return jsonb_build_object(
         'ok', true,
         'deduplicated', true,
         'already', true,
         'paymentId', v_existing.id,
+        'invoiceNumber', v_check.invoice_number,
         'amount', v_existing.amount,
         'method', v_existing.method
       );
@@ -180,6 +217,7 @@ begin
       'ok', true,
       'already', true,
       'deduplicated', true,
+      'invoiceNumber', v_check.invoice_number,
       'message', 'This bill is already settled.'
     );
   end if;
@@ -200,18 +238,8 @@ begin
   v_outstanding := greatest(0.00, round(v_total - v_paid, 2));
 
   if v_outstanding <= 0.00 then
-    -- Check has 0 balance due; mark settled
-    update public.table_checks
-       set status = 'PAID',
-           closed_at = coalesce(closed_at, now()),
-           updated_at = now()
-     where id = p_check;
-    return jsonb_build_object(
-      'ok', true,
-      'already', true,
-      'deduplicated', true,
-      'message', 'This bill is already settled.'
-    );
+    -- Zero-balance check: reuse finalization logic to allocate invoice and close session
+    return public.finalize_table_check(p_tenant, p_check, p_actor);
   end if;
 
   -- 5. Full settlement validation: compare exact currency amounts
@@ -241,8 +269,29 @@ begin
      where id = v_check.table_id;
   end if;
 
-  if v_location is null then
+  if v_location is null and v_check.location_id is not null then
     v_location := v_check.location_id;
+  end if;
+
+  if v_location is null then
+    select location_id into v_location
+      from public.orders
+     where check_id = p_check and location_id is not null
+     limit 1;
+  end if;
+
+  if v_location is null then
+    select t.location_id into v_location
+      from public.orders o
+      join public.tables t on t.id = o.table_id
+     where o.check_id = p_check and t.location_id is not null
+     limit 1;
+  end if;
+
+  if v_location is null and v_staff_actor is not null then
+    select location_id into v_location
+      from public.staff
+     where id = p_actor and tenant_id = p_tenant;
   end if;
 
   -- 7. Record authoritative payment record
@@ -256,35 +305,32 @@ begin
   )
   returning id into v_payment_id;
 
-  -- 8. Atomically update check to settled
+  -- 8. Update check paid total and location
   update public.table_checks
      set paid_total = v_paid + v_amt,
-         status = 'PAID',
-         closed_at = coalesce(closed_at, now()),
          location_id = coalesce(location_id, v_location),
          version = version + 1,
          updated_at = now()
    where id = p_check;
 
-  -- 9. Update orders attached to this check
+  -- 9. Persist location on orders
   update public.orders
-     set status = 'COMPLETED',
-         payment_status = 'PAID',
-         paid_at = coalesce(paid_at, now()),
-         completed_at = coalesce(completed_at, now()),
-         location_id = coalesce(location_id, v_location),
-         updated_at = now()
-   where check_id = p_check
-     and status in ('PENDING', 'PREPARING', 'READY', 'SERVED', 'COMPLETED');
+     set location_id = coalesce(location_id, v_location)
+   where check_id = p_check and location_id is null;
+
+  -- 10. Reuse existing finalization logic so check reaches PAID with invoice and closed session
+  v_fin := public.finalize_table_check(p_tenant, p_check, p_actor);
 
   return jsonb_build_object(
     'ok', true,
     'deduplicated', false,
     'paymentId', v_payment_id,
+    'invoiceNumber', v_fin->>'invoiceNumber',
     'amount', v_amt,
     'method', coalesce(p_method, 'CASH'),
     'totalPaid', v_paid + v_amt,
-    'outstanding', 0.00
+    'outstanding', 0.00,
+    'endedSessionId', v_fin->>'endedSessionId'
   );
 end $$;
 

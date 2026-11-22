@@ -608,16 +608,6 @@ async function recordPayment(req: Request): Promise<Response> {
     }
     return json(req, { error: message || "Could not record the payment." }, 500);
   }
-        req,
-        { error: `${outstanding} is still due on this table — check the amount.`, code: "overpayment" },
-        409,
-      );
-    }
-    if (message.includes("CHECK_PAID")) {
-      return json(req, { ok: true, already: true, deduplicated: true, message: "This bill is already settled." }, 200);
-    }
-    return json(req, { error: message || "Could not record the payment." }, 500);
-  }
 
   if ((result as any)?.already) {
     return json(req, { ok: true, already: true, deduplicated: true, ...(result as any) }, 200);

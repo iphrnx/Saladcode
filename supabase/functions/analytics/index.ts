@@ -224,34 +224,44 @@ serve(async (req: Request) => {
       new Set([...payments.map((p) => p.check_id), ...checks.map((c) => c.id)].filter(Boolean))
     );
 
-    // Fetch missing check metadata if needed
+    // Fetch missing check metadata if needed with deterministic ordering and error propagation
     const missingCheckIds = candidateCheckIds.filter((cid) => !localCheckMap.has(cid));
     if (missingCheckIds.length > 0) {
       for (let i = 0; i < missingCheckIds.length; i += 100) {
         const chunk = missingCheckIds.slice(i, i + 100);
-        const { data: extraChecks } = await db
-          .from("table_checks")
-          .select("id, table_id, session_id, order_type, status, subtotal, discount, tax, service_charge, total, paid_total, closed_at, invoice_date, location_id, created_at")
-          .eq("tenant_id", tenantId)
-          .in("id", chunk);
-        for (const c of extraChecks ?? []) localCheckMap.set(c.id, c);
+        const extraChecks = await fetchAllPages<any>(async (from, to) => {
+          return await db
+            .from("table_checks")
+            .select("id, table_id, session_id, order_type, status, subtotal, discount, tax, service_charge, total, paid_total, closed_at, invoice_date, location_id, created_at")
+            .eq("tenant_id", tenantId)
+            .in("id", chunk)
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true })
+            .range(from, to);
+        });
+        for (const c of extraChecks) localCheckMap.set(c.id, c);
       }
     }
 
     // Determine ledger ownership across each candidate check's FULL payment history
+    // Paginate deterministically and propagate query errors
     const allHistoryLedgerPaymentsByCheck = new Map<string, any[]>();
     if (candidateCheckIds.length > 0) {
       for (let i = 0; i < candidateCheckIds.length; i += 100) {
         const chunk = candidateCheckIds.slice(i, i + 100);
-        const { data: historyPayments } = await db
-          .from("check_payments")
-          .select("id, check_id, amount, method, status, staff_id, location_id, created_at")
-          .eq("tenant_id", tenantId)
-          .eq("status", "SUCCEEDED")
-          .in("check_id", chunk)
-          .order("created_at", { ascending: true });
+        const historyPayments = await fetchAllPages<any>(async (from, to) => {
+          return await db
+            .from("check_payments")
+            .select("id, check_id, amount, method, status, staff_id, location_id, created_at")
+            .eq("tenant_id", tenantId)
+            .eq("status", "SUCCEEDED")
+            .in("check_id", chunk)
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true })
+            .range(from, to);
+        });
 
-        for (const p of historyPayments ?? []) {
+        for (const p of historyPayments) {
           if (!allHistoryLedgerPaymentsByCheck.has(p.check_id)) {
             allHistoryLedgerPaymentsByCheck.set(p.check_id, []);
           }
@@ -260,31 +270,47 @@ serve(async (req: Request) => {
       }
     }
 
-    // Determine authoritative settlement event per check
+    // Determine authoritative settlement event per check using verified full settlement rule
     const candidateEvents: ReconciledEvent[] = [];
     for (const cid of candidateCheckIds) {
       const chk = localCheckMap.get(cid);
-      const historyPayments = allHistoryLedgerPaymentsByCheck.get(cid);
+      const historyPayments = allHistoryLedgerPaymentsByCheck.get(cid) ?? [];
+      const checkTotal = Number(chk?.total || 0);
 
-      if (historyPayments && historyPayments.length > 0) {
-        // Authoritative Ledger-backed settlement: take the final full-settlement payment record
-        const finalPayment = historyPayments[historyPayments.length - 1];
-        const rawMethod = String(finalPayment.method || "").toUpperCase();
+      // Identify the verified full-settlement payment (cumulative payments reaching check total)
+      let fullSettlementPayment: any = null;
+      let runningPaid = 0;
+      for (const p of historyPayments) {
+        runningPaid += Number(p.amount || 0);
+        if (checkTotal > 0 && Math.round(runningPaid * 100) >= Math.round(checkTotal * 100)) {
+          fullSettlementPayment = p;
+          break;
+        }
+      }
+
+      // If check total is unset/0 but successful payments exist, use the last payment that covered balance
+      if (!fullSettlementPayment && checkTotal <= 0 && historyPayments.length > 0) {
+        fullSettlementPayment = historyPayments[historyPayments.length - 1];
+      }
+
+      if (fullSettlementPayment) {
+        // Authoritative verified full ledger settlement
+        const rawMethod = String(fullSettlementPayment.method || "").toUpperCase();
         const method: "CASH" | "UPI" | "CARD" | "OTHER" =
           rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
 
-        const locId = finalPayment.location_id || chk?.location_id || (chk?.table_id ? tableMap.get(chk.table_id)?.location_id : null) || null;
+        const locId = fullSettlementPayment.location_id || chk?.location_id || (chk?.table_id ? tableMap.get(chk.table_id)?.location_id : null) || null;
 
         candidateEvents.push({
           checkId: cid,
-          amount: Number(finalPayment.amount || 0),
-          settledAt: new Date(finalPayment.created_at),
+          amount: Number(chk?.total && chk.total > 0 ? chk.total : fullSettlementPayment.amount || 0),
+          settledAt: new Date(fullSettlementPayment.created_at),
           method,
           locationId: locId,
           isLedger: true,
         });
-      } else if (chk && chk.status === "PAID") {
-        // Authoritative Legacy settlement fallback (no ledger settlement exists anywhere across history)
+      } else if (chk && chk.status === "PAID" && (chk.closed_at || chk.invoice_date)) {
+        // Authoritative verified legacy settlement fallback (no ledger full settlement exists)
         const amt = Number(chk.paid_total > 0 ? chk.paid_total : chk.total || 0);
         if (amt > 0) {
           const settleTime = chk.closed_at
