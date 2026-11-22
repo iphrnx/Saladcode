@@ -12,6 +12,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test:promo": "tsx scripts/test-promo.mts",
+    "test:promo:harden": "tsx scripts/test-promo-harden-suite.mts",
     "test:superadmin": "tsx scripts/test-superadmin-security.mts && tsx scripts/test-superadmin-api.mts",
     "test:gemini": "tsx scripts/test-gemini.mts",
     "test:reviews": "tsx --env-file=.env.local scripts/test-reviews.mts",

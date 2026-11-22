@@ -52,6 +52,7 @@ export interface QueueEntry {
   nextAttemptAt: number
   createdAt: number
   lastError?: string
+  errorCode?: string
   /** Nonce of the tab currently submitting this entry. */
   claimId?: string | null
   claimAt?: number | null
@@ -63,7 +64,7 @@ export interface QueueHooks {
   /** The order is on the server (fresh commit or reconciled). */
   onConfirmed?: (order: any, entry: QueueEntry) => void
   /** The order permanently failed / was rejected. */
-  onFailed?: (error: string, entry: QueueEntry) => void
+  onFailed?: (error: string, entry: QueueEntry, code?: string) => void
   /** An entry changed state (pending/submitting/failed). */
   onChange?: (entries: QueueEntry[]) => void
 }
@@ -102,8 +103,8 @@ function newKey(): string {
 
 export type SubmitResult =
   | { outcome: 'confirmed'; order: any }
-  | { outcome: 'uncertain'; error: string }
-  | { outcome: 'rejected'; error: string }
+  | { outcome: 'uncertain'; error: string; code?: string }
+  | { outcome: 'rejected'; error: string; code?: string }
 
 /**
  * One submission cycle for one entry: reconcile first when this is a retry,
@@ -164,12 +165,14 @@ export async function submitEntry(
     }
     const err = await res.json().catch(() => ({}))
     const rawError = err?.error || ''
+    const errorCode = err?.code || ''
     const lowerError = String(rawError).toLowerCase()
 
     // Deterministic errors will not resolve with automated retries:
-    // client validation, session invalid/ended, table missing, unavailable dishes, or any 4xx.
+    // client validation, session invalid/ended, table missing, unavailable dishes, pricing changed, or any 4xx.
     const isDeterministic =
       res.status < 500 ||
+      errorCode === 'ORDER_PRICING_CHANGED' ||
       lowerError.includes('session') ||
       lowerError.includes('table_required') ||
       lowerError.includes('unavailable') ||
@@ -181,12 +184,12 @@ export async function submitEntry(
       lowerError.includes('22p02')
 
     if (!isDeterministic && res.status >= 500) {
-      return { outcome: 'uncertain', error: cleanOrderErrorMessage(rawError) }
+      return { outcome: 'uncertain', error: cleanOrderErrorMessage(rawError), code: errorCode }
     }
     // A real answer from the server: the cart is wrong, the session ended, or
     // the price changed. Retrying the same payload will not fix it — a human
     // needs to see this.
-    return { outcome: 'rejected', error: cleanOrderErrorMessage(rawError || `Rejected (${res.status})`) }
+    return { outcome: 'rejected', error: cleanOrderErrorMessage(rawError || `Rejected (${res.status})`), code: errorCode }
   } catch (e: any) {
     return { outcome: 'uncertain', error: e?.message || 'Network error' }
   }
@@ -468,13 +471,13 @@ export class OrderQueue {
         if (result.outcome === 'confirmed') {
           this.confirm(due.key, result.order)
         } else if (result.outcome === 'rejected') {
-          const failedEntry = { ...held, state: 'failed' as const, lastError: result.error, claimId: null, claimAt: null }
+          const failedEntry = { ...held, state: 'failed' as const, lastError: result.error, errorCode: result.code, claimId: null, claimAt: null }
           this.save(
             currentEntries.map((e) =>
               e.key === due.key ? failedEntry : e,
             ),
           )
-          this.hooks.onFailed?.(result.error, failedEntry)
+          this.hooks.onFailed?.(result.error, failedEntry, result.code)
         } else {
           const attempts = held.attempts + 1
           const isFailed = attempts >= MAX_ATTEMPTS
@@ -484,6 +487,7 @@ export class OrderQueue {
             attempts,
             nextAttemptAt: this.now() + backoffDelayMs(attempts),
             lastError: result.error,
+            errorCode: result.code,
             claimId: null,
             claimAt: null,
           }
@@ -493,7 +497,7 @@ export class OrderQueue {
             ),
           )
           if (isFailed) {
-            this.hooks.onFailed?.(result.error, updatedEntry)
+            this.hooks.onFailed?.(result.error, updatedEntry, result.code)
           }
         }
       }

@@ -18,6 +18,8 @@ export interface CartItem {
   image?: string | null
   quantity: number
   notes?: string
+  unavailable?: boolean
+  unavailableReason?: string
 }
 
 /**
