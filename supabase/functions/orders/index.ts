@@ -351,19 +351,22 @@ async function priceAndCreateOrder(
     tenantId: string;
     tableId: string | null;
     tableSessionId: string | null;
+    createNewSession?: boolean;
+    sessionToken?: string | null;
     items: any[];
     orderType?: string | null;
     customerName?: string | null;
     customerPhone?: string | null;
     notes?: string | null;
     promoCode?: string | null;
+    promoQuote?: any;
     servedById?: string | null;
     /** PENDING (default) or PENDING_ACTIVATION while the table awaits approval. */
     status?: "PENDING" | "PENDING_ACTIVATION";
   },
   idempotencyKey: string | null = null,
 ): Promise<
-  | { ok: true; order: any; promoApplied: boolean; promoReason?: string; deduplicated?: boolean }
+  | { ok: true; order: any; promoApplied: boolean; promoReason?: string; deduplicated?: boolean; sessionId?: string; sessionToken?: string }
   | { ok: false; error: string; status: number; reason?: "empty" | "unavailable" }
 > {
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -386,22 +389,26 @@ async function priceAndCommitOnce(
     tenantId: string;
     tableId: string | null;
     tableSessionId: string | null;
+    createNewSession?: boolean;
+    sessionToken?: string | null;
     items: any[];
     orderType?: string | null;
     customerName?: string | null;
     customerPhone?: string | null;
     notes?: string | null;
     promoCode?: string | null;
+    promoQuote?: any;
     servedById?: string | null;
+    status?: "PENDING" | "PENDING_ACTIVATION";
   },
   idempotencyKey: string | null,
 ): Promise<
-  | { ok: true; order: any; promoApplied: boolean; promoReason?: string; deduplicated?: boolean }
+  | { ok: true; order: any; promoApplied: boolean; promoReason?: string; deduplicated?: boolean; sessionId?: string; sessionToken?: string }
   | { ok: false; error: string; status: number; reason?: "empty" | "unavailable"; retry?: boolean }
 > {
   const {
     tenantId, tableId, tableSessionId, items, orderType,
-    customerName, customerPhone, notes, promoCode, servedById,
+    customerName, customerPhone, notes, promoCode, promoQuote, servedById,
   } = args;
 
   // One read for every dish on the order rather than one per line. Malformed ids
@@ -511,6 +518,57 @@ async function priceAndCommitOnce(
     promoApplied = true;
     promoReason = null;
     evaluatedPromo = promoEval.promo;
+
+    // Validate server-issued quote if supplied (e.g. from POS Apply)
+    if (promoQuote) {
+      if (promoQuote.tenantId && promoQuote.tenantId !== tenantId) {
+        return {
+          ok: false,
+          error: "Promo quote does not match this restaurant. Please reapply the promo code.",
+          status: 409,
+          retry: false,
+        };
+      }
+      if (promoQuote.code && normalizePromoCode(promoQuote.code) !== normalizePromoCode(promoEval.code || promoCode)) {
+        return {
+          ok: false,
+          error: "Promo quote code does not match. Please reapply the promo code.",
+          status: 409,
+          retry: false,
+        };
+      }
+      const quoteType = normalizePromoType(promoQuote.type);
+      const evalType = normalizePromoType(promoEval.promo?.type);
+      const quoteValue = Number(promoQuote.value);
+      const evalValue = Number(promoEval.promo?.value);
+      const quoteCap = Number(promoQuote.maxDiscount ?? promoQuote.max_discount ?? 0);
+      const evalCap = Number(promoEval.promo?.max_discount ?? promoEval.promo?.maxDiscount ?? 0);
+      const quoteMin = Number(promoQuote.minOrder ?? promoQuote.min_order ?? 0);
+      const evalMin = Number(promoEval.promo?.min_order ?? promoEval.promo?.minOrder ?? 0);
+
+      if (
+        (quoteType && evalType && quoteType !== evalType) ||
+        (!isNaN(quoteValue) && !isNaN(evalValue) && quoteValue !== evalValue) ||
+        quoteCap !== evalCap ||
+        quoteMin !== evalMin
+      ) {
+        return {
+          ok: false,
+          error: "Promo quote is stale: promo terms have changed. Please reapply the promo code and review the updated total.",
+          status: 409,
+          retry: false,
+        };
+      }
+
+      if (promoQuote.discount !== undefined && Number(promoQuote.discount) !== Number(discount)) {
+        return {
+          ok: false,
+          error: "Promo quote is stale: cart subtotal or discount has changed. Please reapply the promo code and review the updated total.",
+          status: 409,
+          retry: false,
+        };
+      }
+    }
   }
 
   const taxableAmount = Math.max(0, +(itemsTotal - discount).toFixed(2));
@@ -528,6 +586,8 @@ async function priceAndCommitOnce(
       tenant_id: tenantId,
       table_id: tableId,
       table_session_id: tableSessionId,
+      create_new_session: args.createNewSession ? true : undefined,
+      session_token: args.sessionToken ?? null,
       order_type: orderType || "DINE_IN",
       items_total: +itemsTotal.toFixed(2),
       discount: +discount.toFixed(2),
@@ -585,11 +645,18 @@ async function priceAndCommitOnce(
           .eq("tenant_id", tenantId)
           .single();
         if (existingRow) {
+          const { data: sessRow } = await db
+            .from("table_sessions")
+            .select("token")
+            .eq("id", existingRow.table_session_id)
+            .maybeSingle();
           return {
             ok: true,
             order: mapOrder(existingRow),
             promoApplied: false,
             deduplicated: true,
+            sessionId: existingRow.table_session_id,
+            sessionToken: sessRow?.token || "",
           };
         }
       }
@@ -624,6 +691,8 @@ async function priceAndCommitOnce(
 
   const orderId = (tx as any)?.order_id as string | undefined;
   const deduplicated = (tx as any)?.deduplicated === true;
+  const sessionId = (tx as any)?.table_session_id as string | undefined;
+  const sessionToken = (tx as any)?.session_token as string | undefined;
   if (!orderId) return { ok: false, error: "Failed to place order", status: 500 };
 
   const { data: orderRow, error: fetchError } = await db
@@ -642,6 +711,8 @@ async function priceAndCommitOnce(
     promoApplied,
     promoReason,
     deduplicated,
+    sessionId,
+    sessionToken,
   };
 }
 
@@ -652,6 +723,7 @@ async function create(req: Request): Promise<Response> {
       orderType,
       items,
       promoCode,
+      promoQuote,
       customerName,
       customerPhone,
       notes,
@@ -749,6 +821,7 @@ async function create(req: Request): Promise<Response> {
         customerPhone,
         notes,
         promoCode,
+        promoQuote,
         servedById: null,
         status: held ? "PENDING_ACTIVATION" : "PENDING",
       }, idempotencyKey);
@@ -866,45 +939,26 @@ async function create(req: Request): Promise<Response> {
       const held = !autoAccept;
 
       const generatedToken = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
-      const { data: newSession, error: newSessionErr } = await db
-        .from("table_sessions")
-        .insert({
-          tenant_id: tableRow.tenant_id,
-          table_id: tableRow.id,
-          status: "ACTIVE",
-          activation_status: held ? "PENDING" : "ACTIVE",
-          token: generatedToken,
-          order_type: "DINE_IN",
-          activated_at: held ? null : new Date().toISOString(),
-          activation_requested_at: held ? new Date().toISOString() : null,
-        })
-        .select("id, token")
-        .single();
 
-      if (newSessionErr || !newSession) {
-        return json(req, { error: "Could not create table session. Please try again." }, 500);
-      }
-      newlyCreatedSessionId = newSession.id;
-
+      // Session, check, order, items, and promo redemption are created atomically in ONE transaction inside create_order_tx
       const created = await priceAndCreateOrder(db, {
         tenantId: tableRow.tenant_id,
         tableId: tableRow.id,
-        tableSessionId: newSession.id,
+        tableSessionId: null,
+        createNewSession: true,
+        sessionToken: generatedToken,
         items,
         orderType: "DINE_IN",
         customerName,
         customerPhone,
         notes,
         promoCode,
+        promoQuote,
         servedById: null,
         status: held ? "PENDING_ACTIVATION" : "PENDING",
       }, idempotencyKey);
 
       if (!created.ok) {
-        // Roll back the session created outside the RPC on rejection
-        if (newlyCreatedSessionId) {
-          await db.from("table_sessions").delete().eq("id", newlyCreatedSessionId).catch(() => {});
-        }
         return json(
           req,
           {
@@ -917,12 +971,15 @@ async function create(req: Request): Promise<Response> {
         );
       }
 
+      const finalSessionToken = created.sessionToken || generatedToken;
+      const finalSessionId = created.sessionId || created.order.tableSessionId;
+
       if (!created.deduplicated) {
         if (held) {
           await publishToStaff(created.order.tenantId, "ACTIVATION_REQUESTED", {
             order: orderEvent(created.order),
           });
-          publishToDiner(newSession.token, "ACTIVATION_REQUESTED", {
+          publishToDiner(finalSessionToken, "ACTIVATION_REQUESTED", {
             order: orderEvent(created.order),
           });
         } else {
@@ -930,15 +987,15 @@ async function create(req: Request): Promise<Response> {
             type: "ORDER_CREATED",
             tenantId: created.order.tenantId,
             order: created.order,
-            sessionToken: newSession.token,
+            sessionToken: finalSessionToken,
           });
         }
       }
 
       return json(req, {
         ...created.order,
-        sessionToken: newSession.token,
-        sessionId: newSession.id,
+        sessionToken: finalSessionToken,
+        sessionId: finalSessionId,
         pendingActivation: held,
       }, 201);
     }
@@ -1085,6 +1142,7 @@ async function create(req: Request): Promise<Response> {
       customerPhone,
       notes,
       promoCode,
+      promoQuote,
       servedById: validServedById,
     }, idempotencyKey);
 

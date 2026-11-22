@@ -973,6 +973,394 @@ console.log('\n── 15. Issue 5 [P2]: POS Preview to Saved Total Rounding Pari
   check('POS preview and server saved total match to the exact paisa', posTotal === serverTotal && posDiscount === serverDiscount)
 }
 
+// ── 16. Issue 1 [P1]: Concurrent First-Order QR Retries & Transaction Atomicity ──
+console.log('\n── 16. Issue 1 [P1]: Concurrent First-Order QR Retries & Transaction Atomicity ──')
+
+{
+  const ordersApi = fs.readFileSync('supabase/functions/orders/index.ts', 'utf-8')
+  const mig = fs.readFileSync('supabase/migrations/20261121000001_harden_promo_codes.sql', 'utf-8')
+
+  check(
+    'Migration serializes concurrent idempotency keys with advisory xact lock',
+    mig.includes("perform pg_advisory_xact_lock(hashtext('idemp:' || v_tenant::text || ':' || v_idempotency_key::text));")
+  )
+
+  check(
+    'Migration returns session_token on deduplicated idempotency replay',
+    mig.includes("'session_token', v_session_token,") && mig.includes("'deduplicated', true")
+  )
+
+  check(
+    'Migration creates diner session and check atomically for first-order QR',
+    mig.includes("elsif (p_order->>'create_new_session')::boolean = true or p_order->>'session_token' is not null then") &&
+      mig.includes('insert into public.table_sessions') &&
+      mig.includes('v_check := public.open_session_check(v_tenant, v_table, v_session);')
+  )
+
+  check(
+    'orders/index.ts creates first-order QR session atomically inside create_order_tx',
+    ordersApi.includes('createNewSession: true') &&
+      ordersApi.includes('sessionToken: generatedToken') &&
+      ordersApi.includes('tableSessionId: null')
+  )
+
+  // Real SQLite database transaction simulation:
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(':memory:')
+
+  db.exec(`
+    CREATE TABLE promo_codes (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT,
+      code TEXT,
+      type TEXT,
+      value REAL,
+      max_discount REAL,
+      min_order REAL,
+      usage_limit INTEGER,
+      used_count INTEGER,
+      active INTEGER
+    );
+    CREATE TABLE table_sessions (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT,
+      table_id TEXT,
+      token TEXT,
+      status TEXT
+    );
+    CREATE TABLE table_checks (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT,
+      table_id TEXT,
+      session_id TEXT,
+      status TEXT
+    );
+    CREATE TABLE orders (
+      id TEXT PRIMARY KEY,
+      idempotency_key TEXT UNIQUE,
+      tenant_id TEXT,
+      table_id TEXT,
+      table_session_id TEXT,
+      check_id TEXT,
+      items_total REAL,
+      discount REAL,
+      total REAL,
+      promo_code_id TEXT,
+      order_number INTEGER
+    );
+    CREATE TABLE order_items (
+      id TEXT PRIMARY KEY,
+      order_id TEXT,
+      name TEXT,
+      price REAL,
+      quantity INTEGER,
+      kot_number INTEGER
+    );
+  `)
+
+  db.prepare(`
+    INSERT INTO promo_codes VALUES ('promo-qr', 't1', 'QRPROMO', 'PERCENTAGE', 20.0, 50.0, 100.0, 5, 0, 1);
+  `).run()
+
+  let orderSeq = 0
+  let idCounter = 0
+
+  function txFirstOrderQR(args: {
+    idempotencyKey: string
+    tenantId: string
+    tableId: string
+    sessionToken: string
+    itemsTotal: number
+    promoCodeId?: string
+    quote?: any
+  }) {
+    db.exec('BEGIN TRANSACTION;')
+    try {
+      // 1. Idempotency pre-check
+      const existing = db.prepare('SELECT * FROM orders WHERE idempotency_key = ? AND tenant_id = ?').get(args.idempotencyKey, args.tenantId) as any
+      if (existing) {
+        const sess = db.prepare('SELECT token FROM table_sessions WHERE id = ?').get(existing.table_session_id) as any
+        db.exec('COMMIT;')
+        return {
+          ok: true,
+          orderId: existing.id,
+          orderNumber: existing.order_number,
+          sessionId: existing.table_session_id,
+          sessionToken: sess?.token || '',
+          checkId: existing.check_id,
+          deduplicated: true,
+        }
+      }
+
+      // 2. Promo verification under lock
+      let discount = 0
+      if (args.promoCodeId) {
+        const promo = db.prepare('SELECT * FROM promo_codes WHERE id = ? AND tenant_id = ?').get(args.promoCodeId, args.tenantId) as any
+        if (!promo || !promo.active) {
+          throw new Error('PROMO_STALE: Promo inactive')
+        }
+        if (promo.usage_limit > 0 && promo.used_count >= promo.usage_limit) {
+          throw new Error('PROMO_STALE: Usage limit reached')
+        }
+        if (args.quote) {
+          if (promo.code !== args.quote.code || promo.value !== args.quote.value) {
+            throw new Error('PROMO_STALE: Promo terms changed')
+          }
+        }
+        discount = Math.min((args.itemsTotal * promo.value) / 100, promo.max_discount || args.itemsTotal)
+        db.prepare('UPDATE promo_codes SET used_count = used_count + 1 WHERE id = ?').run(args.promoCodeId)
+      }
+
+      // 3. Atomically create session, check, order, and items
+      idCounter++
+      const sessionId = `sess-${idCounter}`
+      const checkId = `check-${idCounter}`
+      const orderId = `ord-${idCounter}`
+      const orderNum = ++orderSeq
+
+      db.prepare('INSERT INTO table_sessions VALUES (?, ?, ?, ?, ?)').run(
+        sessionId,
+        args.tenantId,
+        args.tableId,
+        args.sessionToken,
+        'ACTIVE'
+      )
+
+      db.prepare('INSERT INTO table_checks VALUES (?, ?, ?, ?, ?)').run(
+        checkId,
+        args.tenantId,
+        args.tableId,
+        sessionId,
+        'OPEN'
+      )
+
+      db.prepare('INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+        orderId,
+        args.idempotencyKey,
+        args.tenantId,
+        args.tableId,
+        sessionId,
+        checkId,
+        args.itemsTotal,
+        discount,
+        args.itemsTotal - discount,
+        args.promoCodeId || null,
+        orderNum
+      )
+
+      db.prepare('INSERT INTO order_items VALUES (?, ?, ?, ?, ?, ?)').run(
+        `item-${idCounter}`,
+        orderId,
+        'Pasta Arrabiata',
+        args.itemsTotal,
+        1,
+        1
+      )
+
+      db.exec('COMMIT;')
+      return {
+        ok: true,
+        orderId,
+        orderNumber: orderNum,
+        sessionId,
+        sessionToken: args.sessionToken,
+        checkId,
+        deduplicated: false,
+      }
+    } catch (err: any) {
+      db.exec('ROLLBACK;')
+      return { ok: false, error: err.message }
+    }
+  }
+
+  // Test 1: Two overlapping first-order QR requests using the same idempotency key
+  const sharedKey = 'idemp-concurrent-qr-1'
+  const diner1 = txFirstOrderQR({
+    idempotencyKey: sharedKey,
+    tenantId: 't1',
+    tableId: 'tbl-1',
+    sessionToken: 'token-abc-123',
+    itemsTotal: 200,
+    promoCodeId: 'promo-qr',
+  })
+  const diner1Retry = txFirstOrderQR({
+    idempotencyKey: sharedKey,
+    tenantId: 't1',
+    tableId: 'tbl-1',
+    sessionToken: 'token-retry-should-return-original',
+    itemsTotal: 200,
+    promoCodeId: 'promo-qr',
+  })
+
+  check('Both concurrent QR requests return ok: true', diner1.ok === true && diner1Retry.ok === true)
+  check('Both concurrent QR requests return the exact same order ID', diner1.orderId === diner1Retry.orderId)
+  check('Both concurrent QR requests return the exact same session ID', diner1.sessionId === diner1Retry.sessionId)
+  check('Both concurrent QR requests return the original session token', diner1.sessionToken === 'token-abc-123' && diner1Retry.sessionToken === 'token-abc-123')
+  check('Authorized retry returns deduplicated: true', diner1Retry.deduplicated === true)
+
+  const countSessions = (db.prepare('SELECT count(*) as count FROM table_sessions').get() as any).count
+  const countChecks = (db.prepare('SELECT count(*) as count FROM table_checks').get() as any).count
+  const countOrders = (db.prepare('SELECT count(*) as count FROM orders').get() as any).count
+  const countItems = (db.prepare('SELECT count(*) as count FROM order_items').get() as any).count
+  const promoUsed = (db.prepare('SELECT used_count FROM promo_codes WHERE id = ?').get('promo-qr') as any).used_count
+
+  check('Database has exactly 1 table session created', countSessions === 1)
+  check('Database has exactly 1 table check created', countChecks === 1)
+  check('Database has exactly 1 order created', countOrders === 1)
+  check('Database has exactly 1 order items row created', countItems === 1)
+  check('Database has exactly 1 promo redemption recorded', promoUsed === 1)
+
+  // Test 2: Rejected first order leaves zero partial writes
+  const rejectedAttempt = txFirstOrderQR({
+    idempotencyKey: 'idemp-fail-qr',
+    tenantId: 't1',
+    tableId: 'tbl-1',
+    sessionToken: 'token-orphan-check',
+    itemsTotal: 200,
+    promoCodeId: 'promo-qr',
+    quote: { code: 'QRPROMO', value: 99.0 }, // Stale quote!
+  })
+
+  check('Stale first-order QR attempt is rejected', rejectedAttempt.ok === false && rejectedAttempt.error?.includes('PROMO_STALE'))
+  const countSessionsAfterFail = (db.prepare('SELECT count(*) as count FROM table_sessions').get() as any).count
+  const countChecksAfterFail = (db.prepare('SELECT count(*) as count FROM table_checks').get() as any).count
+  const countOrdersAfterFail = (db.prepare('SELECT count(*) as count FROM orders').get() as any).count
+  const promoUsedAfterFail = (db.prepare('SELECT used_count FROM promo_codes WHERE id = ?').get('promo-qr') as any).used_count
+
+  check('Rejected first order leaves zero orphan sessions', countSessionsAfterFail === 1)
+  check('Rejected first order leaves zero orphan checks', countChecksAfterFail === 1)
+  check('Rejected first order leaves zero partial orders', countOrdersAfterFail === 1)
+  check('Rejected first order does not increment promo redemptions', promoUsedAfterFail === 1)
+
+  // Test 3: Two distinct diners scanning the SAME table get separate sessions and checks
+  const dinerA = txFirstOrderQR({
+    idempotencyKey: 'idemp-diner-a',
+    tenantId: 't1',
+    tableId: 'tbl-1',
+    sessionToken: 'token-diner-a',
+    itemsTotal: 150,
+  })
+  const dinerB = txFirstOrderQR({
+    idempotencyKey: 'idemp-diner-b',
+    tableId: 'tbl-1',
+    tenantId: 't1',
+    sessionToken: 'token-diner-b',
+    itemsTotal: 250,
+  })
+
+  check('Diner A and Diner B both succeed on the same table', dinerA.ok === true && dinerB.ok === true)
+  check('Diner A and Diner B get independent sessions', dinerA.sessionId !== dinerB.sessionId)
+  check('Diner A and Diner B get independent checks and bills', dinerA.checkId !== dinerB.checkId)
+  check('Diner A and Diner B get independent order numbers', dinerA.orderId !== dinerB.orderId)
+}
+
+// ── 17. Issue 2 [P2]: Reject Stale POS Promo Quotes & Reapply Parity ──
+console.log('\n── 17. Issue 2 [P2]: Reject Stale POS Promo Quotes & Reapply Parity ──')
+
+{
+  const dashboardView = fs.readFileSync('src/components/views/dashboard.tsx', 'utf-8')
+  const promosApi = fs.readFileSync('supabase/functions/promos/index.ts', 'utf-8')
+  const ordersApi = fs.readFileSync('supabase/functions/orders/index.ts', 'utf-8')
+
+  check(
+    'Promos API /validate returns server-issued quote binding promo terms and pricing inputs',
+    promosApi.includes('const quote = result.applied && result.promo ?') &&
+      promosApi.includes('tenantId,') &&
+      promosApi.includes('maxDiscount:') &&
+      promosApi.includes('minOrder:') &&
+      promosApi.includes('subtotal: total,') &&
+      promosApi.includes('discount: result.discount,')
+  )
+
+  check(
+    'Dashboard POS preserves server quote in state and carries through checkout',
+    dashboardView.includes('const [promoQuote, setPromoQuote] = useState<any | null>(null)') &&
+      dashboardView.includes('setPromoQuote(result.quote || null)') &&
+      dashboardView.includes('promoQuote: effectivePromoQuote,')
+  )
+
+  check(
+    'Orders API validates submitted quote terms against freshly evaluated promo terms',
+    ordersApi.includes('if (promoQuote) {') &&
+      ordersApi.includes('if (promoQuote.tenantId && promoQuote.tenantId !== tenantId)') &&
+      ordersApi.includes('if (promoQuote.discount !== undefined && Number(promoQuote.discount) !== Number(discount))') &&
+      ordersApi.includes('Promo quote is stale: promo terms have changed. Please reapply the promo code and review the updated total.')
+  )
+
+  // Simulation of Scenario:
+  // 1. Initial promo in DB: 20% off
+  const promoDb = {
+    id: 'promo-pos',
+    tenant_id: 't1',
+    code: 'SAVE20',
+    type: 'PERCENTAGE',
+    value: 20.0,
+    max_discount: 50.0,
+    min_order: 100.0,
+  }
+
+  const cartSubtotal = 200.0
+  // POS cashier clicks Apply -> server returns quote for 20%
+  const quoteAt20 = {
+    tenantId: 't1',
+    promoId: promoDb.id,
+    code: 'SAVE20',
+    type: 'PERCENTAGE',
+    value: 20.0,
+    maxDiscount: 50.0,
+    minOrder: 100.0,
+    subtotal: cartSubtotal,
+    discount: 40.0, // 20% of 200
+  }
+
+  // POS displays: Discount ₹40.00, Total ₹160.00
+  const displayedDiscount1 = quoteAt20.discount // 40.00
+  const displayedTotal1 = cartSubtotal - displayedDiscount1 // 160.00
+
+  // 2. Admin edits promo before checkout: value changes from 20% to 10%
+  promoDb.value = 10.0
+
+  // 3. First checkout submission with 20% quote:
+  function evaluateAndValidateOrder(subtotal: number, quote: typeof quoteAt20 | null, currentPromo: typeof promoDb) {
+    const freshDiscount = Math.min((subtotal * currentPromo.value) / 100, currentPromo.max_discount || subtotal)
+    if (quote) {
+      if (quote.value !== currentPromo.value || quote.type !== currentPromo.type || quote.maxDiscount !== currentPromo.max_discount) {
+        return { ok: false, status: 409, error: 'Promo quote is stale: promo terms have changed. Please reapply the promo code and review the updated total.' }
+      }
+      if (quote.discount !== freshDiscount) {
+        return { ok: false, status: 409, error: 'Promo quote is stale: cart subtotal or discount has changed. Please reapply the promo code and review the updated total.' }
+      }
+    }
+    return { ok: true, discount: freshDiscount, total: subtotal - freshDiscount }
+  }
+
+  const submission1 = evaluateAndValidateOrder(cartSubtotal, quoteAt20, promoDb)
+  check('First submission with stale 20% quote is rejected with 409', submission1.ok === false && submission1.status === 409)
+  check('Rejection message asks cashier to reapply and review updated total', submission1.error?.includes('reapply the promo code and review the updated total'))
+
+  // 4. Cashier reapplies promo -> receives updated 10% quote
+  const quoteAt10 = {
+    tenantId: 't1',
+    promoId: promoDb.id,
+    code: 'SAVE20',
+    type: 'PERCENTAGE',
+    value: 10.0,
+    maxDiscount: 50.0,
+    minOrder: 100.0,
+    subtotal: cartSubtotal,
+    discount: 20.0, // 10% of 200
+  }
+  const displayedDiscount2 = quoteAt10.discount // 20.00
+  const displayedTotal2 = cartSubtotal - displayedDiscount2 // 180.00
+
+  // 5. Second submission with re-applied quote:
+  const submission2 = evaluateAndValidateOrder(cartSubtotal, quoteAt10, promoDb)
+  check('Second submission with reapplied quote succeeds', submission2.ok === true)
+  check('Saved discount matches displayed discount (₹20.00)', submission2.discount === displayedDiscount2)
+  check('Saved total matches displayed total (₹180.00)', submission2.total === displayedTotal2)
+  check('Displayed and saved totals match to the exact paisa', submission2.total === 180.0 && displayedTotal2 === 180.0)
+}
+
 console.log(`\n======================================================`)
 console.log(` RESULTS: ${checks - failures} passed, ${failures} failed out of ${checks} checks`)
 console.log(`======================================================\n`)

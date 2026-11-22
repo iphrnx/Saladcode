@@ -226,6 +226,7 @@ export function DashboardView() {
   const [lastOrder, setLastOrder] = useState<any>(null)
   const [cartOpen, setCartOpen] = useState(false)
   const [appliedPromo, setAppliedPromo] = useState<any | null>(null)
+  const [promoQuote, setPromoQuote] = useState<any | null>(null)
   const [promoError, setPromoError] = useState('')
   const [promoChecking, setPromoChecking] = useState(false)
   const [customerName, setCustomerName] = useState('')
@@ -307,6 +308,7 @@ export function DashboardView() {
         subtractCartLines(entry.payload.items ?? [])
         setPromoCode('')
         setAppliedPromo(null)
+        setPromoQuote(null)
         setPromoError('')
         if (tenantId && userId) {
           clearPosSessionDraft(tenantId, userId, entry.payload.tableSessionId)
@@ -341,7 +343,9 @@ export function DashboardView() {
         // while strictly retaining the cart.
         if (msg.toLowerCase().includes('promo') || msg.toLowerCase().includes('reapply')) {
           setAppliedPromo(null)
+          setPromoQuote(null)
           setPromoError(msg)
+          setCartOpen(true)
         }
         q.retire(entry.key)
       },
@@ -462,6 +466,7 @@ export function DashboardView() {
       const min = Number(appliedPromo.minOrder ?? appliedPromo.min_order ?? 0)
       if (subtotal < min) {
         setAppliedPromo(null)
+        setPromoQuote(null)
         setPromoError(`Promo "${appliedPromo.code}" requires minimum order of ${tenant?.currencySymbol || '₹'}${min.toFixed(2)}`)
       }
     }
@@ -479,6 +484,7 @@ export function DashboardView() {
     const code = promoCode.trim()
     if (!code) {
       setAppliedPromo(null)
+      setPromoQuote(null)
       return
     }
     setPromoChecking(true)
@@ -493,12 +499,14 @@ export function DashboardView() {
 
       if (!result.applied) {
         setAppliedPromo(null)
+        setPromoQuote(null)
         setPromoError(result.reason || tr('pos.promoInvalid'))
         toast.error(result.reason || tr('pos.promoInvalid'))
         return
       }
 
       setAppliedPromo(result.promo)
+      setPromoQuote(result.quote || null)
       setPromoCode(result.code || code)
       toast.success(`Promo "${result.code}" applied`, {
         description: result.promo.type === 'PERCENTAGE'
@@ -510,6 +518,7 @@ export function DashboardView() {
       // that lands here is a permission, server or network failure, so it must
       // not be reported as "Promo invalid".
       setAppliedPromo(null)
+      setPromoQuote(null)
       setPromoError(describeFailure(err, 'the promo code').message)
       handleAction(err, 'the promo code')
     } finally {
@@ -519,6 +528,7 @@ export function DashboardView() {
 
   const removePromo = () => {
     setAppliedPromo(null)
+    setPromoQuote(null)
     setPromoCode('')
     setPromoError('')
   }
@@ -1447,6 +1457,7 @@ export function DashboardView() {
     const effectivePromoCode = appliedPromo && subtotal >= promoMin && discount > 0
       ? (appliedPromo.code || promoCode.trim())
       : undefined
+    const effectivePromoQuote = effectivePromoCode ? (promoQuote || undefined) : undefined
 
     orderQueue(tenant.id, data.currentUser.id, {}).enqueue(
       'pos',
@@ -1457,6 +1468,7 @@ export function DashboardView() {
         orderType,
         items,
         promoCode: effectivePromoCode,
+        promoQuote: effectivePromoQuote,
         customerName: orderType !== 'DINE_IN' ? (customerName.trim() || undefined) : undefined,
         customerPhone: orderType !== 'DINE_IN' ? (customerPhone.trim() || undefined) : undefined,
         servedById: data.currentUser.id,

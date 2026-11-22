@@ -18,6 +18,7 @@ declare
   v_tenant uuid := (p_order->>'tenant_id')::uuid;
   v_table uuid := nullif(p_order->>'table_id', '')::uuid;
   v_session uuid := nullif(p_order->>'table_session_id', '')::uuid;
+  v_session_token text := null;
   v_order_type text := coalesce(p_order->>'order_type', 'DINE_IN');
   v_idempotency_key uuid := null;
   v_order_id uuid;
@@ -44,19 +45,26 @@ begin
     v_idempotency_key := p_idempotency_key::uuid;
   end if;
 
-  -- 1. Idempotency pre-check
+  -- 1. Idempotency pre-check & concurrency serialization
   if v_idempotency_key is not null then
+    perform pg_advisory_xact_lock(hashtext('idemp:' || v_tenant::text || ':' || v_idempotency_key::text));
+
     select id, order_number, check_id, table_session_id
       into v_existing_order
       from public.orders
      where idempotency_key = v_idempotency_key
        and tenant_id = v_tenant;
     if v_existing_order.id is not null then
+      select token into v_session_token
+        from public.table_sessions
+       where id = v_existing_order.table_session_id;
+
       return jsonb_build_object(
         'order_id', v_existing_order.id,
         'order_number', v_existing_order.order_number,
         'check_id', v_existing_order.check_id,
         'table_session_id', v_existing_order.table_session_id,
+        'session_token', v_session_token,
         'deduplicated', true
       );
     end if;
@@ -147,11 +155,32 @@ begin
           raise exception 'SESSION_INVALID_OR_ENDED' using errcode = 'P0001';
         end if;
         v_check := public.open_session_check(v_tenant, v_table, v_session);
+        select token into v_session_token from public.table_sessions where id = v_session;
+      elsif (p_order->>'create_new_session')::boolean = true or p_order->>'session_token' is not null then
+        -- First-order QR scan or explicit new sitting: create session and check atomically in this transaction
+        insert into public.table_sessions (
+          tenant_id, table_id, order_type, status, activation_status,
+          token, customer_name, customer_phone, notes,
+          activated_at, activation_requested_at
+        ) values (
+          v_tenant, v_table, 'DINE_IN', 'ACTIVE',
+          case when p_status = 'PENDING_ACTIVATION' then 'PENDING' else 'ACTIVE' end,
+          coalesce(nullif(p_order->>'session_token', ''), encode(extensions.gen_random_bytes(24), 'hex')),
+          nullif(p_order->>'customer_name', ''),
+          nullif(p_order->>'customer_phone', ''),
+          nullif(p_order->>'notes', ''),
+          case when p_status = 'PENDING_ACTIVATION' then null else now() end,
+          case when p_status = 'PENDING_ACTIVATION' then now() else null end
+        )
+        returning id, token into v_session, v_session_token;
+
+        v_check := public.open_session_check(v_tenant, v_table, v_session);
       else
         v_check := public.open_table_check(v_tenant, v_table, null);
         select coalesce(session_id, anchor_session_id) into v_session
           from public.table_checks
          where id = v_check;
+        select token into v_session_token from public.table_sessions where id = v_session;
       end if;
     else
       raise exception 'TABLE_REQUIRED_FOR_DINE_IN' using errcode = 'P0001';
@@ -170,6 +199,7 @@ begin
         raise exception 'SESSION_INVALID_OR_ENDED' using errcode = 'P0001';
       end if;
       v_check := public.open_session_check(v_tenant, null, v_session);
+      select token into v_session_token from public.table_sessions where id = v_session;
     else
       -- Brand-new independent Takeaway or Delivery session created atomically
       insert into public.table_sessions (
@@ -183,7 +213,7 @@ begin
         nullif(p_order->>'notes', ''),
         now()
       )
-      returning id into v_session;
+      returning id, token into v_session, v_session_token;
 
       v_check := public.open_session_check(v_tenant, null, v_session);
     end if;
@@ -230,11 +260,16 @@ begin
          where idempotency_key = v_idempotency_key
            and tenant_id = v_tenant;
         if v_existing_order.id is not null then
+          select token into v_session_token
+            from public.table_sessions
+           where id = v_existing_order.table_session_id;
+
           return jsonb_build_object(
             'order_id', v_existing_order.id,
             'order_number', v_existing_order.order_number,
             'check_id', v_existing_order.check_id,
             'table_session_id', v_existing_order.table_session_id,
+            'session_token', v_session_token,
             'deduplicated', true
           );
         end if;
@@ -342,11 +377,16 @@ begin
     end if;
   end if;
 
+  if v_session_token is null and v_session is not null then
+    select token into v_session_token from public.table_sessions where id = v_session;
+  end if;
+
   return jsonb_build_object(
     'order_id', v_order_id,
     'order_number', v_order_num,
     'check_id', v_check,
-    'table_session_id', v_session
+    'table_session_id', v_session,
+    'session_token', v_session_token
   );
 end;
 $$;

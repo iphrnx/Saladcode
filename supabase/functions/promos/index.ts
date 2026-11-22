@@ -105,12 +105,26 @@ async function validate(req: Request): Promise<Response> {
     currencySymbol: tenant?.currency_symbol ?? "₹",
   });
 
+  const quote = result.applied && result.promo ? {
+    tenantId,
+    promoId: result.promo.id,
+    code: result.code || result.promo.code,
+    type: normalizePromoType(result.promo.type),
+    value: Number(result.promo.value),
+    maxDiscount: Number(result.promo.max_discount ?? result.promo.maxDiscount ?? 0),
+    minOrder: Number(result.promo.min_order ?? result.promo.minOrder ?? 0),
+    subtotal: total,
+    discount: result.discount,
+    issuedAt: new Date().toISOString(),
+  } : null;
+
   return json(req, {
     applied: result.applied,
     reason: result.reason,
     discount: result.discount,
     code: result.code,
     promo: result.promo ? mapPromo(result.promo) : null,
+    quote,
   });
 }
 
