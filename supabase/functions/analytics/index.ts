@@ -469,12 +469,14 @@ serve(async (req: Request) => {
   }
 
   // Payment method breakdowns (Cash, UPI, Card, Other accurately reported)
+  // Exclude zero-amount settlement events (e.g. ₹0 comped sales) from payment-method transaction counts
   let cashAmount = 0, cashCount = 0;
   let upiAmount = 0, upiCount = 0;
   let cardAmount = 0, cardCount = 0;
   let otherAmount = 0, otherCount = 0;
 
   for (const e of filteredEvents) {
+    if (e.amount <= 0) continue;
     if (e.method === "CASH") {
       cashAmount += e.amount;
       cashCount++;

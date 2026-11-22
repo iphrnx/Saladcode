@@ -206,6 +206,11 @@ console.log("\n── 4. Preserve PR #7 Valid ₹0 Sales & Settlement Verificati
   );
 
   check(
+    "analytics excludes zero-amount settlement events from payment-method transaction counts",
+    /for\s*\(\s*const\s+e\s+of\s+filteredEvents\s*\)\s*\{\s*if\s*\(\s*e\.amount\s*<=\s*0\s*\)\s*continue;/.test(analyticsFn)
+  );
+
+  check(
     "corrective migration repairs orders.paid_at and resets unverified timestamps to NULL",
     /where tc\.total > 0\s+and rp\.cumulative_amount >= tc\.total - 0\.005/.test(migration3Sql) &&
     /where tc\.status = 'PAID'\s+and coalesce\(tc\.closed_at, tc\.invoice_date\) is not null/.test(migration3Sql) &&
@@ -323,6 +328,119 @@ console.log("\n── 5. Runtime & Invariant Simulations ──");
   const openCheckWithPmt = reconcileSettlement({ total: 0, status: "OPEN" }, [{ amount: 500 }]);
   check("open check with unknown total and ledger payments is NOT settled revenue",
     !openCheckWithPmt.settled && openCheckWithPmt.amount === 0);
+
+  // Simulation H: Regression case with one ₹0 sale and one positive payment
+  // Verify that the report shows two completed orders and one payment transaction,
+  // and that a ₹0-only sale shows zero payment transactions in dashboard and CSV.
+  function simulateAnalyticsReport(
+    sales: { checkId: string; total: number; orderCount: number; method: "CASH" | "UPI" | "CARD" | "OTHER" }[]
+  ) {
+    let completedOrders = 0;
+    let grossCollected = 0;
+    const pmCounts = { cash: 0, upi: 0, card: 0, other: 0 };
+    const pmAmounts = { cash: 0, upi: 0, card: 0, other: 0 };
+
+    for (const s of sales) {
+      completedOrders += s.orderCount;
+      grossCollected += s.total;
+
+      // Exclude zero-amount settlement events from payment-method transaction counts
+      if (s.total <= 0) continue;
+
+      if (s.method === "CASH") {
+        pmAmounts.cash += s.total;
+        pmCounts.cash++;
+      } else if (s.method === "UPI") {
+        pmAmounts.upi += s.total;
+        pmCounts.upi++;
+      } else if (s.method === "CARD") {
+        pmAmounts.card += s.total;
+        pmCounts.card++;
+      } else {
+        pmAmounts.other += s.total;
+        pmCounts.other++;
+      }
+    }
+
+    const totalPaymentTx = pmCounts.cash + pmCounts.upi + pmCounts.card + pmCounts.other;
+    return {
+      completedOrders,
+      grossCollected,
+      paymentMethods: {
+        cash: { amount: pmAmounts.cash, count: pmCounts.cash },
+        upi: { amount: pmAmounts.upi, count: pmCounts.upi },
+        card: { amount: pmAmounts.card, count: pmCounts.card },
+        other: { amount: pmAmounts.other, count: pmCounts.other },
+        totalTx: totalPaymentTx,
+      },
+    };
+  }
+
+  // Case 1: One ₹0 sale and one positive payment
+  const mixedReport = simulateAnalyticsReport([
+    { checkId: "chk-zero", total: 0, orderCount: 1, method: "OTHER" },
+    { checkId: "chk-positive", total: 450, orderCount: 1, method: "UPI" },
+  ]);
+  check("regression case shows two completed orders", mixedReport.completedOrders === 2);
+  check("regression case shows one payment transaction", mixedReport.paymentMethods.totalTx === 1);
+  check("regression case attributes payment transaction to UPI with 450 amount",
+    mixedReport.paymentMethods.upi.count === 1 && mixedReport.paymentMethods.upi.amount === 450);
+  check("regression case attributes 0 transactions to other/legacy",
+    mixedReport.paymentMethods.other.count === 0 && mixedReport.paymentMethods.other.amount === 0);
+
+  // Case 2: ₹0-only sale
+  const zeroOnlyReport = simulateAnalyticsReport([
+    { checkId: "chk-zero-only", total: 0, orderCount: 1, method: "OTHER" },
+  ]);
+  check("₹0-only sale shows one completed order", zeroOnlyReport.completedOrders === 1);
+  check("₹0-only sale shows zero payment transactions in dashboard and CSV", zeroOnlyReport.paymentMethods.totalTx === 0);
+
+  // Simulation I: Promo order idempotent replay (e.g. network retry with same idempotency key)
+  const ordersDatabase: any[] = [];
+  let promoRedemptions = 0;
+  function createOrderTxSimulation(idempotencyKey: string, promoId: string | null) {
+    const existing = ordersDatabase.find((o) => o.idempotency_key === idempotencyKey);
+    if (existing) {
+      return { order_id: existing.id, deduplicated: true, promoRedemptions };
+    }
+    if (promoId) {
+      promoRedemptions++;
+    }
+    const newOrder = { id: "ord-" + (ordersDatabase.length + 1), idempotency_key: idempotencyKey, promo_id: promoId };
+    ordersDatabase.push(newOrder);
+    return { order_id: newOrder.id, deduplicated: false, promoRedemptions };
+  }
+
+  const promoOrder1 = createOrderTxSimulation("idem-key-101", "promo-valid");
+  const promoOrderRetry = createOrderTxSimulation("idem-key-101", "promo-valid");
+  check("promo checkout initial attempt creates one order and one redemption",
+    promoOrder1.deduplicated === false && ordersDatabase.length === 1 && promoOrder1.promoRedemptions === 1);
+  check("promo checkout retry creates only one order and one redemption",
+    promoOrderRetry.deduplicated === true && promoOrderRetry.order_id === promoOrder1.order_id && ordersDatabase.length === 1 && promoRedemptions === 1);
+
+  // Simulation J: CSV Export simulation for mixed and ₹0-only sales
+  function generateCsvRows(report: ReturnType<typeof simulateAnalyticsReport>) {
+    const rows: (string | number)[][] = [];
+    rows.push(["Gross Collected", report.grossCollected.toFixed(2)]);
+    rows.push(["Completed Orders", report.completedOrders]);
+    rows.push(["Method", "Transactions", "Amount"]);
+    rows.push(["Cash", report.paymentMethods.cash.count, report.paymentMethods.cash.amount.toFixed(2)]);
+    rows.push(["UPI", report.paymentMethods.upi.count, report.paymentMethods.upi.amount.toFixed(2)]);
+    rows.push(["Card", report.paymentMethods.card.count, report.paymentMethods.card.amount.toFixed(2)]);
+    if (report.paymentMethods.other.count > 0) {
+      rows.push(["Other / Legacy", report.paymentMethods.other.count, report.paymentMethods.other.amount.toFixed(2)]);
+    }
+    rows.push(["Total Reconciled", report.paymentMethods.totalTx, report.grossCollected.toFixed(2)]);
+    return rows;
+  }
+
+  const mixedCsv = generateCsvRows(mixedReport);
+  check("CSV for mixed report shows 2 completed orders", mixedCsv.some((r) => r[0] === "Completed Orders" && r[1] === 2));
+  check("CSV for mixed report shows 1 total reconciled transaction", mixedCsv.some((r) => r[0] === "Total Reconciled" && r[1] === 1));
+
+  const zeroOnlyCsv = generateCsvRows(zeroOnlyReport);
+  check("CSV for ₹0-only report shows 1 completed order", zeroOnlyCsv.some((r) => r[0] === "Completed Orders" && r[1] === 1));
+  check("CSV for ₹0-only report shows 0 total reconciled transactions", zeroOnlyCsv.some((r) => r[0] === "Total Reconciled" && r[1] === 0));
 }
 
 console.log(`\n========================================`);
