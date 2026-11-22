@@ -368,7 +368,7 @@ async function priceAndCreateOrder(
   idempotencyKey: string | null = null,
 ): Promise<
   | { ok: true; order: any; promoApplied: boolean; promoReason?: string; deduplicated?: boolean; sessionId?: string; sessionToken?: string }
-  | { ok: false; error: string; status: number; reason?: "empty" | "unavailable" }
+  | { ok: false; error: string; code?: string; status: number; reason?: "empty" | "unavailable"; retry?: boolean }
 > {
   for (let attempt = 0; attempt < 2; attempt++) {
     const result = await priceAndCommitOnce(db, args, idempotencyKey);
@@ -377,7 +377,7 @@ async function priceAndCreateOrder(
     if ((result as any).retry) {
       // Second refusal: the menu or promo genuinely does not fit this cart.
       // Say it plainly instead of looping.
-      return { ok: false, error: "The order could not be completed as priced. Please review the cart and try again.", status: 409 };
+      return { ok: false, error: "The order could not be completed as priced. Please review the cart and try again.", code: "ORDER_PRICING_CHANGED", status: 409 };
     }
     return result;
   }
@@ -406,7 +406,7 @@ async function priceAndCommitOnce(
   idempotencyKey: string | null,
 ): Promise<
   | { ok: true; order: any; promoApplied: boolean; promoReason?: string; deduplicated?: boolean; sessionId?: string; sessionToken?: string }
-  | { ok: false; error: string; status: number; reason?: "empty" | "unavailable"; retry?: boolean }
+  | { ok: false; error: string; code?: string; status: number; reason?: "empty" | "unavailable"; retry?: boolean }
 > {
   const {
     tenantId, tableId, tableSessionId, items, orderType,
@@ -557,6 +557,7 @@ async function priceAndCommitOnce(
         return {
           ok: false,
           error: "Promo quote is stale: promo terms have changed. Please reapply the promo code and review the updated total.",
+          code: "ORDER_PRICING_CHANGED",
           status: 409,
           retry: false,
         };
@@ -566,6 +567,7 @@ async function priceAndCommitOnce(
         return {
           ok: false,
           error: "Promo quote is stale: cart subtotal or discount has changed. Please reapply the promo code and review the updated total.",
+          code: "ORDER_PRICING_CHANGED",
           status: 409,
           retry: false,
         };
@@ -602,6 +604,7 @@ async function priceAndCommitOnce(
       return {
         ok: false,
         error: "Order pricing has changed since review. Please review the updated cart totals and try again.",
+        code: "ORDER_PRICING_CHANGED",
         status: 409,
         retry: false,
       };
@@ -655,7 +658,7 @@ async function priceAndCommitOnce(
     // something changed in the few milliseconds since.
     if (msg.includes("PROMO_STALE") || msg.includes("PROMO_REJECTED")) {
       const cleanMsg = msg.replace(/^.*PROMO_(STALE|REJECTED):\s*/, "") || "Promo code terms have changed, expired, or reached usage limit. Please reapply the promo code.";
-      return { ok: false, error: cleanMsg, status: 409, retry: false };
+      return { ok: false, error: cleanMsg, code: "ORDER_PRICING_CHANGED", status: 409, retry: false };
     }
     if (msg.includes("ITEM_UNAVAILABLE")) {
       return { ok: false, error: msg, status: 409, retry: true };
@@ -872,6 +875,7 @@ async function create(req: Request): Promise<Response> {
               created.reason === "unavailable"
                 ? "One or more items are no longer available"
                 : created.error,
+            ...(created.code ? { code: created.code } : {}),
           },
           created.status,
         );
@@ -1001,6 +1005,7 @@ async function create(req: Request): Promise<Response> {
               created.reason === "unavailable"
                 ? "One or more items are no longer available"
                 : created.error,
+            ...(created.code ? { code: created.code } : {}),
           },
           created.status,
         );
@@ -1186,7 +1191,14 @@ async function create(req: Request): Promise<Response> {
       if (newlyCreatedSessionId) {
         await db.from("table_sessions").delete().eq("id", newlyCreatedSessionId).catch(() => {});
       }
-      return json(req, { error: created.error }, created.status);
+      return json(
+        req,
+        {
+          error: created.error,
+          ...(created.code ? { code: created.code } : {}),
+        },
+        created.status,
+      );
     }
 
     if (!created.deduplicated) {

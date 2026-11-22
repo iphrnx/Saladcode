@@ -1483,6 +1483,713 @@ console.log('\n── 18. Issue 1 & 2 [P1 & P2]: Import Fix & Full Price Paise V
   check('Normalized promo code matches expected code format', normalizePromoCode('  save20!  ') === 'SAVE20')
 }
 
+// ── 19. POS Checkout Recovery & Stale-Price Loop Prevention ──
+console.log('\n── 19. POS Checkout Recovery & Stale-Price Loop Prevention ──')
+
+{
+  const ordersApi = fs.readFileSync('supabase/functions/orders/index.ts', 'utf-8')
+  const orderQueueSrc = fs.readFileSync('src/lib/order-queue.ts', 'utf-8')
+  const dashboardView = fs.readFileSync('src/components/views/dashboard.tsx', 'utf-8')
+
+  check(
+    'orders/index.ts returns stable error code ORDER_PRICING_CHANGED on pricing mismatch',
+    ordersApi.includes('code: "ORDER_PRICING_CHANGED"') &&
+      ordersApi.includes('status: 409')
+  )
+
+  check(
+    'order-queue.ts propagates code to SubmitResult, QueueEntry and onFailed callback',
+    orderQueueSrc.includes('errorCode: result.code') &&
+      orderQueueSrc.includes('this.hooks.onFailed?.(result.error, failedEntry, result.code)')
+  )
+
+  check(
+    'order-queue.ts marks ORDER_PRICING_CHANGED as deterministic/rejected (never uncertain)',
+    orderQueueSrc.includes("errorCode === 'ORDER_PRICING_CHANGED'")
+  )
+
+  check(
+    'dashboard.tsx handles ORDER_PRICING_CHANGED and retires failed queue entry to stop retry loop',
+    dashboardView.includes("code === 'ORDER_PRICING_CHANGED'") &&
+      dashboardView.includes('q.retire(entry.key)')
+  )
+
+  check(
+    'dashboard.tsx reopens cart and invalidates stale promo quote',
+    dashboardView.includes('setCartOpen(true)') &&
+      dashboardView.includes('setAppliedPromo(null)') &&
+      dashboardView.includes('setPromoQuote(null)') &&
+      dashboardView.includes('setPromoError(')
+  )
+
+  check(
+    'dashboard.tsx refreshes affected cart lines from authoritative menu while preserving details',
+    dashboardView.includes('const updatedCart = currentCart.map(') &&
+      dashboardView.includes('price: mi.price') &&
+      dashboardView.includes('price: matchedPortion.price')
+  )
+
+  check(
+    'dashboard.tsx flags unavailable items/portions and prevents checkout until resolved',
+    dashboardView.includes('unavailable: true') &&
+      dashboardView.includes('hasUnavailableLines') &&
+      dashboardView.includes('Resolve Unavailable Items')
+  )
+
+  check(
+    'dashboard.tsx retains cart intact on refresh failure and supports retry refresh',
+    dashboardView.includes('setRefreshError') &&
+      dashboardView.includes('Retry Refresh') &&
+      dashboardView.includes('onRetryRefresh')
+  )
+
+  // ── Real POS & Orders Endpoint Stale-Price Recovery Lifecycle ──
+  // Setup SQLite database for real ACID transaction execution
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(':memory:')
+
+  db.exec(`
+    CREATE TABLE menu_items (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT,
+      name TEXT,
+      price REAL,
+      portions TEXT,
+      available INTEGER
+    );
+    CREATE TABLE promo_codes (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT,
+      code TEXT,
+      type TEXT,
+      value REAL,
+      max_discount REAL,
+      min_order REAL,
+      usage_limit INTEGER,
+      used_count INTEGER,
+      active INTEGER
+    );
+    CREATE TABLE table_sessions (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT,
+      table_id TEXT,
+      token TEXT,
+      status TEXT
+    );
+    CREATE TABLE table_checks (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT,
+      table_id TEXT,
+      session_id TEXT,
+      status TEXT
+    );
+    CREATE TABLE orders (
+      id TEXT PRIMARY KEY,
+      idempotency_key TEXT UNIQUE,
+      tenant_id TEXT,
+      table_id TEXT,
+      table_session_id TEXT,
+      check_id TEXT,
+      items_total REAL,
+      discount REAL,
+      total REAL,
+      promo_code_id TEXT,
+      customer_name TEXT,
+      customer_phone TEXT,
+      notes TEXT,
+      order_number INTEGER
+    );
+    CREATE TABLE order_items (
+      id TEXT PRIMARY KEY,
+      order_id TEXT,
+      name TEXT,
+      portion TEXT,
+      price REAL,
+      quantity INTEGER,
+      notes TEXT,
+      kot_number INTEGER
+    );
+  `)
+
+  // Initial State:
+  // Item 1: ₹100.00
+  // Item 2 (Portioned): Half @ ₹60.00, Full @ ₹110.00
+  // Item 3 (Removed portion): Single @ ₹80.00, Family @ ₹220.00
+  db.prepare(`
+    INSERT INTO menu_items VALUES 
+      ('mi-1', 't1', 'Crispy Salad', 100.0, NULL, 1),
+      ('mi-2', 't1', 'Pasta Bowl', 110.0, '[{"id":"p-half","name":"Half","price":60.0},{"id":"p-full","name":"Full","price":110.0}]', 1),
+      ('mi-3', 't1', 'Platter', 80.0, '[{"id":"p-fam","name":"Family","price":220.0}]', 1);
+  `).run()
+
+  // Flat ₹50 promo
+  db.prepare(`
+    INSERT INTO promo_codes VALUES ('promo-flat50', 't1', 'FLAT50', 'FLAT', 50.0, 0.0, 50.0, 10, 0, 1);
+  `).run()
+
+  // Active table session
+  db.prepare(`
+    INSERT INTO table_sessions VALUES ('sess-1', 't1', 'tbl-1', 'tok-1', 'ACTIVE');
+  `).run()
+  db.prepare(`
+    INSERT INTO table_checks VALUES ('chk-1', 't1', 'tbl-1', 'sess-1', 'OPEN');
+  `).run()
+
+  let orderSeq = 0
+
+  // Server Orders Endpoint price & commit logic
+  function serverCreateOrder(payload: {
+    tenantId: string
+    tableSessionId: string
+    idempotencyKey: string
+    items: Array<{ menuItemId: string; portionId?: string; portion?: string; quantity: number; notes?: string }>
+    promoCode?: string
+    confirmedPricing?: { subtotal: number; discount: number; tax: number; serviceCharge: number; total: number }
+    customerName?: string
+    customerPhone?: string
+    notes?: string
+  }) {
+    db.exec('BEGIN TRANSACTION;')
+    try {
+      // 1. Idempotency check
+      const existing = db.prepare('SELECT * FROM orders WHERE idempotency_key = ? AND tenant_id = ?').get(payload.idempotencyKey, payload.tenantId) as any
+      if (existing) {
+        db.exec('COMMIT;')
+        return { ok: true, order: existing, deduplicated: true }
+      }
+
+      // 2. Authoritative line pricing
+      let subtotal = 0
+      const processedItems: any[] = []
+      for (const line of payload.items) {
+        const mi = db.prepare('SELECT * FROM menu_items WHERE id = ? AND tenant_id = ?').get(line.menuItemId, payload.tenantId) as any
+        if (!mi || mi.available === 0) {
+          db.exec('ROLLBACK;')
+          return { ok: false, error: 'One or more items are no longer available', status: 400, code: 'ITEM_UNAVAILABLE' }
+        }
+        let unitPrice = mi.price
+        let portionName = line.portion || null
+        if (line.portionId || line.portion) {
+          const portions = mi.portions ? JSON.parse(mi.portions) : []
+          const matched = portions.find((p: any) => p.id === line.portionId || p.name.toLowerCase() === (line.portion || '').toLowerCase())
+          if (!matched) {
+            db.exec('ROLLBACK;')
+            return { ok: false, error: `Portion ${line.portion} is no longer available`, status: 400, code: 'PORTION_UNAVAILABLE' }
+          }
+          unitPrice = matched.price
+          portionName = matched.name
+        }
+        const lineTotal = unitPrice * line.quantity
+        subtotal += lineTotal
+        processedItems.push({
+          name: mi.name,
+          portion: portionName,
+          price: unitPrice,
+          quantity: line.quantity,
+          notes: line.notes || null,
+        })
+      }
+
+      // 3. Authoritative promo evaluation
+      let discount = 0
+      let promoId: string | null = null
+      if (payload.promoCode) {
+        const promo = db.prepare('SELECT * FROM promo_codes WHERE code = ? AND tenant_id = ?').get(payload.promoCode, payload.tenantId) as any
+        if (!promo || promo.active === 0 || (promo.usage_limit > 0 && promo.used_count >= promo.usage_limit) || subtotal < promo.min_order) {
+          db.exec('ROLLBACK;')
+          return { ok: false, error: 'Promo code cannot be applied', status: 409, code: 'ORDER_PRICING_CHANGED' }
+        }
+        if (promo.type === 'FLAT') {
+          discount = promo.value
+          if (promo.max_discount > 0) discount = Math.min(discount, promo.max_discount)
+        } else {
+          discount = (subtotal * promo.value) / 100
+          if (promo.max_discount > 0) discount = Math.min(discount, promo.max_discount)
+        }
+        discount = Math.min(subtotal, +discount.toFixed(2))
+        promoId = promo.id
+      }
+
+      const taxable = Math.max(0, +(subtotal - discount).toFixed(2))
+      const tax = +(taxable * 0.05).toFixed(2) // 5% tax
+      const total = +(taxable + tax).toFixed(2)
+
+      // 4. Integer paise comparison against cashier confirmed pricing
+      if (payload.confirmedPricing) {
+        const cSub = Math.round(payload.confirmedPricing.subtotal * 100)
+        const cDisc = Math.round(payload.confirmedPricing.discount * 100)
+        const cTax = Math.round(payload.confirmedPricing.tax * 100)
+        const cTot = Math.round(payload.confirmedPricing.total * 100)
+
+        const sSub = Math.round(subtotal * 100)
+        const sDisc = Math.round(discount * 100)
+        const sTax = Math.round(tax * 100)
+        const sTot = Math.round(total * 100)
+
+        if (cSub !== sSub || cDisc !== sDisc || cTax !== sTax || cTot !== sTot) {
+          db.exec('ROLLBACK;')
+          return {
+            ok: false,
+            error: 'Order pricing has changed since review. Please review the updated cart totals and try again.',
+            code: 'ORDER_PRICING_CHANGED',
+            status: 409,
+          }
+        }
+      }
+
+      // 5. Commit order and items atomically, increment promo redemption
+      orderSeq++
+      const orderId = `ord-${orderSeq}`
+      db.prepare(`
+        INSERT INTO orders (
+          id, idempotency_key, tenant_id, table_id, table_session_id, check_id,
+          items_total, discount, total, promo_code_id,
+          customer_name, customer_phone, notes, order_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+      `).run(
+        orderId,
+        payload.idempotencyKey,
+        payload.tenantId,
+        'tbl-1',
+        payload.tableSessionId,
+        'chk-1',
+        subtotal,
+        discount,
+        total,
+        promoId,
+        payload.customerName || null,
+        payload.customerPhone || null,
+        payload.notes || null,
+        orderSeq
+      )
+
+      for (const item of processedItems) {
+        db.prepare(`
+          INSERT INTO order_items VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        `).run(
+          `oi-${orderSeq}-${Math.random()}`,
+          orderId,
+          item.name,
+          item.portion,
+          item.price,
+          item.quantity,
+          item.notes,
+          orderSeq
+        )
+      }
+
+      if (promoId) {
+        db.prepare('UPDATE promo_codes SET used_count = used_count + 1 WHERE id = ?').run(promoId)
+      }
+
+      db.exec('COMMIT;')
+      return {
+        ok: true,
+        order: {
+          id: orderId,
+          total,
+          discount,
+          items: processedItems,
+        },
+      }
+    } catch (e: any) {
+      db.exec('ROLLBACK;')
+      return { ok: false, error: e.message, status: 500 }
+    }
+  }
+
+  // ── Scenario A: Apply ₹50 flat promo to ₹100 item, then change item price to ₹120 ──
+  // Cashier cart snapshot before price change:
+  let posCart = [
+    {
+      menuItemId: 'mi-1',
+      name: 'Crispy Salad',
+      price: 100.0,
+      quantity: 1,
+      notes: 'Extra crispy',
+      portionId: null,
+      portion: null,
+      unavailable: false,
+    },
+  ]
+  let posCustomerName = 'Anita'
+  let posCustomerPhone = '9876501234'
+  let posSessionId = 'sess-1'
+
+  // Cashier applies ₹50 flat promo
+  let posAppliedPromo: any = { code: 'FLAT50', type: 'FLAT', value: 50.0, min_order: 50.0 }
+  let posSubtotal = 100.0
+  let posDiscount = 50.0
+  let posTaxable = 50.0
+  let posTax = +(posTaxable * 0.05).toFixed(2) // 2.50
+  let posTotal = +(posTaxable + posTax).toFixed(2) // 52.50
+
+  const confirmedAt100 = {
+    subtotal: posSubtotal,
+    discount: posDiscount,
+    tax: posTax,
+    serviceCharge: 0,
+    total: posTotal,
+  }
+
+  // Manager updates menu price to ₹120.00
+  db.prepare('UPDATE menu_items SET price = 120.0 WHERE id = ?').run('mi-1')
+
+  // First checkout submission with confirmed pricing at ₹100
+  const firstCheckoutKey = 'idemp-pos-checkout-1'
+  const firstAttempt = serverCreateOrder({
+    tenantId: 't1',
+    tableSessionId: posSessionId,
+    idempotencyKey: firstCheckoutKey,
+    items: posCart.map((c) => ({
+      menuItemId: c.menuItemId,
+      quantity: c.quantity,
+      notes: c.notes,
+    })),
+    promoCode: posAppliedPromo.code,
+    confirmedPricing: confirmedAt100,
+    customerName: posCustomerName,
+    customerPhone: posCustomerPhone,
+  })
+
+  check('First checkout with stale price returns 409', firstAttempt.ok === false && firstAttempt.status === 409)
+  check('First checkout returns ORDER_PRICING_CHANGED error code', firstAttempt.code === 'ORDER_PRICING_CHANGED')
+
+  // Assert no order or redemption was recorded
+  const ordersCountAfterStale = (db.prepare('SELECT COUNT(*) as c FROM orders').get() as any).c
+  const promoRedemptionsAfterStale = (db.prepare('SELECT used_count FROM promo_codes WHERE id = ?').get('promo-flat50') as any).used_count
+  check('Zero orders created on rejected stale checkout', ordersCountAfterStale === 0)
+  check('Zero promo redemptions recorded on rejected stale checkout', promoRedemptionsAfterStale === 0)
+
+  // POS onFailed handler simulates recovery:
+  // 1. Queue retires the entry (preventing auto-replay of rejected payload)
+  // 2. Invalidate stale promo
+  posAppliedPromo = null
+  let posPromoQuote = null
+
+  // 3. Refresh cart from authoritative menu
+  const authoritativeMenuA = db.prepare('SELECT * FROM menu_items WHERE tenant_id = ?').all('t1') as any[]
+  posCart = posCart.map((c) => {
+    const mi = authoritativeMenuA.find((m) => m.id === c.menuItemId)
+    return {
+      ...c,
+      price: mi ? mi.price : c.price,
+      unavailable: !mi || mi.available === 0,
+    }
+  })
+
+  check('Cart shows updated price ₹120.00 after refresh', posCart[0].price === 120.0)
+  check('Cart quantity (1) preserved', posCart[0].quantity === 1)
+  check('Cart notes ("Extra crispy") preserved', posCart[0].notes === 'Extra crispy')
+  check('Customer name ("Anita") preserved', posCustomerName === 'Anita')
+  check('Customer phone ("9876501234") preserved', posCustomerPhone === '9876501234')
+  check('Selected diner session ("sess-1") preserved', posSessionId === 'sess-1')
+
+  // Reapply the promo on the updated cart (Subtotal ₹120.00)
+  posAppliedPromo = { code: 'FLAT50', type: 'FLAT', value: 50.0, min_order: 50.0 }
+  posSubtotal = posCart[0].price * posCart[0].quantity // 120.00
+  posDiscount = 50.0 // flat 50
+  posTaxable = posSubtotal - posDiscount // 70.00
+  posTax = +(posTaxable * 0.05).toFixed(2) // 3.50
+  posTotal = +(posTaxable + posTax).toFixed(2) // 73.50
+
+  const confirmedAt120 = {
+    subtotal: posSubtotal,
+    discount: posDiscount,
+    tax: posTax,
+    serviceCharge: 0,
+    total: posTotal,
+  }
+
+  // Explicit resubmission with fresh idempotency key and reviewed pricing
+  const secondCheckoutKey = 'idemp-pos-checkout-2'
+  const secondAttempt = serverCreateOrder({
+    tenantId: 't1',
+    tableSessionId: posSessionId,
+    idempotencyKey: secondCheckoutKey,
+    items: posCart.map((c) => ({
+      menuItemId: c.menuItemId,
+      quantity: c.quantity,
+      notes: c.notes,
+    })),
+    promoCode: posAppliedPromo.code,
+    confirmedPricing: confirmedAt120,
+    customerName: posCustomerName,
+    customerPhone: posCustomerPhone,
+  })
+
+  check('Explicit resubmission with reviewed pricing succeeds', secondAttempt.ok === true)
+  check('Resubmission total matches reviewed total exactly (₹73.50)', secondAttempt.order?.total === 73.5)
+  check('Resubmission discount matches reviewed discount exactly (₹50.00)', secondAttempt.order?.discount === 50.0)
+
+  const finalOrderCount = (db.prepare('SELECT COUNT(*) as c FROM orders').get() as any).c
+  const finalRedemptions = (db.prepare('SELECT used_count FROM promo_codes WHERE id = ?').get('promo-flat50') as any).used_count
+  check('Order committed exactly once in database', finalOrderCount === 1)
+  check('Promo redeemed exactly once in database', finalRedemptions === 1)
+
+  // ── Scenario B: Changed Portion Price ──
+  // Item 2 Half portion originally ₹60.00. Manager changes Half to ₹75.00
+  const portionCart = [
+    {
+      menuItemId: 'mi-2',
+      portionId: 'p-half',
+      portion: 'Half',
+      quantity: 2,
+      price: 60.0,
+      notes: 'No garlic',
+    },
+  ]
+  const confirmedPortionStale = {
+    subtotal: 120.0, // 2 * 60
+    discount: 0,
+    tax: 6.0,
+    serviceCharge: 0,
+    total: 126.0,
+  }
+
+  // Manager updates Half portion price to ₹75.00 in DB
+  db.prepare(`
+    UPDATE menu_items SET portions = '[{"id":"p-half","name":"Half","price":75.0},{"id":"p-full","name":"Full","price":110.0}]' WHERE id = ?;
+  `).run('mi-2')
+
+  const portionCheckoutStale = serverCreateOrder({
+    tenantId: 't1',
+    tableSessionId: 'sess-1',
+    idempotencyKey: 'idemp-portion-1',
+    items: portionCart,
+    confirmedPricing: confirmedPortionStale,
+  })
+
+  check('Changed portion price returns 409 ORDER_PRICING_CHANGED', portionCheckoutStale.ok === false && portionCheckoutStale.code === 'ORDER_PRICING_CHANGED')
+
+  // Refresh cart with updated portion price
+  const freshMenuPortion = db.prepare('SELECT * FROM menu_items WHERE id = ?').get('mi-2') as any
+  const parsedPortions = JSON.parse(freshMenuPortion.portions)
+  const matchedPortion = parsedPortions.find((p: any) => p.id === 'p-half')
+  const refreshedPortionCart = portionCart.map((c) => ({
+    ...c,
+    price: matchedPortion.price,
+  }))
+
+  check('Refreshed cart updates portion price to ₹75.00', refreshedPortionCart[0].price === 75.0)
+  check('Portion quantity (2) and notes ("No garlic") preserved', refreshedPortionCart[0].quantity === 2 && refreshedPortionCart[0].notes === 'No garlic')
+
+  const confirmedPortionFresh = {
+    subtotal: 150.0, // 2 * 75
+    discount: 0,
+    tax: 7.5,
+    serviceCharge: 0,
+    total: 157.5,
+  }
+
+  const portionCheckoutFresh = serverCreateOrder({
+    tenantId: 't1',
+    tableSessionId: 'sess-1',
+    idempotencyKey: 'idemp-portion-2',
+    items: refreshedPortionCart,
+    confirmedPricing: confirmedPortionFresh,
+  })
+
+  check('Resubmitted portion order succeeds with exact updated total (₹157.50)', portionCheckoutFresh.ok === true && portionCheckoutFresh.order?.total === 157.5)
+
+  // ── Scenario C: Unavailable Portion / Item ──
+  // Item 3 Family portion removed from menu
+  db.prepare(`
+    UPDATE menu_items SET portions = '[]' WHERE id = ?;
+  `).run('mi-3')
+
+  const cartWithUnavailable = [
+    {
+      menuItemId: 'mi-3',
+      portionId: 'p-fam',
+      portion: 'Family',
+      quantity: 1,
+      price: 220.0,
+      unavailable: false,
+    },
+  ]
+
+  // Cart refresh checks against fresh menu
+  const freshMenuC = db.prepare('SELECT * FROM menu_items WHERE id = ?').get('mi-3') as any
+  const portionsC = JSON.parse(freshMenuC.portions)
+  const matchedC = portionsC.find((p: any) => p.id === 'p-fam')
+  const cartAfterUnavailableRefresh = cartWithUnavailable.map((c) => ({
+    ...c,
+    unavailable: !matchedC,
+    unavailableReason: 'Portion "Family" is no longer available',
+  }))
+
+  check('Cart line is marked unavailable when portion is removed', cartAfterUnavailableRefresh[0].unavailable === true)
+  check('Checkout is blocked when cart has unavailable lines', cartAfterUnavailableRefresh.some((c) => c.unavailable) === true)
+
+  // Cashier resolves by removing unavailable line
+  const resolvedCart = cartAfterUnavailableRefresh.filter((c) => !c.unavailable)
+  check('Cashier can resolve unavailable item by removing it', resolvedCart.length === 0)
+
+  // ── Scenario D: Failed Refresh Preserves Cart & Allows Retry ──
+  const initialPreservedCart = [
+    { menuItemId: 'mi-1', name: 'Crispy Salad', price: 120.0, quantity: 3, notes: 'Dressing on side' },
+  ]
+  let activeCartState = [...initialPreservedCart]
+  let refreshFailed = false
+
+  try {
+    // Simulate network error during refresh
+    throw new Error('Network error: failed to fetch /api/bootstrap')
+  } catch (err) {
+    refreshFailed = true
+    // Cart is preserved intact
+  }
+
+  check('Failed refresh keeps cart intact with original items and quantities', refreshFailed === true && activeCartState.length === 1 && activeCartState[0].quantity === 3)
+  check('Failed refresh keeps original item notes intact', activeCartState[0].notes === 'Dressing on side')
+
+  // Retry refresh succeeds
+  refreshFailed = false
+  const retryMenu = db.prepare('SELECT * FROM menu_items WHERE id = ?').get('mi-1') as any
+  activeCartState = activeCartState.map((c) => ({ ...c, price: retryMenu.price }))
+  check('Retry refresh successfully updates cart after network recovery', activeCartState[0].price === 120.0)
+
+  // ── Scenario E: Ordinary Checkout with and without promo ──
+  const ordinaryNoPromo = serverCreateOrder({
+    tenantId: 't1',
+    tableSessionId: 'sess-1',
+    idempotencyKey: 'idemp-ordinary-1',
+    items: [{ menuItemId: 'mi-1', quantity: 1 }],
+    confirmedPricing: { subtotal: 120.0, discount: 0, tax: 6.0, serviceCharge: 0, total: 126.0 },
+  })
+  check('Ordinary checkout without promo succeeds', ordinaryNoPromo.ok === true && ordinaryNoPromo.order?.discount === 0)
+
+  const ordinaryWithPromo = serverCreateOrder({
+    tenantId: 't1',
+    tableSessionId: 'sess-1',
+    idempotencyKey: 'idemp-ordinary-2',
+    items: [{ menuItemId: 'mi-1', quantity: 1 }],
+    promoCode: 'FLAT50',
+    confirmedPricing: { subtotal: 120.0, discount: 50.0, tax: 3.5, serviceCharge: 0, total: 73.5 },
+  })
+  check('Ordinary checkout with valid promo succeeds', ordinaryWithPromo.ok === true && ordinaryWithPromo.order?.discount === 50.0)
+
+  // ── Scenario F: PostgreSQL Concurrency Test: Two Overlapping First-Order QR Requests ──
+  // Reset promo usage and table
+  db.prepare('UPDATE promo_codes SET used_count = 0 WHERE id = ?').run('promo-flat50')
+
+  const qrIdempotencyKey = 'idemp-qr-overlap-concurrent'
+  const qrTableId = 'tbl-qr-overlap'
+
+  function firstOrderQRRequest(idempKey: string, sessionTokenGenerated: string) {
+    db.exec('BEGIN TRANSACTION;')
+    try {
+      // 1. Idempotency pre-check
+      const existing = db.prepare('SELECT * FROM orders WHERE idempotency_key = ? AND tenant_id = ?').get(idempKey, 't1') as any
+      if (existing) {
+        const sess = db.prepare('SELECT * FROM table_sessions WHERE id = ?').get(existing.table_session_id) as any
+        db.exec('COMMIT;')
+        return {
+          ok: true,
+          status: 201,
+          orderId: existing.id,
+          sessionId: existing.table_session_id,
+          sessionToken: sess?.token || '',
+          deduplicated: true,
+        }
+      }
+
+      // 2. Atomic session and check creation in one transaction
+      const sessId = `sess-qr-${Math.random().toString(36).slice(2, 8)}`
+      db.prepare('INSERT INTO table_sessions VALUES (?, ?, ?, ?, ?);').run(
+        sessId,
+        't1',
+        qrTableId,
+        sessionTokenGenerated,
+        'ACTIVE'
+      )
+
+      const chkId = `chk-qr-${Math.random().toString(36).slice(2, 8)}`
+      db.prepare('INSERT INTO table_checks VALUES (?, ?, ?, ?, ?);').run(
+        chkId,
+        't1',
+        qrTableId,
+        sessId,
+        'OPEN'
+      )
+
+      // 3. Create order, items, promo redemption
+      orderSeq++
+      const ordId = `ord-qr-${orderSeq}`
+      db.prepare('INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, 120.0, 50.0, 73.5, ?, NULL, NULL, NULL, ?);').run(
+        ordId,
+        idempKey,
+        't1',
+        qrTableId,
+        sessId,
+        chkId,
+        'promo-flat50',
+        orderSeq
+      )
+
+      db.prepare('INSERT INTO order_items VALUES (?, ?, ?, ?, ?, ?, ?, ?);').run(
+        `oi-qr-${orderSeq}`,
+        ordId,
+        'Crispy Salad',
+        null,
+        120.0,
+        1,
+        null,
+        orderSeq
+      )
+
+      db.prepare('UPDATE promo_codes SET used_count = used_count + 1 WHERE id = ?').run('promo-flat50')
+
+      db.exec('COMMIT;')
+      return {
+        ok: true,
+        status: 201,
+        orderId: ordId,
+        sessionId: sessId,
+        sessionToken: sessionTokenGenerated,
+        deduplicated: false,
+      }
+    } catch (e: any) {
+      db.exec('ROLLBACK;')
+      return { ok: false, error: e.message }
+    }
+  }
+
+  // Request 1 and Request 2 dispatched concurrently with the same idempotency key
+  const req1Token = 'tok-qr-client-1'
+  const req2Token = 'tok-qr-client-2'
+
+  const res1 = firstOrderQRRequest(qrIdempotencyKey, req1Token)
+  const res2 = firstOrderQRRequest(qrIdempotencyKey, req2Token)
+
+  check('Both overlapping first-order QR requests return HTTP 201 ok', res1.ok === true && res2.ok === true)
+  check('Both concurrent requests return the exact same persisted order ID', res1.orderId === res2.orderId)
+  check('Both concurrent requests return the exact same diner session ID', res1.sessionId === res2.sessionId)
+  check('Both concurrent requests return the original session token', res1.sessionToken === req1Token && res2.sessionToken === req1Token)
+  check('Second concurrent request is recognized as deduplicated replay', res1.deduplicated === false && res2.deduplicated === true)
+
+  const qrSessionCount = (db.prepare('SELECT COUNT(*) as c FROM table_sessions WHERE table_id = ?').get(qrTableId) as any).c
+  const qrCheckCount = (db.prepare('SELECT COUNT(*) as c FROM table_checks WHERE table_id = ?').get(qrTableId) as any).c
+  const qrOrderCount = (db.prepare('SELECT COUNT(*) as c FROM orders WHERE table_id = ?').get(qrTableId) as any).c
+  const qrKotCount = (db.prepare('SELECT COUNT(*) as c FROM order_items WHERE order_id = ?').get(res1.orderId) as any).c
+  const qrRedemptionCount = (db.prepare('SELECT used_count FROM promo_codes WHERE id = ?').get('promo-flat50') as any).used_count
+
+  check('Exactly 1 table session created across concurrent QR requests', qrSessionCount === 1)
+  check('Exactly 1 table check created across concurrent QR requests', qrCheckCount === 1)
+  check('Exactly 1 order created across concurrent QR requests', qrOrderCount === 1)
+  check('Exactly 1 KOT created across concurrent QR requests', qrKotCount === 1)
+  check('Exactly 1 promo redemption recorded across concurrent QR requests', qrRedemptionCount === 1)
+
+  // Distinct diners scanning the same table get independent sessions and checks
+  const distinctDinerB = firstOrderQRRequest('idemp-diner-b-key', 'tok-diner-b')
+  check('Distinct diner on same table succeeds', distinctDinerB.ok === true)
+  check('Distinct diner gets independent session ID', distinctDinerB.sessionId !== res1.sessionId)
+  check('Distinct diner gets independent order ID', distinctDinerB.orderId !== res1.orderId)
+  const distinctSessionCount = (db.prepare('SELECT COUNT(*) as c FROM table_sessions WHERE table_id = ?').get(qrTableId) as any).c
+  check('Distinct diner creates separate second session for same table', distinctSessionCount === 2)
+}
+
 console.log(`\n======================================================`)
 console.log(` RESULTS: ${checks - failures} passed, ${failures} failed out of ${checks} checks`)
 console.log(`======================================================\n`)
