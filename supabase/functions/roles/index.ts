@@ -4,7 +4,7 @@ import { guard, splitPermissions } from "../_shared/auth.ts";
 import { admin } from "../_shared/db.ts";
 import { toCamel } from "../_shared/case.ts";
 import { escalationMessage } from "../_shared/grants.ts";
-import { PERMISSION_GROUPS, PERMISSION_KEYS, RESERVED_ROLE_NAMES } from "../_shared/permissions.ts";
+import { PERMISSION_GROUPS, PERMISSION_KEYS, PERMISSION_METADATA, RESERVED_ROLE_NAMES } from "../_shared/permissions.ts";
 import { body, json, preflight, subPath } from "../_shared/http.ts";
 
 /**
@@ -93,6 +93,7 @@ async function list(req: Request): Promise<Response> {
     users: toCamel(usersRes.data ?? []),
     permissionKeys: PERMISSION_KEYS,
     permissionGroups: PERMISSION_GROUPS,
+    permissionMetadata: PERMISSION_METADATA,
   });
 }
 

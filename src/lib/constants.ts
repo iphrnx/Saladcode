@@ -62,10 +62,13 @@ export const ORDER_TYPE = {
 export {
   PERMISSION_KEYS,
   PERMISSION_GROUPS,
+  PERMISSION_METADATA,
   PERMISSION_IMPLICATIONS,
   RESERVED_ROLE_NAMES,
   ORDER_STATUS_KEYS,
   expandPermissions,
   hasEffectivePermission,
   canOrderAction,
+  type PermissionKey,
+  type PermissionMeta,
 } from '../../supabase/functions/_shared/permissions'
