@@ -362,6 +362,7 @@ async function priceAndCreateOrder(
     promoQuote?: any;
     pricing?: any;
     servedById?: string | null;
+    locationId?: string | null;
     /** PENDING (default) or PENDING_ACTIVATION while the table awaits approval. */
     status?: "PENDING" | "PENDING_ACTIVATION";
   },
@@ -401,6 +402,7 @@ async function priceAndCommitOnce(
     promoQuote?: any;
     pricing?: any;
     servedById?: string | null;
+    locationId?: string | null;
     status?: "PENDING" | "PENDING_ACTIVATION";
   },
   idempotencyKey: string | null,
@@ -640,6 +642,7 @@ async function priceAndCommitOnce(
       customer_phone: customerPhone || null,
       notes: notes || null,
       served_by_id: servedById ?? null,
+      location_id: args.locationId ?? null,
     },
     p_items: itemData,
     p_promo_code_id: promoCodeId ?? null,
@@ -703,6 +706,8 @@ async function priceAndCommitOnce(
       msg.includes("AMBIGUOUS_TABLE_SESSION") ||
       msg.includes("TABLE_REQUIRED_FOR_DINE_IN") ||
       msg.includes("INVALID_STATUS") ||
+      msg.includes("LOCATION_NOT_FOUND") ||
+      msg.includes("LOCATION_CONFLICT") ||
       code === "P0001" ||
       code === "22P02" ||
       code === "23502" ||
@@ -716,6 +721,10 @@ async function priceAndCommitOnce(
           ? "Multiple active sessions found for this table. Please select the specific session card."
           : msg.includes("TABLE_REQUIRED_FOR_DINE_IN")
           ? "A table must be selected for Dine-in orders."
+          : msg.includes("LOCATION_NOT_FOUND")
+          ? "The specified location is not valid for this restaurant."
+          : msg.includes("LOCATION_CONFLICT")
+          ? "Order location conflicts with the existing table or check location."
           : msg || "Invalid order details.";
       return { ok: false, error: clientMsg, status: 400 };
     }
@@ -1172,6 +1181,30 @@ async function create(req: Request): Promise<Response> {
       if (user) validServedById = user.id;
     }
 
+    // Resolve location for sale creation (Dine-in resolves from table if omitted; Takeaway/Delivery fallback to staff)
+    let locationId: string | null = b.locationId || b.location_id || null;
+    const isDineIn = orderType === "DINE_IN" || !!tableId;
+    if (!locationId && !isDineIn) {
+      if (validServedById) {
+        const { data: st } = await db
+          .from("staff")
+          .select("location_id")
+          .eq("id", validServedById)
+          .eq("tenant_id", tenantId)
+          .maybeSingle();
+        if (st?.location_id) locationId = st.location_id;
+      }
+      if (!locationId && g.session?.subjectId) {
+        const { data: st } = await db
+          .from("staff")
+          .select("location_id")
+          .eq("id", g.session.subjectId)
+          .eq("tenant_id", tenantId)
+          .maybeSingle();
+        if (st?.location_id) locationId = st.location_id;
+      }
+    }
+
     const created = await priceAndCreateOrder(db, {
       tenantId,
       tableId,
@@ -1185,6 +1218,7 @@ async function create(req: Request): Promise<Response> {
       promoQuote,
       pricing,
       servedById: validServedById,
+      locationId,
     }, idempotencyKey);
 
     if (!created.ok) {

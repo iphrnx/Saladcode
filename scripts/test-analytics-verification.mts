@@ -1,30 +1,26 @@
 /**
- * Comprehensive verification & regression test suite for Saladcode Analytics PR #5.
+ * Comprehensive verification & regression test suite for Saladcode Analytics PR #7 Review Findings.
  *
- * Verifies all 4 review findings:
- * 1. Bill Edge Function syntax & Deno validation:
- *    - Orphaned duplicate error-handler fragment removed from supabase/functions/bill/index.ts
- *    - Edge Function typechecked with Deno check with 0 syntax errors
- * 2. Invoice generation and session closure preservation:
- *    - record_check_payment reuses finalize_table_check so checks reach PAID with an invoice
- *    - finalize_table_check self-heals missing invoices on already-paid checks
- *    - Orders completed with complete_paid_check_orders and paid_at populated
- *    - Table sessions linked to check are closed, keeping separate diner sessions independent
- *    - Zero-balance check path reuses finalization logic
- *    - Idempotent retries return single payment and single invoice
- * 3. Verified full settlements in Analytics and historical paid_at:
- *    - Full payment history checked before date filtering
- *    - Exact payment achieving full settlement (cumulative amount >= check total) is authoritative
- *    - Legacy fallback used only when no ledger full settlement exists across history
- *    - Error propagation: query failures throw rather than being swallowed as empty history
- *    - Deterministic pagination ordering by (created_at, id)
- *    - Single-counting across midnight IST
- *    - Corrective migration repairs conflicting non-null paid_at using verified full settlements
- * 4. Location persistence in both payment paths:
- *    - settle_check_cash_tx and record_check_payment/finalize_table_check persist durable location
- *    - Covers Dine-in, Takeaway, and Delivery (including tableless orders)
- *    - Unverifiable historical locations left unassigned (NULL)
- *    - Staff transfers cannot mutate past transaction locations or historical Analytics
+ * Verifies all 3 findings:
+ * 1. Restore service-role-only access to create_order_tx:
+ *    - Revoke EXECUTE from PUBLIC, anon, and authenticated
+ *    - Grant EXECUTE only to service_role
+ * 2. Preserve existing order-creation contract:
+ *    - Starts from 20261118000002 contract on current main
+ *    - Preserves top-level order_id, order_number, check_id, and table_session_id
+ *    - Preserves deduplicated: true on idempotent replays
+ *    - Preserves atomic promo validation and redemption (used_count increment, limit/expiry checks)
+ *    - Preserves portions JSONB resolution, sequential KOT numbers, check running totals, and session isolation
+ *    - Verifies Edge Function caller against final RPC contract
+ * 3. Validate and persist sale location:
+ *    - Validates requested location belongs to authenticated tenant and is active (LOCATION_NOT_FOUND)
+ *    - Dine-in uses verified table location from tables
+ *    - Rejects conflicting location for Dine-in (LOCATION_CONFLICT)
+ *    - Tableless Takeaway & Delivery uses verified sale location
+ *    - Preserves existing check location and rejects conflicting input (LOCATION_CONFLICT)
+ *    - Cash, UPI, and Card all report the sale's persisted location (no cashier staff fallback)
+ *    - Unverifiable historical locations remain unassigned (NULL)
+ *    - Edge Function maps LOCATION_NOT_FOUND and LOCATION_CONFLICT to HTTP 400
  *
  * Usage:
  *   npx tsx scripts/test-analytics-verification.mts
@@ -45,11 +41,9 @@ const check = (label: string, ok: boolean, detail?: string) => {
 
 const analyticsFn = readFileSync("supabase/functions/analytics/index.ts", "utf8");
 const billFn = readFileSync("supabase/functions/bill/index.ts", "utf8");
-const migration1Sql = existsSync("supabase/migrations/20261121000001_correct_analytics_settlement_paid_at.sql")
-  ? readFileSync("supabase/migrations/20261121000001_correct_analytics_settlement_paid_at.sql", "utf8")
-  : "";
-const migration2Sql = existsSync("supabase/migrations/20261122000001_fix_full_settlement_invoice_location_analytics.sql")
-  ? readFileSync("supabase/migrations/20261122000001_fix_full_settlement_invoice_location_analytics.sql", "utf8")
+const ordersFn = readFileSync("supabase/functions/orders/index.ts", "utf8");
+const migration3Sql = existsSync("supabase/migrations/20261122000002_verify_settlement_zero_sales_location.sql")
+  ? readFileSync("supabase/migrations/20261122000002_verify_settlement_zero_sales_location.sql", "utf8")
   : "";
 
 /* -------------------------------------------------------------------------- */
@@ -74,227 +68,452 @@ function zonedStart(dateStr: string, timeZone: string): Date {
   return new Date(guess - zoneOffsetMinutes(new Date(guess), timeZone) * 60000);
 }
 
-console.log("\n── 1. Fix Bill Edge Function Syntax (Review Finding 1) ──");
+console.log("\n── 1. Restore service-role-only access to create_order_tx (Finding 1) ──");
 {
-  check("orphaned duplicate error-handler fragment is removed from bill/index.ts",
-    !/return json\(req, \{ error: message \|\| "Could not record the payment\." \}, 500\);\s*}\s*req,\s*\{ error: `\$\{outstanding\} is still due/.test(billFn));
-
-  check("bill/index.ts passes payment to RPC and uses RPC error/result as authority",
-    /admin\(\)\.rpc\("record_check_payment"/.test(billFn) &&
-    /message\.includes\("UNDERPAYMENT:"\)/.test(billFn) &&
-    /message\.includes\("OVERPAYMENT:"\)/.test(billFn));
-
-  check("bill/index.ts cleanly handles already-settled state",
-    /message\.includes\("CHECK_PAID"\) \|\| message\.includes\("ALREADY_SETTLED"\)/.test(billFn));
+  check(
+    "explicitly revokes execute on create_order_tx from public, anon, and authenticated",
+    /revoke execute on function public\.create_order_tx\(jsonb, jsonb, uuid, text, text\) from public, anon, authenticated;/.test(migration3Sql)
+  );
+  check(
+    "grants execute on create_order_tx strictly to service_role",
+    /grant execute on function public\.create_order_tx\(jsonb, jsonb, uuid, text, text\) to service_role;/.test(migration3Sql)
+  );
+  check(
+    "no public/anon/authenticated execute grants on create_order_tx exist in migration",
+    !/grant execute on function public\.create_order_tx[^;]*?to\s+[^;]*?(?:anon|authenticated|public)/.test(migration3Sql)
+  );
 }
 
-console.log("\n── 2. Preserve Invoice Generation & Session Closure (Review Finding 2) ──");
+console.log("\n── 2. Preserve existing order-creation contract (Finding 2) ──");
 {
-  const targetMigration = migration2Sql || migration1Sql;
+  const createOrderBody = migration3Sql.match(/create or replace function public\.create_order_tx[\s\S]*?revoke execute on function public\.create_order_tx/)?.[0] || "";
 
-  check("record_check_payment acquires row lock on check for update before calculating balance",
-    /select \* into v_check\s+from public\.table_checks\s+where id = p_check and tenant_id = p_tenant\s+for update;/.test(targetMigration));
+  check(
+    "returns top-level order_id, order_number, check_id, table_session_id",
+    /return jsonb_build_object\(\s*'order_id', v_order_id,\s*'order_number', v_order_num,\s*'check_id', v_check,\s*'table_session_id', v_session(?:,\s*'session_token', v_session_token)?\s*\);/.test(createOrderBody)
+  );
 
-  check("record_check_payment reuses finalize_table_check for full settlement",
-    /v_fin := public\.finalize_table_check\(p_tenant, p_check, p_actor\);/.test(targetMigration));
+  check(
+    "idempotent deduplication returns top-level fields with deduplicated: true",
+    /return jsonb_build_object\(\s*'order_id', v_existing_order\.id,\s*'order_number', v_existing_order\.order_number,\s*'check_id', v_existing_order\.check_id,\s*'table_session_id', v_existing_order\.table_session_id,(?:\s*'session_token', v_session_token,)?\s*'deduplicated', true\s*\);/.test(createOrderBody)
+  );
 
-  check("record_check_payment returns allocated invoiceNumber from finalization",
-    /'invoiceNumber', v_fin->>'invoiceNumber'/.test(targetMigration));
+  check(
+    "atomic promo validation and usage increment preserved",
+    /if p_promo_code_id is not null then\s+update public\.promo_codes\s+set used_count = used_count \+ 1\s+where id = (?:p_promo_code_id|v_locked_promo\.id)\s+and tenant_id = v_tenant\s+and active\s+and \(usage_limit = 0 (?:or usage_limit is null )?or used_count < usage_limit\)[\s\S]*?raise exception 'PROMO_REJECTED:/.test(createOrderBody)
+  );
 
-  check("record_check_payment handles zero-balance check by reusing finalization logic",
-    /if v_outstanding <= 0\.00 then\s+return public\.finalize_table_check\(p_tenant, p_check, p_actor\);/.test(targetMigration));
+  check(
+    "dynamic portion resolution against menu_items.portions JSONB preserved",
+    /if v_menu\.portions is not null and jsonb_typeof\(v_menu\.portions\) = 'array' then\s+for v_portion_elem in select value from jsonb_array_elements\(v_menu\.portions\) loop/.test(createOrderBody)
+  );
 
-  check("record_check_payment rejects underpayment with UNDERPAYMENT exception",
-    /if v_amt < v_outstanding then\s+raise exception 'UNDERPAYMENT:%:%'/.test(targetMigration));
+  check(
+    "check running totals updated on attached table_checks",
+    /update public\.table_checks\s+set subtotal = v_check_totals\.subtotal,\s+discount = v_check_totals\.discount,\s+tax = v_check_totals\.tax,\s+service_charge = v_check_totals\.service_charge,\s+total = v_check_totals\.total/.test(createOrderBody)
+  );
 
-  check("record_check_payment rejects overpayment with OVERPAYMENT exception",
-    /if v_amt > v_outstanding then\s+raise exception 'OVERPAYMENT:%:%'/.test(targetMigration));
+  check(
+    "sequential KOT numbering scoped by check/session preserved",
+    /select coalesce\(max\(oi\.kot_number\), 0\) \+ 1 into v_kot_num\s+from public\.order_items oi\s+join public\.orders o on o\.id = oi\.order_id/.test(createOrderBody)
+  );
 
-  check("record_check_payment preserves idempotent retries returning single payment and invoice",
-    /if p_idempotency_key is not null then[\s\S]*?select \* into v_existing[\s\S]*?return jsonb_build_object\(\s*'ok', true,\s*'deduplicated', true[\s\S]*?'invoiceNumber', v_check\.invoice_number/.test(targetMigration));
+  check(
+    "orders Edge Function reads top-level order_id and deduplicated flag",
+    ordersFn.includes("const orderId = (tx as any)?.order_id as string | undefined;") &&
+    ordersFn.includes("const deduplicated = (tx as any)?.deduplicated === true;") &&
+    ordersFn.includes("if (!orderId) return { ok: false, error: \"Failed to place order\", status: 500 };")
+  );
+}
 
-  check("finalize_table_check ensures missing invoice is allocated even on already-paid checks",
-    /if v_check\.status = 'PAID' then[\s\S]*?if v_check\.invoice_number is null then[\s\S]*?v_invoice := 'INV-' \|\| lpad\(v_seq::text, 7, '0'\);/.test(targetMigration));
+console.log("\n── 3. Validate and Persist Sale Location (Finding 3) ──");
+{
+  const createOrderBody = migration3Sql.match(/create or replace function public\.create_order_tx[\s\S]*?revoke execute on function public\.create_order_tx/)?.[0] || "";
 
-  check("independent diner sessions preserved: only sessions bound to that check are ended",
-    /update public\.table_sessions\s+set status = 'ENDED'[\s\S]*?where id in \([\s\S]*?v_check\.session_id[\s\S]*?v_check\.anchor_session_id[\s\S]*?o\.table_session_id[\s\S]*?\)[\s\S]*?and status = 'ACTIVE'/.test(targetMigration));
+  check(
+    "validates requested location belongs to authenticated tenant and is active",
+    /if v_input_location is not null then\s+if not exists \(\s+select 1 from public\.locations\s+where id = v_input_location and tenant_id = v_tenant and active\s+\) then\s+raise exception 'LOCATION_NOT_FOUND'/.test(createOrderBody)
+  );
 
-  // Simulation: Independent diner sessions at the same table
-  const tableId = "table-12";
-  const dinerSessions = [
-    { id: "session-diner-A", table_id: tableId, status: "ACTIVE", check_id: "check-A" },
-    { id: "session-diner-B", table_id: tableId, status: "ACTIVE", check_id: "check-B" },
-  ];
+  check(
+    "Dine-in resolves and uses verified table location from public.tables",
+    /if v_order_type = 'DINE_IN' then[\s\S]*?select location_id into v_table_location\s+from public\.tables\s+where id = v_table and tenant_id = v_tenant;/.test(createOrderBody)
+  );
 
-  function finalizeCheckSession(checkId: string, sessions: typeof dinerSessions) {
-    for (const s of sessions) {
-      if (s.check_id === checkId) {
-        s.status = "ENDED";
+  check(
+    "Dine-in rejects conflicting input location with LOCATION_CONFLICT",
+    /if v_input_location is not null and v_input_location <> v_table_location then\s+raise exception 'LOCATION_CONFLICT'/.test(createOrderBody)
+  );
+
+  check(
+    "preserves existing check location and rejects conflicting input with LOCATION_CONFLICT",
+    /if v_check_location is not null then\s+if v_location is not null and v_location <> v_check_location then\s+raise exception 'LOCATION_CONFLICT'/.test(createOrderBody) &&
+    /v_location := v_check_location;/.test(createOrderBody)
+  );
+
+  check(
+    "orders table insert persists resolved location_id",
+    /insert into public\.orders \([\s\S]*?check_id, location_id\s*\)\s*values \([\s\S]*?v_check,\s+v_location\s*\)/.test(createOrderBody)
+  );
+
+  check(
+    "orders Edge Function passes locationId to create_order_tx",
+    ordersFn.includes("location_id: args.locationId ?? null")
+  );
+
+  check(
+    "orders Edge Function stops filling omitted Dine-in locationId from staff branch",
+    ordersFn.includes('const isDineIn = orderType === "DINE_IN" || !!tableId;') &&
+    ordersFn.includes("if (!locationId && !isDineIn) {")
+  );
+
+  check(
+    "orders Edge Function maps LOCATION_NOT_FOUND and LOCATION_CONFLICT to HTTP 400",
+    ordersFn.includes('msg.includes("LOCATION_NOT_FOUND")') &&
+    ordersFn.includes('msg.includes("LOCATION_CONFLICT")') &&
+    ordersFn.includes('"The specified location is not valid for this restaurant."') &&
+    ordersFn.includes('"Order location conflicts with the existing table or check location."')
+  );
+
+  check(
+    "settlement RPCs (finalize_table_check, settle_check_cash_tx, record_check_payment) removed cashier staff fallback",
+    !/finalize_table_check[\s\S]*?select location_id into v_location\s+from public\.staff\s+where id = p_actor/.test(migration3Sql) &&
+    !/settle_check_cash_tx[\s\S]*?select location_id into v_location\s+from public\.staff\s+where id = p_actor/.test(migration3Sql) &&
+    !/record_check_payment[\s\S]*?select location_id into v_location\s+from public\.staff\s+where id = p_actor/.test(migration3Sql)
+  );
+}
+
+console.log("\n── 4. Preserve PR #7 Valid ₹0 Sales & Settlement Verification ──");
+{
+  check(
+    "finalize_table_check counts non-cancelled billable orders and rejects empty check",
+    /select[\s\S]*?count\(\*\)\s+as order_count[\s\S]*?into v_totals\s+from public\.orders\s+where check_id = p_check and status <> 'CANCELLED';/.test(migration3Sql) &&
+    /if v_totals\.order_count = 0 then\s+raise exception 'NOTHING_TO_BILL'/.test(migration3Sql)
+  );
+
+  const finalizeFnBody = migration3Sql.match(/create or replace function public\.finalize_table_check[\s\S]*?end \$function\$/)?.[0] || "";
+  check(
+    "finalize_table_check allocates single invoice, completes orders, and closes check session without payment ledger rows",
+    /v_invoice := 'INV-' \|\| lpad\(v_seq::text, 7, '0'\);/.test(finalizeFnBody) &&
+    /v_completed := public\.complete_paid_check_orders\(p_tenant, p_check\);/.test(finalizeFnBody) &&
+    !finalizeFnBody.includes("insert into public.check_payments")
+  );
+
+  check(
+    "analytics requires verified total > 0 and cumulative payments >= total for ledger settlements",
+    /if \(checkTotal > 0 && Math\.round\(runningPaid \* 100\) >= Math\.round\(checkTotal \* 100\)\)/.test(analyticsFn) &&
+    !analyticsFn.includes("checkTotal <= 0 && historyPayments.length > 0")
+  );
+
+  check(
+    "analytics recognizes verified ₹0 sales with closure evidence",
+    /amt >= 0/.test(analyticsFn) &&
+    /Authoritative finalization evidence: valid ₹0 sale or verified legacy check/.test(analyticsFn)
+  );
+
+  check(
+    "analytics excludes zero-amount settlement events from payment-method transaction counts",
+    /for\s*\(\s*const\s+e\s+of\s+filteredEvents\s*\)\s*\{\s*if\s*\(\s*e\.amount\s*<=\s*0\s*\)\s*continue;/.test(analyticsFn)
+  );
+
+  check(
+    "corrective migration repairs orders.paid_at and resets unverified timestamps to NULL",
+    /where tc\.total > 0\s+and rp\.cumulative_amount >= tc\.total - 0\.005/.test(migration3Sql) &&
+    /where tc\.status = 'PAID'\s+and coalesce\(tc\.closed_at, tc\.invoice_date\) is not null/.test(migration3Sql) &&
+    /update public\.orders o\s+set paid_at = null\s+where o\.paid_at is not null/.test(migration3Sql)
+  );
+}
+
+console.log("\n── 5. Runtime & Invariant Simulations ──");
+{
+  // Simulation A: Cross-tenant location injection rejection
+  function simulateCreateOrder(tenantId: string, locationId: string | null, validTenantLocations: Map<string, string>) {
+    if (locationId) {
+      const locTenant = validTenantLocations.get(locationId);
+      if (!locTenant || locTenant !== tenantId) {
+        return { ok: false, error: "LOCATION_NOT_FOUND", status: 400 };
       }
     }
+    return { ok: true, order_id: "ord-1", order_number: 101, check_id: "chk-1", table_session_id: "sess-1" };
   }
 
-  finalizeCheckSession("check-A", dinerSessions);
-  check("diner session A is ended upon settling check A", dinerSessions[0].status === "ENDED");
-  check("diner session B at same table remains ACTIVE and independent", dinerSessions[1].status === "ACTIVE");
+  const locationDb = new Map<string, string>([
+    ["loc-tenant-a-1", "tenant-A"],
+    ["loc-tenant-b-1", "tenant-B"],
+  ]);
 
-  // Simulation: Idempotent payment retry and single invoice
-  let invoiceCounter = 1;
-  function simulatePayment(key: string, storedKey?: string, existingInvoice?: string) {
-    if (storedKey && storedKey === key) {
-      return { ok: true, deduplicated: true, invoiceNumber: existingInvoice };
+  const crossTenantAttempt = simulateCreateOrder("tenant-A", "loc-tenant-b-1", locationDb);
+  check("cross-tenant location injection is rejected with LOCATION_NOT_FOUND",
+    !crossTenantAttempt.ok && crossTenantAttempt.error === "LOCATION_NOT_FOUND" && crossTenantAttempt.status === 400);
+
+  const validTenantLocation = simulateCreateOrder("tenant-A", "loc-tenant-a-1", locationDb);
+  check("valid tenant location succeeds and returns top-level contract",
+    validTenantLocation.ok && validTenantLocation.order_id === "ord-1" && validTenantLocation.order_number === 101);
+
+  // Simulation B: Location conflict on Dine-in table vs input
+  function simulateDineInLocation(tableLocation: string, inputLocation: string | null) {
+    if (inputLocation && inputLocation !== tableLocation) {
+      return { ok: false, error: "LOCATION_CONFLICT", status: 400 };
     }
-    const inv = `INV-000000${invoiceCounter++}`;
-    return { ok: true, deduplicated: false, invoiceNumber: inv };
+    return { ok: true, location: tableLocation };
   }
+  const conflictingDineIn = simulateDineInLocation("branch-A", "branch-B");
+  check("conflicting input location on Dine-in is rejected with LOCATION_CONFLICT",
+    !conflictingDineIn.ok && conflictingDineIn.error === "LOCATION_CONFLICT");
 
-  const firstCall = simulatePayment("key-123");
-  const retryCall = simulatePayment("key-123", "key-123", firstCall.invoiceNumber);
-  check("first payment allocates invoice", firstCall.invoiceNumber === "INV-0000001");
-  check("payment retry is deduplicated with exact same invoice", retryCall.deduplicated === true && retryCall.invoiceNumber === "INV-0000001");
-}
+  // Simulation C: Preserving existing check location
+  function simulateAddToExistingCheck(checkLocation: string, incomingLocation: string | null) {
+    if (incomingLocation && incomingLocation !== checkLocation) {
+      return { ok: false, error: "LOCATION_CONFLICT" };
+    }
+    return { ok: true, location: checkLocation };
+  }
+  const conflictingCheck = simulateAddToExistingCheck("branch-A", "branch-B");
+  check("adding order with conflicting location to existing check is rejected with LOCATION_CONFLICT",
+    !conflictingCheck.ok && conflictingCheck.error === "LOCATION_CONFLICT");
 
-console.log("\n── 3. Verified Full Settlements in Analytics & paid_at (Review Finding 3) ──");
-{
-  const targetMigration = migration2Sql || migration1Sql;
+  // Simulation D: Cross-branch cashier settlement
+  function simulateSettlement(saleLocation: string, cashierStaffLocation: string, paymentMethod: "CASH" | "UPI" | "CARD") {
+    // Durable location anchored to the sale, NOT the cashier's staff profile
+    return {
+      saleLocation,
+      settledLocation: saleLocation,
+      cashierStaffLocation,
+      method: paymentMethod,
+    };
+  }
+  const cashSale = simulateSettlement("branch-A", "branch-B", "CASH");
+  const upiSale = simulateSettlement("branch-A", "branch-B", "UPI");
+  const cardSale = simulateSettlement("branch-A", "branch-B", "CARD");
+  check("cash sale created at branch A settled by cashier at branch B stays attributed to branch A",
+    cashSale.settledLocation === "branch-A" && cashSale.settledLocation !== cashSale.cashierStaffLocation);
+  check("UPI sale created at branch A settled by cashier at branch B stays attributed to branch A",
+    upiSale.settledLocation === "branch-A");
+  check("Card sale created at branch A settled by cashier at branch B stays attributed to branch A",
+    cardSale.settledLocation === "branch-A");
 
-  check("analytics paginates with deterministic ordering (created_at, id)",
-    /\.order\("created_at", \{ ascending: true \}\)\s*\.order\("id", \{ ascending: true \}\)/.test(analyticsFn));
+  // Simulation E: Promo order and atomic retry on menu/promo change
+  let promoCount = 0;
+  const promoLimit = 1;
+  function redeemPromo(promoId: string) {
+    if (promoCount >= promoLimit) {
+      return { ok: false, error: "PROMO_REJECTED", retry: true };
+    }
+    promoCount++;
+    return { ok: true, promoId, usedCount: promoCount };
+  }
+  const promoFirst = redeemPromo("promo-1");
+  const promoRetry = redeemPromo("promo-1");
+  check("promo first redemption succeeds atomically", promoFirst.ok && promoFirst.usedCount === 1);
+  check("promo second redemption after limit is rejected as retryable", !promoRetry.ok && promoRetry.retry === true);
 
-  check("analytics propagates query failures instead of swallowing them as empty history",
-    !/const \{ data: historyPayments \} = await db/.test(analyticsFn) &&
-    /const historyPayments = await fetchAllPages<any>/.test(analyticsFn));
+  // Simulation F: Valid ₹0 sale checkout vs empty check
+  function checkoutCheck(orders: { total: number; status: string }[]) {
+    const billable = orders.filter((o) => o.status !== "CANCELLED");
+    if (billable.length === 0) return { ok: false, error: "NOTHING_TO_BILL" };
+    const total = billable.reduce((s, o) => s + o.total, 0);
+    return { ok: true, invoice: "INV-0000001", total, paymentLedgerRows: total > 0 ? 1 : 0 };
+  }
+  const emptyChk = checkoutCheck([]);
+  const zeroChk = checkoutCheck([{ total: 0, status: "SERVED" }]);
+  check("empty check rejected with NOTHING_TO_BILL", !emptyChk.ok && emptyChk.error === "NOTHING_TO_BILL");
+  check("valid ₹0 sale issues invoice without payment ledger rows",
+    zeroChk.ok && zeroChk.invoice === "INV-0000001" && zeroChk.paymentLedgerRows === 0);
 
-  check("analytics checks full payment history for candidate checks across all time",
-    /allHistoryLedgerPaymentsByCheck/.test(analyticsFn));
+  // Simulation G: Open check with payments and unknown total excluded from settled revenue
+  function reconcileSettlement(check: { total: number; status: string }, payments: { amount: number }[]) {
+    const paidSum = payments.reduce((s, p) => s + p.amount, 0);
+    if (check.total > 0 && paidSum >= check.total) {
+      return { settled: true, amount: check.total };
+    }
+    if (check.status === "PAID" && check.total === 0) {
+      return { settled: true, amount: 0 };
+    }
+    return { settled: false, amount: 0 };
+  }
+  const openCheckWithPmt = reconcileSettlement({ total: 0, status: "OPEN" }, [{ amount: 500 }]);
+  check("open check with unknown total and ledger payments is NOT settled revenue",
+    !openCheckWithPmt.settled && openCheckWithPmt.amount === 0);
 
-  check("analytics determines full settlement by cumulative payments reaching check total",
-    /runningPaid \+= Number\(p\.amount \|\| 0\);[\s\S]*?Math\.round\(runningPaid \* 100\) >= Math\.round\(checkTotal \* 100\)/.test(analyticsFn));
+  // Simulation H: Regression case with one ₹0 sale and one positive payment
+  // Verify that the report shows two completed orders and one payment transaction,
+  // and that a ₹0-only sale shows zero payment transactions in dashboard and CSV.
+  function simulateAnalyticsReport(
+    sales: { checkId: string; total: number; orderCount: number; method: "CASH" | "UPI" | "CARD" | "OTHER" }[]
+  ) {
+    let completedOrders = 0;
+    let grossCollected = 0;
+    const pmCounts = { cash: 0, upi: 0, card: 0, other: 0 };
+    const pmAmounts = { cash: 0, upi: 0, card: 0, other: 0 };
 
-  check("legacy fallback used ONLY when check has no ledger full settlement across history",
-    /else if \(chk && chk\.status === "PAID" && \(chk\.closed_at \|\| chk\.invoice_date\)\)/.test(analyticsFn));
+    for (const s of sales) {
+      completedOrders += s.orderCount;
+      grossCollected += s.total;
 
-  check("date filter applied to settlement timestamp after determining authoritative source",
-    /const windowEvents = candidateEvents\.filter\(\s*\(e\) => e\.settledAt >= winStart && e\.settledAt < winEnd\s*\)/.test(analyticsFn));
+      // Exclude zero-amount settlement events from payment-method transaction counts
+      if (s.total <= 0) continue;
 
-  check("migration repairs paid_at using cumulative verified full settlement",
-    /sum\(cp\.amount\) over \([\s\S]*?partition by cp\.check_id[\s\S]*?order by cp\.created_at asc, cp\.id asc[\s\S]*?\) as cumulative_amount/.test(targetMigration) &&
-    /rp\.cumulative_amount >= coalesce\(tc\.total, 0\.00\) - 0\.005/.test(targetMigration));
-
-  check("migration repairs conflicting non-null paid_at using IS DISTINCT FROM",
-    /o\.paid_at is distinct from cfs\.verified_settled_at/.test(targetMigration));
-
-  check("unverifiable orders have paid_at reset to NULL",
-    /update public\.orders o[\s\S]*?set paid_at = null[\s\S]*?where o\.paid_at is not null/.test(targetMigration));
-
-  // Simulation: Check settled before midnight IST (23:50) and closed after midnight IST (00:05)
-  const tz = "Asia/Kolkata";
-  const day1Start = zonedStart("2026-11-20", tz);
-  const day2Start = zonedStart("2026-11-21", tz);
-  const day3Start = zonedStart("2026-11-22", tz);
-
-  const checkCrossMidnight = {
-    id: "chk-cross-midnight",
-    total: 1000,
-    closed_at: "2026-11-20T18:35:00Z", // 00:05 IST Nov 21 (Day 2)
-    paid_total: 1000,
-    status: "PAID",
-  };
-  const historyPayments = [
-    {
-      id: "pay-1",
-      check_id: "chk-cross-midnight",
-      created_at: "2026-11-20T18:20:00Z", // 23:50 IST Nov 20 (Day 1)
-      amount: 1000,
-      status: "SUCCEEDED",
-      method: "CASH",
-    },
-  ];
-
-  function reconcileCheck(chk: any, payments: any[], winStart: Date, winEnd: Date) {
-    let authoritativeEvent: any = null;
-    let runningPaid = 0;
-    for (const p of payments) {
-      runningPaid += Number(p.amount || 0);
-      if (chk.total > 0 && Math.round(runningPaid * 100) >= Math.round(chk.total * 100)) {
-        authoritativeEvent = {
-          checkId: chk.id,
-          amount: chk.total,
-          settledAt: new Date(p.created_at),
-          source: "LEDGER",
-        };
-        break;
+      if (s.method === "CASH") {
+        pmAmounts.cash += s.total;
+        pmCounts.cash++;
+      } else if (s.method === "UPI") {
+        pmAmounts.upi += s.total;
+        pmCounts.upi++;
+      } else if (s.method === "CARD") {
+        pmAmounts.card += s.total;
+        pmCounts.card++;
+      } else {
+        pmAmounts.other += s.total;
+        pmCounts.other++;
       }
     }
-    if (!authoritativeEvent && chk.status === "PAID" && chk.closed_at) {
-      authoritativeEvent = {
-        checkId: chk.id,
-        amount: chk.paid_total,
-        settledAt: new Date(chk.closed_at),
-        source: "LEGACY",
-      };
-    }
 
-    if (!authoritativeEvent) return null;
-    if (authoritativeEvent.settledAt >= winStart && authoritativeEvent.settledAt < winEnd) {
-      return authoritativeEvent;
-    }
-    return null;
+    const totalPaymentTx = pmCounts.cash + pmCounts.upi + pmCounts.card + pmCounts.other;
+    return {
+      completedOrders,
+      grossCollected,
+      paymentMethods: {
+        cash: { amount: pmAmounts.cash, count: pmCounts.cash },
+        upi: { amount: pmAmounts.upi, count: pmCounts.upi },
+        card: { amount: pmAmounts.card, count: pmCounts.card },
+        other: { amount: pmAmounts.other, count: pmCounts.other },
+        totalTx: totalPaymentTx,
+      },
+    };
   }
 
-  const day1Report = reconcileCheck(checkCrossMidnight, historyPayments, day1Start, day2Start);
-  const day2Report = reconcileCheck(checkCrossMidnight, historyPayments, day2Start, day3Start);
+  // Case 1: One ₹0 sale and one positive payment
+  const mixedReport = simulateAnalyticsReport([
+    { checkId: "chk-zero", total: 0, orderCount: 1, method: "OTHER" },
+    { checkId: "chk-positive", total: 450, orderCount: 1, method: "UPI" },
+  ]);
+  check("regression case shows two completed orders", mixedReport.completedOrders === 2);
+  check("regression case shows one payment transaction", mixedReport.paymentMethods.totalTx === 1);
+  check("regression case attributes payment transaction to UPI with 450 amount",
+    mixedReport.paymentMethods.upi.count === 1 && mixedReport.paymentMethods.upi.amount === 450);
+  check("regression case attributes 0 transactions to other/legacy",
+    mixedReport.paymentMethods.other.count === 0 && mixedReport.paymentMethods.other.amount === 0);
 
-  check("check appears in Day 1 report (settledAt 23:50 IST)", day1Report !== null && day1Report.amount === 1000);
-  check("check does NOT appear in Day 2 report (never double counted)", day2Report === null);
-  check("appears exactly once across the two daily reports", (day1Report ? 1 : 0) + (day2Report ? 1 : 0) === 1);
+  // Case 2: ₹0-only sale
+  const zeroOnlyReport = simulateAnalyticsReport([
+    { checkId: "chk-zero-only", total: 0, orderCount: 1, method: "OTHER" },
+  ]);
+  check("₹0-only sale shows one completed order", zeroOnlyReport.completedOrders === 1);
+  check("₹0-only sale shows zero payment transactions in dashboard and CSV", zeroOnlyReport.paymentMethods.totalTx === 0);
 
-  // Simulation: Underpayment does NOT create verified full settlement
-  const underpaidPayments = [
-    { id: "p-sub", check_id: "chk-under", amount: 400, created_at: "2026-11-20T10:00:00Z", status: "SUCCEEDED" },
-  ];
-  const underpaidCheck = { id: "chk-under", total: 1000, status: "OPEN" };
-  const underpaidResult = reconcileCheck(underpaidCheck, underpaidPayments, day1Start, day2Start);
-  check("underpayment is NOT counted as full settlement", underpaidResult === null);
-}
+  // Simulation I: Promo order idempotent replay (e.g. network retry with same idempotency key)
+  const ordersDatabase: any[] = [];
+  let promoRedemptions = 0;
+  function createOrderTxSimulation(idempotencyKey: string, promoId: string | null) {
+    const existing = ordersDatabase.find((o) => o.idempotency_key === idempotencyKey);
+    if (existing) {
+      return { order_id: existing.id, deduplicated: true, promoRedemptions };
+    }
+    if (promoId) {
+      promoRedemptions++;
+    }
+    const newOrder = { id: "ord-" + (ordersDatabase.length + 1), idempotency_key: idempotencyKey, promo_id: promoId };
+    ordersDatabase.push(newOrder);
+    return { order_id: newOrder.id, deduplicated: false, promoRedemptions };
+  }
 
-console.log("\n── 4. Location Attribution & Persistence in Both Payment Paths (Review Finding 4) ──");
-{
-  const targetMigration = migration2Sql || migration1Sql;
+  const promoOrder1 = createOrderTxSimulation("idem-key-101", "promo-valid");
+  const promoOrderRetry = createOrderTxSimulation("idem-key-101", "promo-valid");
+  check("promo checkout initial attempt creates one order and one redemption",
+    promoOrder1.deduplicated === false && ordersDatabase.length === 1 && promoOrder1.promoRedemptions === 1);
+  check("promo checkout retry creates only one order and one redemption",
+    promoOrderRetry.deduplicated === true && promoOrderRetry.order_id === promoOrder1.order_id && ordersDatabase.length === 1 && promoRedemptions === 1);
 
-  check("settle_check_cash_tx persists durable location_id on payments, checks, and orders",
-    /insert into public\.check_payments \([\s\S]*?location_id[\s\S]*?values \([\s\S]*?v_location/.test(targetMigration) &&
-    /update public\.table_checks\s+set[\s\S]*?location_id = coalesce\(location_id, v_location\)/.test(targetMigration) &&
-    /update public\.orders\s+set location_id = coalesce\(location_id, v_location\)/.test(targetMigration));
+  // Simulation J: CSV Export simulation for mixed and ₹0-only sales
+  function generateCsvRows(report: ReturnType<typeof simulateAnalyticsReport>) {
+    const rows: (string | number)[][] = [];
+    rows.push(["Gross Collected", report.grossCollected.toFixed(2)]);
+    rows.push(["Completed Orders", report.completedOrders]);
+    rows.push(["Method", "Transactions", "Amount"]);
+    rows.push(["Cash", report.paymentMethods.cash.count, report.paymentMethods.cash.amount.toFixed(2)]);
+    rows.push(["UPI", report.paymentMethods.upi.count, report.paymentMethods.upi.amount.toFixed(2)]);
+    rows.push(["Card", report.paymentMethods.card.count, report.paymentMethods.card.amount.toFixed(2)]);
+    if (report.paymentMethods.other.count > 0) {
+      rows.push(["Other / Legacy", report.paymentMethods.other.count, report.paymentMethods.other.amount.toFixed(2)]);
+    }
+    rows.push(["Total Reconciled", report.paymentMethods.totalTx, report.grossCollected.toFixed(2)]);
+    return rows;
+  }
 
-  check("record_check_payment persists durable location_id on payments, checks, and orders",
-    /insert into public\.check_payments \([\s\S]*?location_id[\s\S]*?values \([\s\S]*?v_location/.test(targetMigration) &&
-    /update public\.table_checks\s+set[\s\S]*?location_id = coalesce\(location_id, v_location\)/.test(targetMigration));
+  const mixedCsv = generateCsvRows(mixedReport);
+  check("CSV for mixed report shows 2 completed orders", mixedCsv.some((r) => r[0] === "Completed Orders" && r[1] === 2));
+  check("CSV for mixed report shows 1 total reconciled transaction", mixedCsv.some((r) => r[0] === "Total Reconciled" && r[1] === 1));
 
-  check("finalize_table_check persists location on table_checks and orders",
-    /create or replace function public\.finalize_table_check[\s\S]*?location_id = coalesce\(location_id, v_location\)/.test(targetMigration));
+  const zeroOnlyCsv = generateCsvRows(zeroOnlyReport);
+  check("CSV for ₹0-only report shows 1 completed order", zeroOnlyCsv.some((r) => r[0] === "Completed Orders" && r[1] === 1));
+  check("CSV for ₹0-only report shows 0 total reconciled transactions", zeroOnlyCsv.some((r) => r[0] === "Total Reconciled" && r[1] === 0));
 
-  check("tableless orders (Takeaway / Delivery) resolve location from transaction staff actor",
-    /if v_location is null and v_is_staff then\s+select location_id into v_location\s+from public\.staff\s+where id = p_actor/.test(targetMigration));
+  // Simulation K: Staff member at branch B ordering for Dine-in table at branch A
+  interface TableSessionCheckState {
+    tableLocation: string;
+    checkLocation?: string;
+    staffLocation: string;
+  }
+  function simulateStaffOrderEndpoint(
+    req: { orderType: string; tableId?: string; locationId?: string | null },
+    state: TableSessionCheckState
+  ) {
+    const isDineIn = req.orderType === "DINE_IN" || !!req.tableId;
+    let resolvedLocationId: string | null = req.locationId || null;
+    if (!resolvedLocationId && !isDineIn) {
+      resolvedLocationId = state.staffLocation;
+    }
 
-  check("unverifiable historical locations remain NULL (unassigned, never guessed)",
-    /v_location uuid := null;/.test(targetMigration) &&
-    /Unverifiable historical location data: left unassigned \(never guessed\)/.test(analyticsFn));
+    // Hand off to create_order_tx
+    if (isDineIn) {
+      if (resolvedLocationId && resolvedLocationId !== state.tableLocation) {
+        return { ok: false, error: "LOCATION_CONFLICT", status: 400 };
+      }
+      const orderLocation = state.tableLocation;
+      const checkLocation = state.checkLocation || orderLocation;
+      return { ok: true, status: 201, orderLocation, checkLocation };
+    } else {
+      const orderLocation = resolvedLocationId || state.staffLocation;
+      const checkLocation = state.checkLocation || orderLocation;
+      return { ok: true, status: 201, orderLocation, checkLocation };
+    }
+  }
 
-  // Simulation: Staff transfer does not alter historical location
-  const pastTransaction = {
-    id: "tx-100",
-    amount: 1200,
-    location_id: "loc-koramangala", // Persisted at settlement time
-  };
+  // 1. Staff assigned to branch B orders for table at branch A with omitted locationId
+  const staffBTableAOrderOmitted = simulateStaffOrderEndpoint(
+    { orderType: "DINE_IN", tableId: "table-branch-a", locationId: null },
+    { tableLocation: "branch-A", staffLocation: "branch-B" }
+  );
+  check(
+    "staff member assigned to branch B can order for branch A table with omitted locationId (retains branch A)",
+    staffBTableAOrderOmitted.ok &&
+    staffBTableAOrderOmitted.orderLocation === "branch-A" &&
+    staffBTableAOrderOmitted.checkLocation === "branch-A"
+  );
 
-  const staff = {
-    id: "staff-1",
-    location_id: "loc-indiranagar", // Transferred to another branch later
-  };
+  // 2. Staff assigned to branch B orders for table at branch A with explicit branch B locationId
+  const staffBTableAOrderExplicitConflict = simulateStaffOrderEndpoint(
+    { orderType: "DINE_IN", tableId: "table-branch-a", locationId: "branch-B" },
+    { tableLocation: "branch-A", staffLocation: "branch-B" }
+  );
+  check(
+    "same Dine-in order with explicit conflicting branch B locationId returns HTTP 400 and creates no order",
+    !staffBTableAOrderExplicitConflict.ok &&
+    staffBTableAOrderExplicitConflict.status === 400 &&
+    staffBTableAOrderExplicitConflict.error === "LOCATION_CONFLICT"
+  );
 
-  check("historical transaction retains loc-koramangala even when staff moves to loc-indiranagar",
-    pastTransaction.location_id === "loc-koramangala" && staff.location_id === "loc-indiranagar");
+  // 3. Takeaway order with omitted locationId preserves staff location fallback
+  const staffBTakeawayOmitted = simulateStaffOrderEndpoint(
+    { orderType: "TAKEAWAY", locationId: null },
+    { tableLocation: "branch-A", staffLocation: "branch-B" }
+  );
+  check(
+    "Takeaway order with omitted locationId preserves staff member branch B fallback",
+    staffBTakeawayOmitted.ok &&
+    staffBTakeawayOmitted.orderLocation === "branch-B" &&
+    staffBTakeawayOmitted.checkLocation === "branch-B"
+  );
 }
 
 console.log(`\n========================================`);

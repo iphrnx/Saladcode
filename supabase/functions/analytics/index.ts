@@ -277,7 +277,7 @@ serve(async (req: Request) => {
       const historyPayments = allHistoryLedgerPaymentsByCheck.get(cid) ?? [];
       const checkTotal = Number(chk?.total || 0);
 
-      // Identify the verified full-settlement payment (cumulative payments reaching check total)
+      // Identify the verified full-settlement payment (requires verified total > 0 and ledger coverage)
       let fullSettlementPayment: any = null;
       let runningPaid = 0;
       for (const p of historyPayments) {
@@ -288,13 +288,8 @@ serve(async (req: Request) => {
         }
       }
 
-      // If check total is unset/0 but successful payments exist, use the last payment that covered balance
-      if (!fullSettlementPayment && checkTotal <= 0 && historyPayments.length > 0) {
-        fullSettlementPayment = historyPayments[historyPayments.length - 1];
-      }
-
       if (fullSettlementPayment) {
-        // Authoritative verified full ledger settlement
+        // Authoritative verified full ledger settlement (checkTotal > 0 and cumulative payments >= checkTotal)
         const rawMethod = String(fullSettlementPayment.method || "").toUpperCase();
         const method: "CASH" | "UPI" | "CARD" | "OTHER" =
           rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
@@ -303,16 +298,16 @@ serve(async (req: Request) => {
 
         candidateEvents.push({
           checkId: cid,
-          amount: Number(chk?.total && chk.total > 0 ? chk.total : fullSettlementPayment.amount || 0),
+          amount: checkTotal,
           settledAt: new Date(fullSettlementPayment.created_at),
           method,
           locationId: locId,
           isLedger: true,
         });
       } else if (chk && chk.status === "PAID" && (chk.closed_at || chk.invoice_date)) {
-        // Authoritative verified legacy settlement fallback (no ledger full settlement exists)
-        const amt = Number(chk.paid_total > 0 ? chk.paid_total : chk.total || 0);
-        if (amt > 0) {
+        // Authoritative finalization evidence: valid ₹0 sale or verified legacy check
+        const amt = Number(chk.paid_total !== undefined && chk.paid_total !== null && chk.paid_total > 0 ? chk.paid_total : (chk.total ?? 0));
+        if (amt >= 0) {
           const settleTime = chk.closed_at
             ? new Date(chk.closed_at)
             : (chk.invoice_date ? new Date(chk.invoice_date) : new Date(chk.created_at));
@@ -474,12 +469,14 @@ serve(async (req: Request) => {
   }
 
   // Payment method breakdowns (Cash, UPI, Card, Other accurately reported)
+  // Exclude zero-amount settlement events (e.g. ₹0 comped sales) from payment-method transaction counts
   let cashAmount = 0, cashCount = 0;
   let upiAmount = 0, upiCount = 0;
   let cardAmount = 0, cardCount = 0;
   let otherAmount = 0, otherCount = 0;
 
   for (const e of filteredEvents) {
+    if (e.amount <= 0) continue;
     if (e.method === "CASH") {
       cashAmount += e.amount;
       cashCount++;

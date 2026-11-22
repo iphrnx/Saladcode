@@ -97,6 +97,7 @@ type PlanRow = {
   trial_days: number;
   features: string[];
   is_active: boolean;
+  is_popular?: boolean | null;
   max_locations: number | null;
   max_staff: number | null;
   max_menu_items: number | null;
@@ -122,7 +123,7 @@ async function activePlans(): Promise<PlanRow[]> {
   const { data } = await admin()
     .from("subscription_plans")
     .select(
-      "id, name, price_monthly, price_yearly, currency, trial_days, features, feature_keys, is_active, max_locations, max_staff, max_menu_items, max_tables, razorpay_plan_id, billing_mode",
+      "id, name, price_monthly, price_yearly, currency, trial_days, features, feature_keys, is_active, is_popular, max_locations, max_staff, max_menu_items, max_tables, razorpay_plan_id, billing_mode",
     )
     .eq("is_active", true)
     .order("sort_order", { ascending: true });
@@ -483,7 +484,7 @@ export async function enforceWriteLimit(
       return { ok: false, reason: "write", error: message, status: 500 };
     }
     console.error("plans: could not enforce the limit", kind, message);
-    return limitCheckFailure({ error: undefined });
+    return { reason: "unavailable" as const, ...limitCheckFailure({ error: undefined }) };
   }
 
   const result = data as any;
@@ -511,7 +512,7 @@ export async function enforceWriteLimit(
   const written = kind === "staff" ? result?.staff : kind === "menuItems" ? result?.item : result?.table;
   if (!result?.ok || !written?.id) {
     console.error("plans: the write returned nothing usable", kind, String(JSON.stringify(result)).slice(0, 200));
-    return limitCheckFailure({ error: undefined });
+    return { reason: "unavailable" as const, ...limitCheckFailure({ error: undefined }) };
   }
 
   return { ok: true, row: written, limit: Number(result.limit ?? limit) };
