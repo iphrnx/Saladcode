@@ -1181,25 +1181,28 @@ async function create(req: Request): Promise<Response> {
       if (user) validServedById = user.id;
     }
 
-    // Resolve location for sale creation (Dine-in, Takeaway, Delivery)
+    // Resolve location for sale creation (Dine-in resolves from table if omitted; Takeaway/Delivery fallback to staff)
     let locationId: string | null = b.locationId || b.location_id || null;
-    if (!locationId && validServedById) {
-      const { data: st } = await db
-        .from("staff")
-        .select("location_id")
-        .eq("id", validServedById)
-        .eq("tenant_id", tenantId)
-        .maybeSingle();
-      if (st?.location_id) locationId = st.location_id;
-    }
-    if (!locationId && g.session?.subjectId) {
-      const { data: st } = await db
-        .from("staff")
-        .select("location_id")
-        .eq("id", g.session.subjectId)
-        .eq("tenant_id", tenantId)
-        .maybeSingle();
-      if (st?.location_id) locationId = st.location_id;
+    const isDineIn = orderType === "DINE_IN" || !!tableId;
+    if (!locationId && !isDineIn) {
+      if (validServedById) {
+        const { data: st } = await db
+          .from("staff")
+          .select("location_id")
+          .eq("id", validServedById)
+          .eq("tenant_id", tenantId)
+          .maybeSingle();
+        if (st?.location_id) locationId = st.location_id;
+      }
+      if (!locationId && g.session?.subjectId) {
+        const { data: st } = await db
+          .from("staff")
+          .select("location_id")
+          .eq("id", g.session.subjectId)
+          .eq("tenant_id", tenantId)
+          .maybeSingle();
+        if (st?.location_id) locationId = st.location_id;
+      }
     }
 
     const created = await priceAndCreateOrder(db, {

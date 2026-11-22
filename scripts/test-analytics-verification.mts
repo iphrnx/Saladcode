@@ -162,6 +162,12 @@ console.log("\n── 3. Validate and Persist Sale Location (Finding 3) ──")
   );
 
   check(
+    "orders Edge Function stops filling omitted Dine-in locationId from staff branch",
+    ordersFn.includes('const isDineIn = orderType === "DINE_IN" || !!tableId;') &&
+    ordersFn.includes("if (!locationId && !isDineIn) {")
+  );
+
+  check(
     "orders Edge Function maps LOCATION_NOT_FOUND and LOCATION_CONFLICT to HTTP 400",
     ordersFn.includes('msg.includes("LOCATION_NOT_FOUND")') &&
     ordersFn.includes('msg.includes("LOCATION_CONFLICT")') &&
@@ -441,6 +447,73 @@ console.log("\n── 5. Runtime & Invariant Simulations ──");
   const zeroOnlyCsv = generateCsvRows(zeroOnlyReport);
   check("CSV for ₹0-only report shows 1 completed order", zeroOnlyCsv.some((r) => r[0] === "Completed Orders" && r[1] === 1));
   check("CSV for ₹0-only report shows 0 total reconciled transactions", zeroOnlyCsv.some((r) => r[0] === "Total Reconciled" && r[1] === 0));
+
+  // Simulation K: Staff member at branch B ordering for Dine-in table at branch A
+  interface TableSessionCheckState {
+    tableLocation: string;
+    checkLocation?: string;
+    staffLocation: string;
+  }
+  function simulateStaffOrderEndpoint(
+    req: { orderType: string; tableId?: string; locationId?: string | null },
+    state: TableSessionCheckState
+  ) {
+    const isDineIn = req.orderType === "DINE_IN" || !!req.tableId;
+    let resolvedLocationId: string | null = req.locationId || null;
+    if (!resolvedLocationId && !isDineIn) {
+      resolvedLocationId = state.staffLocation;
+    }
+
+    // Hand off to create_order_tx
+    if (isDineIn) {
+      if (resolvedLocationId && resolvedLocationId !== state.tableLocation) {
+        return { ok: false, error: "LOCATION_CONFLICT", status: 400 };
+      }
+      const orderLocation = state.tableLocation;
+      const checkLocation = state.checkLocation || orderLocation;
+      return { ok: true, status: 201, orderLocation, checkLocation };
+    } else {
+      const orderLocation = resolvedLocationId || state.staffLocation;
+      const checkLocation = state.checkLocation || orderLocation;
+      return { ok: true, status: 201, orderLocation, checkLocation };
+    }
+  }
+
+  // 1. Staff assigned to branch B orders for table at branch A with omitted locationId
+  const staffBTableAOrderOmitted = simulateStaffOrderEndpoint(
+    { orderType: "DINE_IN", tableId: "table-branch-a", locationId: null },
+    { tableLocation: "branch-A", staffLocation: "branch-B" }
+  );
+  check(
+    "staff member assigned to branch B can order for branch A table with omitted locationId (retains branch A)",
+    staffBTableAOrderOmitted.ok &&
+    staffBTableAOrderOmitted.orderLocation === "branch-A" &&
+    staffBTableAOrderOmitted.checkLocation === "branch-A"
+  );
+
+  // 2. Staff assigned to branch B orders for table at branch A with explicit branch B locationId
+  const staffBTableAOrderExplicitConflict = simulateStaffOrderEndpoint(
+    { orderType: "DINE_IN", tableId: "table-branch-a", locationId: "branch-B" },
+    { tableLocation: "branch-A", staffLocation: "branch-B" }
+  );
+  check(
+    "same Dine-in order with explicit conflicting branch B locationId returns HTTP 400 and creates no order",
+    !staffBTableAOrderExplicitConflict.ok &&
+    staffBTableAOrderExplicitConflict.status === 400 &&
+    staffBTableAOrderExplicitConflict.error === "LOCATION_CONFLICT"
+  );
+
+  // 3. Takeaway order with omitted locationId preserves staff location fallback
+  const staffBTakeawayOmitted = simulateStaffOrderEndpoint(
+    { orderType: "TAKEAWAY", locationId: null },
+    { tableLocation: "branch-A", staffLocation: "branch-B" }
+  );
+  check(
+    "Takeaway order with omitted locationId preserves staff member branch B fallback",
+    staffBTakeawayOmitted.ok &&
+    staffBTakeawayOmitted.orderLocation === "branch-B" &&
+    staffBTakeawayOmitted.checkLocation === "branch-B"
+  );
 }
 
 console.log(`\n========================================`);
