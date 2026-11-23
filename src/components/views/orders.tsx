@@ -2763,10 +2763,10 @@ function OrderRow({
                   <DishThumb src={dishImages[order.items[1]?.menuItemId]} />
                 )}
 
-                {/* 3rd thumbnail: visible on wider screens (>= 400px) if >= 3 items */}
+                {/* 3rd thumbnail: visible on wider screens if space allows */}
                 {order.items.length >= 3 && (
                   <DishThumb
-                    className="hidden min-[400px]:grid"
+                    className="hidden min-[400px]:grid lg:hidden xl:grid"
                     src={dishImages[order.items[2]?.menuItemId]}
                   />
                 )}
@@ -2774,11 +2774,11 @@ function OrderRow({
                 {/* +N badge when items exceed what's visible */}
                 {order.items.length > 3 ? (
                   <span className="grid size-9 sm:size-10 shrink-0 place-items-center rounded-xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs sm:text-[13px] font-bold text-orange-600 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-                    <span className="min-[400px]:hidden">+{order.items.length - 2}</span>
-                    <span className="hidden min-[400px]:inline">+{order.items.length - 3}</span>
+                    <span className="min-[400px]:hidden lg:inline xl:hidden">+{order.items.length - 2}</span>
+                    <span className="hidden min-[400px]:inline lg:hidden xl:inline">+{order.items.length - 3}</span>
                   </span>
                 ) : order.items.length === 3 ? (
-                  <span className="min-[400px]:hidden grid size-9 sm:size-10 shrink-0 place-items-center rounded-xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs font-bold text-orange-600 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+                  <span className="min-[400px]:hidden lg:grid xl:hidden grid size-9 sm:size-10 shrink-0 place-items-center rounded-xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs font-bold text-orange-600 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
                     +1
                   </span>
                 ) : null}
