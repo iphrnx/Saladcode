@@ -102,6 +102,30 @@ check(
   analyticsView.includes("the-salad-report_${locSlug}")
 );
 
+// 5. Correctness fixes: pmTotal fallback, zero refund formatting, subtitle and operations scope labels
+console.log("\n── 5. Correctness & Labeling Fixes ──");
+check(
+  "pmTotal calculation removes || 1 fallback so valid 0 values do not turn into ₹1.00",
+  !analyticsView.includes("const pmTotal = (pm?.cash.amount ?? 0) + (pm?.upi.amount ?? 0) + (pm?.card.amount ?? 0) + (pm?.other?.amount ?? 0) || 1") &&
+  analyticsView.includes("const pmTotal = (pm?.cash.amount ?? 0) + (pm?.upi.amount ?? 0) + (pm?.card.amount ?? 0) + (pm?.other?.amount ?? 0)")
+);
+
+check(
+  "zero refunds are formatted as ₹0.00 instead of em-dash",
+  analyticsView.includes("${sym}0.00")
+);
+
+check(
+  "Category subtitle removes duplicate 'vs.' typo",
+  !analyticsView.includes("Compared with vs.") &&
+  analyticsView.includes("Category contribution · {compRangeLabel ? `Compared with ${compRangeLabel}` : rangeLabel}")
+);
+
+check(
+  "Operations performance label correctly reflects settled orders scope",
+  analyticsView.includes("orders settled")
+);
+
 console.log("\n========================================================");
 console.log("Verification Summary: All Batch 3 checks PASSED! (100%)");
 console.log("========================================================\n");

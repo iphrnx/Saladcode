@@ -651,7 +651,7 @@ export function AnalyticsView() {
         analytics.paymentMethods.upi.count +
         analytics.paymentMethods.card.count +
         (analytics.paymentMethods.other?.count ?? 0)
-      push('Total Reconciled', totalTx, money(analytics.paymentMethods.totalCollected ?? analytics.paymentMethods.total), money(analytics.paymentMethods.totalRefunds ?? 0), money(analytics.paymentMethods.totalNet ?? analytics.paymentMethods.total))
+      push('Total Reconciled', totalTx, money(analytics.paymentMethods.totalCollected ?? pmTotal), money(analytics.paymentMethods.totalRefunds ?? 0), money(analytics.paymentMethods.totalNet ?? (pmTotal - (analytics.paymentMethods.totalRefunds ?? 0))))
       blank()
     }
 
@@ -861,7 +861,7 @@ export function AnalyticsView() {
 
   // Payment method totals & percentages
   const pm = analytics?.paymentMethods
-  const pmTotal = (pm?.cash.amount ?? 0) + (pm?.upi.amount ?? 0) + (pm?.card.amount ?? 0) + (pm?.other?.amount ?? 0) || 1
+  const pmTotal = (pm?.cash.amount ?? 0) + (pm?.upi.amount ?? 0) + (pm?.card.amount ?? 0) + (pm?.other?.amount ?? 0)
 
   // Category totals for inline percentages
   const catTotal = (analytics?.categoryBreakdown ?? []).reduce((s, c) => s + c.value, 0) || 1
@@ -1655,7 +1655,7 @@ export function AnalyticsView() {
                     <span>Revenue by Category</span>
                   </h3>
                   <p className="text-[11px] text-muted-foreground">
-                    Category contribution · {compRangeLabel ? `Compared with vs. ${compRangeLabel}` : rangeLabel}
+                    Category contribution · {compRangeLabel ? `Compared with ${compRangeLabel}` : rangeLabel}
                   </p>
                 </div>
 
@@ -1808,7 +1808,9 @@ export function AnalyticsView() {
               <div className="h-6 w-px bg-border/60" />
               <div>
                 <span className="text-[10px] text-muted-foreground block">Refunds</span>
-                <span className="font-semibold tabular-nums text-red-500">-{sym}{(pm?.totalRefunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span className="font-semibold tabular-nums text-red-500">
+                  {(pm?.totalRefunds ?? 0) > 0 ? `-${sym}${(pm?.totalRefunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
+                </span>
               </div>
               <div className="h-6 w-px bg-border/60" />
               <div>
@@ -1847,7 +1849,7 @@ export function AnalyticsView() {
                     {sym}{(pm?.cash?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </td>
                   <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
-                    {(pm?.cash?.refunds ?? 0) > 0 ? `-${sym}${(pm?.cash?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
+                    {(pm?.cash?.refunds ?? 0) > 0 ? `-${sym}${(pm?.cash?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
                   </td>
                   <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
                     {sym}{((pm?.cash?.net ?? ((pm?.cash?.amount ?? 0) - (pm?.cash?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
@@ -1871,7 +1873,7 @@ export function AnalyticsView() {
                     {sym}{(pm?.upi?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </td>
                   <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
-                    {(pm?.upi?.refunds ?? 0) > 0 ? `-${sym}${(pm?.upi?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
+                    {(pm?.upi?.refunds ?? 0) > 0 ? `-${sym}${(pm?.upi?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
                   </td>
                   <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
                     {sym}{((pm?.upi?.net ?? ((pm?.upi?.amount ?? 0) - (pm?.upi?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
@@ -1895,7 +1897,7 @@ export function AnalyticsView() {
                     {sym}{(pm?.card?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </td>
                   <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
-                    {(pm?.card?.refunds ?? 0) > 0 ? `-${sym}${(pm?.card?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
+                    {(pm?.card?.refunds ?? 0) > 0 ? `-${sym}${(pm?.card?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
                   </td>
                   <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
                     {sym}{((pm?.card?.net ?? ((pm?.card?.amount ?? 0) - (pm?.card?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
@@ -1920,7 +1922,7 @@ export function AnalyticsView() {
                       {sym}{(pm?.other?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
                     <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
-                      {(pm?.other?.refunds ?? 0) > 0 ? `-${sym}${(pm?.other?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
+                      {(pm?.other?.refunds ?? 0) > 0 ? `-${sym}${(pm?.other?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
                     </td>
                     <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
                       {sym}{((pm?.other?.net ?? ((pm?.other?.amount ?? 0) - (pm?.other?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
@@ -1966,7 +1968,7 @@ export function AnalyticsView() {
                     {sym}{(pm?.totalCollected ?? pmTotal).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </td>
                   <td className="text-right py-2.5 px-3 tabular-nums text-red-500">
-                    {(pm?.totalRefunds ?? 0) > 0 ? `-${sym}${(pm?.totalRefunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
+                    {(pm?.totalRefunds ?? 0) > 0 ? `-${sym}${(pm?.totalRefunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
                   </td>
                   <td className="text-right py-2.5 px-3 tabular-nums text-emerald-500 font-bold">
                     {sym}{(pm?.totalNet ?? (pmTotal - (pm?.totalRefunds ?? 0))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
@@ -2173,7 +2175,7 @@ export function AnalyticsView() {
                   <span className="text-2xl font-bold tabular-nums text-foreground">
                     {loading ? '—' : (analytics?.operationsPerformance?.orderVolume ?? analytics?.totalOrders ?? 0).toLocaleString()}
                   </span>
-                  <span className="text-xs text-muted-foreground">orders placed</span>
+                  <span className="text-xs text-muted-foreground">orders settled</span>
                 </div>
               </div>
               <div className="mt-3 pt-2.5 border-t border-border/40 text-[11px] space-y-1 text-muted-foreground">
@@ -2266,7 +2268,7 @@ export function AnalyticsView() {
                       <span className="text-muted-foreground">{r.method}</span>
                       <div className="text-right tabular-nums">
                         <span className="font-medium text-red-400">
-                          {r.amount > 0 ? `-${sym}${r.amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
+                          {r.amount > 0 ? `-${sym}${r.amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
                         </span>
                         <span className="text-[10px] text-muted-foreground ml-1.5">({r.count})</span>
                       </div>
