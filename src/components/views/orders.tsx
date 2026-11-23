@@ -2708,9 +2708,7 @@ function OrderRow({
               aria-hidden
               className="h-4 sm:h-4.5 w-1 rounded-full bg-orange-500 shrink-0"
             />
-            <span className="shrink-0 text-sm sm:text-[15px] font-bold tabular-nums text-foreground tracking-tight">
-              #{order.orderNumber}
-            </span>
+            <span className="shrink-0 text-sm sm:text-[15px] font-bold tabular-nums text-foreground tracking-tight">#{order.orderNumber}</span>
             <span aria-hidden className="shrink-0 text-neutral-300 dark:text-neutral-600 text-xs select-none">
               |
             </span>
