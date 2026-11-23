@@ -137,4 +137,13 @@ export function reservedRoleName(name: string): string | null {
 
 /** The same resolved-permission rule the server's guard uses (legacy aliases
  * included), so a button and the endpoint it calls can never disagree. */
-export { hasEffectivePermission } from '@/lib/constants'
+export {
+  hasEffectivePermission,
+  expandPermissions,
+  PERMISSION_KEYS,
+  PERMISSION_GROUPS,
+  PERMISSION_METADATA,
+  PERMISSION_IMPLICATIONS,
+  type PermissionKey,
+  type PermissionMeta,
+} from '@/lib/constants'
