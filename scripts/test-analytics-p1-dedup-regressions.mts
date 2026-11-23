@@ -129,7 +129,9 @@ const mockOrders = [
     items: [],
   },
   // 2. Distinct order refund on Check 2:
-  // On the same check "chk-distinct", but NOT linked to "pay-void-300-tue"
+  // On the same check "chk-distinct", but NOT linked to "pay-void-300-tue" via structured payment_id.
+  // Note: Its notes and cancellation_reason explicitly mention "pay-void-300-tue", but because
+  // mentions in text do not prove same reversal, it must NOT be deduplicated!
   {
     id: "ord-distinct-100",
     order_number: 102,
@@ -146,6 +148,8 @@ const mockOrders = [
     tax: 0,
     service_charge: 0,
     total: 100,
+    cancellation_reason: "Refunding partial order items after void of pay-void-300-tue",
+    notes: "Customer complained; references pay-void-300-tue on check chk-distinct",
     paid_at: TUE_NOON,
     refunded_at: TUE_NOON,
     created_at: TUE_NOON,

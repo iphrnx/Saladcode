@@ -468,15 +468,10 @@ serve(async (req: Request) => {
     // Collect authoritative ledger void identifiers and mappings
     const ledgerVoidPaymentIds = new Set<string>();
     const ledgerVoidIdempotencyKeys = new Map<string, string>(); // idempotency_key -> payment.id
-    const ledgerVoidNoteLinks = new Set<string>(); // order IDs explicitly linked in void notes
 
     for (const p of voidPayments) {
       if (p.id) ledgerVoidPaymentIds.add(String(p.id));
       if (p.idempotency_key) ledgerVoidIdempotencyKeys.set(String(p.idempotency_key), String(p.id));
-      if (p.note) {
-        const m = String(p.note).match(/order[:\s]+([a-zA-Z0-9_-]+)/i);
-        if (m) ledgerVoidNoteLinks.add(m[1]);
-      }
     }
 
     const seenReversalIds = new Set<string>();
@@ -518,8 +513,9 @@ serve(async (req: Request) => {
     }
 
     // 2. Authoritative legacy order refunds
-    // Deduplicate ONLY when a verified payment ID, refund ID, or existing authoritative mapping proves both records represent the same reversal.
-    // A shared check ID, amount, or timestamp is insufficient. Preserve distinct reversals on the same check!
+    // Deduplicate ONLY through a structured, verified link (such as order.payment_id pointing to the voided payment).
+    // Free-text notes and cancellation reasons are NOT used for deduplication because mentioning a payment ID
+    // does not prove two records represent the same reversal. Preserve distinct reversals on the same check!
     for (const o of orderRefunds) {
       const amt = Number(o.total || 0);
       if (amt <= 0) continue;
@@ -540,23 +536,10 @@ serve(async (req: Request) => {
       const isProvenDuplicate =
         (linkedPaymentId && ledgerVoidPaymentIds.has(linkedPaymentId)) ||
         ledgerVoidPaymentIds.has(oid) || // order ID matches payment ID
-        (o.idempotency_key && ledgerVoidIdempotencyKeys.has(String(o.idempotency_key))) ||
-        ledgerVoidNoteLinks.has(oid);
+        (o.idempotency_key && ledgerVoidIdempotencyKeys.has(String(o.idempotency_key)));
 
-      // Also check if order's reason or notes explicitly links to a known ledger void payment ID
-      let explicitNoteLink = false;
-      if (!isProvenDuplicate) {
-        const orderText = `${o.cancellation_reason || ""} ${o.notes || ""}`;
-        for (const pid of ledgerVoidPaymentIds) {
-          if (orderText.includes(pid)) {
-            explicitNoteLink = true;
-            break;
-          }
-        }
-      }
-
-      if (isProvenDuplicate || explicitNoteLink) {
-        // Proven duplicate of an authoritative ledger void record representing the same reversal.
+      if (isProvenDuplicate) {
+        // Proven duplicate of an authoritative ledger void record through structured identity.
         // Deduplicate before date and location filters.
         continue;
       }
