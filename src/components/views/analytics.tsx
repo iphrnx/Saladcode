@@ -18,7 +18,7 @@ import { Button } from '@/components/ui/button'
 import { Calendar } from '@/components/ui/calendar'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import type { DateRange } from 'react-day-picker'
-import { format, startOfMonth, subDays, differenceInCalendarDays } from 'date-fns'
+import { format, startOfMonth, subDays, differenceInCalendarDays, parseISO } from 'date-fns'
 import {
   IndianRupee, ShoppingBag, ClipboardList, CalendarDays,
   ArrowUpRight, ArrowDownRight, ArrowLeftRight, Download, Clock, Utensils, Trophy,
@@ -632,18 +632,21 @@ export function AnalyticsView() {
 
     if (analytics.paymentMethods) {
       push('Payment Method Breakdown')
-      push('Method', 'Transactions', `Amount (${sym})`)
-      push('Cash', analytics.paymentMethods.cash.count, money(analytics.paymentMethods.cash.amount))
-      push('UPI', analytics.paymentMethods.upi.count, money(analytics.paymentMethods.upi.amount))
-      push('Card', analytics.paymentMethods.card.count, money(analytics.paymentMethods.card.amount))
-      if (analytics.paymentMethods.other && analytics.paymentMethods.other.count > 0) {
-        push('Other / Legacy', analytics.paymentMethods.other.count, money(analytics.paymentMethods.other.amount))
+      push('Method', 'Transactions', `Collected (${sym})`, `Refunds (${sym})`, `Net Amount (${sym})`)
+      push('Cash', analytics.paymentMethods.cash.count, money(analytics.paymentMethods.cash.amount), money(analytics.paymentMethods.cash.refunds ?? 0), money(analytics.paymentMethods.cash.net ?? analytics.paymentMethods.cash.amount))
+      push('UPI', analytics.paymentMethods.upi.count, money(analytics.paymentMethods.upi.amount), money(analytics.paymentMethods.upi.refunds ?? 0), money(analytics.paymentMethods.upi.net ?? analytics.paymentMethods.upi.amount))
+      push('Card', analytics.paymentMethods.card.count, money(analytics.paymentMethods.card.amount), money(analytics.paymentMethods.card.refunds ?? 0), money(analytics.paymentMethods.card.net ?? analytics.paymentMethods.card.amount))
+      if (analytics.paymentMethods.other && (analytics.paymentMethods.other.count > 0 || analytics.paymentMethods.other.amount > 0 || (analytics.paymentMethods.other.refunds ?? 0) > 0)) {
+        push('Other / Legacy', analytics.paymentMethods.other.count, money(analytics.paymentMethods.other.amount), money(analytics.paymentMethods.other.refunds ?? 0), money(analytics.paymentMethods.other.net ?? analytics.paymentMethods.other.amount))
+      }
+      if (analytics.paymentMethods.unattributedRefunds && analytics.paymentMethods.unattributedRefunds.amount > 0) {
+        push('Refunds (Method Unavailable)', analytics.paymentMethods.unattributedRefunds.count, money(0), money(analytics.paymentMethods.unattributedRefunds.amount), money(-analytics.paymentMethods.unattributedRefunds.amount))
       }
       const totalTx = analytics.paymentMethods.cash.count +
                       analytics.paymentMethods.upi.count +
                       analytics.paymentMethods.card.count +
                       (analytics.paymentMethods.other?.count ?? 0)
-      push('Total Reconciled', totalTx, money(analytics.paymentMethods.total))
+      push('Total Reconciled', totalTx, money(analytics.paymentMethods.totalCollected ?? analytics.paymentMethods.total), money(analytics.paymentMethods.totalRefunds ?? 0), money(analytics.paymentMethods.totalNet ?? analytics.paymentMethods.total))
       blank()
     }
 
@@ -663,8 +666,8 @@ export function AnalyticsView() {
     blank()
 
     push('Top tables')
-    push('Table', 'Orders', `Revenue (${sym})`)
-    for (const t of analytics.topTables ?? []) push(t.name, t.orders, money(t.revenue))
+    push('Table', 'Sessions', `Revenue (${sym})`, `Average Bill (${sym})`)
+    for (const t of analytics.topTables ?? []) push(t.name, t.sessionCount ?? t.orders, money(t.revenue), money(t.averageBill ?? t.avgBill ?? 0))
     blank()
 
     push('Categories')
@@ -702,15 +705,24 @@ export function AnalyticsView() {
       : format(range.from, 'd MMM yyyy')
     : 'Select dates'
 
-  // Determine comparison period date range (same duration immediately preceding)
-  const fromDate = range.from ?? new Date()
-  const toDate = range.to ?? fromDate
-  const daysDiff = Math.max(1, differenceInCalendarDays(toDate, fromDate) + 1)
-  const prevTo = subDays(fromDate, 1)
-  const prevFrom = subDays(prevTo, daysDiff - 1)
-  const compRangeLabel = daysDiff === 1
-    ? format(prevFrom, 'd MMM yyyy')
-    : `${format(prevFrom, 'd MMM')} – ${format(prevTo, 'd MMM yyyy')}`
+  // Determine comparison period date range (use API's actual comparison dates when available)
+  let compRangeLabel = ''
+  if (analytics?.comparison?.period?.from && analytics?.comparison?.period?.to) {
+    const apiPrevFrom = parseISO(analytics.comparison.period.from)
+    const apiPrevTo = parseISO(analytics.comparison.period.to)
+    compRangeLabel = analytics.comparison.period.from === analytics.comparison.period.to
+      ? format(apiPrevFrom, 'd MMM yyyy')
+      : `${format(apiPrevFrom, 'd MMM')} – ${format(apiPrevTo, 'd MMM yyyy')}`
+  } else {
+    const fromDate = range.from ?? new Date()
+    const toDate = range.to ?? fromDate
+    const daysDiff = Math.max(1, differenceInCalendarDays(toDate, fromDate) + 1)
+    const prevTo = subDays(fromDate, 1)
+    const prevFrom = subDays(prevTo, daysDiff - 1)
+    compRangeLabel = daysDiff === 1
+      ? format(prevFrom, 'd MMM yyyy')
+      : `${format(prevFrom, 'd MMM')} – ${format(prevTo, 'd MMM yyyy')}`
+  }
 
   const locations = analytics?.locations ?? []
   const hasMultipleLocations = locations.length > 1
@@ -1753,7 +1765,11 @@ export function AnalyticsView() {
                                 </span>
                               )
                             ) : (
-                              <span className="text-[10px] text-muted-foreground/60">—</span>
+                              (c.revenue ?? c.value) > 0 ? (
+                                <span className="text-[10px] font-semibold text-primary px-1 py-0.5 rounded bg-primary/10">New</span>
+                              ) : (
+                                <span className="text-[10px] text-muted-foreground/60">—</span>
+                              )
                             )}
                           </div>
                         </div>
@@ -2488,9 +2504,15 @@ function FinancialKpiCard({
               </span>
             )
           ) : (
-            <span className="text-[10px] text-muted-foreground/60 px-1.5 py-0.5 rounded bg-secondary/30">
-              —
-            </span>
+            (!isEmpty && !isRealZero && value && value !== '₹0' && value !== '₹0.00' && value !== '0') ? (
+              <span className="text-[10px] font-semibold text-primary px-1.5 py-0.5 rounded bg-primary/10">
+                New
+              </span>
+            ) : (
+              <span className="text-[10px] text-muted-foreground/60 px-1.5 py-0.5 rounded bg-secondary/30">
+                —
+              </span>
+            )
           )}
         </div>
         <p className="text-[11px] font-medium text-muted-foreground truncate">{label}</p>

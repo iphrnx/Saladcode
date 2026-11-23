@@ -1042,6 +1042,7 @@ serve(async (req: Request) => {
     if (!settlementTime || isNaN(settlementTime.getTime())) continue;
     if (settlementTime < prevRangeStart || settlementTime >= prevRangeEnd) continue;
 
+    o.settledAt = settlementTime;
     prevQualifyingOrders.push(o);
   }
 
@@ -1080,7 +1081,7 @@ serve(async (req: Request) => {
       return +(((curr - prev) / prev) * 100).toFixed(1);
     }
     if (prev === 0 && curr > 0) {
-      return 100.0;
+      return null;
     }
     if (prev === 0 && curr === 0) {
       return 0.0;
@@ -1115,7 +1116,7 @@ serve(async (req: Request) => {
       if (prevRev > 0) {
         growth = +(((rev - prevRev) / prevRev) * 100).toFixed(1);
       } else if (prevRev === 0 && rev > 0) {
-        growth = 100.0;
+        growth = null;
       } else if (prevRev === 0 && rev === 0) {
         growth = 0.0;
       }
