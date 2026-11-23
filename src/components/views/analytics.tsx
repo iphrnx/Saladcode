@@ -24,7 +24,7 @@ import {
   ArrowUpRight, ArrowDownRight, ArrowLeftRight, Download, Clock, Utensils, Trophy,
   CalendarIcon, ChevronDown, MapPin, Layers, Sparkles,
   CreditCard, Smartphone, Banknote, Receipt, Bike, TrendingUp, Check,
-  Filter, X, Flame, Tag, AlertCircle, HelpCircle,
+  Filter, X, Flame, Tag, AlertCircle, HelpCircle, Timer, Hourglass, Activity,
 } from 'lucide-react'
 import { formatCurrency } from '@/lib/constants'
 import { toast } from 'sonner'
@@ -93,6 +93,22 @@ interface ComparisonSummary {
   netSalesChange: number | null
 }
 
+interface OperationsPerformance {
+  orderVolume: number
+  preparationTime: {
+    averageMinutes: number | null
+    contributingRecords: number
+    startEvent: string
+    endEvent: string
+  }
+  serviceTime: {
+    averageMinutes: number | null
+    contributingRecords: number
+    startEvent: string
+    endEvent: string
+  }
+}
+
 interface AnalyticsPayload {
   range?: { from: string; to: string; days: number; timezone: string }
   totalRevenue: number
@@ -115,6 +131,7 @@ interface AnalyticsPayload {
   advanced?: boolean
   categoryBreakdown: CatBreak[]
   paymentMethods?: PaymentMethodSummary
+  operationsPerformance?: OperationsPerformance
   locations?: LocationOption[]
   multiLocationEnabled?: boolean
 }
@@ -2004,6 +2021,123 @@ export function AnalyticsView() {
                 </table>
               </div>
             )}
+          </div>
+        </Card>
+
+        {/* Row 7: Section 9 - Operations Performance */}
+        <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+            <div>
+              <h3 className="text-sm font-bold tracking-tight flex items-center gap-1.5">
+                <Activity className="size-4 text-emerald-500" />
+                Operations Performance
+              </h3>
+              <p className="text-[11px] text-muted-foreground">
+                Kitchen and service speed metrics · Only completed, chronological timings are included in averages
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {/* 1. Preparation Time */}
+            <div className="p-3.5 rounded-lg bg-secondary/25 border border-border/50 flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                    <Timer className="size-3.5 text-blue-500" />
+                    Preparation Time
+                  </span>
+                  <span className="text-[10px] text-muted-foreground bg-secondary px-2 py-0.5 rounded-full">
+                    Kitchen
+                  </span>
+                </div>
+                <div className="mt-2.5 flex items-baseline gap-1.5">
+                  <span className="text-2xl font-bold tabular-nums text-foreground">
+                    {loading ? '—' : analytics?.operationsPerformance?.preparationTime?.averageMinutes != null ? `${analytics.operationsPerformance.preparationTime.averageMinutes}` : '—'}
+                  </span>
+                  {analytics?.operationsPerformance?.preparationTime?.averageMinutes != null && (
+                    <span className="text-xs text-muted-foreground">mins</span>
+                  )}
+                </div>
+              </div>
+              <div className="mt-3 pt-2.5 border-t border-border/40 text-[11px] space-y-1 text-muted-foreground">
+                <div className="flex justify-between items-center">
+                  <span>Contributing records:</span>
+                  <span className="font-medium text-foreground tabular-nums">
+                    {loading ? '—' : analytics?.operationsPerformance?.preparationTime?.contributingRecords ?? 0}
+                  </span>
+                </div>
+                <div className="text-[10px] text-muted-foreground/80 leading-tight">
+                  <span className="font-medium text-muted-foreground">Start:</span> Order Placed (created_at)<br />
+                  <span className="font-medium text-muted-foreground">End:</span> Order Completed (completed_at)
+                </div>
+              </div>
+            </div>
+
+            {/* 2. Service Time */}
+            <div className="p-3.5 rounded-lg bg-secondary/25 border border-border/50 flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                    <Hourglass className="size-3.5 text-purple-500" />
+                    Service Time
+                  </span>
+                  <span className="text-[10px] text-muted-foreground bg-secondary px-2 py-0.5 rounded-full">
+                    Dine-in Sitting
+                  </span>
+                </div>
+                <div className="mt-2.5 flex items-baseline gap-1.5">
+                  <span className="text-2xl font-bold tabular-nums text-foreground">
+                    {loading ? '—' : analytics?.operationsPerformance?.serviceTime?.averageMinutes != null ? `${analytics.operationsPerformance.serviceTime.averageMinutes}` : '—'}
+                  </span>
+                  {analytics?.operationsPerformance?.serviceTime?.averageMinutes != null && (
+                    <span className="text-xs text-muted-foreground">mins</span>
+                  )}
+                </div>
+              </div>
+              <div className="mt-3 pt-2.5 border-t border-border/40 text-[11px] space-y-1 text-muted-foreground">
+                <div className="flex justify-between items-center">
+                  <span>Contributing records:</span>
+                  <span className="font-medium text-foreground tabular-nums">
+                    {loading ? '—' : analytics?.operationsPerformance?.serviceTime?.contributingRecords ?? 0}
+                  </span>
+                </div>
+                <div className="text-[10px] text-muted-foreground/80 leading-tight">
+                  <span className="font-medium text-muted-foreground">Start:</span> Table Check Opened (created_at)<br />
+                  <span className="font-medium text-muted-foreground">End:</span> Check Closed (closed_at)
+                </div>
+              </div>
+            </div>
+
+            {/* 3. Order Volume */}
+            <div className="p-3.5 rounded-lg bg-secondary/25 border border-border/50 flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                    <ClipboardList className="size-3.5 text-amber-500" />
+                    Order Volume
+                  </span>
+                  <span className="text-[10px] text-muted-foreground bg-secondary px-2 py-0.5 rounded-full">
+                    Scope Total
+                  </span>
+                </div>
+                <div className="mt-2.5 flex items-baseline gap-1.5">
+                  <span className="text-2xl font-bold tabular-nums text-foreground">
+                    {loading ? '—' : (analytics?.operationsPerformance?.orderVolume ?? analytics?.totalOrders ?? 0).toLocaleString()}
+                  </span>
+                  <span className="text-xs text-muted-foreground">orders placed</span>
+                </div>
+              </div>
+              <div className="mt-3 pt-2.5 border-t border-border/40 text-[11px] space-y-1 text-muted-foreground">
+                <div className="flex justify-between items-center">
+                  <span>Scope:</span>
+                  <span className="font-medium text-foreground">Settled in window</span>
+                </div>
+                <div className="text-[10px] text-muted-foreground/80 leading-tight">
+                  Excludes cancelled & void orders; includes all dine-in, takeaway, & delivery orders.
+                </div>
+              </div>
+            </div>
           </div>
         </Card>
       </div>

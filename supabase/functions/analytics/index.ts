@@ -471,6 +471,11 @@ serve(async (req: Request) => {
       tableId: effectiveTableId,
       tableName: resolvedTable?.name || (normalizedType === "DINE_IN" ? "Table" : normalizedType),
       settledAt: settlementTime,
+      createdAt: o.created_at ? new Date(o.created_at) : null,
+      completedAt: o.completed_at ? new Date(o.completed_at) : null,
+      paidAt: o.paid_at ? new Date(o.paid_at) : null,
+      checkOpenedAt: chk?.created_at ? new Date(chk.created_at) : null,
+      checkClosedAt: chk?.closed_at ? new Date(chk.closed_at) : null,
       checkId: o.check_id || null,
       paymentMethod: o.payment_method || null,
       items: (o.items ?? []).map((it: any) => ({
@@ -721,6 +726,63 @@ serve(async (req: Request) => {
   }
 
   /* -------------------------------------------------------------------------- */
+  /* Section 9: Operations Performance (Preparation, Service, and Volume)       */
+  /* -------------------------------------------------------------------------- */
+  // 1. Preparation Time: measured from order placement (created_at) to completion (completed_at)
+  // Only orders with valid, chronological timestamps are included.
+  const validPrepMinutes: number[] = [];
+  // 2. Service Time: measured from initial sitting / check creation to final settlement/closure
+  // Only closed checks with valid, chronological timestamps are included.
+  const validServiceMinutes: number[] = [];
+  const processedServiceChecks = new Set<string>();
+
+  for (const o of qualifyingOrders) {
+    if (o.createdAt && o.completedAt) {
+      const diffMs = o.completedAt.getTime() - o.createdAt.getTime();
+      // Exclude negative or corrupt (> 24 hours) timing
+      if (diffMs >= 0 && diffMs <= 24 * 60 * 60 * 1000) {
+        validPrepMinutes.push(Math.round(diffMs / 60000));
+      }
+    }
+
+    if (o.checkId && !processedServiceChecks.has(o.checkId)) {
+      processedServiceChecks.add(o.checkId);
+      const chk = mainCheckMap.get(o.checkId);
+      const openTime = chk?.created_at ? new Date(chk.created_at) : null;
+      const closeTime = chk?.closed_at ? new Date(chk.closed_at) : (chk?.invoice_date ? new Date(chk.invoice_date) : null);
+      if (openTime && closeTime) {
+        const svcMs = closeTime.getTime() - openTime.getTime();
+        if (svcMs >= 0 && svcMs <= 24 * 60 * 60 * 1000) {
+          validServiceMinutes.push(Math.round(svcMs / 60000));
+        }
+      }
+    }
+  }
+
+  const avgPrepTimeMinutes = validPrepMinutes.length > 0
+    ? +(validPrepMinutes.reduce((s, v) => s + v, 0) / validPrepMinutes.length).toFixed(1)
+    : null;
+  const avgServiceTimeMinutes = validServiceMinutes.length > 0
+    ? +(validServiceMinutes.reduce((s, v) => s + v, 0) / validServiceMinutes.length).toFixed(1)
+    : null;
+
+  const operationsPerformance = {
+    orderVolume: qualifyingOrders.length,
+    preparationTime: {
+      averageMinutes: avgPrepTimeMinutes,
+      contributingRecords: validPrepMinutes.length,
+      startEvent: "Order Placed (created_at)",
+      endEvent: "Order Completed (completed_at)",
+    },
+    serviceTime: {
+      averageMinutes: avgServiceTimeMinutes,
+      contributingRecords: validServiceMinutes.length,
+      startEvent: "Table Check Opened (created_at)",
+      endEvent: "Check Finalized & Closed (closed_at)",
+    },
+  };
+
+  /* -------------------------------------------------------------------------- */
   /* Independent Today & Yesterday Queries (Run through identical reconciliation)*/
   /* -------------------------------------------------------------------------- */
   const todayStart = zonedStart(todayStr, timeZone);
@@ -923,6 +985,7 @@ serve(async (req: Request) => {
     topTables: isAdvanced ? topTables : [],
     hourly: isAdvanced ? hourly : [],
     hourlyBreakdown: isAdvanced ? hourlyBreakdown : [],
+    operationsPerformance,
     paymentMethods: {
       cash: { amount: +cashAmount.toFixed(2), count: cashCount, refunds: +cashRefunds.toFixed(2), net: cashNet },
       upi: { amount: +upiAmount.toFixed(2), count: upiCount, refunds: +upiRefunds.toFixed(2), net: upiNet },
