@@ -2628,14 +2628,25 @@ function Figure({ icon: Icon, label, amount, currencySymbol, tone }: {
   )
 }
 
-function DishThumb({ src }: { src?: string }) {
+function DishThumb({ src, className }: { src?: string; className?: string }) {
   const [failedSrc, setFailedSrc] = useState<string>()
   return (
-    <span className="relative grid size-11 sm:size-12 shrink-0 place-items-center overflow-hidden rounded-xl bg-orange-50/70 text-muted-foreground border border-neutral-200/70 dark:border-border/60 dark:bg-secondary/60 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-      <Utensils aria-hidden className="size-4 text-orange-400/80" />
+    <span
+      className={cn(
+        'relative grid size-9 sm:size-10 shrink-0 place-items-center overflow-hidden rounded-xl bg-orange-50/70 text-muted-foreground border border-neutral-200/70 dark:border-border/60 dark:bg-secondary/60 shadow-[0_1px_2px_rgba(0,0,0,0.04)]',
+        className,
+      )}
+    >
+      <Utensils aria-hidden className="size-3.5 text-orange-400/80" />
       {src && failedSrc !== src && (
         // Menu image URLs are already supplied by the existing menu data.
-        <img src={src} alt="" loading="lazy" onError={() => setFailedSrc(src)} className="absolute inset-0 size-full object-cover" />
+        <img
+          src={src}
+          alt=""
+          loading="lazy"
+          onError={() => setFailedSrc(src)}
+          className="absolute inset-0 size-full object-cover"
+        />
       )}
     </span>
   )
@@ -2691,28 +2702,31 @@ function OrderRow({
             : 'rounded-[16px] bg-transparent hover:bg-orange-50/20 dark:hover:bg-white/[0.02]',
         )}
       >
-        <span className="flex min-h-9 items-center gap-1.5 sm:gap-2">
-          <span
-            aria-hidden
-            className="h-4 sm:h-4.5 w-1 rounded-full bg-orange-500 shrink-0"
-          />
-          <span className="shrink-0 text-sm sm:text-[15px] font-bold tabular-nums text-foreground tracking-tight">
-            #{order.orderNumber}
+        <span className="flex min-h-9 flex-wrap items-center justify-between gap-x-1.5 gap-y-1 py-0.5">
+          <span className="flex min-w-0 items-center gap-1.5 sm:gap-2">
+            <span
+              aria-hidden
+              className="h-4 sm:h-4.5 w-1 rounded-full bg-orange-500 shrink-0"
+            />
+            <span className="shrink-0 text-sm sm:text-[15px] font-bold tabular-nums text-foreground tracking-tight">
+              #{order.orderNumber}
+            </span>
+            <span aria-hidden className="shrink-0 text-neutral-300 dark:text-neutral-600 text-xs select-none">
+              |
+            </span>
+            <time
+              dateTime={order.createdAt}
+              title={orderWhen(order.createdAt, { timeZone, now })}
+              className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground font-medium"
+            >
+              <Clock aria-hidden className="size-3.5 text-muted-foreground/70 shrink-0" />
+              <span className="truncate">{formatOrderRelativeTime(order.createdAt, timeZone, now)}</span>
+            </time>
           </span>
-          <span aria-hidden className="shrink-0 text-neutral-300 dark:text-neutral-600 text-xs select-none">
-            |
-          </span>
-          <time
-            dateTime={order.createdAt}
-            title={orderWhen(order.createdAt, { timeZone, now })}
-            className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground font-medium"
-          >
-            <Clock aria-hidden className="size-3.5 text-muted-foreground/70 shrink-0" />
-            <span>{formatOrderRelativeTime(order.createdAt, timeZone, now)}</span>
-          </time>
+
           <span
             className={cn(
-              'ml-auto flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-semibold border transition-colors',
+              'ml-auto flex max-w-full shrink-0 items-center gap-1 sm:gap-1.5 rounded-full px-2 sm:px-2.5 py-0.5 text-xs font-semibold border transition-colors',
               order.status === 'PREPARING'
                 ? 'bg-blue-50 text-blue-700 border-blue-200/70 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-900/50'
                 : ['PENDING', 'PENDING_ACTIVATION'].includes(order.status)
@@ -2723,7 +2737,7 @@ function OrderRow({
             )}
           >
             <StatusIcon aria-hidden className="size-3.5 shrink-0" />
-            <span>{statusLabel}</span>
+            <span className="truncate">{statusLabel}</span>
             <ChevronRight
               aria-hidden
               className={cn(
@@ -2745,15 +2759,35 @@ function OrderRow({
           <span className="min-h-0 overflow-hidden">
             {order.items.length > 0 && (
               <span className="flex min-w-0 items-center gap-1.5 sm:gap-2 pt-2 pb-0.5 pl-0.5">
-                {order.items.slice(0, 3).map((item) => (
-                  <DishThumb key={item.id} src={dishImages[item.menuItemId]} />
-                ))}
-                {order.items.length > 3 && (
-                  <span className="grid size-11 sm:size-12 shrink-0 place-items-center rounded-xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs sm:text-[13px] font-bold text-orange-600 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-                    +{order.items.length - 3}
-                  </span>
+                {/* 1st thumbnail: always visible */}
+                <DishThumb src={dishImages[order.items[0]?.menuItemId]} />
+
+                {/* 2nd thumbnail: visible if >= 2 items */}
+                {order.items.length >= 2 && (
+                  <DishThumb src={dishImages[order.items[1]?.menuItemId]} />
                 )}
-                <span className="min-w-0 flex-1 pl-1 sm:pl-2">
+
+                {/* 3rd thumbnail: visible on wider screens (>= 400px) if >= 3 items */}
+                {order.items.length >= 3 && (
+                  <DishThumb
+                    className="hidden min-[400px]:grid"
+                    src={dishImages[order.items[2]?.menuItemId]}
+                  />
+                )}
+
+                {/* +N badge when items exceed what's visible */}
+                {order.items.length > 3 ? (
+                  <span className="grid size-9 sm:size-10 shrink-0 place-items-center rounded-xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs sm:text-[13px] font-bold text-orange-600 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+                    <span className="min-[400px]:hidden">+{order.items.length - 2}</span>
+                    <span className="hidden min-[400px]:inline">+{order.items.length - 3}</span>
+                  </span>
+                ) : order.items.length === 3 ? (
+                  <span className="min-[400px]:hidden grid size-9 sm:size-10 shrink-0 place-items-center rounded-xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs font-bold text-orange-600 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+                    +1
+                  </span>
+                ) : null}
+
+                <span className="min-w-0 flex-1 pl-1 sm:pl-1.5">
                   <span className="line-clamp-2 text-xs sm:text-[12.5px] leading-snug font-medium text-foreground/80">
                     {previewNames}
                   </span>
@@ -2782,7 +2816,7 @@ function OrderRow({
                     key={item.id}
                     className="grid grid-cols-[auto_minmax(0,1fr)_auto_minmax(3.5rem,auto)] items-center gap-2 sm:gap-2.5 py-2 pl-0.5 text-xs sm:text-[13px]"
                   >
-                    <DishThumb src={dishImages[item.menuItemId]} />
+                    <DishThumb className="size-8.5 sm:size-9" src={dishImages[item.menuItemId]} />
                     <div className="min-w-0 [overflow-wrap:anywhere]">
                       <p className="font-bold text-xs sm:text-[13.5px] text-foreground leading-tight">
                         {item.name}
