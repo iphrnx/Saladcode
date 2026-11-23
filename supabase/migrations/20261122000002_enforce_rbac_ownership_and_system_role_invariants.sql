@@ -34,6 +34,11 @@ begin
 end;
 $$;
 
+-- Restrict direct execution of lock_tenant_for_owner_change and tenant_owner_guard from PUBLIC, anon, and authenticated.
+-- The function runs with SECURITY DEFINER and is executed internally by the check_last_active_owner trigger.
+revoke all on function public.lock_tenant_for_owner_change(uuid) from public, anon, authenticated;
+revoke all on table public.tenant_owner_guard from public, anon, authenticated;
+
 create or replace function public.check_last_active_owner()
 returns trigger
 language plpgsql

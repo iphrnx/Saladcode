@@ -164,6 +164,164 @@ async function runTests() {
   check("Retry succeeds: dialog closes and switches tab to staff", sm2.unsavedTarget === null && sm2.activeTab === "staff");
   check("Retry succeeds: saveSwitchError cleared", sm2.saveSwitchError === null);
 
+  // 7. Role Creation onCreated Unsaved Edits Flow
+  console.log("\n── Role Creation onCreated Unsaved Edits Flow ──");
+  const sm3 = new RolesNavigationStateMachine();
+  sm3.selectedId = "role-1";
+  sm3.isDetailDirty = false;
+
+  // Clean editor role creation
+  const handleRoleCreated = async (newRole: { id: string; name: string }) => {
+    // In RolesView: onCreated calls await refresh() then handleSelectRole(newRole.id)
+    sm3.handleSelectRole(newRole.id);
+  };
+
+  await handleRoleCreated({ id: "role-new-1", name: "Sommelier" });
+  check("Clean editor onCreated: selects new role immediately", sm3.selectedId === "role-new-1" && sm3.unsavedTarget === null);
+
+  // Dirty editor role creation
+  sm3.selectedId = "role-1";
+  sm3.isDetailDirty = true;
+  await handleRoleCreated({ id: "role-new-2", name: "Barista" });
+  check("Dirty editor onCreated: does NOT change selectedId directly", sm3.selectedId === "role-1");
+  check("Dirty editor onCreated: triggers unsaved changes dialog with new role target", sm3.unsavedTarget?.type === "role" && sm3.unsavedTarget.id === "role-new-2");
+
+  // User chooses Stay on Role
+  sm3.handleDismissDialog(false);
+  check("Dirty editor onCreated -> Stay: preserves current selection and draft", sm3.selectedId === "role-1" && sm3.unsavedTarget === null && sm3.isDetailDirty === true);
+
+  // Re-trigger dirty creation switch
+  await handleRoleCreated({ id: "role-new-2", name: "Barista" });
+
+  // Save fails on Save & Switch
+  sm3.saveFn = async () => false;
+  const saveFailed = await sm3.handleConfirmSaveSwitch();
+  check("Dirty editor onCreated -> Save & Switch fails: returns false", saveFailed === false);
+  check("Dirty editor onCreated -> Save & Switch fails: preserves current selection", sm3.selectedId === "role-1");
+  check("Dirty editor onCreated -> Save & Switch fails: dialog stays open for retry", sm3.unsavedTarget?.type === "role" && sm3.unsavedTarget.id === "role-new-2");
+  check("Dirty editor onCreated -> Save & Switch fails: error message displayed", sm3.saveSwitchError !== null);
+
+  // Save succeeds on retry
+  sm3.saveFn = async () => {
+    sm3.isDetailDirty = false;
+    return true;
+  };
+  const saveRetry = await sm3.handleConfirmSaveSwitch();
+  check("Dirty editor onCreated -> Save retry succeeds: returns true", saveRetry === true);
+  check("Dirty editor onCreated -> Save retry succeeds: dialog closed", sm3.unsavedTarget === null);
+  check("Dirty editor onCreated -> Save retry succeeds: switched to new role", sm3.selectedId === "role-new-2");
+
+  // 8. Bulk Permission Editing Editability & State Tests
+  console.log("\n── Bulk Permission Editing with Role Manager ──");
+  const PERMISSION_IMPLICATIONS: Record<string, string> = {
+    "orders.create": "orders.view",
+    "orders.edit": "orders.view",
+    "orders.cancel": "orders.view",
+    "orders.complete": "orders.view",
+    "orders.prepare": "orders.view",
+    "orders.ready": "orders.view",
+    "orders.serve": "orders.view",
+    "orders.discount": "orders.view",
+    "payments.refund": "payments.collect",
+    "table-sessions.manage": "tables.view",
+    "menu.manage": "menu.view",
+    "tables.manage": "tables.view",
+    "promos.manage": "promos.view",
+    "settings.manage": "settings.view",
+    "security.manage": "security.view",
+  };
+
+  const expandPermissions = (perms: readonly string[]) => {
+    const out = new Set<string>();
+    for (const p of perms) {
+      out.add(p);
+      const implied = PERMISSION_IMPLICATIONS[p];
+      if (implied) out.add(implied);
+    }
+    return [...out];
+  };
+
+  // Scenario: Role manager can grant only some permissions in Orders group
+  const managerGrantableKeys = ["orders.view", "orders.prepare", "orders.ready", "orders.serve"];
+  const ordersGroupPerms = [
+    "orders.view", "orders.create", "orders.edit", "orders.cancel",
+    "orders.complete", "orders.prepare", "orders.ready", "orders.serve", "orders.discount"
+  ];
+
+  let permState: string[] = [];
+  const viewerCanGrant = (perm: string) => managerGrantableKeys.includes(perm);
+
+  const isPermEditable = (perm: string, currentPerms: string[]) => {
+    if (!viewerCanGrant(perm)) return false;
+    const lockedByUngrantable = currentPerms.some(
+      (k) => PERMISSION_IMPLICATIONS[k] === perm && !viewerCanGrant(k)
+    );
+    if (lockedByUngrantable) return false;
+    return true;
+  };
+
+  const getBulkState = (groupPerms: string[], currentPerms: string[]) => {
+    const effective = expandPermissions(currentPerms);
+    const editablePerms = groupPerms.filter((p) => isPermEditable(p, currentPerms));
+    const hasEditable = editablePerms.length > 0;
+    const allEditableOn = hasEditable && editablePerms.every((p) => effective.includes(p));
+    return { editablePerms, hasEditable, allEditableOn, label: allEditableOn ? "Clear" : "Select all" };
+  };
+
+  const toggleGroup = (groupPerms: string[], on: boolean, currentPerms: string[]) => {
+    const editableInGroup = groupPerms.filter((p) => isPermEditable(p, currentPerms));
+    if (editableInGroup.length === 0) return currentPerms;
+    if (on) {
+      return Array.from(new Set([...currentPerms, ...editableInGroup]));
+    } else {
+      return currentPerms.filter((p) => !editableInGroup.includes(p));
+    }
+  };
+
+  // Initial state: empty custom role
+  let bulkState = getBulkState(ordersGroupPerms, permState);
+  check("Manager can edit only their 4 grantable permissions in Orders (4/9)", bulkState.editablePerms.length === 4);
+  check("Initial bulk button state calculates to 'Select all'", bulkState.label === "Select all" && bulkState.allEditableOn === false);
+
+  // Click Select All
+  permState = toggleGroup(ordersGroupPerms, true, permState);
+  check("Select All grants ONLY the 4 grantable permissions", permState.length === 4 && permState.every(p => managerGrantableKeys.includes(p)));
+  check("Select All does NOT grant unheld orders.create, edit, cancel, complete, discount", !permState.includes("orders.cancel") && !permState.includes("orders.create"));
+
+  // Check state after Select All
+  bulkState = getBulkState(ordersGroupPerms, permState);
+  check("Bulk button state calculates to 'Clear' after Select All", bulkState.label === "Clear" && bulkState.allEditableOn === true);
+
+  // Click Clear
+  permState = toggleGroup(ordersGroupPerms, false, permState);
+  check("Clear removes all editable permissions", permState.length === 0);
+  bulkState = getBulkState(ordersGroupPerms, permState);
+  check("Bulk button state flips back to 'Select all' after Clear", bulkState.label === "Select all" && bulkState.allEditableOn === false);
+
+  // Scenario: Role already contains locked permissions (orders.cancel set by Owner)
+  permState = ["orders.cancel", "orders.prepare"];
+  bulkState = getBulkState(ordersGroupPerms, permState);
+  // orders.cancel implies orders.view and is ungrantable by manager, so orders.view is locked by ungrantable implication
+  check("orders.view is locked when ungrantable orders.cancel is present", !isPermEditable("orders.view", permState));
+  check("orders.prepare and orders.ready remain editable", isPermEditable("orders.prepare", permState) && isPermEditable("orders.ready", permState));
+
+  // Select all preserves locked orders.cancel
+  permState = toggleGroup(ordersGroupPerms, true, permState);
+  check("Select all preserves locked orders.cancel in permState", permState.includes("orders.cancel"));
+  check("Select all enabled orders.ready and orders.serve", permState.includes("orders.ready") && permState.includes("orders.serve"));
+
+  // Clear preserves locked orders.cancel and respects implication of orders.view
+  permState = toggleGroup(ordersGroupPerms, false, permState);
+  check("Clear preserves locked orders.cancel in permState", permState.includes("orders.cancel"));
+  check("Clear removed editable orders.prepare, orders.ready, orders.serve", !permState.includes("orders.prepare") && !permState.includes("orders.ready") && !permState.includes("orders.serve"));
+  const effectiveAfterClear = expandPermissions(permState);
+  check("effectivePerms still holds orders.view because locked orders.cancel implies it", effectiveAfterClear.includes("orders.view"));
+
+  // Scenario: Manager holds 0 permissions in Settings group
+  const settingsGroupPerms = ["settings.view", "settings.manage"];
+  const settingsBulk = getBulkState(settingsGroupPerms, permState);
+  check("Manager holds 0 permissions in Settings -> hasEditable is false (button disabled)", settingsBulk.hasEditable === false && settingsBulk.editablePerms.length === 0);
+
   console.log("\n========================================================");
   console.log(`  Results: ${pass}/${pass + fail} checks passed${fail ? ` — ${fail} FAILED` : ""}`);
   console.log("========================================================\n");

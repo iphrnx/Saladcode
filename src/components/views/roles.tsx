@@ -506,10 +506,10 @@ export function RolesView() {
         initialData={duplicateRoleData}
         headers={headers}
         handleAction={handleAction}
-        onCreated={(newRole) => {
-          setSelectedId(newRole.id)
+        onCreated={async (newRole) => {
           setDuplicateRoleData(null)
-          refresh()
+          await refresh()
+          handleSelectRole(newRole.id)
         }}
       />
 
@@ -701,7 +701,9 @@ function RoleDetail({
   const reserved = name !== role.name ? reservedRoleName(name) : null
   const viewerCanGrant = (perm: string) => grantableKeys.includes(perm)
   const impliedByManage = (perm: string) =>
-    Object.entries(PERMISSION_IMPLICATIONS).find(([, v]) => v === perm)?.[0] ?? null
+    Object.entries(PERMISSION_IMPLICATIONS).find(([k, v]) => v === perm && permState.includes(k))?.[0] ??
+    Object.entries(PERMISSION_IMPLICATIONS).find(([, v]) => v === perm)?.[0] ??
+    null
 
   // Re-sync when role changes from parent
   useEffect(() => {
@@ -756,18 +758,46 @@ function RoleDetail({
     onDirtyChange?.(dirty, saveRole, discardChanges)
   }, [dirty, saveRole, discardChanges, onDirtyChange])
 
+  const isPermEditable = useCallback(
+    (perm: string) => {
+      if (isSystem || !canManageRoles) return false
+      if (!viewerCanGrant(perm)) return false
+      // If this permission is implied by an ungrantable key currently in permState,
+      // that key cannot be removed by the current viewer, so this perm is permanently locked on.
+      const lockedByUngrantable = permState.some(
+        (k) => PERMISSION_IMPLICATIONS[k] === perm && !viewerCanGrant(k)
+      )
+      if (lockedByUngrantable) return false
+      return true
+    },
+    [isSystem, canManageRoles, viewerCanGrant, permState]
+  )
+
   const togglePerm = (key: string) => {
     if (isSystem || !canManageRoles) return
     setPermState((prev) => (prev.includes(key) ? prev.filter((p) => p !== key) : [...prev, key]))
   }
 
-  const toggleGroup = (groupPerms: readonly string[], on: boolean) => {
+  const toggleGroup = useCallback((groupPerms: readonly string[], on: boolean) => {
     if (isSystem || !canManageRoles) return
     setPermState((prev) => {
-      if (on) return Array.from(new Set([...prev, ...groupPerms]))
-      return prev.filter((p) => !groupPerms.includes(p))
+      const editableInGroup = groupPerms.filter((perm) => {
+        if (!viewerCanGrant(perm)) return false
+        const lockedByUngrantable = prev.some(
+          (k) => PERMISSION_IMPLICATIONS[k] === perm && !viewerCanGrant(k)
+        )
+        return !lockedByUngrantable
+      })
+
+      if (editableInGroup.length === 0) return prev
+
+      if (on) {
+        return Array.from(new Set([...prev, ...editableInGroup]))
+      } else {
+        return prev.filter((p) => !editableInGroup.includes(p))
+      }
     })
-  }
+  }, [isSystem, canManageRoles, viewerCanGrant])
 
   const removeRole = async () => {
     if (deleteConfirm !== role.name) {
@@ -924,6 +954,10 @@ function RoleDetail({
                 const allOn = enabledCount === group.perms.length
                 const isOpen = openGroups[group.label] ?? false
 
+                const editablePerms = group.perms.filter(isPermEditable)
+                const hasEditable = editablePerms.length > 0
+                const allEditableOn = hasEditable && editablePerms.every((p) => effectivePerms.includes(p))
+
                 return (
                   <Collapsible
                     key={group.label}
@@ -950,10 +984,11 @@ function RoleDetail({
                           type="button"
                           variant="ghost"
                           size="sm"
-                          onClick={() => toggleGroup(group.perms, !allOn)}
-                          className="text-xs h-7 px-2 text-primary hover:text-primary hover:bg-primary/10"
+                          disabled={!hasEditable}
+                          onClick={() => toggleGroup(group.perms, !allEditableOn)}
+                          className="text-xs h-7 px-2 text-primary hover:text-primary hover:bg-primary/10 disabled:opacity-40"
                         >
-                          {allOn ? 'Clear' : 'Select all'}
+                          {allEditableOn ? 'Clear' : 'Select all'}
                         </Button>
                       )}
                     </div>

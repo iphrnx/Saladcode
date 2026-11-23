@@ -260,6 +260,14 @@ if (fs.existsSync(migrationPath)) {
   check('migration safely accommodates purge_tenant() with app.purging_tenant setting',
     migrationContent.includes("app.purging_tenant")
   );
+
+  check('migration revokes direct execution of lock_tenant_for_owner_change and tenant_owner_guard from public, anon, and authenticated',
+    migrationContent.includes("revoke all on function public.lock_tenant_for_owner_change(uuid) from public, anon, authenticated") &&
+    migrationContent.includes("revoke all on table public.tenant_owner_guard from public, anon, authenticated")
+  );
+
+  const followUpMigrationPath = path.resolve('supabase/migrations/20261123000001_restrict_owner_guard_helper.sql');
+  check('follow-up migration 20261123000001 exists for applied instances', fs.existsSync(followUpMigrationPath));
 }
 
 // ---------------------------------------------------------------------------

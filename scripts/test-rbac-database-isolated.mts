@@ -157,6 +157,9 @@ async function runSuite() {
       create table if not exists public.settings (id uuid primary key default gen_random_uuid(), tenant_id uuid);
       create table if not exists public.security_logs (id uuid primary key default gen_random_uuid(), tenant_id uuid);
       create table if not exists public.tenant_realtime (id uuid primary key default gen_random_uuid(), tenant_id uuid);
+
+      do $$ begin create role anon nologin; exception when duplicate_object then null; end $$;
+      do $$ begin create role authenticated nologin; exception when duplicate_object then null; end $$;
     `);
     check("Base schema created successfully", true);
 
@@ -169,6 +172,38 @@ async function runSuite() {
     const migrationSql = fs.readFileSync(migrationPath, "utf-8");
     await client1.query(migrationSql);
     check("Migration 20261122000002 applied with 0 errors", true);
+
+    // 2.1 Verify Restricted Privileges
+    console.log("\n── 2.1 Verifying Effective Privileges ──");
+    const followUpPath = path.resolve(
+      process.cwd(),
+      "supabase/migrations/20261123000001_restrict_owner_guard_helper.sql"
+    );
+    if (fs.existsSync(followUpPath)) {
+      const followUpSql = fs.readFileSync(followUpPath, "utf-8");
+      await client1.query(followUpSql);
+      check("Follow-up migration 20261123000001 applied with 0 errors", true);
+    }
+
+    const anonExecRes = await client1.query<{ has_priv: boolean }>(
+      `select has_function_privilege('anon', 'public.lock_tenant_for_owner_change(uuid)', 'execute') as has_priv;`
+    );
+    check("anon role cannot execute public.lock_tenant_for_owner_change", anonExecRes.rows[0].has_priv === false);
+
+    const authExecRes = await client1.query<{ has_priv: boolean }>(
+      `select has_function_privilege('authenticated', 'public.lock_tenant_for_owner_change(uuid)', 'execute') as has_priv;`
+    );
+    check("authenticated role cannot execute public.lock_tenant_for_owner_change", authExecRes.rows[0].has_priv === false);
+
+    const anonTableRes = await client1.query<{ has_priv: boolean }>(
+      `select has_table_privilege('anon', 'public.tenant_owner_guard', 'select') as has_priv;`
+    );
+    check("anon role cannot select public.tenant_owner_guard", anonTableRes.rows[0].has_priv === false);
+
+    const authTableRes = await client1.query<{ has_priv: boolean }>(
+      `select has_table_privilege('authenticated', 'public.tenant_owner_guard', 'select') as has_priv;`
+    );
+    check("authenticated role cannot select public.tenant_owner_guard", authTableRes.rows[0].has_priv === false);
 
     // 3. Test Last Active Owner Invariants
     console.log("\n── 3. Testing Last Active Owner Invariants ──");
