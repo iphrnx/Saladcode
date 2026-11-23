@@ -190,7 +190,7 @@ serve(async (req: Request) => {
     checkId: string | null;
     orderId: string | null;
     amount: number;
-    timestamp: Date;
+    timestamp: Date | null;
     method: "CASH" | "UPI" | "CARD" | "OTHER" | null;
     locationId: string | null;
   }
@@ -198,7 +198,13 @@ serve(async (req: Request) => {
   async function getReconciledEventsForWindow(
     winStart: Date,
     winEnd: Date
-  ): Promise<{ events: ReconciledEvent[]; checkMap: Map<string, any>; orders: any[]; refunds: ReconciledRefund[] }> {
+  ): Promise<{
+    events: ReconciledEvent[];
+    checkMap: Map<string, any>;
+    orders: any[];
+    refunds: ReconciledRefund[];
+    unknownDateRefunds: ReconciledRefund[];
+  }> {
     // A. Query payments recorded in or near the window (both succeeded and voided)
     const payments = await fetchAllPages<any>(async (from, to) => {
       return await db
@@ -216,11 +222,9 @@ serve(async (req: Request) => {
     const voidPayments = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("check_payments")
-        .select("id, check_id, amount, method, status, staff_id, location_id, created_at")
+        .select("id, check_id, amount, method, status, staff_id, location_id, created_at, voided_at")
         .eq("tenant_id", tenantId)
         .eq("status", "VOID")
-        .gte("created_at", winStart.toISOString())
-        .lt("created_at", winEnd.toISOString())
         .order("created_at", { ascending: true })
         .order("id", { ascending: true })
         .range(from, to);
@@ -423,58 +427,107 @@ serve(async (req: Request) => {
       (e) => e.settledAt >= winStart && e.settledAt < winEnd
     );
 
-    // D. Query refunds in the window from authoritative ledger voids and legacy refunded orders
+    // D. Query refunds across authoritative ledger voids and legacy refunded orders
     const orderRefunds = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("orders")
-        .select("id, check_id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at")
+        .select("id, check_id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at, refunded_at")
         .eq("tenant_id", tenantId)
         .in("payment_status", ["REFUNDED", "refunded"])
-        .gte("updated_at", winStart.toISOString())
-        .lt("updated_at", winEnd.toISOString())
-        .order("updated_at", { ascending: true })
+        .order("created_at", { ascending: true })
         .order("id", { ascending: true })
         .range(from, to);
     });
 
-    const voidCheckIds = new Set<string>();
-    const reconciledRefunds: ReconciledRefund[] = [];
+    // If any voided payments lack voided_at, check security_logs for verified reversal event
+    const unverifiedVoidPayments = voidPayments.filter((p) => !p.voided_at);
+    const auditVoidMap = new Map<string, Date>();
+    if (unverifiedVoidPayments.length > 0) {
+      try {
+        const logs = await fetchAllPages<any>(async (from, to) => {
+          return await db
+            .from("security_logs")
+            .select("meta, created_at")
+            .eq("tenant_id", tenantId)
+            .eq("action", "CHECK_PAYMENT_REVERSED")
+            .order("created_at", { ascending: true })
+            .range(from, to);
+        });
+        for (const log of logs) {
+          for (const p of unverifiedVoidPayments) {
+            if (log.meta && String(log.meta).includes(p.id) && !auditVoidMap.has(p.id)) {
+              auditVoidMap.set(p.id, new Date(log.created_at));
+            }
+          }
+        }
+      } catch {
+        // Fallback gracefully if security_logs table is unreadable
+      }
+    }
+
+    // Deduplicate only records proven to represent the same reversal, using stable identifiers BEFORE applying date filters.
+    // Preserve distinct refunds on the same check!
+    const ledgerVoidCheckIds = new Set<string>();
+    for (const p of voidPayments) {
+      if (p.check_id) ledgerVoidCheckIds.add(p.check_id);
+    }
+
+    const seenReversalIds = new Set<string>();
+    const candidateRefunds: ReconciledRefund[] = [];
 
     // 1. Authoritative check payment voids from ledger
     for (const p of voidPayments) {
       const amt = Number(p.amount || 0);
       if (amt <= 0) continue;
+      if (seenReversalIds.has(p.id)) continue;
+      seenReversalIds.add(p.id);
+
       const chk = localCheckMap.get(p.check_id);
       const locId = p.location_id || chk?.location_id || (chk?.table_id ? tableMap.get(chk.table_id)?.location_id : null) || null;
       const rawMethod = String(p.method || "").toUpperCase();
       const method: "CASH" | "UPI" | "CARD" | "OTHER" =
         rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
 
-      if (p.check_id) voidCheckIds.add(p.check_id);
+      let verifiedTime: Date | null = null;
+      if (p.voided_at) {
+        const d = new Date(p.voided_at);
+        if (!isNaN(d.getTime())) verifiedTime = d;
+      } else if (auditVoidMap.has(p.id)) {
+        verifiedTime = auditVoidMap.get(p.id)!;
+      }
+      // Never use p.created_at as the refund date!
 
-      reconciledRefunds.push({
+      candidateRefunds.push({
         id: p.id,
         source: "CHECK_PAYMENT_VOID",
         checkId: p.check_id || null,
         orderId: null,
         amount: amt,
-        timestamp: new Date(p.created_at),
+        timestamp: verifiedTime,
         method,
         locationId: locId,
       });
     }
 
-    // 2. Authoritative legacy order refunds (avoid double-counting with check payment voids)
+    // 2. Authoritative legacy order refunds (avoid double-counting with check payment voids across sources)
     for (const o of orderRefunds) {
-      if (o.check_id && voidCheckIds.has(o.check_id)) {
+      const amt = Number(o.total || 0);
+      if (amt <= 0) continue;
+      if (seenReversalIds.has(o.id)) continue;
+
+      // If this order belongs to a check with authoritative check payment voids in the ledger,
+      // the ledger is the primary source; deduplicate across sources before date filtering.
+      if (o.check_id && ledgerVoidCheckIds.has(o.check_id)) {
         continue;
       }
-      const amt = Number(o.total || 0);
-      // Avoid presenting an estimate if amount is missing or invalid
-      if (amt <= 0) continue;
+      seenReversalIds.add(o.id);
 
-      const refTime = o.updated_at ? new Date(o.updated_at) : (o.paid_at ? new Date(o.paid_at) : (o.created_at ? new Date(o.created_at) : null));
-      if (!refTime || isNaN(refTime.getTime())) continue;
+      let verifiedTime: Date | null = null;
+      if (o.refunded_at) {
+        const d = new Date(o.refunded_at);
+        if (!isNaN(d.getTime())) verifiedTime = d;
+      }
+      // Never use mutable o.updated_at or o.created_at as the refund date!
 
       const rawMethod = String(o.payment_method || "").toUpperCase();
       const method: "CASH" | "UPI" | "CARD" | "OTHER" | null =
@@ -482,26 +535,49 @@ serve(async (req: Request) => {
 
       const locId = resolveEntityLocation(o, localCheckMap);
 
-      reconciledRefunds.push({
+      candidateRefunds.push({
         id: o.id,
         source: "ORDER_REFUND",
         checkId: o.check_id || null,
         orderId: o.id,
         amount: amt,
-        timestamp: refTime,
+        timestamp: verifiedTime,
         method,
         locationId: locId,
       });
     }
 
-    return { events: windowEvents, checkMap: localCheckMap, orders: allWindowOrders, refunds: reconciledRefunds };
+    // Partition candidates into dated refunds within [winStart, winEnd) and unknown-date refunds
+    const reconciledRefunds: ReconciledRefund[] = [];
+    const unknownDateRefunds: ReconciledRefund[] = [];
+
+    for (const r of candidateRefunds) {
+      if (!r.timestamp) {
+        unknownDateRefunds.push(r);
+      } else if (r.timestamp >= winStart && r.timestamp < winEnd) {
+        reconciledRefunds.push(r);
+      }
+    }
+
+    return {
+      events: windowEvents,
+      checkMap: localCheckMap,
+      orders: allWindowOrders,
+      refunds: reconciledRefunds,
+      unknownDateRefunds,
+    };
   }
 
   /* -------------------------------------------------------------------------- */
   /* Reconcile Main Reporting Window                                            */
   /* -------------------------------------------------------------------------- */
-  const { events: mainEvents, checkMap: mainCheckMap, orders: mainOrders, refunds: mainRefunds } =
-    await getReconciledEventsForWindow(rangeStart, rangeEnd);
+  const {
+    events: mainEvents,
+    checkMap: mainCheckMap,
+    orders: mainOrders,
+    refunds: mainRefunds,
+    unknownDateRefunds: mainUnknownDateRefunds,
+  } = await getReconciledEventsForWindow(rangeStart, rangeEnd);
 
   // Apply location filter uniformly
   const filteredEvents = mainEvents.filter((e) => {
@@ -600,7 +676,12 @@ serve(async (req: Request) => {
     return r.locationId === selectedLocationId;
   });
 
-  // Attribution of refunds across methods
+  const filteredUnknownDateRefunds = (mainUnknownDateRefunds ?? []).filter((r) => {
+    if (!selectedLocationId) return true;
+    return r.locationId === selectedLocationId;
+  });
+
+  // Attribution of dated refunds across methods
   let cashRefunds = 0, upiRefunds = 0, cardRefunds = 0, otherRefunds = 0, unattributedRefunds = 0;
   let cashRefundCount = 0, upiRefundCount = 0, cardRefundCount = 0, otherRefundCount = 0, unattributedRefundCount = 0;
   for (const r of filteredRefunds) {
@@ -636,6 +717,20 @@ serve(async (req: Request) => {
   const totalRefundAmount = +(cashRefunds + upiRefunds + cardRefunds + otherRefunds + unattributedRefunds).toFixed(2);
   const paymentBreakdownTotal = +(cashAmount + upiAmount + cardAmount + otherAmount).toFixed(2);
   const totalNetAmount = +(paymentBreakdownTotal - totalRefundAmount).toFixed(2);
+
+  // Surface unknown-date reversals separately (excluded from dated totals)
+  let unknownDateRefundAmount = 0;
+  let unknownDateRefundCount = 0;
+  for (const r of filteredUnknownDateRefunds) {
+    unknownDateRefundAmount += r.amount;
+    unknownDateRefundCount++;
+  }
+  unknownDateRefundAmount = +unknownDateRefundAmount.toFixed(2);
+  const unknownDateRefundsInfo = unknownDateRefundCount > 0 ? {
+    amount: unknownDateRefundAmount,
+    count: unknownDateRefundCount,
+    note: "Historical reversals with unverified timestamps excluded from dated totals",
+  } : undefined;
 
   /* -------------------------------------------------------------------------- */
   /* Daily Revenue Aggregation (Asia/Kolkata timezone boundaries)               */
@@ -945,6 +1040,7 @@ serve(async (req: Request) => {
 
   // Populate daily refunds from filteredRefunds
   for (const r of filteredRefunds) {
+    if (!r.timestamp) continue;
     const dateStr = zonedDateStr(r.timestamp, timeZone);
     if (dailyRefundsMap[dateStr] !== undefined) {
       dailyRefundsMap[dateStr] += r.amount;
@@ -963,6 +1059,7 @@ serve(async (req: Request) => {
     discountedOrdersCount,
     totalRefunds: totalRefundAmount, // Reconciled with payment ledger refund calculation
     refundedTransactionsCount: filteredRefunds.length,
+    unknownDateRefunds: unknownDateRefundsInfo,
     discountsByOrderType: Object.entries(discountsByOrderType).map(([type, val]) => ({
       type,
       amount: +val.amount.toFixed(2),
@@ -1196,6 +1293,7 @@ serve(async (req: Request) => {
         amount: +unattributedRefunds.toFixed(2),
         count: unattributedRefundCount,
       } : undefined,
+      unknownDateRefunds: unknownDateRefundsInfo,
       totalCollected: paymentBreakdownTotal,
       totalRefunds: totalRefundAmount,
       totalNet: totalNetAmount,

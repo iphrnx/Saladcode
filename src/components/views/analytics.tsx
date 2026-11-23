@@ -73,6 +73,7 @@ interface PaymentMethodSummary {
   card: PaymentMethodDetail
   other?: PaymentMethodDetail
   unattributedRefunds?: { amount: number; count: number }
+  unknownDateRefunds?: { amount: number; count: number; note?: string }
   totalCollected?: number
   totalRefunds?: number
   totalNet?: number
@@ -122,6 +123,7 @@ interface DiscountsAndRefunds {
   discountedOrdersCount: number
   totalRefunds: number
   refundedTransactionsCount: number
+  unknownDateRefunds?: { amount: number; count: number; note?: string }
   discountsByOrderType: { type: string; amount: number; count: number }[]
   refundsByMethod: { method: string; amount: number; count: number }[]
   trend: DiscountsAndRefundsTrendItem[]
@@ -641,6 +643,9 @@ export function AnalyticsView() {
       }
       if (analytics.paymentMethods.unattributedRefunds && analytics.paymentMethods.unattributedRefunds.amount > 0) {
         push('Refunds (Method Unavailable)', analytics.paymentMethods.unattributedRefunds.count, money(0), money(analytics.paymentMethods.unattributedRefunds.amount), money(-analytics.paymentMethods.unattributedRefunds.amount))
+      }
+      if (analytics.paymentMethods.unknownDateRefunds && analytics.paymentMethods.unknownDateRefunds.count > 0) {
+        push('Historical Reversals (Unknown Date - Excluded from Period)', analytics.paymentMethods.unknownDateRefunds.count, money(0), money(analytics.paymentMethods.unknownDateRefunds.amount), money(-analytics.paymentMethods.unknownDateRefunds.amount))
       }
       const totalTx = analytics.paymentMethods.cash.count +
         analytics.paymentMethods.upi.count +
@@ -1970,6 +1975,14 @@ export function AnalyticsView() {
               </tfoot>
             </table>
           </div>
+          {Boolean((pm?.unknownDateRefunds?.count ?? 0) > 0) && (
+            <div className="mt-3 flex items-center justify-between text-xs px-3 py-2 rounded-md bg-secondary/30 border border-border/40 text-muted-foreground">
+              <div className="flex items-center gap-1.5">
+                <AlertCircle className="size-3.5 text-amber-500" />
+                <span>{pm?.unknownDateRefunds?.count} historical reversals ({sym}{(pm?.unknownDateRefunds?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) with unverified dates excluded from dated totals.</span>
+              </div>
+            </div>
+          )}
         </Card>
 
         {/* Row 6: Section 8 - Top Tables */}
@@ -2261,6 +2274,12 @@ export function AnalyticsView() {
                   ))}
                   {(analytics?.discountsAndRefunds?.refundsByMethod ?? []).length === 0 && (
                     <div className="text-xs text-muted-foreground/60 py-2 text-center">No refunds recorded in this period</div>
+                  )}
+                  {Boolean((analytics?.discountsAndRefunds?.unknownDateRefunds?.count ?? 0) > 0) && (
+                    <div className="mt-2 text-[11px] text-amber-500/90 flex items-center gap-1.5 pt-1 border-t border-border/30">
+                      <AlertCircle className="size-3" />
+                      <span>{analytics?.discountsAndRefunds?.unknownDateRefunds?.count} historical reversals ({sym}{(analytics?.discountsAndRefunds?.unknownDateRefunds?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) with unverified dates excluded from period totals.</span>
+                    </div>
                   )}
                 </div>
               </div>
