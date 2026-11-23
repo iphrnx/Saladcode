@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, Line,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LabelList,
@@ -192,18 +192,19 @@ function ChartTooltip({ active, payload, label, currencySymbol = '₹' }: any) {
   )
 }
 
-function RevenueTrendTooltip({ active, payload, label, currencySymbol = '₹', compDateLabel }: any) {
+function RevenueTrendTooltip({ active, payload, label, currencySymbol = '₹', compDateLabel, isComparisonEnabled = true }: any) {
   if (!active || !payload || !payload.length) return null
   const currentItem = payload.find((p: any) => p.dataKey === 'currentRevenue' || p.dataKey === 'revenue')
-  const prevItem = payload.find((p: any) => p.dataKey === 'prevRevenue')
+  const prevItem = isComparisonEnabled ? payload.find((p: any) => p.dataKey === 'prevRevenue') : null
   const curVal = Number(currentItem?.value ?? 0)
   const prevVal = prevItem ? Number(prevItem.value ?? 0) : null
   const curOrders = currentItem?.payload?.currentOrders
   const prevOrders = prevItem?.payload?.prevOrders
   const periodText = currentItem?.payload?.period || label
+  const priorLabel = prevItem?.payload?.prevDate || prevItem?.payload?.prevPeriod || (compDateLabel ? compDateLabel : null)
 
   let pctChange: number | null = null
-  if (prevVal !== null && prevVal !== undefined) {
+  if (isComparisonEnabled && prevVal !== null && prevVal !== undefined) {
     if (prevVal > 0) {
       pctChange = +(((curVal - prevVal) / prevVal) * 100).toFixed(1)
     } else if (prevVal === 0 && curVal > 0) {
@@ -232,11 +233,11 @@ function RevenueTrendTooltip({ active, payload, label, currencySymbol = '₹', c
             )}
           </div>
         </div>
-        {prevItem && (
+        {isComparisonEnabled && prevItem && (
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-1.5">
               <span className="inline-block size-2 rounded-full bg-slate-400" />
-              <span className="text-muted-foreground truncate max-w-[100px]">{compDateLabel ? `Prior period:` : 'Prior:'}</span>
+              <span className="text-muted-foreground truncate max-w-[130px]">{priorLabel ? `Prior (${priorLabel}):` : 'Prior:'}</span>
             </div>
             <div className="text-right tabular-nums">
               <span className="font-medium text-muted-foreground">{currencySymbol}{(prevVal ?? 0).toFixed(2)}</span>
@@ -246,9 +247,9 @@ function RevenueTrendTooltip({ active, payload, label, currencySymbol = '₹', c
             </div>
           </div>
         )}
-        {pctChange !== null && (
+        {isComparisonEnabled && pctChange !== null && (
           <div className="flex items-center justify-between pt-1 border-t border-border/30 text-[11px]">
-            <span className="text-muted-foreground">Change:</span>
+            <span className="text-muted-foreground">vs. Prior Period:</span>
             <span className={cn(
               'font-semibold tabular-nums',
               pctChange > 0 ? 'text-emerald-500' : pctChange < 0 ? 'text-red-500' : 'text-muted-foreground'
@@ -349,7 +350,7 @@ function ItemSalesTooltip({ active, payload, currencySymbol = '₹' }: any) {
   )
 }
 
-function CategoryRevenueTooltip({ active, payload, currencySymbol = '₹' }: any) {
+function CategoryRevenueTooltip({ active, payload, currencySymbol = '₹', isComparisonEnabled = true }: any) {
   if (!active || !payload || !payload.length) return null
   const item = payload[0]?.payload
   const rev = Number(item?.revenue ?? item?.value ?? 0)
@@ -376,7 +377,7 @@ function CategoryRevenueTooltip({ active, payload, currencySymbol = '₹' }: any
           <span className="text-muted-foreground">Revenue Share:</span>
           <span className="font-medium tabular-nums text-foreground">{share}%</span>
         </div>
-        {growth !== undefined && growth !== null && (
+        {isComparisonEnabled && growth !== undefined && growth !== null && (
           <div className="flex items-center justify-between gap-2 text-[11px] pt-0.5 border-t border-border/30">
             <span className="text-muted-foreground">vs. Prior Period:</span>
             <span className={cn(
@@ -422,9 +423,16 @@ function groupRevenueData(
       const prevChunk = prevDaily.slice(i, i + chunkSize)
       const startDay = curChunk[0]
       const endDay = curChunk[curChunk.length - 1]
+      const prevStartDay = prevChunk[0]
+      const prevEndDay = prevChunk[prevChunk.length - 1]
       const wNum = Math.floor(i / chunkSize) + 1
       const startLabel = startDay?.date ? startDay.date : `Day ${i + 1}`
       const endLabel = endDay?.date ? endDay.date : `Day ${i + curChunk.length}`
+      const prevStartLabel = prevStartDay?.date ? prevStartDay.date : ''
+      const prevEndLabel = prevEndDay?.date ? prevEndDay.date : ''
+      const prevPeriod = prevStartLabel && prevEndLabel
+        ? (prevStartLabel === prevEndLabel ? prevStartLabel : `${prevStartLabel} – ${prevEndLabel}`)
+        : ''
       const curRev = +curChunk.reduce((s, c) => s + c.revenue, 0).toFixed(2)
       const curOrders = curChunk.reduce((s, c) => s + c.orders, 0)
       const prevRev = +prevChunk.reduce((s, c) => s + c.revenue, 0).toFixed(2)
@@ -433,6 +441,7 @@ function groupRevenueData(
         key: `w-${wNum}`,
         label: `W${wNum}`,
         period: `Week ${wNum} (${startLabel} – ${endLabel})`,
+        prevPeriod: prevPeriod ? `Week ${wNum} (${prevPeriod})` : '',
         currentRevenue: curRev,
         currentOrders: curOrders,
         prevRevenue: prevRev,
@@ -505,7 +514,9 @@ export function AnalyticsView() {
   const [selectedLocationId, setSelectedLocationId] = useState<string>('')
   const [locationOpen, setLocationOpen] = useState(false)
   const [revenueGrouping, setRevenueGrouping] = useState<'daily' | 'weekly' | 'monthly'>('daily')
-  const [showRevenueComparison, setShowRevenueComparison] = useState(true)
+  const [isComparisonEnabled, setIsComparisonEnabled] = useState(true)
+  const showRevenueComparison = isComparisonEnabled
+  const setShowRevenueComparison = setIsComparisonEnabled
   const [orderTypeMetric, setOrderTypeMetric] = useState<'revenue' | 'orders'>('revenue')
   const [hourlyRankMetric, setHourlyRankMetric] = useState<'orders' | 'revenue'>('orders')
   const [itemRankMetric, setItemRankMetric] = useState<'qty' | 'revenue'>('qty')
@@ -597,12 +608,43 @@ export function AnalyticsView() {
     if (bgTimer.current) clearTimeout(bgTimer.current)
   }, [])
 
+  const pm = analytics?.paymentMethods
+  const pmTotal = (pm?.cash.amount ?? 0) + (pm?.upi.amount ?? 0) + (pm?.card.amount ?? 0) + (pm?.other?.amount ?? 0)
+  const resolvedPaymentTotals = useMemo(() => {
+    if (!pm) return { collected: 0, refunds: 0, net: 0 }
+
+    const derivedCollected = pmTotal
+    const derivedRefunds =
+      (pm.cash?.refunds ?? 0) +
+      (pm.upi?.refunds ?? 0) +
+      (pm.card?.refunds ?? 0) +
+      (pm.other?.refunds ?? 0) +
+      (pm.unattributedRefunds?.amount ?? 0)
+
+    const collected =
+      pm.totalCollected !== undefined && pm.totalCollected !== null
+        ? Number(pm.totalCollected)
+        : derivedCollected
+
+    const refunds =
+      pm.totalRefunds !== undefined && pm.totalRefunds !== null
+        ? Number(pm.totalRefunds)
+        : derivedRefunds
+
+    const net =
+      pm.totalNet !== undefined && pm.totalNet !== null
+        ? Number(pm.totalNet)
+        : collected - refunds
+
+    return { collected, refunds, net }
+  }, [pm, pmTotal])
+
   const exportReport = () => {
     if (!analytics || !data) return
     const rows: (string | number)[][] = []
     const push = (...cells: (string | number)[]) => rows.push(cells)
     const blank = () => rows.push([])
-    const money = (n: number) => n.toFixed(2)
+    const money = (n: number | undefined | null) => (Number.isFinite(Number(n)) ? Number(n).toFixed(2) : '0.00')
 
     const selectedLoc = (analytics.locations ?? []).find((l) => l.id === selectedLocationId)
 
@@ -635,11 +677,26 @@ export function AnalyticsView() {
     if (analytics.paymentMethods) {
       push('Payment Method Breakdown')
       push('Method', 'Transactions', `Collected (${sym})`, `Refunds (${sym})`, `Net Amount (${sym})`)
-      push('Cash', analytics.paymentMethods.cash.count, money(analytics.paymentMethods.cash.amount), money(analytics.paymentMethods.cash.refunds ?? 0), money(analytics.paymentMethods.cash.net ?? analytics.paymentMethods.cash.amount))
-      push('UPI', analytics.paymentMethods.upi.count, money(analytics.paymentMethods.upi.amount), money(analytics.paymentMethods.upi.refunds ?? 0), money(analytics.paymentMethods.upi.net ?? analytics.paymentMethods.upi.amount))
-      push('Card', analytics.paymentMethods.card.count, money(analytics.paymentMethods.card.amount), money(analytics.paymentMethods.card.refunds ?? 0), money(analytics.paymentMethods.card.net ?? analytics.paymentMethods.card.amount))
+      const cashNet = analytics.paymentMethods.cash.net !== undefined && analytics.paymentMethods.cash.net !== null
+        ? Number(analytics.paymentMethods.cash.net)
+        : (analytics.paymentMethods.cash.amount ?? 0) - (analytics.paymentMethods.cash.refunds ?? 0)
+      push('Cash', analytics.paymentMethods.cash.count, money(analytics.paymentMethods.cash.amount), money(analytics.paymentMethods.cash.refunds ?? 0), money(cashNet))
+
+      const upiNet = analytics.paymentMethods.upi.net !== undefined && analytics.paymentMethods.upi.net !== null
+        ? Number(analytics.paymentMethods.upi.net)
+        : (analytics.paymentMethods.upi.amount ?? 0) - (analytics.paymentMethods.upi.refunds ?? 0)
+      push('UPI', analytics.paymentMethods.upi.count, money(analytics.paymentMethods.upi.amount), money(analytics.paymentMethods.upi.refunds ?? 0), money(upiNet))
+
+      const cardNet = analytics.paymentMethods.card.net !== undefined && analytics.paymentMethods.card.net !== null
+        ? Number(analytics.paymentMethods.card.net)
+        : (analytics.paymentMethods.card.amount ?? 0) - (analytics.paymentMethods.card.refunds ?? 0)
+      push('Card', analytics.paymentMethods.card.count, money(analytics.paymentMethods.card.amount), money(analytics.paymentMethods.card.refunds ?? 0), money(cardNet))
+
       if (analytics.paymentMethods.other && (analytics.paymentMethods.other.count > 0 || analytics.paymentMethods.other.amount > 0 || (analytics.paymentMethods.other.refunds ?? 0) > 0)) {
-        push('Other / Legacy', analytics.paymentMethods.other.count, money(analytics.paymentMethods.other.amount), money(analytics.paymentMethods.other.refunds ?? 0), money(analytics.paymentMethods.other.net ?? analytics.paymentMethods.other.amount))
+        const otherNet = analytics.paymentMethods.other.net !== undefined && analytics.paymentMethods.other.net !== null
+          ? Number(analytics.paymentMethods.other.net)
+          : (analytics.paymentMethods.other.amount ?? 0) - (analytics.paymentMethods.other.refunds ?? 0)
+        push('Other / Legacy', analytics.paymentMethods.other.count, money(analytics.paymentMethods.other.amount), money(analytics.paymentMethods.other.refunds ?? 0), money(otherNet))
       }
       if (analytics.paymentMethods.unattributedRefunds && analytics.paymentMethods.unattributedRefunds.amount > 0) {
         push('Refunds (Method Unavailable)', analytics.paymentMethods.unattributedRefunds.count, money(0), money(analytics.paymentMethods.unattributedRefunds.amount), money(-analytics.paymentMethods.unattributedRefunds.amount))
@@ -651,7 +708,7 @@ export function AnalyticsView() {
         analytics.paymentMethods.upi.count +
         analytics.paymentMethods.card.count +
         (analytics.paymentMethods.other?.count ?? 0)
-      push('Total Reconciled', totalTx, money(analytics.paymentMethods.totalCollected ?? pmTotal), money(analytics.paymentMethods.totalRefunds ?? 0), money(analytics.paymentMethods.totalNet ?? (pmTotal - (analytics.paymentMethods.totalRefunds ?? 0))))
+      push('Total Reconciled', totalTx, money(analytics.paymentMethods.totalCollected ?? resolvedPaymentTotals.collected), money(analytics.paymentMethods.totalRefunds ?? resolvedPaymentTotals.refunds), money(analytics.paymentMethods.totalNet ?? resolvedPaymentTotals.net))
       blank()
     }
 
@@ -853,15 +910,15 @@ export function AnalyticsView() {
     return (revB - revA) || a.name.localeCompare(b.name)
   })
 
+  const displayCategories = isComparisonEnabled
+    ? rankedCategories
+    : rankedCategories.filter((c) => (c.revenue ?? c.value ?? 0) > 0)
+
   const availableCategories = Array.from(new Set(
     rawCategories.map((c) => c.name).concat(
       (analytics?.topItems ?? []).map((it) => it.category || 'Other')
     )
   )).sort()
-
-  // Payment method totals & percentages
-  const pm = analytics?.paymentMethods
-  const pmTotal = (pm?.cash.amount ?? 0) + (pm?.upi.amount ?? 0) + (pm?.card.amount ?? 0) + (pm?.other?.amount ?? 0)
 
   // Category totals for inline percentages
   const catTotal = (analytics?.categoryBreakdown ?? []).reduce((s, c) => s + c.value, 0) || 1
@@ -955,14 +1012,25 @@ export function AnalyticsView() {
               </Popover>
             )}
 
-            {/* Previous-period comparison badge */}
-            <div
-              className="hidden sm:inline-flex items-center gap-1.5 h-8 px-2.5 rounded-md border border-border/70 bg-card text-xs text-muted-foreground shadow-xs select-none"
-              title={`Comparing against previous period: ${compRangeLabel}`}
+            {/* Previous-period comparison toggle */}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={isComparisonEnabled}
+              onClick={() => setIsComparisonEnabled((prev) => !prev)}
+              className={cn(
+                'inline-flex items-center gap-1.5 h-8 px-2.5 rounded-md border text-xs font-medium transition-colors cursor-pointer select-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
+                isComparisonEnabled
+                  ? 'border-primary/40 bg-primary/10 text-primary hover:bg-primary/15'
+                  : 'border-border/70 bg-card text-muted-foreground hover:bg-secondary/40'
+              )}
+              title={isComparisonEnabled ? `Comparing against prior period: ${compRangeLabel}` : 'Comparison disabled. Click to enable'}
             >
-              <ArrowLeftRight className="size-3.5 text-primary shrink-0" />
-              <span className="truncate max-w-[160px] md:max-w-[190px]">vs. {compRangeLabel}</span>
-            </div>
+              <ArrowLeftRight className={cn('size-3.5 shrink-0 transition-colors', isComparisonEnabled ? 'text-primary' : 'text-muted-foreground/60')} />
+              <span className="truncate max-w-[140px] sm:max-w-[190px]">
+                {isComparisonEnabled ? <>vs. {compRangeLabel}</> : 'Compare: Off'}
+              </span>
+            </button>
 
             {/* Date range picker with non-clipped 2-row layout on mobile */}
             <Popover open={rangeOpen} onOpenChange={setRangeOpen}>
@@ -1040,7 +1108,7 @@ export function AnalyticsView() {
                 Financial Overview
               </h2>
               <p className="text-[11px] text-muted-foreground">
-                Audited core revenue & sales metrics · Compared with {compRangeLabel}
+                Audited core revenue & sales metrics{isComparisonEnabled && compRangeLabel ? ` · Compared with ${compRangeLabel}` : ''}
               </p>
             </div>
             <div className="hidden sm:flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -1063,6 +1131,7 @@ export function AnalyticsView() {
               hasError={hasError}
               isEmpty={isEmptyPeriod}
               isRealZero={isRealZeroRev}
+              isComparisonEnabled={isComparisonEnabled}
             />
             <FinancialKpiCard
               icon={ClipboardList}
@@ -1076,6 +1145,7 @@ export function AnalyticsView() {
               hasError={hasError}
               isEmpty={isEmptyPeriod}
               isRealZero={isRealZeroOrders}
+              isComparisonEnabled={isComparisonEnabled}
             />
             <FinancialKpiCard
               icon={ShoppingBag}
@@ -1089,6 +1159,7 @@ export function AnalyticsView() {
               hasError={hasError}
               isEmpty={isEmptyPeriod}
               isRealZero={isRealZeroAvg}
+              isComparisonEnabled={isComparisonEnabled}
             />
             <FinancialKpiCard
               icon={Receipt}
@@ -1102,6 +1173,7 @@ export function AnalyticsView() {
               hasError={hasError}
               isEmpty={isEmptyPeriod}
               isRealZero={isRealZeroNet}
+              isComparisonEnabled={isComparisonEnabled}
             />
           </div>
         </section>
@@ -1146,17 +1218,19 @@ export function AnalyticsView() {
                   {hasComparisonData && (
                     <button
                       type="button"
+                      role="switch"
+                      aria-checked={showRevenueComparison}
                       onClick={() => setShowRevenueComparison((prev) => !prev)}
                       className={cn(
-                        'flex items-center gap-1 text-[11px] h-7 px-2 rounded-lg border font-medium transition-colors',
+                        'flex items-center gap-1 text-[11px] h-7 px-2 rounded-lg border font-medium transition-colors cursor-pointer',
                         showRevenueComparison
-                          ? 'border-primary/40 bg-primary/10 text-primary'
+                          ? 'border-primary/40 bg-primary/10 text-primary hover:bg-primary/15'
                           : 'border-border/60 bg-secondary/40 text-muted-foreground hover:text-foreground'
                       )}
-                      title={`Toggle comparison with prior period: ${compRangeLabel}`}
+                      title={showRevenueComparison ? `Toggle comparison with prior period: ${compRangeLabel}` : 'Enable comparison'}
                     >
                       <ArrowLeftRight className="size-3" />
-                      <span>vs. Prior</span>
+                      <span>{showRevenueComparison ? 'vs. Prior' : 'Compare: Off'}</span>
                     </button>
                   )}
                 </div>
@@ -1197,7 +1271,7 @@ export function AnalyticsView() {
                       tickLine={false}
                       tickFormatter={(v) => `${sym}${v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v}`}
                     />
-                    <Tooltip content={<RevenueTrendTooltip currencySymbol={sym} compDateLabel={compRangeLabel} />} />
+                    <Tooltip content={<RevenueTrendTooltip currencySymbol={sym} compDateLabel={compRangeLabel} isComparisonEnabled={isComparisonEnabled} />} />
                     <Area
                       type="monotone"
                       dataKey="currentRevenue"
@@ -1655,7 +1729,7 @@ export function AnalyticsView() {
                     <span>Revenue by Category</span>
                   </h3>
                   <p className="text-[11px] text-muted-foreground">
-                    Category contribution · {compRangeLabel ? `Compared with ${compRangeLabel}` : rangeLabel}
+                    Category contribution · {isComparisonEnabled && compRangeLabel ? `Compared with ${compRangeLabel}` : rangeLabel}
                   </p>
                 </div>
 
@@ -1670,14 +1744,14 @@ export function AnalyticsView() {
               {/* Chart */}
               {loading ? (
                 <ChartSkeleton className="h-[180px]" />
-              ) : rankedCategories.length === 0 ? (
+              ) : displayCategories.length === 0 ? (
                 <div className="flex h-[180px] items-center justify-center text-xs text-muted-foreground">
                   No category data available
                 </div>
               ) : (
                 <div className="h-[180px]">
                   <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={rankedCategories} margin={{ top: 8, right: 8, bottom: 0, left: -16 }}>
+                    <BarChart data={displayCategories} margin={{ top: 8, right: 8, bottom: 0, left: -16 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false} />
                       <XAxis dataKey="name" tick={{ fill: AXIS, fontSize: 10 }} axisLine={false} tickLine={false} />
                       <YAxis
@@ -1686,9 +1760,9 @@ export function AnalyticsView() {
                         tickLine={false}
                         tickFormatter={(v) => `${sym}${v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v}`}
                       />
-                      <Tooltip content={<CategoryRevenueTooltip currencySymbol={sym} />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
+                      <Tooltip content={<CategoryRevenueTooltip currencySymbol={sym} isComparisonEnabled={isComparisonEnabled} />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
                       <Bar dataKey="value" name="Revenue" radius={[4, 4, 0, 0]} barSize={22}>
-                        {rankedCategories.map((_, i) => (
+                        {displayCategories.map((_, i) => (
                           <Cell key={i} fill={COLORS[i % COLORS.length]} />
                         ))}
                       </Bar>
@@ -1706,17 +1780,17 @@ export function AnalyticsView() {
                   <span>Revenue</span>
                   <span className="hidden sm:inline">Units</span>
                   <span>Share</span>
-                  <span>vs Prior</span>
+                  {isComparisonEnabled && <span>vs Prior</span>}
                 </div>
               </div>
 
               <div className="max-h-[220px] overflow-y-auto scrollbar-thin space-y-1">
-                {rankedCategories.length === 0 ? (
+                {displayCategories.length === 0 ? (
                   <p className="text-xs text-muted-foreground py-3 text-center">No category data</p>
                 ) : (
-                  rankedCategories.map((c, i) => {
+                  displayCategories.map((c, i) => {
                     const isSelected = selectedCategoryFilter === c.name
-                    const hasValidGrowth = c.growth !== undefined && c.growth !== null
+                    const hasValidGrowth = isComparisonEnabled && c.growth !== undefined && c.growth !== null
                     const isPos = hasValidGrowth && c.growth! > 0.05
                     const isNeg = hasValidGrowth && c.growth! < -0.05
                     const isZeroGrowth = hasValidGrowth && Math.abs(c.growth!) <= 0.05
@@ -1754,29 +1828,27 @@ export function AnalyticsView() {
                           <span className="text-[11px] text-muted-foreground w-10 text-right">
                             {c.share ?? 0}%
                           </span>
-                          <div className="w-14 text-right">
-                            {hasValidGrowth ? (
-                              isZeroGrowth ? (
-                                <span className="text-[10px] text-muted-foreground">0.0%</span>
-                              ) : isPos ? (
-                                <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
-                                  <ArrowUpRight className="size-2.5 shrink-0" />
-                                  +{c.growth}%
-                                </span>
-                              ) : (
-                                <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-red-600 dark:text-red-400">
-                                  <ArrowDownRight className="size-2.5 shrink-0" />
-                                  {c.growth}%
-                                </span>
-                              )
-                            ) : (
-                              (c.revenue ?? c.value) > 0 ? (
-                                <span className="text-[10px] font-semibold text-primary px-1 py-0.5 rounded bg-primary/10">New</span>
+                          {isComparisonEnabled && (
+                            <div className="w-14 text-right">
+                              {hasValidGrowth ? (
+                                isZeroGrowth ? (
+                                  <span className="text-[10px] text-muted-foreground">0.0%</span>
+                                ) : isPos ? (
+                                  <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                                    <ArrowUpRight className="size-2.5 shrink-0" />
+                                    +{c.growth}%
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-red-600 dark:text-red-400">
+                                    <ArrowDownRight className="size-2.5 shrink-0" />
+                                    {c.growth}%
+                                  </span>
+                                )
                               ) : (
                                 <span className="text-[10px] text-muted-foreground/60">—</span>
-                              )
-                            )}
-                          </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </button>
                     )
@@ -1803,19 +1875,23 @@ export function AnalyticsView() {
             <div className="flex items-center gap-3 text-xs bg-secondary/30 px-3 py-1.5 rounded-lg border border-border/40">
               <div>
                 <span className="text-[10px] text-muted-foreground block">Total Collected</span>
-                <span className="font-semibold tabular-nums text-foreground">{sym}{(pm?.totalCollected ?? pmTotal).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span className="font-semibold tabular-nums text-foreground">{sym}{resolvedPaymentTotals.collected.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
               </div>
               <div className="h-6 w-px bg-border/60" />
               <div>
                 <span className="text-[10px] text-muted-foreground block">Refunds</span>
                 <span className="font-semibold tabular-nums text-red-500">
-                  {(pm?.totalRefunds ?? 0) > 0 ? `-${sym}${(pm?.totalRefunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
+                  {resolvedPaymentTotals.refunds > 0 ? `-${sym}${resolvedPaymentTotals.refunds.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
                 </span>
               </div>
               <div className="h-6 w-px bg-border/60" />
               <div>
                 <span className="text-[10px] text-muted-foreground block">Net Settled</span>
-                <span className="font-semibold tabular-nums text-emerald-500">{sym}{(pm?.totalNet ?? (pmTotal - (pm?.totalRefunds ?? 0))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span className={cn('font-semibold tabular-nums', resolvedPaymentTotals.net < 0 ? 'text-red-500' : 'text-emerald-500')}>
+                  {resolvedPaymentTotals.net < 0
+                    ? `-${sym}${Math.abs(resolvedPaymentTotals.net).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                    : `${sym}${resolvedPaymentTotals.net.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+                </span>
               </div>
             </div>
           </div>
@@ -1965,13 +2041,15 @@ export function AnalyticsView() {
                     {(pm?.cash?.count ?? 0) + (pm?.upi?.count ?? 0) + (pm?.card?.count ?? 0) + (pm?.other?.count ?? 0)}
                   </td>
                   <td className="text-right py-2.5 px-3 tabular-nums text-foreground">
-                    {sym}{(pm?.totalCollected ?? pmTotal).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    {sym}{resolvedPaymentTotals.collected.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </td>
                   <td className="text-right py-2.5 px-3 tabular-nums text-red-500">
-                    {(pm?.totalRefunds ?? 0) > 0 ? `-${sym}${(pm?.totalRefunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
+                    {resolvedPaymentTotals.refunds > 0 ? `-${sym}${resolvedPaymentTotals.refunds.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
                   </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums text-emerald-500 font-bold">
-                    {sym}{(pm?.totalNet ?? (pmTotal - (pm?.totalRefunds ?? 0))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  <td className={cn('text-right py-2.5 px-3 tabular-nums font-bold', resolvedPaymentTotals.net < 0 ? 'text-red-500' : 'text-emerald-500')}>
+                    {resolvedPaymentTotals.net < 0
+                      ? `-${sym}${Math.abs(resolvedPaymentTotals.net).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                      : `${sym}${resolvedPaymentTotals.net.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
                   </td>
                 </tr>
               </tfoot>
@@ -2378,8 +2456,9 @@ export function AnalyticsView() {
               })
             }
 
-            // Observation 3: Sales change vs. previous period (suppressed when comparison data is missing/insufficient)
+            // Observation 3: Sales change vs. previous period (suppressed when comparison data is missing/insufficient or comparison is disabled)
             if (
+              isComparisonEnabled &&
               analytics?.comparison?.previous &&
               analytics.comparison.previous.revenue > 0 &&
               analytics.comparison.revenueChange !== null &&
@@ -2472,6 +2551,7 @@ function FinancialKpiCard({
   hasError = false,
   isEmpty = false,
   isRealZero = false,
+  isComparisonEnabled = true,
 }: {
   icon: any
   label: string
@@ -2484,6 +2564,7 @@ function FinancialKpiCard({
   hasError?: boolean
   isEmpty?: boolean
   isRealZero?: boolean
+  isComparisonEnabled?: boolean
 }) {
   const accents: Record<string, string> = {
     coral: 'bg-primary/10 text-primary border-primary/20',
@@ -2492,7 +2573,7 @@ function FinancialKpiCard({
     blue: 'bg-blue-500/10 text-blue-500 dark:text-blue-400 border-blue-500/20',
   }
 
-  const hasValidChange = !loading && !hasError && change !== undefined && change !== null && !Number.isNaN(change)
+  const hasValidChange = isComparisonEnabled && !loading && !hasError && change !== undefined && change !== null && !Number.isNaN(change)
   const isZeroChange = hasValidChange && Math.abs(change) < 0.05
   const isPositive = hasValidChange && change >= 0.05
   const isNegative = hasValidChange && change <= -0.05
@@ -2510,6 +2591,8 @@ function FinancialKpiCard({
             <span className="text-[10px] font-medium text-destructive/80 px-1.5 py-0.5 rounded bg-destructive/10">
               Error
             </span>
+          ) : !isComparisonEnabled ? (
+            null
           ) : hasValidChange ? (
             isZeroChange ? (
               <span className="text-[11px] font-medium text-muted-foreground px-1.5 py-0.5 rounded bg-secondary/60">
@@ -2525,15 +2608,9 @@ function FinancialKpiCard({
               </span>
             )
           ) : (
-            (!isEmpty && !isRealZero && value && value !== '₹0' && value !== '₹0.00' && value !== '0') ? (
-              <span className="text-[10px] font-semibold text-primary px-1.5 py-0.5 rounded bg-primary/10">
-                New
-              </span>
-            ) : (
-              <span className="text-[10px] text-muted-foreground/60 px-1.5 py-0.5 rounded bg-secondary/30">
-                —
-              </span>
-            )
+            <span className="text-[10px] text-muted-foreground/60 px-1.5 py-0.5 rounded bg-secondary/30">
+              —
+            </span>
           )}
         </div>
         <p className="text-[11px] font-medium text-muted-foreground truncate">{label}</p>
@@ -2559,7 +2636,7 @@ function FinancialKpiCard({
         ) : (
           <div className="space-y-0.5 min-w-0">
             <p className="text-[11px] text-muted-foreground truncate">{subtext}</p>
-            {comparisonDateLabel && (
+            {isComparisonEnabled && comparisonDateLabel && (
               <p className="text-[10px] text-muted-foreground/75 truncate">
                 vs. {comparisonDateLabel}
               </p>

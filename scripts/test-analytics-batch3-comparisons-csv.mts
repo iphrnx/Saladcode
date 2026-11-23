@@ -47,15 +47,15 @@ check(
 );
 
 check(
-  "FinancialKpiCard displays 'New' badge when prior value is zero/missing and current value > 0",
-  analyticsView.includes("(!isEmpty && !isRealZero && value && value !== '₹0' && value !== '₹0.00' && value !== '0') ? (") &&
-  analyticsView.includes("New")
+  "FinancialKpiCard displays '—' when prior value is zero/missing and current value > 0",
+  analyticsView.includes("hasValidChange ? (") &&
+  analyticsView.includes("text-[10px] text-muted-foreground/60 px-1.5 py-0.5 rounded bg-secondary/30") &&
+  analyticsView.includes("—")
 );
 
 check(
-  "CategoryBreakdown table displays 'New' badge when prior revenue is 0 and current revenue > 0",
-  analyticsView.includes("(c.revenue ?? c.value) > 0 ? (") &&
-  analyticsView.includes("New")
+  "CategoryBreakdown table displays '—' when prior revenue is 0 and current revenue > 0",
+  analyticsView.includes("<span className=\"text-[10px] text-muted-foreground/60\">—</span>")
 );
 
 // 3. API's actual comparison dates in UI labels
@@ -118,7 +118,7 @@ check(
 check(
   "Category subtitle removes duplicate 'vs.' typo",
   !analyticsView.includes("Compared with vs.") &&
-  analyticsView.includes("Category contribution · {compRangeLabel ? `Compared with ${compRangeLabel}` : rangeLabel}")
+  analyticsView.includes("Category contribution · {isComparisonEnabled && compRangeLabel ? `Compared with ${compRangeLabel}` : rangeLabel}")
 );
 
 check(
