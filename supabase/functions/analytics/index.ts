@@ -184,17 +184,41 @@ serve(async (req: Request) => {
     isLedger: boolean;
   }
 
+  interface ReconciledRefund {
+    id: string;
+    source: "CHECK_PAYMENT_VOID" | "ORDER_REFUND";
+    checkId: string | null;
+    orderId: string | null;
+    amount: number;
+    timestamp: Date;
+    method: "CASH" | "UPI" | "CARD" | "OTHER" | null;
+    locationId: string | null;
+  }
+
   async function getReconciledEventsForWindow(
     winStart: Date,
     winEnd: Date
-  ): Promise<{ events: ReconciledEvent[]; checkMap: Map<string, any>; orders: any[]; refunds: any[] }> {
-    // A. Query payments recorded in or near the window
+  ): Promise<{ events: ReconciledEvent[]; checkMap: Map<string, any>; orders: any[]; refunds: ReconciledRefund[] }> {
+    // A. Query payments recorded in or near the window (both succeeded and voided)
     const payments = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("check_payments")
         .select("id, check_id, amount, method, status, staff_id, location_id, created_at")
         .eq("tenant_id", tenantId)
         .eq("status", "SUCCEEDED")
+        .gte("created_at", winStart.toISOString())
+        .lt("created_at", winEnd.toISOString())
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true })
+        .range(from, to);
+    });
+
+    const voidPayments = await fetchAllPages<any>(async (from, to) => {
+      return await db
+        .from("check_payments")
+        .select("id, check_id, amount, method, status, staff_id, location_id, created_at")
+        .eq("tenant_id", tenantId)
+        .eq("status", "VOID")
         .gte("created_at", winStart.toISOString())
         .lt("created_at", winEnd.toISOString())
         .order("created_at", { ascending: true })
@@ -221,7 +245,7 @@ serve(async (req: Request) => {
 
     // Identify all candidate checks
     const candidateCheckIds = Array.from(
-      new Set([...payments.map((p) => p.check_id), ...checks.map((c) => c.id)].filter(Boolean))
+      new Set([...payments.map((p) => p.check_id), ...voidPayments.map((p) => p.check_id), ...checks.map((c) => c.id)].filter(Boolean))
     );
 
     // Fetch missing check metadata if needed with deterministic ordering and error propagation
@@ -399,11 +423,11 @@ serve(async (req: Request) => {
       (e) => e.settledAt >= winStart && e.settledAt < winEnd
     );
 
-    // Query refunded orders in the window
-    const windowRefunds = await fetchAllPages<any>(async (from, to) => {
+    // D. Query refunds in the window from authoritative ledger voids and legacy refunded orders
+    const orderRefunds = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("orders")
-        .select("id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at")
+        .select("id, check_id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at")
         .eq("tenant_id", tenantId)
         .in("payment_status", ["REFUNDED", "refunded"])
         .gte("updated_at", winStart.toISOString())
@@ -413,7 +437,64 @@ serve(async (req: Request) => {
         .range(from, to);
     });
 
-    return { events: windowEvents, checkMap: localCheckMap, orders: allWindowOrders, refunds: windowRefunds };
+    const voidCheckIds = new Set<string>();
+    const reconciledRefunds: ReconciledRefund[] = [];
+
+    // 1. Authoritative check payment voids from ledger
+    for (const p of voidPayments) {
+      const amt = Number(p.amount || 0);
+      if (amt <= 0) continue;
+      const chk = localCheckMap.get(p.check_id);
+      const locId = p.location_id || chk?.location_id || (chk?.table_id ? tableMap.get(chk.table_id)?.location_id : null) || null;
+      const rawMethod = String(p.method || "").toUpperCase();
+      const method: "CASH" | "UPI" | "CARD" | "OTHER" =
+        rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
+
+      if (p.check_id) voidCheckIds.add(p.check_id);
+
+      reconciledRefunds.push({
+        id: p.id,
+        source: "CHECK_PAYMENT_VOID",
+        checkId: p.check_id || null,
+        orderId: null,
+        amount: amt,
+        timestamp: new Date(p.created_at),
+        method,
+        locationId: locId,
+      });
+    }
+
+    // 2. Authoritative legacy order refunds (avoid double-counting with check payment voids)
+    for (const o of orderRefunds) {
+      if (o.check_id && voidCheckIds.has(o.check_id)) {
+        continue;
+      }
+      const amt = Number(o.total || 0);
+      // Avoid presenting an estimate if amount is missing or invalid
+      if (amt <= 0) continue;
+
+      const refTime = o.updated_at ? new Date(o.updated_at) : (o.paid_at ? new Date(o.paid_at) : (o.created_at ? new Date(o.created_at) : null));
+      if (!refTime || isNaN(refTime.getTime())) continue;
+
+      const rawMethod = String(o.payment_method || "").toUpperCase();
+      const method: "CASH" | "UPI" | "CARD" | "OTHER" | null =
+        rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : rawMethod === "OTHER" ? "OTHER" : null;
+
+      const locId = resolveEntityLocation(o, localCheckMap);
+
+      reconciledRefunds.push({
+        id: o.id,
+        source: "ORDER_REFUND",
+        checkId: o.check_id || null,
+        orderId: o.id,
+        amount: amt,
+        timestamp: refTime,
+        method,
+        locationId: locId,
+      });
+    }
+
+    return { events: windowEvents, checkMap: localCheckMap, orders: allWindowOrders, refunds: reconciledRefunds };
   }
 
   /* -------------------------------------------------------------------------- */
@@ -469,6 +550,7 @@ serve(async (req: Request) => {
       serviceCharge: Number(o.service_charge || 0),
       orderType: normalizedType,
       tableId: effectiveTableId,
+      tableSessionId: o.table_session_id || null,
       tableName: resolvedTable?.name || (normalizedType === "DINE_IN" ? "Table" : normalizedType),
       settledAt: settlementTime,
       createdAt: o.created_at ? new Date(o.created_at) : null,
@@ -511,24 +593,28 @@ serve(async (req: Request) => {
     }
   }
 
+  // Apply location filter uniformly to refunds:
+  // Unresolved-location refunds (r.locationId === null) appear in "All Locations" only, never leaking into specific branches
+  const filteredRefunds = (mainRefunds ?? []).filter((r) => {
+    if (!selectedLocationId) return true;
+    return r.locationId === selectedLocationId;
+  });
+
   // Attribution of refunds across methods
   let cashRefunds = 0, upiRefunds = 0, cardRefunds = 0, otherRefunds = 0, unattributedRefunds = 0;
   let cashRefundCount = 0, upiRefundCount = 0, cardRefundCount = 0, otherRefundCount = 0, unattributedRefundCount = 0;
-  for (const r of mainRefunds ?? []) {
-    const locId = r.location_id;
-    if (selectedLocationId && locId && locId !== selectedLocationId) continue;
-    const rawMethod = String(r.payment_method || "").toUpperCase();
-    const amt = Number(r.total || 0);
-    if (rawMethod === "CASH") {
+  for (const r of filteredRefunds) {
+    const amt = r.amount;
+    if (r.method === "CASH") {
       cashRefunds += amt;
       cashRefundCount++;
-    } else if (rawMethod === "UPI") {
+    } else if (r.method === "UPI") {
       upiRefunds += amt;
       upiRefundCount++;
-    } else if (rawMethod === "CARD") {
+    } else if (r.method === "CARD") {
       cardRefunds += amt;
       cardRefundCount++;
-    } else if (rawMethod === "OTHER") {
+    } else if (r.method === "OTHER") {
       otherRefunds += amt;
       otherRefundCount++;
     } else {
@@ -536,6 +622,12 @@ serve(async (req: Request) => {
       unattributedRefundCount++;
     }
   }
+
+  cashRefunds = +cashRefunds.toFixed(2);
+  upiRefunds = +upiRefunds.toFixed(2);
+  cardRefunds = +cardRefunds.toFixed(2);
+  otherRefunds = +otherRefunds.toFixed(2);
+  unattributedRefunds = +unattributedRefunds.toFixed(2);
 
   const cashNet = +(cashAmount - cashRefunds).toFixed(2);
   const upiNet = +(upiAmount - upiRefunds).toFixed(2);
@@ -634,13 +726,35 @@ serve(async (req: Request) => {
     TAKEAWAY: { count: 0, revenue: 0 },
     DELIVERY: { count: 0, revenue: 0 },
   };
+
+  // Completed order counts per order type
   for (const o of qualifyingOrders) {
     const t = o.orderType;
     if (!typeMap[t]) typeMap[t] = { count: 0, revenue: 0 };
     typeMap[t].count++;
-    typeMap[t].revenue += Number(o.total || 0);
   }
-  const totalOrderTypeRev = Object.values(typeMap).reduce((s, v) => s + v.revenue, 0);
+
+  // Authoritative revenue per order type built from scoped settlement events (once per settlement)
+  for (const e of filteredEvents) {
+    let t = "TAKEAWAY";
+    if (e.checkId) {
+      const chk = mainCheckMap.get(e.checkId);
+      const rawType = String(chk?.order_type || (chk?.table_id ? "DINE_IN" : "TAKEAWAY"))
+        .toUpperCase()
+        .replace(/[-\s]/g, "_");
+      t = ["DINE_IN", "TAKEAWAY", "DELIVERY"].includes(rawType) ? rawType : (chk?.table_id ? "DINE_IN" : "TAKEAWAY");
+    } else if (e.orderId) {
+      const o = mainOrders.find((ord) => ord.id === e.orderId);
+      const rawType = String(o?.order_type || (o?.table_id ? "DINE_IN" : "TAKEAWAY"))
+        .toUpperCase()
+        .replace(/[-\s]/g, "_");
+      t = ["DINE_IN", "TAKEAWAY", "DELIVERY"].includes(rawType) ? rawType : (o?.table_id ? "DINE_IN" : "TAKEAWAY");
+    }
+    if (!typeMap[t]) typeMap[t] = { count: 0, revenue: 0 };
+    typeMap[t].revenue += e.amount;
+  }
+
+  const totalOrderTypeRev = +(Object.values(typeMap).reduce((s, v) => s + v.revenue, 0)).toFixed(2);
   const typeBreakdown = Object.entries(typeMap).map(([type, v]) => ({
     type,
     count: v.count,
@@ -678,7 +792,8 @@ serve(async (req: Request) => {
     if (!tablePerf[o.tableId]) {
       tablePerf[o.tableId] = { tableId: o.tableId, name, sessions: new Set(), revenue: 0 };
     }
-    tablePerf[o.tableId].sessions.add(o.id);
+    const sessionId = o.tableSessionId || o.id;
+    tablePerf[o.tableId].sessions.add(sessionId);
     tablePerf[o.tableId].revenue += Number(o.total || 0);
   }
 
@@ -702,13 +817,23 @@ serve(async (req: Request) => {
 
   const hourly: number[] = new Array(24).fill(0);
   const hourlyRevenueArr: number[] = new Array(24).fill(0);
+
+  // Hourly order volume from qualifyingOrders
   for (const o of qualifyingOrders) {
     const h = zonedHour(o.settledAt, timeZone);
     if (h >= 0 && h < 24) {
       hourly[h]++;
-      hourlyRevenueArr[h] += Number(o.total || 0);
     }
   }
+
+  // Hourly settled revenue from scoped settlement events (once per settlement)
+  for (const e of filteredEvents) {
+    const h = zonedHour(e.settledAt, timeZone);
+    if (h >= 0 && h < 24) {
+      hourlyRevenueArr[h] += e.amount;
+    }
+  }
+
   const hourlyBreakdown = Array.from({ length: 24 }, (_, h) => ({
     hour: h,
     orders: hourly[h],
@@ -818,21 +943,11 @@ serve(async (req: Request) => {
     }
   }
 
-  // Populate daily refunds from mainRefunds
-  let totalRefundsCount = 0;
-  for (const r of mainRefunds ?? []) {
-    const locId = r.location_id;
-    if (selectedLocationId && locId && locId !== selectedLocationId) continue;
-    const amt = Number(r.total || 0);
-    if (amt > 0) {
-      totalRefundsCount++;
-      const refTime = r.updated_at ? new Date(r.updated_at) : (r.created_at ? new Date(r.created_at) : null);
-      if (refTime) {
-        const dateStr = zonedDateStr(refTime, timeZone);
-        if (dailyRefundsMap[dateStr] !== undefined) {
-          dailyRefundsMap[dateStr] += amt;
-        }
-      }
+  // Populate daily refunds from filteredRefunds
+  for (const r of filteredRefunds) {
+    const dateStr = zonedDateStr(r.timestamp, timeZone);
+    if (dailyRefundsMap[dateStr] !== undefined) {
+      dailyRefundsMap[dateStr] += r.amount;
     }
   }
 
@@ -847,7 +962,7 @@ serve(async (req: Request) => {
     totalDiscounts: +totalDiscounts.toFixed(2),
     discountedOrdersCount,
     totalRefunds: totalRefundAmount, // Reconciled with payment ledger refund calculation
-    refundedTransactionsCount: totalRefundsCount,
+    refundedTransactionsCount: filteredRefunds.length,
     discountsByOrderType: Object.entries(discountsByOrderType).map(([type, val]) => ({
       type,
       amount: +val.amount.toFixed(2),
