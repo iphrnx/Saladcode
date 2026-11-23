@@ -25,7 +25,7 @@ import {
   CalendarIcon, ChevronDown, MapPin, Layers, Sparkles,
   CreditCard, Smartphone, Banknote, Receipt, Bike, TrendingUp, Check,
   Filter, X, Flame, Tag, AlertCircle, HelpCircle, Timer, Hourglass, Activity,
-  Percent, RotateCcw,
+  Percent, RotateCcw, Lightbulb,
 } from 'lucide-react'
 import { formatCurrency } from '@/lib/constants'
 import { toast } from 'sonner'
@@ -1092,7 +1092,7 @@ export function AnalyticsView() {
         {/* Row 2: Revenue Trend (2 cols) + Order Types Donut (1 col) */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
           {/* Section 2: Revenue Trend */}
-          <Card className="rounded-xl border border-border/70 bg-card p-4 lg:col-span-2 shadow-sm flex flex-col justify-between">
+          <Card id="section-revenue-trend" className="rounded-xl border border-border/70 bg-card p-4 lg:col-span-2 shadow-sm flex flex-col justify-between">
             <div>
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
                 <div>
@@ -1307,7 +1307,7 @@ export function AnalyticsView() {
         </div>
 
         {/* Row 3: Section 4 - Sales by Hour */}
-        <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm">
+        <Card id="section-sales-by-hour" className="rounded-xl border border-border/70 bg-card p-4 shadow-sm">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 mb-3">
             <div>
               <h3 className="text-sm font-bold tracking-tight flex items-center gap-1.5">
@@ -1629,7 +1629,7 @@ export function AnalyticsView() {
           </Card>
 
           {/* Section 6: Revenue by Category */}
-          <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm flex flex-col justify-between space-y-3">
+          <Card id="section-revenue-by-category" className="rounded-xl border border-border/70 bg-card p-4 shadow-sm flex flex-col justify-between space-y-3">
             <div>
               <div className="flex items-center justify-between gap-2 mb-2.5">
                 <div>
@@ -2285,6 +2285,138 @@ export function AnalyticsView() {
               </p>
             </div>
           </div>
+        </Card>
+
+        {/* Row 9: Section 11 - Business Insights */}
+        <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="text-sm font-bold tracking-tight flex items-center gap-1.5">
+                <Lightbulb className="size-4 text-amber-500" />
+                Business Insights
+              </h3>
+              <p className="text-[11px] text-muted-foreground">
+                Automated rule-based observations from verified performance metrics and period comparisons
+              </p>
+            </div>
+            <Sparkles className="size-4 text-amber-500/70" />
+          </div>
+
+          {(() => {
+            const insights: {
+              id: string
+              title: string
+              observation: string
+              badge: string
+              dateRange: string
+              targetSectionId: string
+              targetSectionName: string
+            }[] = []
+
+            // Observation 1: Busiest Hour
+            if (activePeakHour && (activePeakHour.orders > 0 || activePeakHour.revenue > 0)) {
+              insights.push({
+                id: 'busiest-hour',
+                title: 'Peak Order Velocity',
+                observation: `Busiest hour was ${activePeakHour.hourSpan} generating ${sym}${activePeakHour.revenue.toFixed(2)} across ${activePeakHour.orders} settled ${activePeakHour.orders === 1 ? 'order' : 'orders'}.`,
+                badge: `${activePeakHour.orders} orders / hr`,
+                dateRange: rangeLabel,
+                targetSectionId: 'section-sales-by-hour',
+                targetSectionName: 'Sales by Hour',
+              })
+            }
+
+            // Observation 2: Highest-Revenue Category
+            const topCat = rankedCategories.length > 0 ? rankedCategories[0] : null
+            if (topCat && (topCat.revenue ?? topCat.value) > 0) {
+              const catRev = topCat.revenue ?? topCat.value
+              insights.push({
+                id: 'top-category',
+                title: 'Category Sales Driver',
+                observation: `${topCat.name} leads total catalog sales with ${sym}${catRev.toFixed(2)} (${topCat.share ?? 0}% revenue share).`,
+                badge: `${topCat.share ?? 0}% catalog share`,
+                dateRange: rangeLabel,
+                targetSectionId: 'section-revenue-by-category',
+                targetSectionName: 'Revenue by Category',
+              })
+            }
+
+            // Observation 3: Sales change vs. previous period (suppressed when comparison data is missing/insufficient)
+            if (
+              analytics?.comparison?.previous &&
+              analytics.comparison.previous.revenue > 0 &&
+              analytics.comparison.revenueChange !== null &&
+              analytics.comparison.revenueChange !== undefined &&
+              Math.abs(analytics.comparison.revenueChange) >= 0.1
+            ) {
+              const changeVal = analytics.comparison.revenueChange
+              const isIncrease = changeVal > 0
+              insights.push({
+                id: 'period-comparison',
+                title: isIncrease ? 'Growth Momentum' : 'Sales Adjustment',
+                observation: `Settled revenue shifted by ${isIncrease ? '+' : ''}${changeVal.toFixed(1)}% (${sym}${analytics.totalRevenue.toFixed(2)} vs. ${sym}${analytics.comparison.previous.revenue.toFixed(2)}) compared to the preceding period.`,
+                badge: `${isIncrease ? '+' : ''}${changeVal.toFixed(1)}% vs. prior`,
+                dateRange: `${rangeLabel} vs. ${compRangeLabel}`,
+                targetSectionId: 'section-revenue-trend',
+                targetSectionName: 'Revenue Trend',
+              })
+            }
+
+            if (loading) {
+              return (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {[1, 2, 3].map((i) => (
+                    <div key={i} className="h-24 rounded-lg bg-secondary/30 animate-pulse" />
+                  ))}
+                </div>
+              )
+            }
+
+            if (insights.length === 0) {
+              return (
+                <div className="flex h-20 items-center justify-center text-xs text-muted-foreground border border-dashed border-border/60 rounded-lg">
+                  Insufficient data in current scope to formulate business observations.
+                </div>
+              )
+            }
+
+            return (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {insights.map((ins) => (
+                  <div
+                    key={ins.id}
+                    className="p-3 rounded-lg bg-secondary/25 border border-border/50 flex flex-col justify-between hover:border-border transition-colors text-xs"
+                  >
+                    <div>
+                      <div className="flex items-center justify-between gap-1 mb-1.5">
+                        <span className="font-semibold text-foreground text-xs">{ins.title}</span>
+                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 shrink-0">
+                          {ins.badge}
+                        </span>
+                      </div>
+                      <p className="text-muted-foreground leading-relaxed text-[11px]">{ins.observation}</p>
+                    </div>
+
+                    <div className="mt-3 pt-2 border-t border-border/40 flex items-center justify-between text-[10px]">
+                      <span className="text-muted-foreground/75 truncate max-w-[130px]">{ins.dateRange}</span>
+                      <a
+                        href={`#${ins.targetSectionId}`}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          const el = document.getElementById(ins.targetSectionId)
+                          el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                        }}
+                        className="inline-flex items-center gap-0.5 font-medium text-primary hover:underline"
+                      >
+                        {ins.targetSectionName}
+                        <ArrowUpRight className="size-2.5" />
+                      </a>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
+          })()}
         </Card>
       </div>
     </div>
