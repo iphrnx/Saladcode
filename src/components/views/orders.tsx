@@ -2639,7 +2639,7 @@ function Figure({ icon: Icon, label, amount, currencySymbol, tone }: {
         className={cn(
           'text-base sm:text-[17.5px] font-bold tabular-nums leading-tight tracking-tight [overflow-wrap:anywhere]',
           tone === 'paid' && 'text-emerald-600 dark:text-emerald-400',
-          tone === 'due' && 'text-[#ea580c] dark:text-orange-400',
+          tone === 'due' && 'text-orange-700 dark:text-orange-400',
           !tone && 'text-foreground',
         )}
       >
@@ -2796,7 +2796,7 @@ function OrderRow({
                 {/* 3rd thumbnail: visible on wider screens if space allows */}
                 {order.items.length >= 3 && (
                   <DishThumb
-                    className="hidden min-[400px]:grid lg:hidden xl:grid"
+                    className="hidden min-[400px]:grid sm:hidden md:grid lg:hidden xl:grid"
                     src={dishImages[order.items[2]?.menuItemId]}
                   />
                 )}
@@ -2804,11 +2804,11 @@ function OrderRow({
                 {/* +N badge when items exceed what's visible */}
                 {order.items.length > 3 ? (
                   <span className="grid size-9 sm:size-10 shrink-0 place-items-center rounded-xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs sm:text-[13px] font-bold text-orange-600 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-                    <span className="min-[400px]:hidden lg:inline xl:hidden">+{order.items.length - 2}</span>
-                    <span className="hidden min-[400px]:inline lg:hidden xl:inline">+{order.items.length - 3}</span>
+                    <span className="min-[400px]:hidden sm:inline md:hidden lg:inline xl:hidden">+{order.items.length - 2}</span>
+                    <span className="hidden min-[400px]:inline sm:hidden md:inline lg:hidden xl:inline">+{order.items.length - 3}</span>
                   </span>
                 ) : order.items.length === 3 ? (
-                  <span className="min-[400px]:hidden lg:grid xl:hidden grid size-9 sm:size-10 shrink-0 place-items-center rounded-xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs font-bold text-orange-600 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+                  <span className="min-[400px]:hidden sm:grid md:hidden lg:grid xl:hidden grid size-9 sm:size-10 shrink-0 place-items-center rounded-xl bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs font-bold text-orange-600 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
                     +1
                   </span>
                 ) : null}

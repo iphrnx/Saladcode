@@ -88,25 +88,29 @@ test('DishThumb uses responsive size (size-9 sm:size-10 / 36-40px)', () => {
   )
 })
 
-test('Collapsed preview shows max 2 thumbnails on <400px and 1024px-1279px, and 3rd thumbnail on wider', () => {
+test('Collapsed preview shows max 2 thumbnails on <400px, 640px-767px, and 1024px-1279px, and 3rd thumbnail on wider', () => {
   assert.ok(
-    ordersSrc.includes('className="hidden min-[400px]:grid lg:hidden xl:grid"'),
-    '3rd thumbnail must adapt on narrow viewports and 3-column desktop to preserve space for item names',
+    ordersSrc.includes('className="hidden min-[400px]:grid sm:hidden md:grid lg:hidden xl:grid"'),
+    '3rd thumbnail must adapt on narrow viewports (including 640px 2-col) and 3-column desktop to preserve space for item names',
   )
 })
 
 test('Badge count responsive calculation adapts between viewports', () => {
   assert.ok(
-    ordersSrc.includes('<span className="min-[400px]:hidden lg:inline xl:hidden">+{order.items.length - 2}</span>'),
-    'On <400px and lg:hidden, badge must show +N based on 2 visible thumbnails',
+    ordersSrc.includes('<span className="min-[400px]:hidden sm:inline md:hidden lg:inline xl:hidden">+{order.items.length - 2}</span>'),
+    'On <400px, sm:inline, and lg:inline, badge must show +N based on 2 visible thumbnails',
   )
   assert.ok(
-    ordersSrc.includes('<span className="hidden min-[400px]:inline lg:hidden xl:inline">+{order.items.length - 3}</span>'),
+    ordersSrc.includes('<span className="hidden min-[400px]:inline sm:hidden md:inline lg:hidden xl:inline">+{order.items.length - 3}</span>'),
     'On wider viewports, badge must show +N based on 3 visible thumbnails',
   )
   assert.ok(
     ordersSrc.includes('order.items.length === 3'),
     'When items count is exactly 3, +1 badge is shown only when 3rd thumbnail is hidden',
+  )
+  assert.ok(
+    ordersSrc.includes('className="min-[400px]:hidden sm:grid md:hidden lg:grid xl:hidden grid size-9 sm:size-10'),
+    'When items count is 3, +1 badge renders with complementary visibility matching hidden 3rd thumbnail',
   )
 })
 
@@ -142,8 +146,38 @@ test('Session stats support compact count on narrow viewports (<350px) and full 
   )
 })
 
-// ── 4. Order Expansion Logic Invariance ────────────────────────────────────
-console.log('\n▶ 4. Order Expansion Logic Preservation...')
+// ── 4. Light-Mode Contrast Contracts ───────────────────────────────────────
+console.log('\n▶ 4. Financial Figures & Light-Mode Contrast Contracts...')
+
+test('Amount due has accessible light-mode contrast (>= 4.5:1) against #fff7ed', () => {
+  assert.ok(
+    ordersSrc.includes("tone === 'due' && 'text-orange-700 dark:text-orange-400'"),
+    'Amount due must use a darker tone such as text-orange-700 for WCAG AA contrast against #fff7ed',
+  )
+
+  // Verify contrast ratio against #fff7ed
+  function lum(hex: string) {
+    const r = parseInt(hex.slice(1, 3), 16) / 255
+    const g = parseInt(hex.slice(3, 5), 16) / 255
+    const b = parseInt(hex.slice(5, 7), 16) / 255
+    const a = [r, g, b].map((v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)))
+    return 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]
+  }
+  function ratio(c1: string, c2: string) {
+    const l1 = lum(c1)
+    const l2 = lum(c2)
+    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)
+  }
+  // Tailwind orange-700 is #c2410c
+  const contrast = ratio('#c2410c', '#fff7ed')
+  assert.ok(
+    contrast >= 4.5,
+    `Contrast ratio of amount due against #fff7ed must be >= 4.5:1, got ${contrast.toFixed(2)}:1`,
+  )
+})
+
+// ── 5. Order Expansion Logic Invariance ────────────────────────────────────
+console.log('\n▶ 5. Order Expansion Logic Preservation...')
 
 test('Order expansion helper behavior: single expands, multiple starts collapsed', () => {
   const o1 = { id: 'order-1', status: 'PENDING' }
@@ -166,8 +200,8 @@ test('Order expansion helper behavior: single expands, multiple starts collapsed
   assert.equal(closed.openId, null)
 })
 
-// ── 5. Viewport Geometry Calculations (320px, 375px, 390px, 768px, 1024px, 1280px) ─
-console.log('\n▶ 5. Viewport Geometry Assertions...')
+// ── 6. Viewport Geometry Calculations (320px, 375px, 390px, 640px, 768px, 1024px, 1280px) ─
+console.log('\n▶ 6. Viewport Geometry Assertions...')
 
 interface ViewportConfig {
   name: string
@@ -185,6 +219,7 @@ const VIEWPORTS: ViewportConfig[] = [
   { name: 'Mobile 320px (iPhone SE)', width: 320, outerPadding: 14 * 2, gridGap: 16, columns: 1, cardPadding: 28, buttonPadding: 20 },
   { name: 'Mobile 375px (iPhone 11/SE2)', width: 375, outerPadding: 14 * 2, gridGap: 16, columns: 1, cardPadding: 28, buttonPadding: 20 },
   { name: 'Mobile 390px (iPhone 14/15)', width: 390, outerPadding: 14 * 2, gridGap: 16, columns: 1, cardPadding: 28, buttonPadding: 20 },
+  { name: 'Narrow 2-col 640px (Small Tablet - 2 cols)', width: 640, outerPadding: 14 * 2, gridGap: 16, columns: 2, cardPadding: 32, buttonPadding: 24 },
   { name: 'Tablet 768px (iPad Mini - 2 cols)', width: 768, outerPadding: 24 * 2, gridGap: 20, columns: 2, cardPadding: 32, buttonPadding: 24 },
   { name: 'Desktop 1024px (Small Laptop - 3 cols)', width: 1024, outerPadding: 24 * 2, gridGap: 20, columns: 3, cardPadding: 32, buttonPadding: 24 },
   { name: 'Desktop 1280px (Standard - 3 cols)', width: 1280, outerPadding: 24 * 2, gridGap: 20, columns: 3, cardPadding: 32, buttonPadding: 24 },
@@ -197,19 +232,19 @@ for (const vp of VIEWPORTS) {
     const cardInnerWidth = cardWidth - vp.cardPadding
     const rowInnerWidth = cardInnerWidth - vp.buttonPadding
 
-    // Thumbnail size is 36px on mobile, 40px on tablet/desktop
+    // Thumbnail size is 36px on mobile (<640px), 40px on tablet/desktop (>=640px)
     const thumbSize = vp.width >= 640 ? 40 : 36
     const gap = 8
 
-    // Visible thumbnails: 2 on <400px and 1024-1279px (3 cols), 3 on wider
-    const visibleThumbs = (vp.width < 400 || (vp.width >= 1024 && vp.width < 1280)) ? 2 : 3
+    // Visible thumbnails: 2 on <400px, 640px-767px (sm 2 cols), and 1024-1279px (lg 3 cols), 3 on wider
+    const visibleThumbs = (vp.width < 400 || (vp.width >= 640 && vp.width < 768) || (vp.width >= 1024 && vp.width < 1280)) ? 2 : 3
     const badgeSize = thumbSize
 
     // Total width of thumbnails + badge
     const thumbsTotalWidth = visibleThumbs * thumbSize + (visibleThumbs - 1) * gap + gap + badgeSize
     const remainingForText = rowInnerWidth - thumbsTotalWidth - 10
 
-    // Ensure there is at least 95px remaining for item names preview even at worst-case 320px
+    // Ensure there is at least 95px remaining for item names preview even at worst-case viewports
     assert.ok(
       remainingForText >= 95,
       `Expected remainingForText >= 95px, got ${remainingForText.toFixed(1)}px on ${vp.name}`,
@@ -228,6 +263,32 @@ for (const vp of VIEWPORTS) {
     )
   })
 }
+
+test('Viewport 640px (2-column) with 4+ items preserves readable space for item names (>= 90px)', () => {
+  const width = 640
+  const outerPadding = 28 // px-3.5 * 2
+  const gridGap = 16 // gap-4
+  const columns = 2 // sm:grid-cols-2
+  const cardPadding = 32 // sm:p-4
+  const buttonPadding = 24 // sm:p-3
+  const cardWidth = (width - outerPadding - (columns - 1) * gridGap) / columns
+  const cardInnerWidth = cardWidth - cardPadding
+  const rowInnerWidth = cardInnerWidth - buttonPadding
+
+  // With 4+ items at 640px, sm:hidden ensures only 2 thumbnails + overflow badge (+2) are rendered
+  const visibleThumbs = 2
+  const thumbSize = 40 // sm:size-10
+  const gap = 8 // sm:gap-2
+  const badgeSize = thumbSize
+
+  const thumbsTotalWidth = visibleThumbs * thumbSize + (visibleThumbs - 1) * gap + gap + badgeSize
+  const remainingForText = rowInnerWidth - thumbsTotalWidth - 10
+
+  assert.ok(
+    remainingForText >= 90,
+    `Expected remainingForText >= 90px with 4+ items at 640px, got ${remainingForText.toFixed(1)}px`,
+  )
+})
 
 console.log(`\nResults: ${passed} passed, ${failed} failed of ${passed + failed} checks.`)
 
