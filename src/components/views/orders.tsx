@@ -2251,12 +2251,28 @@ function SittingCard({
     const paymentMethod = formatPaymentMethod((check as any)?.payments?.[0]?.method || (check as any)?.paymentMethod || sitting.latest.paymentMethod || 'Cash')
     const paidAmount = money(currencySymbol, check?.paid ?? sitting.total)
 
+    // Formatted session time or reference (distinguishes separate visits at the same table)
+    const sessionTimeRef = sitting.endedAt
+      ? formatOrderRelativeTime(sitting.endedAt, timeZone, now)
+      : (check as any)?.closedAt
+        ? formatOrderRelativeTime((check as any).closedAt, timeZone, now)
+        : sitting.startedAt
+          ? formatOrderRelativeTime(sitting.startedAt, timeZone, now)
+          : null
+
+    const summaryParts = [
+      `${sitting.orders.length} order${sitting.orders.length === 1 ? '' : 's'}`,
+      `${sitting.qtyCount} item${sitting.qtyCount === 1 ? '' : 's'}`,
+      sittingDuration(sitting.startedAt, sitting.endedAt, now),
+      sessionTimeRef,
+    ].filter(Boolean) as string[]
+
     return (
       <Card
         data-order-card
         data-session-card={sitting.sessionId ?? undefined}
         className={cn(
-          'group relative w-full self-start overflow-hidden rounded-[20px] sm:rounded-[22px] border p-3.5 sm:p-4',
+          'group relative w-full self-start !min-h-0 !h-auto overflow-hidden rounded-[20px] sm:rounded-[22px] border p-3.5 sm:p-4',
           'border-neutral-200/80 dark:border-border/70 bg-card shadow-[0_2px_12px_-2px_rgba(0,0,0,0.04)] dark:shadow-none transition-all duration-200 hover:border-primary/40 hover:shadow-md cursor-pointer',
         )}
         onClick={() => onOpenOrders(sitting)}
@@ -2265,39 +2281,45 @@ function SittingCard({
           aria-hidden="true"
           className="pointer-events-none absolute -top-16 -right-16 size-40 rounded-full bg-gradient-to-br from-orange-400/10 via-orange-200/5 to-transparent blur-xl dark:from-orange-500/5 dark:via-transparent"
         />
-        <div className="relative z-10 flex items-center justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="font-bold text-foreground text-sm sm:text-[15px] truncate">
-                {labelName}
-              </span>
-              <span className="text-muted-foreground/60 text-xs shrink-0">•</span>
-              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-800 border border-emerald-200/60 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-800/50 shrink-0">
-                <Check className="size-3 stroke-[2.5]" />
-                Paid via {paymentMethod}
-              </span>
-              <span className="text-muted-foreground/60 text-xs shrink-0">•</span>
-              <span className="text-xs sm:text-[13.5px] font-bold tabular-nums text-foreground shrink-0">
-                {paidAmount}
-              </span>
-            </div>
-            <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
-              <span className="inline-flex items-center rounded-md bg-secondary px-2 py-0.5 text-[10.5px] font-medium text-muted-foreground border border-border/40">
-                Session Ended
-              </span>
-              <span className="text-muted-foreground/60 text-xs">•</span>
-              <p className="text-xs text-muted-foreground truncate">
-                {sitting.orders.length} order{sitting.orders.length === 1 ? '' : 's'} • {sitting.qtyCount} item{sitting.qtyCount === 1 ? '' : 's'} • {sittingDuration(sitting.startedAt, sitting.endedAt, now)}
-              </p>
-            </div>
+        <div className="relative z-10 flex flex-col gap-2">
+          {/* Top: table name and Paid via Cash/UPI/Card badge */}
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="font-bold text-foreground text-sm sm:text-[15px] truncate leading-tight">
+              {labelName}
+            </h3>
+            <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-800 border border-emerald-200/60 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-800/50">
+              <Check className="size-3 stroke-[2.5]" />
+              Paid via {paymentMethod}
+            </span>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0" onClick={(e) => e.stopPropagation()}>
+          {/* Below: paid amount, Session Ended badge */}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-base sm:text-[17px] font-bold tabular-nums text-foreground tracking-tight">
+              {paidAmount}
+            </span>
+            <span className="inline-flex items-center rounded-md bg-secondary px-2 py-0.5 text-[10.5px] font-medium text-muted-foreground border border-border/40">
+              Session Ended
+            </span>
+          </div>
+
+          {/* Compact summary with order count, item count, duration, and session time (dots only between visible values) */}
+          <div className="flex items-center gap-1.5 flex-wrap text-xs text-muted-foreground">
+            {summaryParts.map((part, idx) => (
+              <span key={idx} className="inline-flex items-center gap-1.5">
+                {idx > 0 && <span aria-hidden className="text-muted-foreground/60 select-none">•</span>}
+                <span>{part}</span>
+              </span>
+            ))}
+          </div>
+
+          {/* Actions: Bill and Details close to the summary, wrapping cleanly on narrow screens */}
+          <div className="flex items-center gap-2 flex-wrap pt-0.5" onClick={(e) => e.stopPropagation()}>
             <Button
               size="sm"
               variant="outline"
               onClick={() => onBill(sitting, false)}
-              className="h-8.5 gap-1.5 rounded-xl px-3 text-xs font-semibold hover:border-orange-300 dark:hover:border-orange-500/40 cursor-pointer"
+              className="h-8 gap-1.5 rounded-xl px-3 text-xs font-semibold hover:border-orange-300 dark:hover:border-orange-500/40 cursor-pointer"
             >
               <ReceiptText className="size-3.5 text-orange-500" />
               <span>Bill</span>
@@ -2306,7 +2328,7 @@ function SittingCard({
               size="sm"
               variant="outline"
               onClick={() => onOpenOrders(sitting)}
-              className="h-8.5 gap-1.5 rounded-xl px-3 text-xs font-semibold hover:border-orange-300 dark:hover:border-orange-500/40 cursor-pointer"
+              className="h-8 gap-1.5 rounded-xl px-3 text-xs font-semibold hover:border-orange-300 dark:hover:border-orange-500/40 cursor-pointer"
             >
               <Info className="size-3.5 text-muted-foreground" />
               <span>Details</span>
@@ -2381,8 +2403,7 @@ function SittingCard({
       data-order-card
       data-session-card={sitting.sessionId ?? undefined}
       className={cn(
-        'group relative flex w-full min-w-0 flex-col rounded-[22px] sm:rounded-[24px] border border-neutral-200/80 dark:border-border/70 bg-card p-3.5 sm:p-4 shadow-[0_4px_20px_-4px_rgba(234,88,12,0.06),0_2px_6px_-1px_rgba(0,0,0,0.04)] dark:shadow-[0_4px_20px_-4px_rgba(0,0,0,0.4)] transition-all duration-200 hover:border-primary/40 hover:shadow-md overflow-hidden',
-        paidOff ? 'self-start' : '',
+        'group relative flex w-full min-w-0 flex-col rounded-[22px] sm:rounded-[24px] border border-neutral-200/80 dark:border-border/70 bg-card p-3.5 sm:p-4 shadow-[0_4px_20px_-4px_rgba(234,88,12,0.06),0_2px_6px_-1px_rgba(0,0,0,0.04)] dark:shadow-[0_4px_20px_-4px_rgba(0,0,0,0.4)] transition-all duration-200 hover:border-primary/40 hover:shadow-md overflow-hidden self-start !min-h-0 !h-auto',
       )}
     >
       {/* Subtle decorative peach gradient near top right */}
@@ -2534,12 +2555,12 @@ function SittingCard({
       </div>
 
       {/* Payment summary and bottom actions */}
-      <div className={cn('relative z-10 pt-3', paidOff ? 'mt-2' : 'mt-auto')}>
+      <div className="relative z-10 mt-3 pt-0">
         <div className="rounded-xl sm:rounded-2xl border border-orange-200/60 dark:border-border/60 bg-[#fff7ed] dark:bg-secondary/40 p-2 sm:p-2.5">
           <dl aria-label={sitting.sharedBill ? "Shared table check" : "Bill totals"} className="grid grid-cols-3 divide-x divide-orange-200/50 dark:divide-border/50">
-            <Figure icon={Layers} label="Total" amount={billTotal} currencySymbol={currencySymbol} />
-            <Figure icon={Wallet} label="Paid" amount={billPaid} currencySymbol={currencySymbol} tone="paid" />
-            <Figure icon={ReceiptText} label="Due" amount={billDue} currencySymbol={currencySymbol} tone={billDue ? 'due' : undefined} />
+            <Figure label="Total" icon={Layers} amount={billTotal} currencySymbol={currencySymbol} />
+            <Figure label="Due" icon={ReceiptText} amount={billDue} currencySymbol={currencySymbol} tone={billDue ? 'due' : undefined} />
+            <Figure label="Paid" icon={Wallet} amount={billPaid} currencySymbol={currencySymbol} tone="paid" />
           </dl>
         </div>
 
@@ -2549,7 +2570,7 @@ function SittingCard({
             className={cn(
               'flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl sm:rounded-2xl px-3.5 text-center text-xs sm:text-[13px] font-bold whitespace-nowrap transition-colors duration-200 border',
               sitting.allServed
-                ? 'border-emerald-300 bg-emerald-50/70 text-emerald-800 dark:border-emerald-800/60 dark:bg-emerald-950/40 dark:text-emerald-300'
+                ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800/60 dark:bg-emerald-950/40 dark:text-emerald-300'
                 : 'border-orange-300 bg-white dark:bg-card text-orange-600 dark:border-orange-500/50 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.03)]',
             )}
           >
@@ -2672,12 +2693,21 @@ function OrderRow({
   onOpen: () => void
 }) {
   const id = useId()
+  const [showAllItems, setShowAllItems] = useState(false)
+  const [prevExpanded, setPrevExpanded] = useState(expanded)
+  if (prevExpanded !== expanded) {
+    setPrevExpanded(expanded)
+    if (!expanded) setShowAllItems(false)
+  }
+
   const state = ORDER_STATUS[order.status as keyof typeof ORDER_STATUS]
   const StatusIcon = order.status === 'PREPARING' ? ChefHat
     : ['PENDING', 'PENDING_ACTIVATION'].includes(order.status) ? Hourglass
     : order.status === 'CANCELLED' ? XCircle : CircleCheck
   const statusLabel = order.status === 'PENDING_ACTIVATION' ? 'Awaiting Acceptance' : state?.label ?? order.status
   const previewNames = order.items.map((item) => item.name).join(', ')
+  const visibleItems = showAllItems ? order.items : order.items.slice(0, 2)
+  const overflowItemCount = order.items.length - 2
 
   return (
     <div
@@ -2806,38 +2836,62 @@ function OrderRow({
         <div className="min-h-0 overflow-hidden">
           <div className="p-2 sm:p-2.5 pt-1">
             {order.items.length > 0 ? (
-              <ul className="divide-y divide-border/50">
-                {order.items.map((item) => (
-                  <li
-                    key={item.id}
-                    className="grid grid-cols-[auto_minmax(0,1fr)_auto_minmax(3.5rem,auto)] items-center gap-2 sm:gap-2.5 py-2 pl-0.5 text-xs sm:text-[13px]"
-                  >
-                    <DishThumb className="size-8.5 sm:size-9" src={dishImages[item.menuItemId]} />
-                    <div className="min-w-0 [overflow-wrap:anywhere]">
-                      <p className="font-bold text-xs sm:text-[13.5px] text-foreground leading-tight">
-                        {item.name}
-                      </p>
-                      {(item.portion || item.notes || (item.kotNumber && item.kotNumber > 1)) && (
-                        <p className="mt-0.5 text-[11px] leading-tight text-muted-foreground">
-                          {[
-                            item.portion,
-                            item.kotNumber && item.kotNumber > 1 ? `KOT ${item.kotNumber}` : null,
-                            item.notes,
-                          ]
-                            .filter(Boolean)
-                            .join(' • ')}
+              <>
+                <ul className="divide-y divide-border/50">
+                  {visibleItems.map((item) => (
+                    <li
+                      key={item.id}
+                      className="grid grid-cols-[auto_minmax(0,1fr)_auto_minmax(3.5rem,auto)] items-center gap-2 sm:gap-2.5 py-2 pl-0.5 text-xs sm:text-[13px]"
+                    >
+                      <DishThumb className="size-8.5 sm:size-9" src={dishImages[item.menuItemId]} />
+                      <div className="min-w-0 [overflow-wrap:anywhere]">
+                        <p className="font-bold text-xs sm:text-[13.5px] text-foreground leading-tight">
+                          {item.name}
                         </p>
-                      )}
-                    </div>
-                    <span className="font-semibold tabular-nums text-muted-foreground text-xs sm:text-[13px]">
-                      ×{item.quantity}
-                    </span>
-                    <span className="text-right font-bold tabular-nums text-foreground text-xs sm:text-[13.5px]">
-                      {compactMoney(currencySymbol, item.price * item.quantity)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
+                        {(item.portion || item.notes || (item.kotNumber && item.kotNumber > 1)) && (
+                          <p className="mt-0.5 text-[11px] leading-tight text-muted-foreground">
+                            {[
+                              item.portion,
+                              item.kotNumber && item.kotNumber > 1 ? `KOT ${item.kotNumber}` : null,
+                              item.notes,
+                            ]
+                              .filter(Boolean)
+                              .join(' • ')}
+                          </p>
+                        )}
+                      </div>
+                      <span className="font-semibold tabular-nums text-muted-foreground text-xs sm:text-[13px]">
+                        ×{item.quantity}
+                      </span>
+                      <span className="text-right font-bold tabular-nums text-foreground text-xs sm:text-[13.5px]">
+                        {compactMoney(currencySymbol, item.price * item.quantity)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                {order.items.length > 2 && (
+                  <div className="flex items-center justify-center pt-1.5 pb-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setShowAllItems((prev) => !prev)}
+                      className="inline-flex items-center gap-1 text-xs font-semibold text-orange-600 hover:text-orange-700 dark:text-orange-400 dark:hover:text-orange-300 transition-colors cursor-pointer"
+                    >
+                      <span>
+                        {showAllItems
+                          ? 'Show fewer items'
+                          : `+${overflowItemCount} more item${overflowItemCount === 1 ? '' : 's'}`}
+                      </span>
+                      <ChevronRight
+                        aria-hidden
+                        className={cn(
+                          'size-3.5 stroke-[2.2] transition-transform duration-200',
+                          showAllItems ? '-rotate-90' : 'rotate-90',
+                        )}
+                      />
+                    </button>
+                  </div>
+                )}
+              </>
             ) : (
               <p className="px-2 py-3 text-xs text-muted-foreground text-center">No items</p>
             )}
