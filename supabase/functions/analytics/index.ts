@@ -131,7 +131,7 @@ serve(async (req: Request) => {
 
   const { data: menuRows } = await db
     .from("menu_items")
-    .select("id, category:categories(name)")
+    .select("id, name, is_active, category:categories(name)")
     .eq("tenant_id", tenantId)
     .limit(5000);
   const catMap: Record<string, string> = {};
@@ -399,13 +399,27 @@ serve(async (req: Request) => {
       (e) => e.settledAt >= winStart && e.settledAt < winEnd
     );
 
-    return { events: windowEvents, checkMap: localCheckMap, orders: allWindowOrders };
+    // Query refunded orders in the window
+    const windowRefunds = await fetchAllPages<any>(async (from, to) => {
+      return await db
+        .from("orders")
+        .select("id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at")
+        .eq("tenant_id", tenantId)
+        .in("payment_status", ["REFUNDED", "refunded"])
+        .gte("updated_at", winStart.toISOString())
+        .lt("updated_at", winEnd.toISOString())
+        .order("updated_at", { ascending: true })
+        .order("id", { ascending: true })
+        .range(from, to);
+    });
+
+    return { events: windowEvents, checkMap: localCheckMap, orders: allWindowOrders, refunds: windowRefunds };
   }
 
   /* -------------------------------------------------------------------------- */
   /* Reconcile Main Reporting Window                                            */
   /* -------------------------------------------------------------------------- */
-  const { events: mainEvents, checkMap: mainCheckMap, orders: mainOrders } =
+  const { events: mainEvents, checkMap: mainCheckMap, orders: mainOrders, refunds: mainRefunds } =
     await getReconciledEventsForWindow(rangeStart, rangeEnd);
 
   // Apply location filter uniformly
@@ -492,6 +506,40 @@ serve(async (req: Request) => {
     }
   }
 
+  // Attribution of refunds across methods
+  let cashRefunds = 0, upiRefunds = 0, cardRefunds = 0, otherRefunds = 0, unattributedRefunds = 0;
+  let cashRefundCount = 0, upiRefundCount = 0, cardRefundCount = 0, otherRefundCount = 0, unattributedRefundCount = 0;
+  for (const r of mainRefunds ?? []) {
+    const locId = r.location_id;
+    if (selectedLocationId && locId && locId !== selectedLocationId) continue;
+    const rawMethod = String(r.payment_method || "").toUpperCase();
+    const amt = Number(r.total || 0);
+    if (rawMethod === "CASH") {
+      cashRefunds += amt;
+      cashRefundCount++;
+    } else if (rawMethod === "UPI") {
+      upiRefunds += amt;
+      upiRefundCount++;
+    } else if (rawMethod === "CARD") {
+      cardRefunds += amt;
+      cardRefundCount++;
+    } else if (rawMethod === "OTHER") {
+      otherRefunds += amt;
+      otherRefundCount++;
+    } else {
+      unattributedRefunds += amt;
+      unattributedRefundCount++;
+    }
+  }
+
+  const cashNet = +(cashAmount - cashRefunds).toFixed(2);
+  const upiNet = +(upiAmount - upiRefunds).toFixed(2);
+  const cardNet = +(cardAmount - cardRefunds).toFixed(2);
+  const otherNet = +(otherAmount - otherRefunds).toFixed(2);
+  const totalRefundAmount = +(cashRefunds + upiRefunds + cardRefunds + otherRefunds + unattributedRefunds).toFixed(2);
+  const paymentBreakdownTotal = +(cashAmount + upiAmount + cardAmount + otherAmount).toFixed(2);
+  const totalNetAmount = +(paymentBreakdownTotal - totalRefundAmount).toFixed(2);
+
   /* -------------------------------------------------------------------------- */
   /* Daily Revenue Aggregation (Asia/Kolkata timezone boundaries)               */
   /* -------------------------------------------------------------------------- */
@@ -532,64 +580,145 @@ serve(async (req: Request) => {
   /* -------------------------------------------------------------------------- */
   /* Top Items, Types, Tables, Hourly, Categories                               */
   /* -------------------------------------------------------------------------- */
-  const itemCounts: Record<string, { name: string; qty: number; revenue: number }> = {};
+  // Initialize all active menu items to support zero-sale items in least-selling view
+  const allItemSalesMap: Record<string, { id?: string; name: string; category: string; qty: number; revenue: number; isZeroSale: boolean }> = {};
+  for (const m of menuRows ?? []) {
+    if ((m as any).is_active === false) continue;
+    const cat = Array.isArray((m as any).category) ? (m as any).category[0]?.name : (m as any).category?.name;
+    allItemSalesMap[(m as any).id] = {
+      id: (m as any).id,
+      name: (m as any).name,
+      category: cat || "Other",
+      qty: 0,
+      revenue: 0,
+      isZeroSale: true,
+    };
+  }
+
   for (const o of qualifyingOrders) {
     for (const it of o.items) {
       const key = it.menuItemId || it.name;
-      if (!itemCounts[key]) itemCounts[key] = { name: it.name, qty: 0, revenue: 0 };
-      itemCounts[key].qty += it.quantity;
-      itemCounts[key].revenue += it.price * it.quantity;
+      if (!allItemSalesMap[key]) {
+        // Historical menu item preserved with audited name and category
+        allItemSalesMap[key] = {
+          id: it.menuItemId || undefined,
+          name: it.name,
+          category: catMap[it.menuItemId] || "Other",
+          qty: 0,
+          revenue: 0,
+          isZeroSale: false,
+        };
+      }
+      allItemSalesMap[key].qty += it.quantity;
+      allItemSalesMap[key].revenue += it.price * it.quantity;
+      allItemSalesMap[key].isZeroSale = false;
     }
   }
-  const topItems = Object.values(itemCounts)
-    .sort((a, b) => b.qty - a.qty || b.revenue - a.revenue)
-    .slice(0, 6)
-    .map((t) => ({ ...t, revenue: +t.revenue.toFixed(2) }));
 
-  const typeMap: Record<string, { count: number; revenue: number }> = {};
+  const allItemsList = Object.values(allItemSalesMap).map((it) => ({
+    ...it,
+    revenue: +it.revenue.toFixed(2),
+  }));
+
+  const topItems = allItemsList
+    .filter((it) => !it.isZeroSale)
+    .sort((a, b) => b.qty - a.qty || b.revenue - a.revenue || a.name.localeCompare(b.name));
+
+  const typeMap: Record<string, { count: number; revenue: number }> = {
+    DINE_IN: { count: 0, revenue: 0 },
+    TAKEAWAY: { count: 0, revenue: 0 },
+    DELIVERY: { count: 0, revenue: 0 },
+  };
   for (const o of qualifyingOrders) {
     const t = o.orderType;
     if (!typeMap[t]) typeMap[t] = { count: 0, revenue: 0 };
     typeMap[t].count++;
     typeMap[t].revenue += Number(o.total || 0);
   }
-  const typeBreakdown = Object.entries(typeMap)
-    .filter(([_, v]) => v.count > 0)
-    .map(([type, v]) => ({
-      type,
-      count: v.count,
-      revenue: +v.revenue.toFixed(2),
-    }));
+  const totalOrderTypeRev = Object.values(typeMap).reduce((s, v) => s + v.revenue, 0);
+  const typeBreakdown = Object.entries(typeMap).map(([type, v]) => ({
+    type,
+    count: v.count,
+    revenue: +v.revenue.toFixed(2),
+    aov: v.count > 0 ? +(v.revenue / v.count).toFixed(2) : 0,
+    share: totalOrderTypeRev > 0 ? +((v.revenue / totalOrderTypeRev) * 100).toFixed(1) : 0,
+  }));
 
-  const tablePerf: Record<string, { name: string; orders: number; revenue: number }> = {};
+  const tablePerf: Record<string, {
+    tableId: string;
+    name: string;
+    sessions: Set<string>;
+    revenue: number;
+  }> = {};
+
+  // 1. Process settled checks: each check settlement counted exactly once
+  for (const e of filteredEvents) {
+    if (!e.checkId) continue;
+    const chk = mainCheckMap.get(e.checkId);
+    const tableId = chk?.table_id;
+    if (!tableId) continue;
+    const name = tableMap.get(tableId)?.name || "Table";
+    if (!tablePerf[tableId]) {
+      tablePerf[tableId] = { tableId, name, sessions: new Set(), revenue: 0 };
+    }
+    const sessionId = chk.session_id || chk.id;
+    tablePerf[tableId].sessions.add(sessionId);
+    tablePerf[tableId].revenue += e.amount;
+  }
+
+  // 2. Direct table orders settled without a check
   for (const o of qualifyingOrders) {
-    if (!o.tableId) continue;
+    if (!o.tableId || o.checkId) continue;
     const name = o.tableName || tableMap.get(o.tableId)?.name || "Table";
-    if (!tablePerf[o.tableId]) tablePerf[o.tableId] = { name, orders: 0, revenue: 0 };
-    tablePerf[o.tableId].orders++;
+    if (!tablePerf[o.tableId]) {
+      tablePerf[o.tableId] = { tableId: o.tableId, name, sessions: new Set(), revenue: 0 };
+    }
+    tablePerf[o.tableId].sessions.add(o.id);
     tablePerf[o.tableId].revenue += Number(o.total || 0);
   }
+
   const topTables = Object.values(tablePerf)
-    .sort((a, b) => b.revenue - a.revenue)
-    .slice(0, 6)
-    .map((t) => ({ ...t, revenue: +t.revenue.toFixed(2) }));
+    .map((t) => {
+      const sessionCount = t.sessions.size;
+      const rev = +t.revenue.toFixed(2);
+      const avgBill = sessionCount > 0 ? +(rev / sessionCount).toFixed(2) : 0;
+      return {
+        tableId: t.tableId,
+        name: t.name,
+        orders: sessionCount, // backward compatibility
+        sessionCount,
+        revenue: rev,
+        averageBill: avgBill,
+        avgBill,
+        utilization: null, // source data lacks defined available-time denominator
+      };
+    })
+    .sort((a, b) => b.revenue - a.revenue || a.name.localeCompare(b.name));
 
   const hourly: number[] = new Array(24).fill(0);
+  const hourlyRevenueArr: number[] = new Array(24).fill(0);
   for (const o of qualifyingOrders) {
     const h = zonedHour(o.settledAt, timeZone);
-    if (h >= 0 && h < 24) hourly[h]++;
+    if (h >= 0 && h < 24) {
+      hourly[h]++;
+      hourlyRevenueArr[h] += Number(o.total || 0);
+    }
   }
+  const hourlyBreakdown = Array.from({ length: 24 }, (_, h) => ({
+    hour: h,
+    orders: hourly[h],
+    revenue: +hourlyRevenueArr[h].toFixed(2),
+  }));
 
-  const catRevenue: Record<string, number> = {};
+  const catStats: Record<string, { revenue: number; units: number }> = {};
   for (const o of qualifyingOrders) {
     for (const it of o.items) {
       const cat = catMap[it.menuItemId] || "Other";
-      catRevenue[cat] = (catRevenue[cat] || 0) + Number(it.price || 0) * Number(it.quantity || 0);
+      if (!catStats[cat]) catStats[cat] = { revenue: 0, units: 0 };
+      catStats[cat].revenue += Number(it.price || 0) * Number(it.quantity || 0);
+      catStats[cat].units += Number(it.quantity || 0);
     }
   }
-  const categoryBreakdown = Object.entries(catRevenue)
-    .map(([name, value]) => ({ name, value: +Number(value || 0).toFixed(2) }))
-    .sort((a, b) => b.value - a.value);
 
   /* -------------------------------------------------------------------------- */
   /* Independent Today & Yesterday Queries (Run through identical reconciliation)*/
@@ -621,6 +750,130 @@ serve(async (req: Request) => {
   }
 
   /* -------------------------------------------------------------------------- */
+  /* Previous Period Comparison Reconciled for Active Reporting Window          */
+  /* -------------------------------------------------------------------------- */
+  const windowDurationMs = rangeEnd.getTime() - rangeStart.getTime();
+  const prevRangeStart = new Date(rangeStart.getTime() - windowDurationMs);
+  const prevRangeEnd = rangeStart;
+  const prevFromStr = zonedDateStr(prevRangeStart, timeZone);
+  const prevToStr = zonedDateStr(new Date(prevRangeEnd.getTime() - DAY_MS), timeZone);
+
+  const { events: prevEvents, checkMap: prevCheckMap, orders: prevOrders } =
+    await getReconciledEventsForWindow(prevRangeStart, prevRangeEnd);
+
+  const filteredPrevEvents = prevEvents.filter((e) => {
+    if (!selectedLocationId) return true;
+    return e.locationId === selectedLocationId;
+  });
+
+  const prevQualifyingOrders: any[] = [];
+  for (const o of prevOrders) {
+    const locId = resolveEntityLocation(o, prevCheckMap);
+    if (selectedLocationId && locId !== selectedLocationId) continue;
+
+    let settlementTime: Date | null = null;
+    if (o.check_id) {
+      const chkEvent = prevEvents.find((e) => e.checkId === o.check_id);
+      if (chkEvent) settlementTime = chkEvent.settledAt;
+    } else if (o.paid_at) {
+      settlementTime = new Date(o.paid_at);
+    } else if (o.completed_at) {
+      settlementTime = new Date(o.completed_at);
+    }
+
+    if (!settlementTime || isNaN(settlementTime.getTime())) continue;
+    if (settlementTime < prevRangeStart || settlementTime >= prevRangeEnd) continue;
+
+    prevQualifyingOrders.push(o);
+  }
+
+  const prevDailyRevenue: { date: string; label: string; revenue: number; orders: number }[] = [];
+  for (let t = prevRangeStart.getTime(); t < prevRangeEnd.getTime(); t += DAY_MS) {
+    const dayStart = new Date(t);
+    const dayEnd = new Date(t + DAY_MS);
+
+    const dayEvents = filteredPrevEvents.filter(
+      (e) => e.settledAt >= dayStart && e.settledAt < dayEnd
+    );
+    const dayRevenue = dayEvents.reduce((s, e) => s + e.amount, 0);
+
+    const dayOrders = prevQualifyingOrders.filter(
+      (o) => o.settledAt >= dayStart && o.settledAt < dayEnd
+    );
+
+    const dateStr = zonedDateStr(dayStart, timeZone);
+    const dayOfWeek = new Date(`${dateStr}T00:00:00Z`).getUTCDay();
+
+    prevDailyRevenue.push({
+      date: dateStr,
+      label: DAY_LABELS[dayOfWeek],
+      revenue: +dayRevenue.toFixed(2),
+      orders: dayOrders.length,
+    });
+  }
+
+  const prevRevenue = +(filteredPrevEvents.reduce((s, e) => s + e.amount, 0)).toFixed(2);
+  const prevTotalOrders = prevQualifyingOrders.length;
+  const prevAvgOrder = prevTotalOrders > 0 ? +(prevRevenue / prevTotalOrders).toFixed(2) : 0;
+  const prevNetSales = +(prevQualifyingOrders.reduce((s: number, o: any) => s + Math.max(0, Number(o.items_total || o.total || 0) - Number(o.discount || 0)), 0)).toFixed(2);
+
+  function calcChange(curr: number, prev: number): number | null {
+    if (prev > 0) {
+      return +(((curr - prev) / prev) * 100).toFixed(1);
+    }
+    if (prev === 0 && curr > 0) {
+      return 100.0;
+    }
+    if (prev === 0 && curr === 0) {
+      return 0.0;
+    }
+    return null;
+  }
+
+  const periodRevenueChange = calcChange(totalRevenue, prevRevenue);
+  const periodOrdersChange = calcChange(totalOrders, prevTotalOrders);
+  const periodAvgOrderChange = calcChange(avgOrder, prevAvgOrder);
+  const periodNetSalesChange = calcChange(netSales, prevNetSales);
+
+  /* -------------------------------------------------------------------------- */
+  /* Previous Period Category Revenue & Reconciled Category Breakdown           */
+  /* -------------------------------------------------------------------------- */
+  const prevCatRevenue: Record<string, number> = {};
+  for (const o of prevQualifyingOrders) {
+    for (const it of (o.items ?? [])) {
+      const cat = catMap[it.menu_item_id || it.menuItemId] || "Other";
+      prevCatRevenue[cat] = (prevCatRevenue[cat] || 0) + Number(it.price || 0) * Number(it.quantity || 0);
+    }
+  }
+
+  const allCatNames = new Set([...Object.keys(catStats), ...Object.keys(prevCatRevenue)]);
+  const totalCatRevenue = Object.values(catStats).reduce((s, v) => s + v.revenue, 0);
+  const categoryBreakdown = Array.from(allCatNames)
+    .map((name) => {
+      const curStat = catStats[name] || { revenue: 0, units: 0 };
+      const rev = +curStat.revenue.toFixed(2);
+      const prevRev = +(prevCatRevenue[name] || 0).toFixed(2);
+      let growth: number | null = null;
+      if (prevRev > 0) {
+        growth = +(((rev - prevRev) / prevRev) * 100).toFixed(1);
+      } else if (prevRev === 0 && rev > 0) {
+        growth = 100.0;
+      } else if (prevRev === 0 && rev === 0) {
+        growth = 0.0;
+      }
+      return {
+        name,
+        value: rev, // backwards compatible
+        revenue: rev,
+        units: curStat.units,
+        share: totalCatRevenue > 0 ? +((rev / totalCatRevenue) * 100).toFixed(1) : 0,
+        previousRevenue: prevRev,
+        growth,
+      };
+    })
+    .sort((a, b) => b.revenue - a.revenue || a.name.localeCompare(b.name));
+
+  /* -------------------------------------------------------------------------- */
   /* Plan Entitlements & Locations                                              */
   /* -------------------------------------------------------------------------- */
   const plan = await resolvePlan(tenantId);
@@ -646,19 +899,47 @@ serve(async (req: Request) => {
     serviceChargeCollected: +serviceChargeCollected.toFixed(2),
     dailyRevenue,
     topItems: isAdvanced ? topItems : [],
+    allItems: isAdvanced ? allItemsList : [],
     categoryBreakdown: isAdvanced ? categoryBreakdown : [],
     advanced: isAdvanced,
     todaysRevenue,
     todaysOrders,
-    revenueChange,
+    revenueChange: periodRevenueChange ?? revenueChange,
+    comparison: {
+      period: { from: prevFromStr, to: prevToStr, days: dailyRevenue.length },
+      previous: {
+        revenue: prevRevenue,
+        orders: prevTotalOrders,
+        avgOrder: prevAvgOrder,
+        netSales: prevNetSales,
+      },
+      dailyRevenue: prevDailyRevenue,
+      revenueChange: periodRevenueChange,
+      ordersChange: periodOrdersChange,
+      avgOrderChange: periodAvgOrderChange,
+      netSalesChange: periodNetSalesChange,
+    },
     typeBreakdown: isAdvanced ? typeBreakdown : [],
     topTables: isAdvanced ? topTables : [],
     hourly: isAdvanced ? hourly : [],
+    hourlyBreakdown: isAdvanced ? hourlyBreakdown : [],
     paymentMethods: {
-      cash: { amount: +cashAmount.toFixed(2), count: cashCount },
-      upi: { amount: +upiAmount.toFixed(2), count: upiCount },
-      card: { amount: +cardAmount.toFixed(2), count: cardCount },
-      other: { amount: +otherAmount.toFixed(2), count: otherCount },
+      cash: { amount: +cashAmount.toFixed(2), count: cashCount, refunds: +cashRefunds.toFixed(2), net: cashNet },
+      upi: { amount: +upiAmount.toFixed(2), count: upiCount, refunds: +upiRefunds.toFixed(2), net: upiNet },
+      card: { amount: +cardAmount.toFixed(2), count: cardCount, refunds: +cardRefunds.toFixed(2), net: cardNet },
+      other: (otherCount > 0 || otherAmount > 0 || otherRefunds > 0) ? {
+        amount: +otherAmount.toFixed(2),
+        count: otherCount,
+        refunds: +otherRefunds.toFixed(2),
+        net: otherNet,
+      } : { amount: 0, count: 0, refunds: 0, net: 0 },
+      unattributedRefunds: unattributedRefunds > 0 ? {
+        amount: +unattributedRefunds.toFixed(2),
+        count: unattributedRefundCount,
+      } : undefined,
+      totalCollected: paymentBreakdownTotal,
+      totalRefunds: totalRefundAmount,
+      totalNet: totalNetAmount,
       total: paymentBreakdownTotal > 0 ? paymentBreakdownTotal : totalRevenue,
     },
     locations: (locRows ?? []).map((l: any) => ({ id: l.id, name: l.name, isPrimary: l.is_primary })),
