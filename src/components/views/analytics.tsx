@@ -25,6 +25,7 @@ import {
   CalendarIcon, ChevronDown, MapPin, Layers, Sparkles,
   CreditCard, Smartphone, Banknote, Receipt, Bike, TrendingUp, Check,
   Filter, X, Flame, Tag, AlertCircle, HelpCircle, Timer, Hourglass, Activity,
+  Percent, RotateCcw,
 } from 'lucide-react'
 import { formatCurrency } from '@/lib/constants'
 import { toast } from 'sonner'
@@ -109,6 +110,23 @@ interface OperationsPerformance {
   }
 }
 
+interface DiscountsAndRefundsTrendItem {
+  date: string
+  label: string
+  discounts: number
+  refunds: number
+}
+
+interface DiscountsAndRefunds {
+  totalDiscounts: number
+  discountedOrdersCount: number
+  totalRefunds: number
+  refundedTransactionsCount: number
+  discountsByOrderType: { type: string; amount: number; count: number }[]
+  refundsByMethod: { method: string; amount: number; count: number }[]
+  trend: DiscountsAndRefundsTrendItem[]
+}
+
 interface AnalyticsPayload {
   range?: { from: string; to: string; days: number; timezone: string }
   totalRevenue: number
@@ -132,6 +150,7 @@ interface AnalyticsPayload {
   categoryBreakdown: CatBreak[]
   paymentMethods?: PaymentMethodSummary
   operationsPerformance?: OperationsPerformance
+  discountsAndRefunds?: DiscountsAndRefunds
   locations?: LocationOption[]
   multiLocationEnabled?: boolean
 }
@@ -2137,6 +2156,133 @@ export function AnalyticsView() {
                   Excludes cancelled & void orders; includes all dine-in, takeaway, & delivery orders.
                 </div>
               </div>
+            </div>
+          </div>
+        </Card>
+
+        {/* Row 8: Section 10 - Discounts & Refunds */}
+        <Card className="rounded-xl border border-border/70 bg-card p-4 shadow-sm">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-4">
+            <div>
+              <h3 className="text-sm font-bold tracking-tight flex items-center gap-1.5">
+                <Percent className="size-4 text-rose-500" />
+                Discounts & Refunds
+              </h3>
+              <p className="text-[11px] text-muted-foreground">
+                Reconciled discounts and refunds attributed to settled orders and ledger records
+              </p>
+            </div>
+            {/* Quick summary totals */}
+            <div className="flex items-center gap-3 text-xs bg-secondary/30 px-3 py-1.5 rounded-lg border border-border/40">
+              <div>
+                <span className="text-[10px] text-muted-foreground block">Total Discounts</span>
+                <span className="font-semibold tabular-nums text-rose-500">
+                  {sym}{(analytics?.discountsAndRefunds?.totalDiscounts ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+              </div>
+              <div className="h-6 w-px bg-border/60" />
+              <div>
+                <span className="text-[10px] text-muted-foreground block">Total Refunds</span>
+                <span className="font-semibold tabular-nums text-red-500">
+                  {sym}{(analytics?.discountsAndRefunds?.totalRefunds ?? (analytics?.paymentMethods?.totalRefunds ?? 0)).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {/* Left: Detail Breakdown Tables */}
+            <div className="space-y-4">
+              {/* Discounts Detail */}
+              <div className="rounded-lg border border-border/50 bg-secondary/20 p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                    <Tag className="size-3.5 text-rose-400" />
+                    Discounts by Channel
+                  </span>
+                  <span className="text-[11px] text-muted-foreground">
+                    {analytics?.discountsAndRefunds?.discountedOrdersCount ?? 0} orders affected
+                  </span>
+                </div>
+                <div className="space-y-1.5 text-xs">
+                  {(analytics?.discountsAndRefunds?.discountsByOrderType ?? []).map((d) => (
+                    <div key={d.type} className="flex items-center justify-between py-1 border-b border-border/30 last:border-0">
+                      <span className="text-muted-foreground">{TYPE_LABEL[d.type] || d.type}</span>
+                      <div className="text-right tabular-nums">
+                        <span className="font-medium text-foreground">{sym}{d.amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                        <span className="text-[10px] text-muted-foreground ml-1.5">({d.count} orders)</span>
+                      </div>
+                    </div>
+                  ))}
+                  {(analytics?.discountsAndRefunds?.discountsByOrderType ?? []).length === 0 && (
+                    <div className="text-xs text-muted-foreground/60 py-2 text-center">No discounts applied in this period</div>
+                  )}
+                </div>
+              </div>
+
+              {/* Refunds Detail */}
+              <div className="rounded-lg border border-border/50 bg-secondary/20 p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                    <RotateCcw className="size-3.5 text-red-400" />
+                    Refunds by Attribution
+                  </span>
+                  <span className="text-[11px] text-muted-foreground">
+                    {analytics?.discountsAndRefunds?.refundedTransactionsCount ?? (analytics?.paymentMethods?.unattributedRefunds ? 1 : 0)} transactions
+                  </span>
+                </div>
+                <div className="space-y-1.5 text-xs">
+                  {(analytics?.discountsAndRefunds?.refundsByMethod ?? []).map((r) => (
+                    <div key={r.method} className="flex items-center justify-between py-1 border-b border-border/30 last:border-0">
+                      <span className="text-muted-foreground">{r.method}</span>
+                      <div className="text-right tabular-nums">
+                        <span className="font-medium text-red-400">
+                          {r.amount > 0 ? `-${sym}${r.amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
+                        </span>
+                        <span className="text-[10px] text-muted-foreground ml-1.5">({r.count})</span>
+                      </div>
+                    </div>
+                  ))}
+                  {(analytics?.discountsAndRefunds?.refundsByMethod ?? []).length === 0 && (
+                    <div className="text-xs text-muted-foreground/60 py-2 text-center">No refunds recorded in this period</div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Right: Daily Trend of Discounts & Refunds */}
+            <div className="rounded-lg border border-border/50 bg-secondary/20 p-3 flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                    <TrendingUp className="size-3.5 text-blue-400" />
+                    Daily Trend
+                  </span>
+                  <div className="flex items-center gap-3 text-[10px]">
+                    <span className="flex items-center gap-1 text-rose-400">
+                      <span className="size-2 rounded-full bg-rose-400" /> Discounts
+                    </span>
+                    <span className="flex items-center gap-1 text-red-400">
+                      <span className="size-2 rounded-full bg-red-400" /> Refunds
+                    </span>
+                  </div>
+                </div>
+                <div className="h-[140px] w-full mt-2">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={analytics?.discountsAndRefunds?.trend ?? []} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#94a3b8" opacity={0.15} vertical={false} />
+                      <XAxis dataKey="label" tick={{ fontSize: 9, fill: '#94a3b8' }} tickLine={false} axisLine={false} />
+                      <YAxis tick={{ fontSize: 9, fill: '#94a3b8' }} tickLine={false} axisLine={false} tickFormatter={(v) => `${v}`} />
+                      <Tooltip content={<ChartTooltip currencySymbol={sym} />} />
+                      <Bar dataKey="discounts" name="Discounts" fill="#fb7185" radius={[2, 2, 0, 0]} />
+                      <Bar dataKey="refunds" name="Refunds" fill="#f87171" radius={[2, 2, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+              <p className="text-[10px] text-muted-foreground/70 text-right mt-2">
+                Reconciled with exact ledger settlement dates in {analytics?.range?.timezone || 'Asia/Kolkata'}
+              </p>
             </div>
           </div>
         </Card>

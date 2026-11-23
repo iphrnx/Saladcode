@@ -783,6 +783,87 @@ serve(async (req: Request) => {
   };
 
   /* -------------------------------------------------------------------------- */
+  /* Section 10: Discounts & Refunds (Reconciled with Settled Orders & Ledger)  */
+  /* -------------------------------------------------------------------------- */
+  let totalDiscounts = 0;
+  let discountedOrdersCount = 0;
+  const discountsByOrderType: Record<string, { amount: number; count: number }> = {
+    DINE_IN: { amount: 0, count: 0 },
+    TAKEAWAY: { amount: 0, count: 0 },
+    DELIVERY: { amount: 0, count: 0 },
+  };
+
+  // Group discounts by day to form a synchronized trend
+  const dailyDiscountsMap: Record<string, number> = {};
+  const dailyRefundsMap: Record<string, number> = {};
+  for (const d of dailyRevenue) {
+    dailyDiscountsMap[d.date] = 0;
+    dailyRefundsMap[d.date] = 0;
+  }
+
+  for (const o of qualifyingOrders) {
+    const disc = Number(o.discount || 0);
+    if (disc > 0) {
+      totalDiscounts += disc;
+      discountedOrdersCount++;
+      const t = o.orderType || "DINE_IN";
+      if (!discountsByOrderType[t]) discountsByOrderType[t] = { amount: 0, count: 0 };
+      discountsByOrderType[t].amount += disc;
+      discountsByOrderType[t].count++;
+
+      const dateStr = zonedDateStr(o.settledAt, timeZone);
+      if (dailyDiscountsMap[dateStr] !== undefined) {
+        dailyDiscountsMap[dateStr] += disc;
+      }
+    }
+  }
+
+  // Populate daily refunds from mainRefunds
+  let totalRefundsCount = 0;
+  for (const r of mainRefunds ?? []) {
+    const locId = r.location_id;
+    if (selectedLocationId && locId && locId !== selectedLocationId) continue;
+    const amt = Number(r.total || 0);
+    if (amt > 0) {
+      totalRefundsCount++;
+      const refTime = r.updated_at ? new Date(r.updated_at) : (r.created_at ? new Date(r.created_at) : null);
+      if (refTime) {
+        const dateStr = zonedDateStr(refTime, timeZone);
+        if (dailyRefundsMap[dateStr] !== undefined) {
+          dailyRefundsMap[dateStr] += amt;
+        }
+      }
+    }
+  }
+
+  const discountsAndRefundsTrend = dailyRevenue.map((d) => ({
+    date: d.date,
+    label: d.label,
+    discounts: +(dailyDiscountsMap[d.date] || 0).toFixed(2),
+    refunds: +(dailyRefundsMap[d.date] || 0).toFixed(2),
+  }));
+
+  const discountsAndRefunds = {
+    totalDiscounts: +totalDiscounts.toFixed(2),
+    discountedOrdersCount,
+    totalRefunds: totalRefundAmount, // Reconciled with payment ledger refund calculation
+    refundedTransactionsCount: totalRefundsCount,
+    discountsByOrderType: Object.entries(discountsByOrderType).map(([type, val]) => ({
+      type,
+      amount: +val.amount.toFixed(2),
+      count: val.count,
+    })),
+    refundsByMethod: [
+      { method: "Cash", amount: cashRefunds, count: cashRefundCount },
+      { method: "UPI / QR", amount: upiRefunds, count: upiRefundCount },
+      { method: "Card / POS", amount: cardRefunds, count: cardRefundCount },
+      ...(otherRefunds > 0 ? [{ method: "Other / Legacy", amount: otherRefunds, count: otherRefundCount }] : []),
+      ...(unattributedRefunds > 0 ? [{ method: "Refunds (Method Unavailable)", amount: unattributedRefunds, count: unattributedRefundCount }] : []),
+    ],
+    trend: discountsAndRefundsTrend,
+  };
+
+  /* -------------------------------------------------------------------------- */
   /* Independent Today & Yesterday Queries (Run through identical reconciliation)*/
   /* -------------------------------------------------------------------------- */
   const todayStart = zonedStart(todayStr, timeZone);
@@ -986,6 +1067,7 @@ serve(async (req: Request) => {
     hourly: isAdvanced ? hourly : [],
     hourlyBreakdown: isAdvanced ? hourlyBreakdown : [],
     operationsPerformance,
+    discountsAndRefunds,
     paymentMethods: {
       cash: { amount: +cashAmount.toFixed(2), count: cashCount, refunds: +cashRefunds.toFixed(2), net: cashNet },
       upi: { amount: +upiAmount.toFixed(2), count: upiCount, refunds: +upiRefunds.toFixed(2), net: upiNet },
