@@ -3,8 +3,21 @@
 --              and staff ownership invariants at the database level.
 
 -- ---------------------------------------------------------------------------
--- 1. TRANSACTIONAL LAST ACTIVE OWNER PROTECTION
+-- 1. TRANSACTIONAL LAST ACTIVE OWNER PROTECTION (DEADLOCK-FREE PER-TENANT SERIALIZATION)
 -- ---------------------------------------------------------------------------
+create or replace function public.lock_tenant_for_owner_change(p_tenant_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if p_tenant_id is not null then
+    perform pg_advisory_xact_lock(hashtext('saladcode_owner_guard'), hashtext(p_tenant_id::text));
+  end if;
+end;
+$$;
+
 create or replace function public.check_last_active_owner()
 returns trigger
 language plpgsql
@@ -17,6 +30,13 @@ declare
 begin
   -- Allow tenant purge operation to proceed without restriction
   if current_setting('app.purging_tenant', true) = 'true' then
+    return coalesce(NEW, OLD);
+  end if;
+
+  -- If the tenant itself is being deleted, allow profiles to cascade-delete
+  if OLD.tenant_id is not null and not exists (
+    select 1 from public.tenants where id = OLD.tenant_id
+  ) then
     return coalesce(NEW, OLD);
   end if;
 
@@ -60,7 +80,13 @@ begin
   end if;
 
   -- An active owner is being deleted, deactivated, demoted, or transferred.
-  -- Verify transactionally with row-level locks that at least one other active owner remains.
+  -- Serialize owner removals per tenant via transactional advisory lock to prevent
+  -- deadlocks from concurrent row-level locks while ensuring strict serial validation.
+  if OLD.tenant_id is not null then
+    perform pg_advisory_xact_lock(hashtext('saladcode_owner_guard'), hashtext(OLD.tenant_id::text));
+  end if;
+
+  -- Verify transactionally that at least one other active owner remains for this restaurant.
   select count(*)
     into v_remaining_owners
     from public.profiles p
@@ -76,8 +102,7 @@ begin
             and r.is_system = true
             and r.name = 'Owner'
        )
-     )
-   for update;
+     );
 
   if v_remaining_owners < 1 then
     raise exception 'CANNOT_REMOVE_LAST_ACTIVE_OWNER: Each restaurant must maintain at least one active owner account.'
@@ -105,6 +130,13 @@ set search_path = public, pg_temp
 as $$
 begin
   if current_setting('app.purging_tenant', true) = 'true' then
+    return coalesce(NEW, OLD);
+  end if;
+
+  -- If the parent restaurant tenant is being deleted, allow system roles to cascade-delete with it
+  if OLD.tenant_id is not null and not exists (
+    select 1 from public.tenants where id = OLD.tenant_id
+  ) then
     return coalesce(NEW, OLD);
   end if;
 

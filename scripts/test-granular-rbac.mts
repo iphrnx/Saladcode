@@ -239,9 +239,9 @@ check('migration file 20261122000002 exists', fs.existsSync(migrationPath));
 
 if (fs.existsSync(migrationPath)) {
   const migrationContent = fs.readFileSync(migrationPath, 'utf-8');
-  check('migration enforces check_last_active_owner() with row-level locks (FOR UPDATE)',
+  check('migration enforces check_last_active_owner() with deadlock-free per-tenant serialization',
     migrationContent.includes('check_last_active_owner()') &&
-    migrationContent.includes('for update') &&
+    migrationContent.includes('pg_advisory_xact_lock') &&
     migrationContent.includes('CANNOT_REMOVE_LAST_ACTIVE_OWNER')
   );
 
