@@ -187,7 +187,7 @@ serve(async (req: Request) => {
   async function getReconciledEventsForWindow(
     winStart: Date,
     winEnd: Date
-  ): Promise<{ events: ReconciledEvent[]; checkMap: Map<string, any>; orders: any[] }> {
+  ): Promise<{ events: ReconciledEvent[]; checkMap: Map<string, any>; orders: any[]; refunds: any[] }> {
     // A. Query payments recorded in or near the window
     const payments = await fetchAllPages<any>(async (from, to) => {
       return await db
@@ -1029,8 +1029,6 @@ serve(async (req: Request) => {
     .eq("tenant_id", tenantId)
     .eq("active", true)
     .order("is_primary", { ascending: false });
-
-  const paymentBreakdownTotal = +(cashAmount + upiAmount + cardAmount + otherAmount).toFixed(2);
 
   return json(req, {
     range: { from: fromStr, to: toStr, days: dailyRevenue.length, timezone: timeZone },
