@@ -36,3 +36,6 @@ npm-debug.log*
 .open-next/
 .wrangler/
 
+# Deno
+deno.lock
+
