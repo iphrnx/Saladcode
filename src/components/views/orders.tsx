@@ -2350,10 +2350,30 @@ function SittingCard({
         ? `${ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType} · ${sitting.latest.customerName}`
         : `Order #${sitting.latest.orderNumber}`)
   const sessionStats = [
-    { icon: ClipboardCheck, label: `${validOrders.length} Order${validOrders.length === 1 ? '' : 's'}` },
-    { icon: Layers, label: `${sitting.qtyCount} Item${sitting.qtyCount === 1 ? '' : 's'}` },
-    { icon: ConciergeBell, label: ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType },
-    { icon: Clock, label: shortDuration(sitting.startedAt, sitting.endedAt, now) },
+    {
+      icon: ClipboardCheck,
+      full: `${validOrders.length} Order${validOrders.length === 1 ? '' : 's'}`,
+      count: String(validOrders.length),
+      suffix: validOrders.length === 1 ? 'Order' : 'Orders',
+      title: `${validOrders.length} Order${validOrders.length === 1 ? '' : 's'}`,
+    },
+    {
+      icon: Layers,
+      full: `${sitting.qtyCount} Item${sitting.qtyCount === 1 ? '' : 's'}`,
+      count: String(sitting.qtyCount),
+      suffix: sitting.qtyCount === 1 ? 'Item' : 'Items',
+      title: `${sitting.qtyCount} Item${sitting.qtyCount === 1 ? '' : 's'}`,
+    },
+    {
+      icon: ConciergeBell,
+      full: ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType,
+      title: `Order Type: ${ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType}`,
+    },
+    {
+      icon: Clock,
+      full: shortDuration(sitting.startedAt, sitting.endedAt, now),
+      title: `Duration: ${sittingDuration(sitting.startedAt, sitting.endedAt, now)}`,
+    },
   ]
 
   return (
@@ -2465,11 +2485,24 @@ function SittingCard({
       </div>
 
       {/* Session metadata strip */}
-      <div className="relative z-10 mt-3 grid grid-cols-4 divide-x divide-orange-200/50 dark:divide-border/50 rounded-xl sm:rounded-2xl bg-[#fff9f4] dark:bg-secondary/40 border border-orange-200/60 dark:border-border/60 py-2 sm:py-2.5 px-1">
-        {sessionStats.map(({ icon: Icon, label }) => (
-          <div key={label} className="flex min-w-0 items-center justify-center gap-1.5 px-1 text-center">
-            <Icon aria-hidden className="size-4 shrink-0 text-orange-500 dark:text-orange-400 stroke-[2.2]" />
-            <span className="text-xs sm:text-[13px] font-semibold text-foreground/90 truncate">{label}</span>
+      <div className="relative z-10 mt-3 grid grid-cols-4 divide-x divide-orange-200/50 dark:divide-border/50 rounded-xl sm:rounded-2xl bg-[#fff9f4] dark:bg-secondary/40 border border-orange-200/60 dark:border-border/60 py-2 sm:py-2.5 px-0.5 sm:px-1">
+        {sessionStats.map(({ icon: Icon, full, count, suffix, title }) => (
+          <div
+            key={title}
+            title={title}
+            className="flex min-w-0 items-center justify-center gap-1 sm:gap-1.5 px-0.5 sm:px-1 text-center"
+          >
+            <Icon aria-hidden className="size-3.5 sm:size-4 shrink-0 text-orange-500 dark:text-orange-400 stroke-[2.2]" />
+            <span className="text-[11px] min-[360px]:text-xs sm:text-[13px] font-semibold text-foreground/90 truncate">
+              {count ? (
+                <>
+                  <span>{count}</span>
+                  <span className="hidden min-[350px]:inline"> {suffix}</span>
+                </>
+              ) : (
+                full
+              )}
+            </span>
           </div>
         ))}
       </div>
