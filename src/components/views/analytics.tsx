@@ -543,8 +543,8 @@ export function AnalyticsView() {
       const json = await res.json()
 
       isFilterActive = activeFilters.current.from === from &&
-                       activeFilters.current.to === to &&
-                       activeFilters.current.locationId === locationId
+        activeFilters.current.to === to &&
+        activeFilters.current.locationId === locationId
 
       // Stale responses from old date ranges, locations, or superseded requests cannot overwrite
       if (!isFilterActive || seq < requestSeq.current) return
@@ -553,8 +553,8 @@ export function AnalyticsView() {
       setDenied(null)
     } catch (err) {
       isFilterActive = activeFilters.current.from === from &&
-                       activeFilters.current.to === to &&
-                       activeFilters.current.locationId === locationId
+        activeFilters.current.to === to &&
+        activeFilters.current.locationId === locationId
       if (!isFilterActive || seq < requestSeq.current) return
 
       if (mode === 'skeleton') handleLoad(err, 'analytics')
@@ -643,9 +643,9 @@ export function AnalyticsView() {
         push('Refunds (Method Unavailable)', analytics.paymentMethods.unattributedRefunds.count, money(0), money(analytics.paymentMethods.unattributedRefunds.amount), money(-analytics.paymentMethods.unattributedRefunds.amount))
       }
       const totalTx = analytics.paymentMethods.cash.count +
-                      analytics.paymentMethods.upi.count +
-                      analytics.paymentMethods.card.count +
-                      (analytics.paymentMethods.other?.count ?? 0)
+        analytics.paymentMethods.upi.count +
+        analytics.paymentMethods.card.count +
+        (analytics.paymentMethods.other?.count ?? 0)
       push('Total Reconciled', totalTx, money(analytics.paymentMethods.totalCollected ?? analytics.paymentMethods.total), money(analytics.paymentMethods.totalRefunds ?? 0), money(analytics.paymentMethods.totalNet ?? analytics.paymentMethods.total))
       blank()
     }
@@ -801,16 +801,16 @@ export function AnalyticsView() {
   const hasHourlyData = hourlyData.some((d) => d.orders > 0 || d.revenue > 0)
   const activePeakHour = hasHourlyData
     ? hourlyData.reduce((best, curr) => {
-        if (hourlyRankMetric === 'orders') {
-          if (curr.orders > best.orders) return curr
-          if (curr.orders === best.orders && curr.revenue > best.revenue) return curr
-          return best
-        } else {
-          if (curr.revenue > best.revenue) return curr
-          if (curr.revenue === best.revenue && curr.orders > best.orders) return curr
-          return best
-        }
-      }, hourlyData[0])
+      if (hourlyRankMetric === 'orders') {
+        if (curr.orders > best.orders) return curr
+        if (curr.orders === best.orders && curr.revenue > best.revenue) return curr
+        return best
+      } else {
+        if (curr.revenue > best.revenue) return curr
+        if (curr.revenue === best.revenue && curr.orders > best.orders) return curr
+        return best
+      }
+    }, hourlyData[0])
     : null
 
   // Section 5: Top / Least Selling Items Computations
@@ -1608,10 +1608,10 @@ export function AnalyticsView() {
                             idx === 0
                               ? 'bg-amber-500/20 text-amber-400'
                               : idx === 1
-                              ? 'bg-slate-300/20 text-slate-300'
-                              : idx === 2
-                              ? 'bg-orange-700/20 text-orange-400'
-                              : 'bg-secondary text-muted-foreground'
+                                ? 'bg-slate-300/20 text-slate-300'
+                                : idx === 2
+                                  ? 'bg-orange-700/20 text-orange-400'
+                                  : 'bg-secondary text-muted-foreground'
                           )}
                         >
                           {idx + 1}
@@ -2027,9 +2027,9 @@ export function AnalyticsView() {
                             <span className={cn(
                               'inline-flex items-center justify-center size-5 rounded text-[10px] font-bold shrink-0',
                               i === 0 ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30' :
-                              i === 1 ? 'bg-slate-300/20 text-slate-300 border border-slate-400/30' :
-                              i === 2 ? 'bg-orange-700/20 text-orange-400 border border-orange-600/30' :
-                              'bg-secondary text-muted-foreground'
+                                i === 1 ? 'bg-slate-300/20 text-slate-300 border border-slate-400/30' :
+                                  i === 2 ? 'bg-orange-700/20 text-orange-400 border border-orange-600/30' :
+                                    'bg-secondary text-muted-foreground'
                             )}>
                               {i + 1}
                             </span>
