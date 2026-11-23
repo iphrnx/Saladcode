@@ -222,7 +222,7 @@ serve(async (req: Request) => {
     const voidPayments = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("check_payments")
-        .select("id, check_id, amount, method, status, staff_id, location_id, created_at, voided_at")
+        .select("id, check_id, amount, method, status, staff_id, location_id, created_at, voided_at, note, idempotency_key")
         .eq("tenant_id", tenantId)
         .eq("status", "VOID")
         .order("created_at", { ascending: true })
@@ -431,7 +431,7 @@ serve(async (req: Request) => {
     const orderRefunds = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("orders")
-        .select("id, check_id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at, refunded_at")
+        .select("id, check_id, payment_id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at, refunded_at, idempotency_key, cancellation_reason, notes")
         .eq("tenant_id", tenantId)
         .in("payment_status", ["REFUNDED", "refunded"])
         .order("created_at", { ascending: true })
@@ -465,11 +465,18 @@ serve(async (req: Request) => {
       }
     }
 
-    // Deduplicate only records proven to represent the same reversal, using stable identifiers BEFORE applying date filters.
-    // Preserve distinct refunds on the same check!
-    const ledgerVoidCheckIds = new Set<string>();
+    // Collect authoritative ledger void identifiers and mappings
+    const ledgerVoidPaymentIds = new Set<string>();
+    const ledgerVoidIdempotencyKeys = new Map<string, string>(); // idempotency_key -> payment.id
+    const ledgerVoidNoteLinks = new Set<string>(); // order IDs explicitly linked in void notes
+
     for (const p of voidPayments) {
-      if (p.check_id) ledgerVoidCheckIds.add(p.check_id);
+      if (p.id) ledgerVoidPaymentIds.add(String(p.id));
+      if (p.idempotency_key) ledgerVoidIdempotencyKeys.set(String(p.idempotency_key), String(p.id));
+      if (p.note) {
+        const m = String(p.note).match(/order[:\s]+([a-zA-Z0-9_-]+)/i);
+        if (m) ledgerVoidNoteLinks.add(m[1]);
+      }
     }
 
     const seenReversalIds = new Set<string>();
@@ -479,8 +486,9 @@ serve(async (req: Request) => {
     for (const p of voidPayments) {
       const amt = Number(p.amount || 0);
       if (amt <= 0) continue;
-      if (seenReversalIds.has(p.id)) continue;
-      seenReversalIds.add(p.id);
+      const pid = String(p.id);
+      if (seenReversalIds.has(pid)) continue;
+      seenReversalIds.add(pid);
 
       const chk = localCheckMap.get(p.check_id);
       const locId = p.location_id || chk?.location_id || (chk?.table_id ? tableMap.get(chk.table_id)?.location_id : null) || null;
@@ -498,7 +506,7 @@ serve(async (req: Request) => {
       // Never use p.created_at as the refund date!
 
       candidateRefunds.push({
-        id: p.id,
+        id: pid,
         source: "CHECK_PAYMENT_VOID",
         checkId: p.check_id || null,
         orderId: null,
@@ -509,18 +517,51 @@ serve(async (req: Request) => {
       });
     }
 
-    // 2. Authoritative legacy order refunds (avoid double-counting with check payment voids across sources)
+    // 2. Authoritative legacy order refunds
+    // Deduplicate ONLY when a verified payment ID, refund ID, or existing authoritative mapping proves both records represent the same reversal.
+    // A shared check ID, amount, or timestamp is insufficient. Preserve distinct reversals on the same check!
     for (const o of orderRefunds) {
       const amt = Number(o.total || 0);
       if (amt <= 0) continue;
-      if (seenReversalIds.has(o.id)) continue;
+      const oid = String(o.id);
+      if (seenReversalIds.has(oid)) continue;
 
-      // If this order belongs to a check with authoritative check payment voids in the ledger,
-      // the ledger is the primary source; deduplicate across sources before date filtering.
-      if (o.check_id && ledgerVoidCheckIds.has(o.check_id)) {
+      // Extract verified payment / refund identifier from legacy order
+      const linkedPaymentId = o.payment_id
+        ? String(o.payment_id)
+        : o.paymentId
+        ? String(o.paymentId)
+        : o.refund_id
+        ? String(o.refund_id)
+        : o.refundId
+        ? String(o.refundId)
+        : null;
+
+      const isProvenDuplicate =
+        (linkedPaymentId && ledgerVoidPaymentIds.has(linkedPaymentId)) ||
+        ledgerVoidPaymentIds.has(oid) || // order ID matches payment ID
+        (o.idempotency_key && ledgerVoidIdempotencyKeys.has(String(o.idempotency_key))) ||
+        ledgerVoidNoteLinks.has(oid);
+
+      // Also check if order's reason or notes explicitly links to a known ledger void payment ID
+      let explicitNoteLink = false;
+      if (!isProvenDuplicate) {
+        const orderText = `${o.cancellation_reason || ""} ${o.notes || ""}`;
+        for (const pid of ledgerVoidPaymentIds) {
+          if (orderText.includes(pid)) {
+            explicitNoteLink = true;
+            break;
+          }
+        }
+      }
+
+      if (isProvenDuplicate || explicitNoteLink) {
+        // Proven duplicate of an authoritative ledger void record representing the same reversal.
+        // Deduplicate before date and location filters.
         continue;
       }
-      seenReversalIds.add(o.id);
+
+      seenReversalIds.add(oid);
 
       let verifiedTime: Date | null = null;
       if (o.refunded_at) {
@@ -536,7 +577,7 @@ serve(async (req: Request) => {
       const locId = resolveEntityLocation(o, localCheckMap);
 
       candidateRefunds.push({
-        id: o.id,
+        id: oid,
         source: "ORDER_REFUND",
         checkId: o.check_id || null,
         orderId: o.id,

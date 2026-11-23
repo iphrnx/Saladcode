@@ -229,6 +229,7 @@ const mockOrders = [
     table_id: null,
     table_session_id: null,
     check_id: "chk-dup",
+    payment_id: "pay-dup", // Linked to pay-dup
     status: "CANCELLED",
     payment_status: "REFUNDED",
     payment_method: "CARD",

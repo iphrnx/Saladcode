@@ -13,13 +13,18 @@ create index if not exists idx_check_payments_tenant_voided_at
   on public.check_payments (tenant_id, voided_at)
   where status = 'VOID';
 
--- 2. Add refunded_at to orders
+-- 2. Add refunded_at and payment_id to orders
 alter table public.orders
-  add column if not exists refunded_at timestamptz;
+  add column if not exists refunded_at timestamptz,
+  add column if not exists payment_id uuid references public.check_payments(id) on delete set null;
 
 create index if not exists idx_orders_tenant_refunded_at
   on public.orders (tenant_id, refunded_at)
   where payment_status in ('REFUNDED', 'refunded');
+
+create index if not exists idx_orders_tenant_payment_id
+  on public.orders (tenant_id, payment_id)
+  where payment_id is not null;
 
 -- 3. Update void_check_payment to write voided_at atomically and preserve on retry
 create or replace function public.void_check_payment(
