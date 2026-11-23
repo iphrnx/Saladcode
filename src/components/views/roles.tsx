@@ -338,6 +338,7 @@ export function RolesView() {
               >
                 {roles.map((role) => {
                   const active = role.id === (selectedRole?.id ?? null)
+                  const isOutOfReach = !role.isSystem && !canGrantRole(parsePerms(role.permissions), callerPermissions)
                   return (
                     <button
                       key={role.id}
@@ -355,6 +356,11 @@ export function RolesView() {
                       <span className="w-2.5 h-2.5 rounded-full shrink-0 ring-1 ring-background" style={{ backgroundColor: role.color }} />
                       <span className="whitespace-nowrap">{role.name}</span>
                       {role.isSystem && <Lock className="h-3 w-3 text-muted-foreground shrink-0" />}
+                      {isOutOfReach && (
+                        <span title="This role includes permissions you don’t hold" className="inline-flex items-center shrink-0">
+                          <Lock className="h-3 w-3 text-amber-500/80" />
+                        </span>
+                      )}
                       <span className="text-[11px] opacity-70 whitespace-nowrap">({memberCounts[role.id] || 0})</span>
                     </button>
                   )
@@ -426,6 +432,7 @@ export function RolesView() {
                     role={role}
                     memberCount={memberCounts[role.id] || 0}
                     active={role.id === (selectedRole?.id ?? null)}
+                    isOutOfReach={!role.isSystem && !canGrantRole(parsePerms(role.permissions), callerPermissions)}
                     onClick={() => handleSelectRole(role.id)}
                   />
                 ))}
@@ -597,12 +604,25 @@ function StatCard({ icon, label, value, tint }: { icon: React.ReactNode; label: 
   )
 }
 
-function RoleListItem({ role, memberCount, active, onClick }: { role: Role; memberCount: number; active: boolean; onClick: () => void }) {
+function RoleListItem({
+  role,
+  memberCount,
+  active,
+  isOutOfReach,
+  onClick,
+}: {
+  role: Role
+  memberCount: number
+  active: boolean
+  isOutOfReach?: boolean
+  onClick: () => void
+}) {
   return (
     <button
+      type="button"
       onClick={onClick}
       className={cn(
-        'w-full text-left rounded-xl border p-3 transition-all',
+        'w-full text-left rounded-xl border p-3 transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-primary',
         active
           ? 'border-primary/50 bg-primary/10 ring-1 ring-primary/30'
           : 'border-border bg-secondary/40 hover:bg-secondary hover:border-border',
@@ -620,6 +640,12 @@ function RoleListItem({ role, memberCount, active, onClick }: { role: Role; memb
               <Badge variant="secondary" className="text-[10px] px-1.5 py-0 h-4 bg-secondary/80 gap-1 font-semibold">
                 <Lock className="h-2.5 w-2.5" />
                 SYSTEM
+              </Badge>
+            )}
+            {isOutOfReach && (
+              <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 border-amber-500/30 text-amber-600 dark:text-amber-400 gap-1 font-semibold">
+                <Lock className="h-2.5 w-2.5" />
+                READ-ONLY
               </Badge>
             )}
           </div>
@@ -716,11 +742,15 @@ function RoleDetail({
   }, [role.id, role.permissions, role.name, role.description, role.color])
 
   const isSystem = role.isSystem
+  const outOfReach = !isSystem && !canGrantRole(parsePerms(role.permissions), grantableKeys)
+  const canEditRole = canManageRoles && !outOfReach
+
   const dirty = useMemo(() => {
+    if (!canEditRole) return false
     const original = parsePerms(role.permissions)
     const samePerms = original.length === permState.length && original.every((p) => permState.includes(p))
     return !samePerms || name !== role.name || description !== (role.description || '') || color !== role.color
-  }, [permState, name, description, color, role])
+  }, [canEditRole, permState, name, description, color, role])
 
   const discardChanges = useCallback(() => {
     setPermState(parsePerms(role.permissions))
@@ -731,6 +761,7 @@ function RoleDetail({
   }, [role])
 
   const saveRole = useCallback(async (): Promise<boolean> => {
+    if (!canEditRole) return false
     setSaving(true)
     setSaveError(null)
     try {
@@ -751,7 +782,7 @@ function RoleDetail({
     } finally {
       setSaving(false)
     }
-  }, [role.id, headers, name, description, permState, color, refresh, handleAction])
+  }, [canEditRole, role.id, headers, name, description, permState, color, refresh, handleAction])
 
   // Inform parent of dirty state for unsaved-changes protection
   useEffect(() => {
@@ -760,7 +791,7 @@ function RoleDetail({
 
   const isPermEditable = useCallback(
     (perm: string) => {
-      if (isSystem || !canManageRoles) return false
+      if (isSystem || !canEditRole) return false
       if (!viewerCanGrant(perm)) return false
       // If this permission is implied by an ungrantable key currently in permState,
       // that key cannot be removed by the current viewer, so this perm is permanently locked on.
@@ -770,16 +801,16 @@ function RoleDetail({
       if (lockedByUngrantable) return false
       return true
     },
-    [isSystem, canManageRoles, viewerCanGrant, permState]
+    [isSystem, canEditRole, viewerCanGrant, permState]
   )
 
   const togglePerm = (key: string) => {
-    if (isSystem || !canManageRoles) return
+    if (isSystem || !canEditRole) return
     setPermState((prev) => (prev.includes(key) ? prev.filter((p) => p !== key) : [...prev, key]))
   }
 
   const toggleGroup = useCallback((groupPerms: readonly string[], on: boolean) => {
-    if (isSystem || !canManageRoles) return
+    if (isSystem || !canEditRole) return
     setPermState((prev) => {
       const editableInGroup = groupPerms.filter((perm) => {
         if (!viewerCanGrant(perm)) return false
@@ -797,9 +828,10 @@ function RoleDetail({
         return prev.filter((p) => !editableInGroup.includes(p))
       }
     })
-  }, [isSystem, canManageRoles, viewerCanGrant])
+  }, [isSystem, canEditRole, viewerCanGrant])
 
   const removeRole = async () => {
+    if (!canEditRole) return
     if (deleteConfirm !== role.name) {
       toast.error(`Type "${role.name}" to confirm`)
       return
@@ -840,11 +872,17 @@ function RoleDetail({
                   System Role
                 </Badge>
               )}
+              {outOfReach && (
+                <Badge variant="outline" className="text-[10px] h-4 px-1.5 border-amber-500/30 text-amber-600 dark:text-amber-400 gap-1 font-semibold">
+                  <Lock className="h-2.5 w-2.5" />
+                  Read-only
+                </Badge>
+              )}
             </div>
             <p className="text-[13px] sm:text-sm text-muted-foreground mt-0.5 line-clamp-2">{description || 'No description provided'}</p>
           </div>
         </div>
-        {!isSystem && canManageRoles && (
+        {!isSystem && canEditRole && (
           <Button variant="ghost" size="icon" className="text-destructive hover:bg-destructive/10 hover:text-destructive" onClick={() => setDeleteOpen(true)}>
             <Trash2 className="h-4 w-4" />
           </Button>
@@ -879,6 +917,19 @@ function RoleDetail({
             </div>
           )}
 
+          {/* Out of reach custom role banner */}
+          {outOfReach && (
+            <div className="flex items-start gap-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 p-3 sm:p-3.5 text-xs text-amber-700 dark:text-amber-400">
+              <Lock className="h-4 w-4 mt-0.5 shrink-0 text-amber-500" />
+              <div>
+                <p className="font-semibold text-foreground">This role includes permissions you don’t hold.</p>
+                <p className="mt-0.5 text-muted-foreground">
+                  You can view this role's configuration, but editing and deletion are restricted to users who hold all of its assigned permissions.
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Role meta: Name & Color */}
           <div className="grid sm:grid-cols-2 gap-2.5 sm:gap-3">
             <div className="space-y-1.5">
@@ -886,7 +937,7 @@ function RoleDetail({
               <Input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                disabled={isSystem || !canManageRoles}
+                disabled={isSystem || !canEditRole}
                 className="bg-secondary/50 border-border"
               />
               {reserved && (
@@ -902,7 +953,7 @@ function RoleDetail({
                   <button
                     key={c}
                     type="button"
-                    disabled={!canManageRoles}
+                    disabled={!canEditRole}
                     onClick={() => setColor(c)}
                     className={cn(
                       'w-7 h-7 sm:w-7 sm:h-7 rounded-full ring-2 ring-offset-2 ring-offset-card transition-all disabled:opacity-40 focus:outline-none focus-visible:ring-primary',
@@ -922,7 +973,7 @@ function RoleDetail({
             <Textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              disabled={!canManageRoles}
+              disabled={!canEditRole}
               rows={2}
               className="bg-secondary/50 border-border resize-none"
               placeholder="What responsibilities does this role hold?"
@@ -979,7 +1030,7 @@ function RoleDetail({
                           {allOn && <Check className="h-3.5 w-3.5 text-emerald-500 ml-auto mr-1 shrink-0" />}
                         </button>
                       </CollapsibleTrigger>
-                      {!isSystem && canManageRoles && (
+                      {!isSystem && canEditRole && (
                         <Button
                           type="button"
                           variant="ghost"
@@ -1005,7 +1056,7 @@ function RoleDetail({
                           const held = effectivePerms.includes(perm)
                           const implied = held && !permState.includes(perm)
                           const ungrantable = !isSystem && canManageRoles && !viewerCanGrant(perm)
-                          const locked = isSystem || !canManageRoles || implied || (!isSystem && ungrantable)
+                          const locked = isSystem || !canEditRole || implied || (!isSystem && ungrantable)
 
                           return (
                             <label
@@ -1020,11 +1071,13 @@ function RoleDetail({
                               title={
                                 isSystem
                                   ? 'System role permissions are fixed and read-only'
-                                  : implied
-                                    ? `Included with ${impliedByManage(perm) ?? 'its manage key'}`
-                                    : ungrantable
-                                      ? 'You cannot grant this permission — you do not hold it'
-                                      : undefined
+                                  : outOfReach
+                                    ? 'This role includes permissions you don’t hold'
+                                    : implied
+                                      ? `Included with ${impliedByManage(perm) ?? 'its manage key'}`
+                                      : ungrantable
+                                        ? 'You cannot grant this permission — you do not hold it'
+                                        : undefined
                               }
                             >
                               <Checkbox
@@ -1079,7 +1132,7 @@ function RoleDetail({
                 Members
                 <span className="text-xs text-muted-foreground font-normal">({members.length})</span>
               </h4>
-              {canManageStaff && (
+              {canManageStaff && !outOfReach && (
                 <Button
                   type="button"
                   variant="outline"
@@ -1097,7 +1150,7 @@ function RoleDetail({
               <div className="rounded-xl border border-dashed border-border p-4 md:p-6 text-center">
                 <Users className="h-8 w-8 text-muted-foreground mx-auto mb-2 opacity-50" />
                 <p className="text-sm text-muted-foreground">No staff assigned to this role yet</p>
-                {canManageStaff && (
+                {canManageStaff && !outOfReach && (
                   <Button
                     type="button"
                     variant="outline"
@@ -1139,7 +1192,7 @@ function RoleDetail({
       </div>
 
       {/* Sticky Save / Discard Bar near viewport bottom whenever editing or dirty */}
-      {canManageRoles && (
+      {canEditRole && (
         <div className={cn(
           'sticky bottom-0 z-30 border-t border-border bg-card/95 backdrop-blur-md p-3 sm:px-4 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 shadow-lg transition-all',
           'pb-[calc(0.75rem+env(safe-area-inset-bottom,0px))]',
@@ -1275,6 +1328,10 @@ function AssignStaffDialog({
     }
     if (isOwner) {
       toast.error('The Owner role cannot be assigned to staff PIN accounts')
+      return
+    }
+    if (!canGrantRole(parsePerms(role.permissions), grantableKeys)) {
+      toast.error('You cannot assign a role with permissions you do not hold')
       return
     }
 

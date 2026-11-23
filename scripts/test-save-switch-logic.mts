@@ -7,6 +7,8 @@
  * 3. On failure: dialog stays open, draft & target preserved, error displayed, retry enabled.
  */
 
+import { canGrantRole } from '../src/lib/permissions.ts';
+
 let pass = 0;
 let fail = 0;
 
@@ -321,6 +323,117 @@ async function runTests() {
   const settingsGroupPerms = ["settings.view", "settings.manage"];
   const settingsBulk = getBulkState(settingsGroupPerms, permState);
   check("Manager holds 0 permissions in Settings -> hasEditable is false (button disabled)", settingsBulk.hasEditable === false && settingsBulk.editablePerms.length === 0);
+
+  // 9. Out-of-Reach Custom Role Read-Only Enforcement & Save Guarding
+  console.log("\n── Out-of-Reach Custom Role Read-Only & Save Guarding ──");
+  
+  // Custom role with security.manage
+  const customSecurityRole = {
+    id: "role-sec-1",
+    name: "Security Lead",
+    description: "Manages security audit and policies",
+    color: "#dc2626",
+    isSystem: false,
+    permissions: ["security.view", "security.manage"],
+  };
+
+  // Custom role with orders permissions
+  const customKitchenRole = {
+    id: "role-kitchen-1",
+    name: "Line Cook",
+    description: "Prepares and ready orders",
+    color: "#2563eb",
+    isSystem: false,
+    permissions: ["orders.view", "orders.prepare"],
+  };
+
+  // System role
+  const systemCashierRole = {
+    id: "role-cashier-sys",
+    name: "Cashier",
+    description: "Front of house payments and orders",
+    color: "#16a34a",
+    isSystem: true,
+    permissions: ["dashboard.view", "orders.view", "orders.create", "payments.collect", "tables.view"],
+  };
+
+  // Mock caller permissions: Manager with roles.manage and orders perms, but NO security perms
+  const managerCallerPerms = ["roles.manage", "roles.view", "orders.view", "orders.prepare", "orders.ready"];
+  // Owner caller permissions: empty list / undefined as per permission system
+  const ownerCallerPerms: string[] = [];
+
+  const checkRoleReachability = (role: { isSystem: boolean; permissions: string[] }, callerPerms: string[]) => {
+    const isSystem = role.isSystem;
+    const canGrant = canGrantRole(role.permissions, callerPerms);
+    const outOfReach = !isSystem && !canGrant;
+    const canEditRole = callerPerms.includes("roles.manage") ? !outOfReach : (callerPerms.length === 0 ? !outOfReach : false);
+    return { isSystem, canGrant, outOfReach, canEditRole };
+  };
+
+  // Simulate saveRole handler with editability guard and fetch interception
+  const createMockRoleDetail = (role: any, callerPerms: string[], canManageRoles: boolean) => {
+    const isSystem = role.isSystem;
+    const outOfReach = !isSystem && !canGrantRole(role.permissions, callerPerms);
+    const canEditRole = canManageRoles && !outOfReach;
+
+    let patchRequestsSent = 0;
+
+    const saveRole = async (): Promise<boolean> => {
+      if (!canEditRole) return false;
+      patchRequestsSent++;
+      return true;
+    };
+
+    return {
+      isSystem,
+      outOfReach,
+      canEditRole,
+      saveRole,
+      getPatchCount: () => patchRequestsSent,
+    };
+  };
+
+  // A. Limited Editor viewing Out-of-reach Custom Role
+  const managerSecDetail = createMockRoleDetail(customSecurityRole, managerCallerPerms, true);
+  check("Limited editor lacks security.manage: outOfReach is true", managerSecDetail.outOfReach === true);
+  check("Limited editor lacks security.manage: canEditRole is false", managerSecDetail.canEditRole === false);
+  const managerSecSaveResult = await managerSecDetail.saveRole();
+  check("Limited editor saveRole() returns false for out-of-reach role", managerSecSaveResult === false);
+  check("Limited editor saveRole() sends ZERO PATCH requests for out-of-reach role", managerSecDetail.getPatchCount() === 0);
+
+  // B. Limited Editor viewing Accessible Custom Role (all permissions held)
+  const managerKitchenDetail = createMockRoleDetail(customKitchenRole, managerCallerPerms, true);
+  check("Limited editor holds all role permissions: outOfReach is false", managerKitchenDetail.outOfReach === false);
+  check("Limited editor holds all role permissions: canEditRole is true", managerKitchenDetail.canEditRole === true);
+  const managerKitchenSaveResult = await managerKitchenDetail.saveRole();
+  check("Limited editor saveRole() succeeds for reachable custom role", managerKitchenSaveResult === true);
+  check("Limited editor saveRole() sends PATCH request for reachable custom role", managerKitchenDetail.getPatchCount() === 1);
+
+  // C. Owner viewing the Out-of-reach Custom Role
+  const ownerSecDetail = createMockRoleDetail(customSecurityRole, ownerCallerPerms, true);
+  check("Owner viewing custom role: outOfReach is false", ownerSecDetail.outOfReach === false);
+  check("Owner viewing custom role: canEditRole is true", ownerSecDetail.canEditRole === true);
+  const ownerSecSaveResult = await ownerSecDetail.saveRole();
+  check("Owner saveRole() succeeds for custom role", ownerSecSaveResult === true);
+  check("Owner saveRole() sends PATCH request", ownerSecDetail.getPatchCount() === 1);
+
+  // D. System Role behavior preserved
+  const cashierDetail = createMockRoleDetail(systemCashierRole, managerCallerPerms, true);
+  check("System role isSystem is true", cashierDetail.isSystem === true);
+  check("System role outOfReach is false", cashierDetail.outOfReach === false);
+  check("System role canEditRole is true (can edit color/description)", cashierDetail.canEditRole === true);
+
+  // E. Save & Switch integration with out-of-reach role
+  const sm4 = new RolesNavigationStateMachine();
+  sm4.selectedId = "role-sec-1";
+  sm4.saveFn = managerSecDetail.saveRole; // Out-of-reach role saveFn
+  sm4.isDetailDirty = true;
+  sm4.handleSelectRole("role-kitchen-1");
+
+  const saveSwitchResult = await sm4.handleConfirmSaveSwitch();
+  check("Save & Switch with out-of-reach role refuses save", saveSwitchResult === false);
+  check("Save & Switch sends ZERO PATCH requests for out-of-reach role", managerSecDetail.getPatchCount() === 0);
+  check("Save & Switch dialog stays open on failure preserving destination", sm4.unsavedTarget?.type === "role" && sm4.unsavedTarget.id === "role-kitchen-1");
 
   console.log("\n========================================================");
   console.log(`  Results: ${pass}/${pass + fail} checks passed${fail ? ` — ${fail} FAILED` : ""}`);

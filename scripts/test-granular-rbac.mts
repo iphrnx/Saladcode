@@ -228,6 +228,9 @@ check('roles.tsx contains sticky actions bar with safe-area padding', rolesViewC
 check('roles.tsx contains Unsaved Changes confirmation dialog', rolesViewContent.includes('Unsaved Changes') && rolesViewContent.includes('AlertDialog'));
 check('roles.tsx has horizontal role selector right-edge gradient indicator', rolesViewContent.includes('bg-gradient-to-l from-background to-transparent'));
 check('roles.tsx removed redundant Role Access h2 heading from body', !rolesViewContent.includes('>Role Access</h2>'));
+check('roles.tsx includes out-of-reach role notice: "This role includes permissions you don’t hold."', rolesViewContent.includes('This role includes permissions you don’t hold.'));
+check('roles.tsx guards saveRole with !canEditRole preventing PATCH for read-only roles', rolesViewContent.includes('if (!canEditRole) return false'));
+check('roles.tsx checks grantableKeys with canGrantRole for custom role reachability', rolesViewContent.includes('canGrantRole(parsePerms(role.permissions), grantableKeys)'));
 
 // ---------------------------------------------------------------------------
 // 8. DATABASE MIGRATION INTEGRITY (TRANSACTIONAL LAST OWNER & SYSTEM INVARIANTS)
