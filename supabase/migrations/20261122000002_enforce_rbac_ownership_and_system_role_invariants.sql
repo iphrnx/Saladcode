@@ -3,8 +3,18 @@
 --              and staff ownership invariants at the database level.
 
 -- ---------------------------------------------------------------------------
--- 1. TRANSACTIONAL LAST ACTIVE OWNER PROTECTION (DEADLOCK-FREE PER-TENANT SERIALIZATION)
+-- 1. TRANSACTIONAL LAST ACTIVE OWNER PROTECTION (GUARD ROW PER-TENANT SERIALIZATION)
 -- ---------------------------------------------------------------------------
+create table if not exists public.tenant_owner_guard (
+  tenant_id uuid primary key references public.tenants(id) on delete cascade,
+  updated_at timestamptz not null default clock_timestamp()
+);
+
+-- Seed guard rows for existing tenants
+insert into public.tenant_owner_guard (tenant_id)
+select id from public.tenants
+on conflict do nothing;
+
 create or replace function public.lock_tenant_for_owner_change(p_tenant_id uuid)
 returns void
 language plpgsql
@@ -13,7 +23,13 @@ set search_path = public, pg_temp
 as $$
 begin
   if p_tenant_id is not null then
-    perform pg_advisory_xact_lock(hashtext('saladcode_owner_guard'), hashtext(p_tenant_id::text));
+    -- Serialize owner-removing operations per tenant by updating the guard row.
+    -- Under READ COMMITTED, concurrent removals wait and recheck after the first commits.
+    -- Under REPEATABLE READ, a stale concurrent update fails with a serialization error (40001).
+    insert into public.tenant_owner_guard (tenant_id, updated_at)
+    values (p_tenant_id, clock_timestamp())
+    on conflict (tenant_id)
+    do update set updated_at = clock_timestamp();
   end if;
 end;
 $$;
@@ -80,10 +96,11 @@ begin
   end if;
 
   -- An active owner is being deleted, deactivated, demoted, or transferred.
-  -- Serialize owner removals per tenant via transactional advisory lock to prevent
-  -- deadlocks from concurrent row-level locks while ensuring strict serial validation.
+  -- Update the per-tenant guard row to serialize owner removals per tenant.
+  -- Under READ COMMITTED, concurrent removals wait and recheck after the first commits.
+  -- Under REPEATABLE READ, a stale concurrent update fails with a serialization error (40001).
   if OLD.tenant_id is not null then
-    perform pg_advisory_xact_lock(hashtext('saladcode_owner_guard'), hashtext(OLD.tenant_id::text));
+    perform public.lock_tenant_for_owner_change(OLD.tenant_id);
   end if;
 
   -- Verify transactionally that at least one other active owner remains for this restaurant.
@@ -247,6 +264,7 @@ begin
   execute 'delete from public.security_logs where tenant_id = $1' using p_tenant_id;
   execute 'delete from public.tenant_realtime where tenant_id = $1' using p_tenant_id;
   execute 'delete from public.locations where tenant_id = $1' using p_tenant_id;
+  execute 'delete from public.tenant_owner_guard where tenant_id = $1' using p_tenant_id;
 
   execute 'delete from public.profiles where tenant_id = $1' using p_tenant_id;
   get diagnostics v_count = row_count; v_removed := v_removed || jsonb_build_object('profiles', v_count);

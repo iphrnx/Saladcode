@@ -82,6 +82,8 @@ export function RolesView() {
   // Unsaved changes tracking across role and tab switches
   const [isDetailDirty, setIsDetailDirty] = useState(false)
   const [unsavedTarget, setUnsavedTarget] = useState<{ type: 'role'; id: string } | { type: 'tab'; tab: 'roles' | 'staff' } | null>(null)
+  const [isSavingSwitch, setIsSavingSwitch] = useState(false)
+  const [saveSwitchError, setSaveSwitchError] = useState<string | null>(null)
   const roleDetailSaveRef = useRef<(() => Promise<boolean>) | null>(null)
   const roleDetailDiscardRef = useRef<(() => void) | null>(null)
 
@@ -166,6 +168,7 @@ export function RolesView() {
   const handleSelectRole = useCallback((roleId: string) => {
     if (roleId === selectedRole?.id) return
     if (isDetailDirty) {
+      setSaveSwitchError(null)
       setUnsavedTarget({ type: 'role', id: roleId })
     } else {
       setSelectedId(roleId)
@@ -175,6 +178,7 @@ export function RolesView() {
   const handleTabChange = useCallback((tab: 'roles' | 'staff') => {
     if (tab === activeTab) return
     if (isDetailDirty) {
+      setSaveSwitchError(null)
       setUnsavedTarget({ type: 'tab', tab })
     } else {
       setActiveTab(tab)
@@ -182,25 +186,44 @@ export function RolesView() {
   }, [activeTab, isDetailDirty])
 
   const handleConfirmSaveSwitch = async () => {
-    if (roleDetailSaveRef.current) {
+    if (isSavingSwitch || !roleDetailSaveRef.current) return
+    setIsSavingSwitch(true)
+    setSaveSwitchError(null)
+    try {
       const ok = await roleDetailSaveRef.current()
       if (ok) {
         const target = unsavedTarget
         setUnsavedTarget(null)
+        setSaveSwitchError(null)
+        setIsSavingSwitch(false)
         if (target?.type === 'role') setSelectedId(target.id)
         if (target?.type === 'tab') setActiveTab(target.tab)
+      } else {
+        setSaveSwitchError('Failed to save changes. Please try again.')
+        setIsSavingSwitch(false)
       }
+    } catch (err: any) {
+      setSaveSwitchError(err?.message || 'Failed to save changes. Please try again.')
+      setIsSavingSwitch(false)
     }
   }
 
   const handleConfirmDiscardSwitch = () => {
+    if (isSavingSwitch) return
     if (roleDetailDiscardRef.current) {
       roleDetailDiscardRef.current()
     }
     const target = unsavedTarget
     setUnsavedTarget(null)
+    setSaveSwitchError(null)
     if (target?.type === 'role') setSelectedId(target.id)
     if (target?.type === 'tab') setActiveTab(target.tab)
+  }
+
+  const handleStayOnRole = () => {
+    if (isSavingSwitch) return
+    setUnsavedTarget(null)
+    setSaveSwitchError(null)
   }
 
   const handleDuplicateSystemRole = useCallback((roleToDuplicate: Role) => {
@@ -491,7 +514,15 @@ export function RolesView() {
       />
 
       {/* Unsaved Changes Confirmation Dialog */}
-      <AlertDialog open={!!unsavedTarget} onOpenChange={(isOpen) => { if (!isOpen) setUnsavedTarget(null) }}>
+      <AlertDialog
+        open={!!unsavedTarget}
+        onOpenChange={(isOpen) => {
+          if (!isOpen && !isSavingSwitch) {
+            setUnsavedTarget(null)
+            setSaveSwitchError(null)
+          }
+        }}
+      >
         <AlertDialogContent className="bg-card border-border sm:max-w-md">
           <AlertDialogHeader>
             <AlertDialogTitle className="flex items-center gap-2">
@@ -502,23 +533,44 @@ export function RolesView() {
               You have unsaved changes to <strong className="text-foreground">{selectedRole?.name}</strong>. If you leave without saving, your edits will be discarded.
             </AlertDialogDescription>
           </AlertDialogHeader>
+
+          {saveSwitchError && (
+            <div className="rounded-lg bg-destructive/10 border border-destructive/20 p-3 text-xs text-destructive flex items-start gap-2">
+              <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+              <span className="flex-1">{saveSwitchError}</span>
+            </div>
+          )}
+
           <AlertDialogFooter className="flex-col sm:flex-row gap-2">
-            <AlertDialogCancel onClick={() => setUnsavedTarget(null)}>
-              Stay on Role
-            </AlertDialogCancel>
             <Button
               variant="outline"
+              disabled={isSavingSwitch}
+              onClick={handleStayOnRole}
+            >
+              Stay on Role
+            </Button>
+            <Button
+              variant="outline"
+              disabled={isSavingSwitch}
               className="text-destructive hover:bg-destructive/10 hover:text-destructive border-destructive/30"
               onClick={handleConfirmDiscardSwitch}
             >
               Discard Changes
             </Button>
-            <AlertDialogAction
+            <Button
+              disabled={isSavingSwitch}
               className="bg-primary hover:bg-primary/90 text-white"
               onClick={handleConfirmSaveSwitch}
             >
-              Save &amp; Switch
-            </AlertDialogAction>
+              {isSavingSwitch ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                  Saving...
+                </>
+              ) : (
+                'Save & Switch'
+              )}
+            </Button>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
