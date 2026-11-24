@@ -207,10 +207,8 @@ function RevenueTrendTooltip({ active, payload, label, currencySymbol = '₹', c
   if (isComparisonEnabled && prevVal !== null && prevVal !== undefined) {
     if (prevVal > 0) {
       pctChange = +(((curVal - prevVal) / prevVal) * 100).toFixed(1)
-    } else if (prevVal === 0 && curVal > 0) {
-      pctChange = 100.0
-    } else if (prevVal === 0 && curVal === 0) {
-      pctChange = 0.0
+    } else {
+      pctChange = null
     }
   }
 
@@ -247,15 +245,19 @@ function RevenueTrendTooltip({ active, payload, label, currencySymbol = '₹', c
             </div>
           </div>
         )}
-        {isComparisonEnabled && pctChange !== null && (
+        {isComparisonEnabled && prevItem && (
           <div className="flex items-center justify-between pt-1 border-t border-border/30 text-[11px]">
             <span className="text-muted-foreground">vs. Prior Period:</span>
-            <span className={cn(
-              'font-semibold tabular-nums',
-              pctChange > 0 ? 'text-emerald-500' : pctChange < 0 ? 'text-red-500' : 'text-muted-foreground'
-            )}>
-              {pctChange > 0 ? `+${pctChange}%` : `${pctChange}%`}
-            </span>
+            {pctChange !== null ? (
+              <span className={cn(
+                'font-semibold tabular-nums',
+                pctChange > 0 ? 'text-emerald-500' : pctChange < 0 ? 'text-red-500' : 'text-muted-foreground'
+              )}>
+                {pctChange > 0 ? `+${pctChange.toFixed(1)}%` : `${pctChange.toFixed(1)}%`}
+              </span>
+            ) : (
+              <span className="text-muted-foreground/60">—</span>
+            )}
           </div>
         )}
       </div>

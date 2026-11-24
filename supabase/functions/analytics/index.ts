@@ -39,6 +39,31 @@ function zonedDateStr(at: Date, timeZone: string): string {
   }).format(at);
 }
 
+function parseYMD(dateStr: string): [number, number, number] {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return [y, m, d];
+}
+
+function formatYMD(y: number, m: number, d: number): string {
+  const mm = String(m).padStart(2, "0");
+  const dd = String(d).padStart(2, "0");
+  return `${y}-${mm}-${dd}`;
+}
+
+function addDaysToYMD(dateStr: string, days: number): string {
+  const [y, m, d] = parseYMD(dateStr);
+  const dt = new Date(Date.UTC(y, m - 1, d + days));
+  return formatYMD(dt.getUTCFullYear(), dt.getUTCMonth() + 1, dt.getUTCDate());
+}
+
+function calendarDaysBetween(startStr: string, endStr: string): number {
+  const [y1, m1, d1] = parseYMD(startStr);
+  const [y2, m2, d2] = parseYMD(endStr);
+  const t1 = Date.UTC(y1, m1 - 1, d1);
+  const t2 = Date.UTC(y2, m2 - 1, d2);
+  return Math.round((t2 - t1) / DAY_MS) + 1; // inclusive count
+}
+
 function zonedHour(at: Date, timeZone: string): number {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone,
@@ -105,15 +130,13 @@ serve(async (req: Request) => {
   let fromStr = url.searchParams.get("from") ?? "";
   let toStr = url.searchParams.get("to") ?? "";
   if (!fromStr || !toStr) {
-    const to = new Date(`${todayStr}T00:00:00Z`);
-    const from = new Date(to.getTime() - (daysParam - 1) * DAY_MS);
-    fromStr = from.toISOString().slice(0, 10);
+    fromStr = addDaysToYMD(todayStr, -(daysParam - 1));
     toStr = todayStr;
   }
   if (fromStr > toStr) [fromStr, toStr] = [toStr, fromStr];
 
   const rangeStart = zonedStart(fromStr, timeZone);
-  const rangeEnd = new Date(zonedStart(toStr, timeZone).getTime() + DAY_MS); // exclusive
+  const rangeEnd = zonedStart(addDaysToYMD(toStr, 1), timeZone); // exclusive (local midnight of next day)
 
   const selectedLocationId = url.searchParams.get("location_id") || url.searchParams.get("locationId") || null;
 
@@ -437,10 +460,16 @@ serve(async (req: Request) => {
     const coveredCheckIds = new Set(candidateEvents.map((e) => e.checkId).filter(Boolean));
     for (const o of allWindowOrders) {
       if (!o.check_id || !coveredCheckIds.has(o.check_id)) {
-        const settleTime = o.paid_at
-          ? new Date(o.paid_at)
-          : (o.completed_at ? new Date(o.completed_at) : (o.created_at ? new Date(o.created_at) : null));
-        if (!settleTime || isNaN(settleTime.getTime())) continue;
+        // Require payment evidence before counting an order as settled:
+        // Must have verified paid_at timestamp. An order's completed_at records fulfillment only.
+        let settleTime: Date | null = null;
+        if (o.paid_at) {
+          const d = new Date(o.paid_at);
+          if (!isNaN(d.getTime())) settleTime = d;
+        }
+
+        // Unpaid or unsettled orders must contribute ₹0 to collections
+        if (!settleTime) continue;
 
         const rawMethod = String(o.payment_method || o.paymentMethod || "").toUpperCase();
         const method: "CASH" | "UPI" | "CARD" | "OTHER" =
@@ -476,50 +505,123 @@ serve(async (req: Request) => {
       };
     }
 
-    const voidPayments = await fetchAllPages<any>(async (from, to) => {
+    // Bound reversal reads to records relevant to the report window:
+    // 1. Dated void payments reversed within the window
+    // 2. Dated void payments originally collected within the window
+    // 3. Void payments with missing timestamps (for timestamp recovery via audit logs)
+    const voidPaymentMap = new Map<string, any>();
+
+    const inRangeVoids = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("check_payments")
         .select("id, check_id, amount, method, status, staff_id, location_id, created_at, voided_at, note, idempotency_key")
         .eq("tenant_id", tenantId)
         .eq("status", "VOID")
-        .order("created_at", { ascending: true })
+        .gte("voided_at", winStart.toISOString())
+        .lt("voided_at", winEnd.toISOString())
         .order("id", { ascending: true })
         .range(from, to);
     });
+    for (const p of inRangeVoids) voidPaymentMap.set(String(p.id), p);
 
-    const orderRefunds = await fetchAllPages<any>(async (from, to) => {
+    const inRangeVoidCollections = await fetchAllPages<any>(async (from, to) => {
+      return await db
+        .from("check_payments")
+        .select("id, check_id, amount, method, status, staff_id, location_id, created_at, voided_at, note, idempotency_key")
+        .eq("tenant_id", tenantId)
+        .eq("status", "VOID")
+        .gte("created_at", winStart.toISOString())
+        .lt("created_at", winEnd.toISOString())
+        .order("id", { ascending: true })
+        .range(from, to);
+    });
+    for (const p of inRangeVoidCollections) voidPaymentMap.set(String(p.id), p);
+
+    const missingTimestampVoidPayments = await fetchAllPages<any>(async (from, to) => {
+      return await db
+        .from("check_payments")
+        .select("id, check_id, amount, method, status, staff_id, location_id, created_at, voided_at, note, idempotency_key")
+        .eq("tenant_id", tenantId)
+        .eq("status", "VOID")
+        .is("voided_at", null)
+        .order("id", { ascending: true })
+        .range(from, to);
+    });
+    for (const p of missingTimestampVoidPayments) voidPaymentMap.set(String(p.id), p);
+
+    const voidPayments = Array.from(voidPaymentMap.values());
+
+    // Bound order refund reads to records relevant to the report window:
+    // 1. Order refunds processed within the window
+    // 2. Order refunds originally collected within the window
+    // 3. Order refunds with missing timestamps
+    const orderRefundMap = new Map<string, any>();
+
+    const inRangeOrderRefunds = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("orders")
         .select("id, check_id, payment_id, table_id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at, refunded_at, idempotency_key, cancellation_reason, notes")
         .eq("tenant_id", tenantId)
         .in("payment_status", ["REFUNDED", "refunded"])
-        .order("created_at", { ascending: true })
+        .gte("refunded_at", winStart.toISOString())
+        .lt("refunded_at", winEnd.toISOString())
         .order("id", { ascending: true })
         .range(from, to);
     });
+    for (const o of inRangeOrderRefunds) orderRefundMap.set(String(o.id), o);
 
-    // For void payments that lack location_id and whose check is not in localCheckMap,
-    // fetch check metadata without polluting candidate settlement check batches
-    const missingVoidCheckIds = Array.from(
-      new Set(
-        voidPayments
+    const inRangeOrderCollections = await fetchAllPages<any>(async (from, to) => {
+      return await db
+        .from("orders")
+        .select("id, check_id, payment_id, table_id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at, refunded_at, idempotency_key, cancellation_reason, notes")
+        .eq("tenant_id", tenantId)
+        .in("payment_status", ["REFUNDED", "refunded"])
+        .gte("paid_at", winStart.toISOString())
+        .lt("paid_at", winEnd.toISOString())
+        .order("id", { ascending: true })
+        .range(from, to);
+    });
+    for (const o of inRangeOrderCollections) orderRefundMap.set(String(o.id), o);
+
+    const missingTimestampOrderRefunds = await fetchAllPages<any>(async (from, to) => {
+      return await db
+        .from("orders")
+        .select("id, check_id, payment_id, table_id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at, refunded_at, idempotency_key, cancellation_reason, notes")
+        .eq("tenant_id", tenantId)
+        .in("payment_status", ["REFUNDED", "refunded"])
+        .is("refunded_at", null)
+        .order("id", { ascending: true })
+        .range(from, to);
+    });
+    for (const o of missingTimestampOrderRefunds) orderRefundMap.set(String(o.id), o);
+
+    const orderRefunds = Array.from(orderRefundMap.values());
+
+    // Load missing check metadata for relevant reversals (void payments and legacy order refunds)
+    // even when the check settled outside the report window
+    const missingRefundCheckIds = Array.from(
+      new Set([
+        ...voidPayments
           .filter((p) => !p.location_id && p.check_id && !localCheckMap.has(p.check_id))
-          .map((p) => p.check_id)
-      )
+          .map((p) => p.check_id),
+        ...orderRefunds
+          .filter((o) => !o.location_id && !o.table_id && o.check_id && !localCheckMap.has(o.check_id))
+          .map((o) => o.check_id),
+      ])
     );
-    if (missingVoidCheckIds.length > 0) {
-      for (let i = 0; i < missingVoidCheckIds.length; i += 100) {
-        const chunk = missingVoidCheckIds.slice(i, i + 100);
-        const extraVoidChecks = await fetchAllPages<any>(async (from, to) => {
+    if (missingRefundCheckIds.length > 0) {
+      for (let i = 0; i < missingRefundCheckIds.length; i += 100) {
+        const chunk = missingRefundCheckIds.slice(i, i + 100);
+        const extraChecks = await fetchAllPages<any>(async (from, to) => {
           return await db
             .from("table_checks")
-            .select("id, table_id, location_id")
+            .select("id, table_id, location_id, status, closed_at, total")
             .eq("tenant_id", tenantId)
             .in("id", chunk)
             .order("id", { ascending: true })
             .range(from, to);
         });
-        for (const c of extraVoidChecks) localCheckMap.set(c.id, c);
+        for (const c of extraChecks) localCheckMap.set(c.id, c);
       }
     }
 
@@ -670,20 +772,30 @@ serve(async (req: Request) => {
         locationId: locId,
       });
 
-      // Account for original collection on its own date under the same ledger basis
+      // Account for original collection on its own date under the same ledger basis,
+      // provided the collection is NOT already included in a settled/paid check
       if (o.paid_at) {
         const paidAt = new Date(o.paid_at);
         if (!isNaN(paidAt.getTime()) && paidAt >= winStart && paidAt < winEnd) {
-          candidateCollections.push({
-            id: oid,
-            source: "ORDER_REFUND",
-            checkId: o.check_id || null,
-            orderId: o.id,
-            amount: amt,
-            timestamp: paidAt,
-            method: (method as any) || "OTHER",
-            locationId: locId,
-          });
+          const linkedCheck = o.check_id ? localCheckMap.get(o.check_id) : null;
+          const checkAlreadyIncludesCollection =
+            linkedCheck &&
+            (linkedCheck.status === "PAID" ||
+              linkedCheck.closed_at ||
+              candidateEvents.some((e) => e.checkId === o.check_id));
+
+          if (!checkAlreadyIncludesCollection) {
+            candidateCollections.push({
+              id: oid,
+              source: "ORDER_REFUND",
+              checkId: o.check_id || null,
+              orderId: o.id,
+              amount: amt,
+              timestamp: paidAt,
+              method: (method as any) || "OTHER",
+              locationId: locId,
+            });
+          }
         }
       }
     }
@@ -744,15 +856,8 @@ serve(async (req: Request) => {
       const d = new Date(o.paid_at);
       if (!isNaN(d.getTime())) settlementTime = d;
     }
-    if (!settlementTime && o.completed_at) {
-      const d = new Date(o.completed_at);
-      if (!isNaN(d.getTime())) settlementTime = d;
-    }
-    if (!settlementTime && (o.status === "COMPLETED" || o.status === "PAID" || o.payment_status === "PAID" || o.payment_status === "paid") && o.created_at) {
-      const d = new Date(o.created_at);
-      if (!isNaN(d.getTime())) settlementTime = d;
-    }
 
+    // Require payment evidence before counting an order as settled
     if (!settlementTime || isNaN(settlementTime.getTime())) continue;
     if (settlementTime < rangeStart || settlementTime >= rangeEnd) continue;
 
@@ -914,12 +1019,14 @@ serve(async (req: Request) => {
   } : undefined;
 
   /* -------------------------------------------------------------------------- */
-  /* Daily Revenue Aggregation (Asia/Kolkata timezone boundaries)               */
+  /* Daily Revenue Aggregation (Calendar day boundaries)                        */
   /* -------------------------------------------------------------------------- */
+  const totalReportDays = calendarDaysBetween(fromStr, toStr);
   const dailyRevenue: { date: string; label: string; revenue: number; orders: number }[] = [];
-  for (let t = rangeStart.getTime(); t < rangeEnd.getTime(); t += DAY_MS) {
-    const dayStart = new Date(t);
-    const dayEnd = new Date(t + DAY_MS);
+  for (let i = 0; i < totalReportDays; i++) {
+    const curDateStr = addDaysToYMD(fromStr, i);
+    const dayStart = zonedStart(curDateStr, timeZone);
+    const dayEnd = zonedStart(addDaysToYMD(curDateStr, 1), timeZone);
 
     const dayEvents = filteredEvents.filter(
       (e) => e.settledAt >= dayStart && e.settledAt < dayEnd
@@ -930,11 +1037,10 @@ serve(async (req: Request) => {
       (o) => o.settledAt >= dayStart && o.settledAt < dayEnd
     );
 
-    const dateStr = zonedDateStr(dayStart, timeZone);
-    const dayOfWeek = new Date(`${dateStr}T00:00:00Z`).getUTCDay();
+    const dayOfWeek = new Date(`${curDateStr}T00:00:00Z`).getUTCDay();
 
     dailyRevenue.push({
-      date: dateStr,
+      date: curDateStr,
       label: DAY_LABELS[dayOfWeek],
       revenue: +dayRevenue.toFixed(2),
       orders: dayOrders.length,
@@ -1260,8 +1366,9 @@ serve(async (req: Request) => {
   /* Independent Today & Yesterday Queries (Run through identical reconciliation)*/
   /* -------------------------------------------------------------------------- */
   const todayStart = zonedStart(todayStr, timeZone);
-  const tomorrowStart = new Date(todayStart.getTime() + DAY_MS);
-  const yesterdayStart = new Date(todayStart.getTime() - DAY_MS);
+  const tomorrowStart = zonedStart(addDaysToYMD(todayStr, 1), timeZone);
+  const yesterdayStr = addDaysToYMD(todayStr, -1);
+  const yesterdayStart = zonedStart(yesterdayStr, timeZone);
 
   // Today's independent reconciliation
   const { events: todayEvents } = await getReconciledEventsForWindow(todayStart, tomorrowStart);
@@ -1288,11 +1395,12 @@ serve(async (req: Request) => {
   /* -------------------------------------------------------------------------- */
   /* Previous Period Comparison Reconciled for Active Reporting Window          */
   /* -------------------------------------------------------------------------- */
-  const windowDurationMs = rangeEnd.getTime() - rangeStart.getTime();
-  const prevRangeStart = new Date(rangeStart.getTime() - windowDurationMs);
-  const prevRangeEnd = rangeStart;
-  const prevFromStr = zonedDateStr(prevRangeStart, timeZone);
-  const prevToStr = zonedDateStr(new Date(prevRangeEnd.getTime() - DAY_MS), timeZone);
+  const durationCalendarDays = calendarDaysBetween(fromStr, toStr);
+  const prevToStr = addDaysToYMD(fromStr, -1);
+  const prevFromStr = addDaysToYMD(prevToStr, -(durationCalendarDays - 1));
+
+  const prevRangeStart = zonedStart(prevFromStr, timeZone);
+  const prevRangeEnd = zonedStart(addDaysToYMD(prevToStr, 1), timeZone); // local midnight of next calendar day (which equals rangeStart)
 
   const { events: prevEvents, checkMap: prevCheckMap, orders: prevOrders } =
     await getReconciledEventsForWindow(prevRangeStart, prevRangeEnd);
@@ -1312,9 +1420,8 @@ serve(async (req: Request) => {
       const chkEvent = prevEvents.find((e) => e.checkId === o.check_id);
       if (chkEvent) settlementTime = chkEvent.settledAt;
     } else if (o.paid_at) {
-      settlementTime = new Date(o.paid_at);
-    } else if (o.completed_at) {
-      settlementTime = new Date(o.completed_at);
+      const d = new Date(o.paid_at);
+      if (!isNaN(d.getTime())) settlementTime = d;
     }
 
     if (!settlementTime || isNaN(settlementTime.getTime())) continue;
@@ -1324,10 +1431,12 @@ serve(async (req: Request) => {
     prevQualifyingOrders.push(o);
   }
 
+  const prevDurationDays = calendarDaysBetween(prevFromStr, prevToStr);
   const prevDailyRevenue: { date: string; label: string; revenue: number; orders: number }[] = [];
-  for (let t = prevRangeStart.getTime(); t < prevRangeEnd.getTime(); t += DAY_MS) {
-    const dayStart = new Date(t);
-    const dayEnd = new Date(t + DAY_MS);
+  for (let i = 0; i < prevDurationDays; i++) {
+    const curDateStr = addDaysToYMD(prevFromStr, i);
+    const dayStart = zonedStart(curDateStr, timeZone);
+    const dayEnd = zonedStart(addDaysToYMD(curDateStr, 1), timeZone);
 
     const dayEvents = filteredPrevEvents.filter(
       (e) => e.settledAt >= dayStart && e.settledAt < dayEnd
@@ -1338,11 +1447,10 @@ serve(async (req: Request) => {
       (o) => o.settledAt >= dayStart && o.settledAt < dayEnd
     );
 
-    const dateStr = zonedDateStr(dayStart, timeZone);
-    const dayOfWeek = new Date(`${dateStr}T00:00:00Z`).getUTCDay();
+    const dayOfWeek = new Date(`${curDateStr}T00:00:00Z`).getUTCDay();
 
     prevDailyRevenue.push({
-      date: dateStr,
+      date: curDateStr,
       label: DAY_LABELS[dayOfWeek],
       revenue: +dayRevenue.toFixed(2),
       orders: dayOrders.length,
