@@ -397,6 +397,11 @@
   min-height: 440px !important;
 }
 
+[data-compact="true"] [data-sitting-board] [data-order-card],
+[data-compact="true"] [data-session-card] {
+  min-height: auto !important;
+}
+
 [data-compact="true"] [data-order-card] .p-3\.5 {
   padding: 0.5rem 0.75rem !important;
 }

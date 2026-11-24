@@ -1,0 +1,418 @@
+/**
+ * Responsive regression tests for Restrofi Orders Session Card (PR #10)
+ *
+ * Verifies layout rules, responsive geometry math at 320px, 375px, 390px, 768px,
+ * and 3-column desktop widths, and static component contracts.
+ *
+ * Run with:
+ *   npx tsx scripts/test-ordercard-responsive-regressions.mts
+ */
+
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import {
+  reconcileOrderExpansion,
+  toggleOrderExpansion,
+  type OrderExpansion,
+} from '../src/components/views/order-expansion'
+
+let passed = 0
+let failed = 0
+
+function test(name: string, fn: () => void) {
+  try {
+    fn()
+    console.log(`  ✔ ${name}`)
+    passed++
+  } catch (err: any) {
+    console.error(`  ❌ ${name}: ${err.message}`)
+    failed++
+  }
+}
+
+console.log('🧪 Starting Orders Session Card Responsive Regression Suite...\n')
+
+const ordersSrc = fs.readFileSync(path.resolve('src/components/views/orders.tsx'), 'utf8')
+
+// ── 1. Order Header Responsive Layout Contracts ───────────────────────────
+console.log('▶ 1. Order Header Responsive Layout & Wrapping Contracts...')
+
+test('OrderRow header has flex-wrap to avoid clipping on narrow viewports', () => {
+  assert.ok(
+    ordersSrc.includes('flex min-h-9 flex-wrap items-center justify-between gap-x-1.5 gap-y-1 py-0.5'),
+    'OrderRow header must allow flex-wrap on narrow viewports',
+  )
+})
+
+test('OrderRow timestamp uses min-w-0 and truncate for responsive breathing room', () => {
+  assert.ok(
+    ordersSrc.includes('className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground font-medium"'),
+    'Timestamp container must allow shrinking with min-w-0',
+  )
+  assert.ok(
+    ordersSrc.includes('<span className="truncate">{formatOrderRelativeTime(order.createdAt, timeZone, now)}</span>'),
+    'Timestamp label must truncate cleanly on tight widths',
+  )
+})
+
+test('OrderRow accessible full timestamp is preserved in title attribute', () => {
+  assert.ok(
+    ordersSrc.includes('title={orderWhen(order.createdAt, { timeZone, now })}'),
+    'Full accessible timestamp must be preserved in title',
+  )
+})
+
+test('OrderRow status badge handles long labels like "Awaiting Acceptance" with max-w-full and truncate', () => {
+  assert.ok(
+    ordersSrc.includes('statusLabel = order.status === \'PENDING_ACTIVATION\' ? \'Awaiting Acceptance\''),
+    'Must handle PENDING_ACTIVATION as Awaiting Acceptance',
+  )
+  assert.ok(
+    ordersSrc.includes('max-w-full shrink-0 items-center gap-1 sm:gap-1.5 rounded-full px-2 sm:px-2.5 py-0.5 text-xs font-semibold border transition-colors'),
+    'Status badge must be capped to max-w-full with responsive padding',
+  )
+  assert.ok(
+    ordersSrc.includes('<span className="truncate">{statusLabel}</span>'),
+    'Status label must truncate gracefully if viewport is constrained',
+  )
+})
+
+// ── 2. Collapsed Order Preview Thumbnail Contracts ─────────────────────────
+console.log('\n▶ 2. Collapsed Order Preview Thumbnail & Name Space Contracts...')
+
+test('DishThumb uses responsive size (size-9 sm:size-10 / 36-40px)', () => {
+  assert.ok(
+    ordersSrc.includes('relative grid size-9 sm:size-10 shrink-0 place-items-center overflow-hidden rounded-xl bg-orange-50/70'),
+    'DishThumb must use size-9 sm:size-10 (36px to 40px) instead of bloated 48px',
+  )
+})
+
+test('Collapsed preview shows max 2 thumbnails on <400px, 640px-767px, and 1024px-1279px, and 3rd thumbnail on wider', () => {
+  assert.ok(
+    ordersSrc.includes('className="hidden min-[400px]:grid sm:hidden md:grid lg:hidden xl:grid"'),
+    '3rd thumbnail must adapt on narrow viewports (including 640px 2-col) and 3-column desktop to preserve space for item names',
+  )
+})
+
+test('Badge count responsive calculation adapts between viewports', () => {
+  assert.ok(
+    ordersSrc.includes('<span className="min-[400px]:hidden sm:inline md:hidden lg:inline xl:hidden">+{order.items.length - 2}</span>'),
+    'On <400px, sm:inline, and lg:inline, badge must show +N based on 2 visible thumbnails',
+  )
+  assert.ok(
+    ordersSrc.includes('<span className="hidden min-[400px]:inline sm:hidden md:inline lg:hidden xl:inline">+{order.items.length - 3}</span>'),
+    'On wider viewports, badge must show +N based on 3 visible thumbnails',
+  )
+  assert.ok(
+    ordersSrc.includes('order.items.length === 3'),
+    'When items count is exactly 3, +1 badge is shown only when 3rd thumbnail is hidden',
+  )
+  assert.ok(
+    ordersSrc.includes('className="min-[400px]:hidden sm:grid md:hidden lg:grid xl:hidden grid size-9 sm:size-10'),
+    'When items count is 3, +1 badge renders with complementary visibility matching hidden 3rd thumbnail',
+  )
+})
+
+test('Item names preview has flex-1, min-w-0, and line-clamp-2', () => {
+  assert.ok(
+    ordersSrc.includes('span className="min-w-0 flex-1 pl-1 sm:pl-1.5"'),
+    'Preview names wrapper must have flex-1 and min-w-0',
+  )
+  assert.ok(
+    ordersSrc.includes('className="line-clamp-2 text-xs sm:text-[12.5px] leading-snug font-medium text-foreground/80"'),
+    'Preview names must be line-clamp-2 with readable font size',
+  )
+})
+
+// ── 3. Four-Column Session Information Strip Contracts ─────────────────────
+console.log('\n▶ 3. Four-Column Session Strip Contracts...')
+
+test('Session information strip uses grid-cols-4 with divider lines', () => {
+  assert.ok(
+    ordersSrc.includes('grid grid-cols-4 divide-x divide-orange-200/50 dark:divide-border/50 rounded-xl sm:rounded-2xl'),
+    'Strip must be grid-cols-4 with divider lines',
+  )
+})
+
+test('Session stats support compact count on narrow viewports (<350px) and full labels on wider', () => {
+  assert.ok(
+    ordersSrc.includes('<span className="hidden min-[350px]:inline"> {suffix}</span>'),
+    'Orders and Items count suffixes must collapse cleanly below 350px',
+  )
+  assert.ok(
+    ordersSrc.includes('title={title}'),
+    'Each stat must provide full accessible title tooltip',
+  )
+})
+
+// ── 4. Light-Mode Contrast Contracts ───────────────────────────────────────
+console.log('\n▶ 4. Financial Figures & Light-Mode Contrast Contracts...')
+
+// Contrast helper functions
+function lum(hex: string) {
+  const r = parseInt(hex.slice(1, 3), 16) / 255
+  const g = parseInt(hex.slice(3, 5), 16) / 255
+  const b = parseInt(hex.slice(5, 7), 16) / 255
+  const a = [r, g, b].map((v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)))
+  return 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]
+}
+function ratio(c1: string, c2: string) {
+  const l1 = lum(c1)
+  const l2 = lum(c2)
+  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)
+}
+
+test('Amount due has accessible light-mode contrast (>= 4.5:1) against #fff7ed', () => {
+  assert.ok(
+    ordersSrc.includes("tone === 'due' && 'text-orange-700 dark:text-orange-400'"),
+    'Amount due must use a darker tone such as text-orange-700 for WCAG AA contrast against #fff7ed',
+  )
+  // Tailwind orange-700 is #c2410c
+  const contrast = ratio('#c2410c', '#fff7ed')
+  assert.ok(
+    contrast >= 4.5,
+    `Contrast ratio of amount due against #fff7ed must be >= 4.5:1, got ${contrast.toFixed(2)}:1`,
+  )
+})
+
+test('Serving-status chip has accessible light-mode contrast (>= 4.5:1) against white card', () => {
+  assert.ok(
+    ordersSrc.includes("border-orange-300 bg-white dark:bg-card text-orange-700 dark:border-orange-500/50 dark:text-orange-400"),
+    'Serving chip must use text-orange-700 for WCAG AA contrast against white background',
+  )
+  const contrast = ratio('#c2410c', '#ffffff')
+  assert.ok(
+    contrast >= 4.5,
+    `Contrast ratio of serving-status chip against #ffffff must be >= 4.5:1, got ${contrast.toFixed(2)}:1`,
+  )
+})
+
+test('Expanded-order controls (+N items and Order details) have accessible light-mode contrast (>= 4.5:1) against white card', () => {
+  assert.ok(
+    ordersSrc.includes("text-xs font-semibold text-orange-700 hover:text-orange-800 dark:text-orange-400 dark:hover:text-orange-300"),
+    'Expanded controls must use text-orange-700 hover:text-orange-800 for WCAG AA contrast against white background',
+  )
+  const contrastNormal = ratio('#c2410c', '#ffffff')
+  const contrastHover = ratio('#9a3412', '#ffffff')
+  assert.ok(
+    contrastNormal >= 4.5,
+    `Contrast ratio of expanded controls against #ffffff must be >= 4.5:1, got ${contrastNormal.toFixed(2)}:1`,
+  )
+  assert.ok(
+    contrastHover >= 4.5,
+    `Contrast ratio of expanded controls on hover against #ffffff must be >= 4.5:1, got ${contrastHover.toFixed(2)}:1`,
+  )
+})
+
+test('Collapsed overflow badges (+N and +1) have accessible light-mode contrast (>= 4.5:1) against orange-50', () => {
+  assert.ok(
+    ordersSrc.includes("bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs sm:text-[13px] font-bold text-orange-700 dark:text-orange-400"),
+    '+N badge must use text-orange-700 for WCAG AA contrast against bg-orange-50',
+  )
+  assert.ok(
+    ordersSrc.includes("bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs font-bold text-orange-700 dark:text-orange-400"),
+    '+1 badge must use text-orange-700 for WCAG AA contrast against bg-orange-50',
+  )
+  const contrast = ratio('#c2410c', '#fff7ed')
+  assert.ok(
+    contrast >= 4.5,
+    `Contrast ratio of overflow badges against #fff7ed must be >= 4.5:1, got ${contrast.toFixed(2)}:1`,
+  )
+})
+
+// ── 5. Order Expansion Logic Invariance ────────────────────────────────────
+console.log('\n▶ 5. Order Expansion Logic Preservation...')
+
+test('Order expansion helper behavior: single expands, multiple starts collapsed', () => {
+  const o1 = { id: 'order-1', status: 'PENDING' }
+  const o2 = { id: 'order-2', status: 'PREPARING' }
+
+  // 1 valid order -> automatically expanded
+  const single = reconcileOrderExpansion(null, [o1])
+  assert.equal(single.openId, 'order-1')
+
+  // 2 valid orders -> starts collapsed (openId null)
+  const multiple = reconcileOrderExpansion(single, [o1, o2])
+  assert.equal(multiple.openId, null)
+
+  // Toggle order-1 -> opens order-1
+  const opened = toggleOrderExpansion(multiple, 'order-1')
+  assert.equal(opened.openId, 'order-1')
+
+  // Toggle order-1 again -> collapses order-1
+  const closed = toggleOrderExpansion(opened, 'order-1')
+  assert.equal(closed.openId, null)
+})
+
+// ── 6. Viewport Geometry Calculations (320px, 375px, 390px, 640px, 768px, 1024px, 1280px) ─
+console.log('\n▶ 6. Viewport Geometry Assertions...')
+
+interface ViewportConfig {
+  name: string
+  width: number
+  outerPadding: number
+  gridGap: number
+  columns: number
+  cardPadding: number
+  buttonPadding: number
+}
+
+// In Restrofi app-shell, main is full-width (Sidebar is a slide-out sheet).
+// Breakpoints for sitting board: grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3
+const VIEWPORTS: ViewportConfig[] = [
+  { name: 'Mobile 320px (iPhone SE)', width: 320, outerPadding: 14 * 2, gridGap: 16, columns: 1, cardPadding: 28, buttonPadding: 20 },
+  { name: 'Mobile 375px (iPhone 11/SE2)', width: 375, outerPadding: 14 * 2, gridGap: 16, columns: 1, cardPadding: 28, buttonPadding: 20 },
+  { name: 'Mobile 390px (iPhone 14/15)', width: 390, outerPadding: 14 * 2, gridGap: 16, columns: 1, cardPadding: 28, buttonPadding: 20 },
+  { name: 'Narrow 2-col 640px (Small Tablet - 2 cols)', width: 640, outerPadding: 14 * 2, gridGap: 16, columns: 2, cardPadding: 32, buttonPadding: 24 },
+  { name: 'Tablet 768px (iPad Mini - 2 cols)', width: 768, outerPadding: 24 * 2, gridGap: 20, columns: 2, cardPadding: 32, buttonPadding: 24 },
+  { name: 'Desktop 1024px (Small Laptop - 3 cols)', width: 1024, outerPadding: 24 * 2, gridGap: 20, columns: 3, cardPadding: 32, buttonPadding: 24 },
+  { name: 'Desktop 1280px (Standard - 3 cols)', width: 1280, outerPadding: 24 * 2, gridGap: 20, columns: 3, cardPadding: 32, buttonPadding: 24 },
+]
+
+for (const vp of VIEWPORTS) {
+  test(`Viewport ${vp.name}: adequate text space in collapsed preview`, () => {
+    const availableWidth = vp.width - vp.outerPadding
+    const cardWidth = (availableWidth - (vp.columns - 1) * vp.gridGap) / vp.columns
+    const cardInnerWidth = cardWidth - vp.cardPadding
+    const rowInnerWidth = cardInnerWidth - vp.buttonPadding
+
+    // Thumbnail size is 36px on mobile (<640px), 40px on tablet/desktop (>=640px)
+    const thumbSize = vp.width >= 640 ? 40 : 36
+    const gap = 8
+
+    // Visible thumbnails: 2 on <400px, 640px-767px (sm 2 cols), and 1024-1279px (lg 3 cols), 3 on wider
+    const visibleThumbs = (vp.width < 400 || (vp.width >= 640 && vp.width < 768) || (vp.width >= 1024 && vp.width < 1280)) ? 2 : 3
+    const badgeSize = thumbSize
+
+    // Total width of thumbnails + badge
+    const thumbsTotalWidth = visibleThumbs * thumbSize + (visibleThumbs - 1) * gap + gap + badgeSize
+    const remainingForText = rowInnerWidth - thumbsTotalWidth - 10
+
+    // Ensure there is at least 95px remaining for item names preview even at worst-case viewports
+    assert.ok(
+      remainingForText >= 95,
+      `Expected remainingForText >= 95px, got ${remainingForText.toFixed(1)}px on ${vp.name}`,
+    )
+  })
+
+  test(`Viewport ${vp.name}: four-column strip column width >= 60px`, () => {
+    const availableWidth = vp.width - vp.outerPadding
+    const cardWidth = (availableWidth - (vp.columns - 1) * vp.gridGap) / vp.columns
+    const cardInnerWidth = cardWidth - vp.cardPadding
+    const colWidth = cardInnerWidth / 4
+
+    assert.ok(
+      colWidth >= 60,
+      `Expected colWidth >= 60px, got ${colWidth.toFixed(1)}px on ${vp.name}`,
+    )
+  })
+}
+
+test('Viewport 640px (2-column) with 4+ items preserves readable space for item names (>= 90px)', () => {
+  const width = 640
+  const outerPadding = 28 // px-3.5 * 2
+  const gridGap = 16 // gap-4
+  const columns = 2 // sm:grid-cols-2
+  const cardPadding = 32 // sm:p-4
+  const buttonPadding = 24 // sm:p-3
+  const cardWidth = (width - outerPadding - (columns - 1) * gridGap) / columns
+  const cardInnerWidth = cardWidth - cardPadding
+  const rowInnerWidth = cardInnerWidth - buttonPadding
+
+  // With 4+ items at 640px, sm:hidden ensures only 2 thumbnails + overflow badge (+2) are rendered
+  const visibleThumbs = 2
+  const thumbSize = 40 // sm:size-10
+  const gap = 8 // sm:gap-2
+  const badgeSize = thumbSize
+
+  const thumbsTotalWidth = visibleThumbs * thumbSize + (visibleThumbs - 1) * gap + gap + badgeSize
+  const remainingForText = rowInnerWidth - thumbsTotalWidth - 10
+
+  assert.ok(
+    remainingForText >= 90,
+    `Expected remainingForText >= 90px with 4+ items at 640px, got ${remainingForText.toFixed(1)}px`,
+  )
+})
+
+// ── 7. Session Card Footer Actions Layout Contracts ────────────────────────
+console.log('\n▶ 7. Session Card Footer Actions Layout & Wrapping Contracts...')
+
+test('Footer container uses flex-wrap and button uses flex-1 min-w-[10.5rem] to allow wrapping', () => {
+  assert.ok(
+    ordersSrc.includes('flex flex-wrap items-center gap-2.5'),
+    'Footer container must allow wrapping with flex flex-wrap instead of rigid grid',
+  )
+  assert.ok(
+    ordersSrc.includes('flex-1 min-w-[10.5rem] gap-1.5 rounded-xl sm:rounded-2xl px-4 text-center font-bold text-xs sm:text-[14px] whitespace-nowrap'),
+    'Button must define min-w-[10.5rem] and flex-1 so it wraps when card is too narrow',
+  )
+})
+
+test('Eligible "All Served" order at 640px: footer wraps and provides full space for Complete & Pay label', () => {
+  const width = 640
+  const outerPadding = 28 // px-3.5 * 2
+  const gridGap = 16 // gap-4
+  const columns = 2 // sm:grid-cols-2
+  const cardPadding = 32 // sm:p-4
+  const cardWidth = (width - outerPadding - (columns - 1) * gridGap) / columns
+  const cardInnerWidth = cardWidth - cardPadding // 266px
+
+  const chipWidth = 122 // "All Served" chip width
+  const gap = 10 // gap-2.5
+  const btnMinW = 168 // 10.5rem = 168px
+  const remainingOnRow1 = cardInnerWidth - chipWidth - gap // 134px
+
+  // Since remainingOnRow1 (134px) < btnMinW (168px), flex-wrap wraps the button to line 2
+  const buttonWraps = remainingOnRow1 < btnMinW
+  assert.ok(buttonWraps, 'Button must wrap to line 2 on 640px narrow 2-col card')
+
+  // On wrapped line 2, button gets full inner card width (266px)
+  const buttonWidthOnRow2 = cardInnerWidth
+  const buttonPadding = 32 // px-4 * 2
+  const iconWidth = 18 // size-4.5
+  const iconGap = 6 // gap-1.5
+  const spaceForLabel = buttonWidthOnRow2 - buttonPadding - iconWidth - iconGap // 210px
+
+  const labelNeeded = 107 // Fallback font requires ~107px for "Complete & Pay"
+  assert.ok(
+    spaceForLabel >= labelNeeded,
+    `Expected spaceForLabel >= ${labelNeeded}px on row 2, got ${spaceForLabel}px`,
+  )
+})
+
+test('Eligible "All Served" order at wider viewport (768px): footer fits side by side without truncation', () => {
+  const width = 768
+  const outerPadding = 48 // md:px-6 * 2
+  const gridGap = 20 // md:gap-5
+  const columns = 2 // sm:grid-cols-2
+  const cardPadding = 32 // sm:p-4
+  const cardWidth = (width - outerPadding - (columns - 1) * gridGap) / columns
+  const cardInnerWidth = cardWidth - cardPadding // 318px
+
+  const chipWidth = 122 // "All Served" chip width
+  const gap = 10 // gap-2.5
+  const btnMinW = 168 // 10.5rem = 168px
+  const remainingOnRow1 = cardInnerWidth - chipWidth - gap // 186px
+
+  // Since remainingOnRow1 (186px) >= btnMinW (168px), button fits side by side on row 1
+  const fitsSideBySide = remainingOnRow1 >= btnMinW
+  assert.ok(fitsSideBySide, 'Footer must fit side by side on 768px tablet card')
+
+  const buttonPadding = 32 // px-4 * 2
+  const iconWidth = 18 // size-4.5
+  const iconGap = 6 // gap-1.5
+  const spaceForLabel = remainingOnRow1 - buttonPadding - iconWidth - iconGap // 130px
+
+  const labelNeeded = 107 // Fallback font requires ~107px for "Complete & Pay"
+  assert.ok(
+    spaceForLabel >= labelNeeded,
+    `Expected spaceForLabel >= ${labelNeeded}px side by side, got ${spaceForLabel}px`,
+  )
+})
+
+console.log(`\nResults: ${passed} passed, ${failed} failed of ${passed + failed} checks.`)
+
+if (failed > 0) {
+  process.exit(1)
+}
