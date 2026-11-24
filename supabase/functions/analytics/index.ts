@@ -26,8 +26,15 @@ function zoneOffsetMinutes(at: Date, timeZone: string): number {
 
 function zonedStart(dateStr: string, timeZone: string): Date {
   const [y, m, d] = dateStr.split("-").map(Number);
-  const guess = Date.UTC(y, m - 1, d, 0, 0, 0);
-  return new Date(guess - zoneOffsetMinutes(new Date(guess), timeZone) * 60000);
+  const targetUtcMidnight = Date.UTC(y, m - 1, d, 0, 0, 0);
+  let current = new Date(targetUtcMidnight - zoneOffsetMinutes(new Date(targetUtcMidnight), timeZone) * 60000);
+  for (let iter = 0; iter < 3; iter++) {
+    const offset = zoneOffsetMinutes(current, timeZone);
+    const refined = new Date(targetUtcMidnight - offset * 60000);
+    if (refined.getTime() === current.getTime()) break;
+    current = refined;
+  }
+  return current;
 }
 
 function zonedDateStr(at: Date, timeZone: string): string {
@@ -456,11 +463,36 @@ serve(async (req: Request) => {
     }
     const allWindowOrders = Array.from(orderMap.values());
 
+    // Ensure all checks referenced by candidate orders are in localCheckMap
+    const missingOrderCheckIds = Array.from(
+      new Set(
+        allWindowOrders
+          .map((o) => o.check_id)
+          .filter((cid) => cid && !localCheckMap.has(cid))
+      )
+    );
+    if (missingOrderCheckIds.length > 0) {
+      for (let i = 0; i < missingOrderCheckIds.length; i += 100) {
+        const chunk = missingOrderCheckIds.slice(i, i + 100);
+        const extraChecks = await fetchAllPages<any>(async (from, to) => {
+          return await db
+            .from("table_checks")
+            .select("id, table_id, session_id, order_type, status, subtotal, discount, tax, service_charge, total, paid_total, closed_at, invoice_date, location_id, created_at")
+            .eq("tenant_id", tenantId)
+            .in("id", chunk)
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true })
+            .range(from, to);
+        });
+        for (const c of extraChecks) localCheckMap.set(c.id, c);
+      }
+    }
+
     // Incorporate orders that settled directly or on checks without separate ledger coverage
     const coveredCheckIds = new Set(candidateEvents.map((e) => e.checkId).filter(Boolean));
     for (const o of allWindowOrders) {
-      if (!o.check_id || !coveredCheckIds.has(o.check_id)) {
-        // Require payment evidence before counting an order as settled:
+      if (!o.check_id) {
+        // Standalone order with valid payment evidence:
         // Must have verified paid_at timestamp. An order's completed_at records fulfillment only.
         let settleTime: Date | null = null;
         if (o.paid_at) {
@@ -476,7 +508,7 @@ serve(async (req: Request) => {
           rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
 
         candidateEvents.push({
-          checkId: o.check_id || null,
+          checkId: null,
           orderId: o.id,
           amount: Number(o.total || 0),
           settledAt: settleTime,
@@ -484,7 +516,37 @@ serve(async (req: Request) => {
           locationId: resolveEntityLocation(o, localCheckMap),
           isLedger: false,
         });
-        if (o.check_id) coveredCheckIds.add(o.check_id);
+      } else if (!coveredCheckIds.has(o.check_id)) {
+        // Linked order fallback: verify that the fallback has valid settlement evidence
+        // and does not duplicate a collection already represented by the reversal path.
+        const chk = localCheckMap.get(o.check_id);
+        const hasCheckSettlement = chk && (chk.status === "PAID" || Boolean(chk.closed_at) || Boolean(chk.invoice_date));
+        if (!hasCheckSettlement) {
+          // Open or unsettled check: backfilled paid_at is stale
+          continue;
+        }
+
+        let settleTime: Date | null = null;
+        if (o.paid_at) {
+          const d = new Date(o.paid_at);
+          if (!isNaN(d.getTime())) settleTime = d;
+        }
+        if (!settleTime) continue;
+
+        const rawMethod = String(o.payment_method || o.paymentMethod || "").toUpperCase();
+        const method: "CASH" | "UPI" | "CARD" | "OTHER" =
+          rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
+
+        candidateEvents.push({
+          checkId: o.check_id,
+          orderId: o.id,
+          amount: Number(o.total || 0),
+          settledAt: settleTime,
+          method,
+          locationId: resolveEntityLocation(o, localCheckMap),
+          isLedger: false,
+        });
+        coveredCheckIds.add(o.check_id);
       }
     }
 
@@ -549,8 +611,6 @@ serve(async (req: Request) => {
     });
     for (const p of missingTimestampVoidPayments) voidPaymentMap.set(String(p.id), p);
 
-    const voidPayments = Array.from(voidPaymentMap.values());
-
     // Bound order refund reads to records relevant to the report window:
     // 1. Order refunds processed within the window
     // 2. Order refunds originally collected within the window
@@ -596,6 +656,46 @@ serve(async (req: Request) => {
     for (const o of missingTimestampOrderRefunds) orderRefundMap.set(String(o.id), o);
 
     const orderRefunds = Array.from(orderRefundMap.values());
+
+    // Look up referenced authoritative ledger void records even if their dates fall outside the selected window
+    const referencedPaymentIds = Array.from(
+      new Set([
+        ...orderRefunds
+          .map((o) =>
+            o.payment_id
+              ? String(o.payment_id)
+              : o.paymentId
+              ? String(o.paymentId)
+              : o.refund_id
+              ? String(o.refund_id)
+              : o.refundId
+              ? String(o.refundId)
+              : null
+          )
+          .filter(Boolean),
+        ...orderRefunds.map((o) => String(o.id)),
+      ])
+    ) as string[];
+
+    const missingReferencedPaymentIds = referencedPaymentIds.filter((pid) => !voidPaymentMap.has(pid));
+    if (missingReferencedPaymentIds.length > 0) {
+      for (let i = 0; i < missingReferencedPaymentIds.length; i += 100) {
+        const chunk = missingReferencedPaymentIds.slice(i, i + 100);
+        const refVoidPayments = await fetchAllPages<any>(async (from, to) => {
+          return await db
+            .from("check_payments")
+            .select("id, check_id, amount, method, status, staff_id, location_id, created_at, voided_at, note, idempotency_key")
+            .eq("tenant_id", tenantId)
+            .eq("status", "VOID")
+            .in("id", chunk)
+            .order("id", { ascending: true })
+            .range(from, to);
+        });
+        for (const p of refVoidPayments) voidPaymentMap.set(String(p.id), p);
+      }
+    }
+
+    const voidPayments = Array.from(voidPaymentMap.values());
 
     // Load missing check metadata for relevant reversals (void payments and legacy order refunds)
     // even when the check settled outside the report window
@@ -851,8 +951,7 @@ serve(async (req: Request) => {
       // Find the check's authoritative settlement event
       const chkEvent = mainEvents.find((e) => e.checkId === o.check_id);
       if (chkEvent) settlementTime = chkEvent.settledAt;
-    }
-    if (!settlementTime && o.paid_at) {
+    } else if (o.paid_at) {
       const d = new Date(o.paid_at);
       if (!isNaN(d.getTime())) settlementTime = d;
     }

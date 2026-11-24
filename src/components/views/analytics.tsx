@@ -458,14 +458,21 @@ function groupRevenueData(
     key: string
     label: string
     period: string
+    prevPeriod?: string
     currentRevenue: number
     currentOrders: number
     prevRevenue: number
     prevOrders: number
+    firstDate?: string
+    lastDate?: string
+    firstPrevDate?: string
+    lastPrevDate?: string
   }>()
 
   daily.forEach((d, i) => {
-    const monthKey = d.date ? d.date.slice(0, 7) : 'all'
+    const monthKey = d.date
+      ? (d.date.includes('-') ? d.date.slice(0, 7) : d.date.split(' ')[0] || 'all')
+      : 'all'
     const p = prevDaily[i]
     if (!monthMap.has(monthKey)) {
       monthMap.set(monthKey, {
@@ -481,13 +488,42 @@ function groupRevenueData(
     const entry = monthMap.get(monthKey)!
     entry.currentRevenue = +(entry.currentRevenue + d.revenue).toFixed(2)
     entry.currentOrders += d.orders
+    if (d.date) {
+      if (!entry.firstDate) entry.firstDate = d.date
+      entry.lastDate = d.date
+    }
     if (p) {
       entry.prevRevenue = +(entry.prevRevenue + p.revenue).toFixed(2)
       entry.prevOrders += p.orders
+      if (p.date) {
+        if (!entry.firstPrevDate) entry.firstPrevDate = p.date
+        entry.lastPrevDate = p.date
+      }
     }
   })
 
-  return Array.from(monthMap.values())
+  return Array.from(monthMap.values()).map((entry) => {
+    const startLabel = entry.firstDate || ''
+    const endLabel = entry.lastDate || ''
+    const prevStartLabel = entry.firstPrevDate || ''
+    const prevEndLabel = entry.lastPrevDate || ''
+    const curPeriod = startLabel && endLabel
+      ? (startLabel === endLabel ? startLabel : `${startLabel} – ${endLabel}`)
+      : entry.period
+    const prevPeriod = prevStartLabel && prevEndLabel
+      ? (prevStartLabel === prevEndLabel ? prevStartLabel : `${prevStartLabel} – ${prevEndLabel}`)
+      : ''
+    return {
+      key: entry.key,
+      label: entry.label,
+      period: entry.label && curPeriod ? `${entry.label} (${curPeriod})` : entry.label,
+      prevPeriod: prevPeriod ? (entry.label ? `${entry.label} (${prevPeriod})` : prevPeriod) : '',
+      currentRevenue: entry.currentRevenue,
+      currentOrders: entry.currentOrders,
+      prevRevenue: entry.prevRevenue,
+      prevOrders: entry.prevOrders,
+    }
+  })
 }
 
 function ChartSkeleton({ className }: { className?: string }) {
