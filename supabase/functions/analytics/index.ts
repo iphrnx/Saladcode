@@ -129,15 +129,24 @@ serve(async (req: Request) => {
     tableMap.set(t.id, t);
   }
 
+  const { data: allCategories } = await db
+    .from("categories")
+    .select("id, name")
+    .eq("tenant_id", tenantId);
+  const categoryMap = new Map<string, string>();
+  for (const c of allCategories ?? []) {
+    categoryMap.set(c.id, c.name);
+  }
+
   const { data: menuRows } = await db
     .from("menu_items")
-    .select("id, name, is_active, category:categories(name)")
+    .select("id, name, category_id, available")
     .eq("tenant_id", tenantId)
     .limit(5000);
   const catMap: Record<string, string> = {};
   for (const m of menuRows ?? []) {
-    const category = Array.isArray((m as any).category) ? (m as any).category[0] : (m as any).category;
-    catMap[(m as any).id] = category?.name || "Other";
+    const catName = (m as any).category_id ? categoryMap.get((m as any).category_id) : null;
+    catMap[(m as any).id] = catName || "Other";
   }
 
   /* -------------------------------------------------------------------------- */
@@ -195,17 +204,32 @@ serve(async (req: Request) => {
     locationId: string | null;
   }
 
+  interface ReconciledCollection {
+    id: string;
+    source: "CHECK_PAYMENT_VOID" | "ORDER_REFUND";
+    checkId: string | null;
+    orderId: string | null;
+    amount: number;
+    timestamp: Date;
+    method: "CASH" | "UPI" | "CARD" | "OTHER";
+    locationId: string | null;
+  }
+
   async function getReconciledEventsForWindow(
     winStart: Date,
-    winEnd: Date
+    winEnd: Date,
+    options: { includeRefunds?: boolean } = {}
   ): Promise<{
     events: ReconciledEvent[];
     checkMap: Map<string, any>;
     orders: any[];
     refunds: ReconciledRefund[];
     unknownDateRefunds: ReconciledRefund[];
+    voidCollections: ReconciledCollection[];
   }> {
-    // A. Query payments recorded in or near the window (both succeeded and voided)
+    const includeRefunds = options.includeRefunds ?? false;
+
+    // A. Query payments recorded in or near the window (succeeded payments)
     const payments = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("check_payments")
@@ -214,17 +238,6 @@ serve(async (req: Request) => {
         .eq("status", "SUCCEEDED")
         .gte("created_at", winStart.toISOString())
         .lt("created_at", winEnd.toISOString())
-        .order("created_at", { ascending: true })
-        .order("id", { ascending: true })
-        .range(from, to);
-    });
-
-    const voidPayments = await fetchAllPages<any>(async (from, to) => {
-      return await db
-        .from("check_payments")
-        .select("id, check_id, amount, method, status, staff_id, location_id, created_at, voided_at, note, idempotency_key")
-        .eq("tenant_id", tenantId)
-        .eq("status", "VOID")
         .order("created_at", { ascending: true })
         .order("id", { ascending: true })
         .range(from, to);
@@ -247,9 +260,9 @@ serve(async (req: Request) => {
     const localCheckMap = new Map<string, any>();
     for (const c of checks) localCheckMap.set(c.id, c);
 
-    // Identify all candidate checks
+    // Identify candidate checks for settlement reconciliation within the window
     const candidateCheckIds = Array.from(
-      new Set([...payments.map((p) => p.check_id), ...voidPayments.map((p) => p.check_id), ...checks.map((c) => c.id)].filter(Boolean))
+      new Set([...payments.map((p) => p.check_id), ...checks.map((c) => c.id)].filter(Boolean))
     );
 
     // Fetch missing check metadata if needed with deterministic ordering and error propagation
@@ -354,7 +367,7 @@ serve(async (req: Request) => {
       }
     }
 
-    // C. Query settled orders in the window
+    // C. Query settled orders in the window (by paid_at or completed_at)
     const paidAtOrders = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("orders")
@@ -371,7 +384,23 @@ serve(async (req: Request) => {
         .range(from, to);
     });
 
-    // Also include orders linked to closed checks where paid_at was null
+    const completedOrders = await fetchAllPages<any>(async (from, to) => {
+      return await db
+        .from("orders")
+        .select("id, order_number, order_type, table_id, table_session_id, check_id, status, payment_status, items_total, discount, tax, service_charge, total, paid_at, completed_at, created_at, served_by_id, payment_method, location_id, items:order_items(id, menu_item_id, name, price, quantity)")
+        .eq("tenant_id", tenantId)
+        .neq("status", "CANCELLED")
+        .neq("status", "REJECTED")
+        .neq("payment_status", "REFUNDED")
+        .neq("payment_status", "refunded")
+        .gte("completed_at", winStart.toISOString())
+        .lt("completed_at", winEnd.toISOString())
+        .order("completed_at", { ascending: true })
+        .order("id", { ascending: true })
+        .range(from, to);
+    });
+
+    // Also include orders linked to candidate checks
     let extraOrders: any[] = [];
     if (candidateCheckIds.length > 0) {
       for (let i = 0; i < candidateCheckIds.length; i += 100) {
@@ -385,7 +414,6 @@ serve(async (req: Request) => {
             .neq("status", "REJECTED")
             .neq("payment_status", "REFUNDED")
             .neq("payment_status", "refunded")
-            .is("paid_at", null)
             .in("check_id", chunk)
             .order("created_at", { ascending: true })
             .order("id", { ascending: true })
@@ -397,21 +425,29 @@ serve(async (req: Request) => {
 
     const orderMap = new Map<string, any>();
     for (const o of paidAtOrders) orderMap.set(o.id, o);
+    for (const o of completedOrders) {
+      if (!orderMap.has(o.id)) orderMap.set(o.id, o);
+    }
     for (const o of extraOrders) {
       if (!orderMap.has(o.id)) orderMap.set(o.id, o);
     }
     const allWindowOrders = Array.from(orderMap.values());
 
-    // Standalone orders (no check)
+    // Incorporate orders that settled directly or on checks without separate ledger coverage
+    const coveredCheckIds = new Set(candidateEvents.map((e) => e.checkId).filter(Boolean));
     for (const o of allWindowOrders) {
-      if (!o.check_id) {
-        const settleTime = o.paid_at ? new Date(o.paid_at) : new Date(o.completed_at || o.created_at);
-        const rawMethod = String(o.payment_method || "").toUpperCase();
+      if (!o.check_id || !coveredCheckIds.has(o.check_id)) {
+        const settleTime = o.paid_at
+          ? new Date(o.paid_at)
+          : (o.completed_at ? new Date(o.completed_at) : (o.created_at ? new Date(o.created_at) : null));
+        if (!settleTime || isNaN(settleTime.getTime())) continue;
+
+        const rawMethod = String(o.payment_method || o.paymentMethod || "").toUpperCase();
         const method: "CASH" | "UPI" | "CARD" | "OTHER" =
           rawMethod === "CASH" ? "CASH" : rawMethod === "UPI" ? "UPI" : rawMethod === "CARD" ? "CARD" : "OTHER";
 
         candidateEvents.push({
-          checkId: null,
+          checkId: o.check_id || null,
           orderId: o.id,
           amount: Number(o.total || 0),
           settledAt: settleTime,
@@ -419,6 +455,7 @@ serve(async (req: Request) => {
           locationId: resolveEntityLocation(o, localCheckMap),
           isLedger: false,
         });
+        if (o.check_id) coveredCheckIds.add(o.check_id);
       }
     }
 
@@ -428,16 +465,63 @@ serve(async (req: Request) => {
     );
 
     // D. Query refunds across authoritative ledger voids and legacy refunded orders
+    if (!includeRefunds) {
+      return {
+        events: windowEvents,
+        checkMap: localCheckMap,
+        orders: allWindowOrders,
+        refunds: [],
+        unknownDateRefunds: [],
+        voidCollections: [],
+      };
+    }
+
+    const voidPayments = await fetchAllPages<any>(async (from, to) => {
+      return await db
+        .from("check_payments")
+        .select("id, check_id, amount, method, status, staff_id, location_id, created_at, voided_at, note, idempotency_key")
+        .eq("tenant_id", tenantId)
+        .eq("status", "VOID")
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true })
+        .range(from, to);
+    });
+
     const orderRefunds = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("orders")
-        .select("id, check_id, payment_id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at, refunded_at, idempotency_key, cancellation_reason, notes")
+        .select("id, check_id, payment_id, table_id, total, payment_status, payment_method, location_id, created_at, paid_at, updated_at, refunded_at, idempotency_key, cancellation_reason, notes")
         .eq("tenant_id", tenantId)
         .in("payment_status", ["REFUNDED", "refunded"])
         .order("created_at", { ascending: true })
         .order("id", { ascending: true })
         .range(from, to);
     });
+
+    // For void payments that lack location_id and whose check is not in localCheckMap,
+    // fetch check metadata without polluting candidate settlement check batches
+    const missingVoidCheckIds = Array.from(
+      new Set(
+        voidPayments
+          .filter((p) => !p.location_id && p.check_id && !localCheckMap.has(p.check_id))
+          .map((p) => p.check_id)
+      )
+    );
+    if (missingVoidCheckIds.length > 0) {
+      for (let i = 0; i < missingVoidCheckIds.length; i += 100) {
+        const chunk = missingVoidCheckIds.slice(i, i + 100);
+        const extraVoidChecks = await fetchAllPages<any>(async (from, to) => {
+          return await db
+            .from("table_checks")
+            .select("id, table_id, location_id")
+            .eq("tenant_id", tenantId)
+            .in("id", chunk)
+            .order("id", { ascending: true })
+            .range(from, to);
+        });
+        for (const c of extraVoidChecks) localCheckMap.set(c.id, c);
+      }
+    }
 
     // If any voided payments lack voided_at, check security_logs for verified reversal event
     const unverifiedVoidPayments = voidPayments.filter((p) => !p.voided_at);
@@ -476,6 +560,7 @@ serve(async (req: Request) => {
 
     const seenReversalIds = new Set<string>();
     const candidateRefunds: ReconciledRefund[] = [];
+    const candidateCollections: ReconciledCollection[] = [];
 
     // 1. Authoritative check payment voids from ledger
     for (const p of voidPayments) {
@@ -510,6 +595,21 @@ serve(async (req: Request) => {
         method,
         locationId: locId,
       });
+
+      // Account for original collection on its own date under the same ledger basis
+      const createdAt = p.created_at ? new Date(p.created_at) : null;
+      if (createdAt && !isNaN(createdAt.getTime()) && createdAt >= winStart && createdAt < winEnd) {
+        candidateCollections.push({
+          id: pid,
+          source: "CHECK_PAYMENT_VOID",
+          checkId: p.check_id || null,
+          orderId: null,
+          amount: amt,
+          timestamp: createdAt,
+          method,
+          locationId: locId,
+        });
+      }
     }
 
     // 2. Authoritative legacy order refunds
@@ -569,6 +669,23 @@ serve(async (req: Request) => {
         method,
         locationId: locId,
       });
+
+      // Account for original collection on its own date under the same ledger basis
+      if (o.paid_at) {
+        const paidAt = new Date(o.paid_at);
+        if (!isNaN(paidAt.getTime()) && paidAt >= winStart && paidAt < winEnd) {
+          candidateCollections.push({
+            id: oid,
+            source: "ORDER_REFUND",
+            checkId: o.check_id || null,
+            orderId: o.id,
+            amount: amt,
+            timestamp: paidAt,
+            method: (method as any) || "OTHER",
+            locationId: locId,
+          });
+        }
+      }
     }
 
     // Partition candidates into dated refunds within [winStart, winEnd) and unknown-date refunds
@@ -589,6 +706,7 @@ serve(async (req: Request) => {
       orders: allWindowOrders,
       refunds: reconciledRefunds,
       unknownDateRefunds,
+      voidCollections: candidateCollections,
     };
   }
 
@@ -601,7 +719,8 @@ serve(async (req: Request) => {
     orders: mainOrders,
     refunds: mainRefunds,
     unknownDateRefunds: mainUnknownDateRefunds,
-  } = await getReconciledEventsForWindow(rangeStart, rangeEnd);
+    voidCollections: mainVoidCollections = [],
+  } = await getReconciledEventsForWindow(rangeStart, rangeEnd, { includeRefunds: true });
 
   // Apply location filter uniformly
   const filteredEvents = mainEvents.filter((e) => {
@@ -614,16 +733,24 @@ serve(async (req: Request) => {
     const locId = resolveEntityLocation(o, mainCheckMap);
     if (selectedLocationId && locId !== selectedLocationId) continue;
 
-    // Check if order belongs to a check that settled in this window
+    // Check if order belongs to a check that settled in this window or settled directly
     let settlementTime: Date | null = null;
     if (o.check_id) {
       // Find the check's authoritative settlement event
       const chkEvent = mainEvents.find((e) => e.checkId === o.check_id);
       if (chkEvent) settlementTime = chkEvent.settledAt;
-    } else if (o.paid_at) {
-      settlementTime = new Date(o.paid_at);
-    } else if (o.completed_at) {
-      settlementTime = new Date(o.completed_at);
+    }
+    if (!settlementTime && o.paid_at) {
+      const d = new Date(o.paid_at);
+      if (!isNaN(d.getTime())) settlementTime = d;
+    }
+    if (!settlementTime && o.completed_at) {
+      const d = new Date(o.completed_at);
+      if (!isNaN(d.getTime())) settlementTime = d;
+    }
+    if (!settlementTime && (o.status === "COMPLETED" || o.status === "PAID" || o.payment_status === "PAID" || o.payment_status === "paid") && o.created_at) {
+      const d = new Date(o.created_at);
+      if (!isNaN(d.getTime())) settlementTime = d;
     }
 
     if (!settlementTime || isNaN(settlementTime.getTime())) continue;
@@ -633,10 +760,17 @@ serve(async (req: Request) => {
     const effectiveTableId = o.table_id || chk?.table_id || null;
     const resolvedTable = effectiveTableId ? tableMap.get(effectiveTableId) : null;
 
-    let normalizedType = String(o.order_type || chk?.order_type || (effectiveTableId ? "DINE_IN" : "TAKEAWAY"))
+    const rawChannel = String(o.channel || o.order_type || o.orderType || o.type || chk?.order_type || chk?.channel || "")
       .toUpperCase()
       .replace(/[-\s]/g, "_");
-    if (!["DINE_IN", "TAKEAWAY", "DELIVERY"].includes(normalizedType)) {
+    let normalizedType = "TAKEAWAY";
+    if (["DINE_IN", "DINEIN"].includes(rawChannel)) {
+      normalizedType = "DINE_IN";
+    } else if (["TAKEAWAY", "TAKE_AWAY", "PICKUP"].includes(rawChannel)) {
+      normalizedType = "TAKEAWAY";
+    } else if (["DELIVERY"].includes(rawChannel)) {
+      normalizedType = "DELIVERY";
+    } else {
       normalizedType = effectiveTableId ? "DINE_IN" : "TAKEAWAY";
     }
 
@@ -689,6 +823,29 @@ serve(async (req: Request) => {
       cardCount++;
     } else {
       otherAmount += e.amount;
+      otherCount++;
+    }
+  }
+
+  // Account for voided collections on their original collection date using the same ledger basis
+  const filteredVoidCollections = (mainVoidCollections ?? []).filter((c) => {
+    if (!selectedLocationId) return true;
+    return c.locationId === selectedLocationId;
+  });
+
+  for (const c of filteredVoidCollections) {
+    if (c.amount <= 0) continue;
+    if (c.method === "CASH") {
+      cashAmount += c.amount;
+      cashCount++;
+    } else if (c.method === "UPI") {
+      upiAmount += c.amount;
+      upiCount++;
+    } else if (c.method === "CARD") {
+      cardAmount += c.amount;
+      cardCount++;
+    } else {
+      otherAmount += c.amount;
       otherCount++;
     }
   }
@@ -799,12 +956,12 @@ serve(async (req: Request) => {
   // Initialize all active menu items to support zero-sale items in least-selling view
   const allItemSalesMap: Record<string, { id?: string; name: string; category: string; qty: number; revenue: number; isZeroSale: boolean }> = {};
   for (const m of menuRows ?? []) {
-    if ((m as any).is_active === false) continue;
-    const cat = Array.isArray((m as any).category) ? (m as any).category[0]?.name : (m as any).category?.name;
+    if ((m as any).available === false) continue;
+    const catName = (m as any).category_id ? categoryMap.get((m as any).category_id) : null;
     allItemSalesMap[(m as any).id] = {
       id: (m as any).id,
       name: (m as any).name,
-      category: cat || "Other",
+      category: catName || "Other",
       qty: 0,
       revenue: 0,
       isZeroSale: true,
@@ -858,16 +1015,16 @@ serve(async (req: Request) => {
     let t = "TAKEAWAY";
     if (e.checkId) {
       const chk = mainCheckMap.get(e.checkId);
-      const rawType = String(chk?.order_type || (chk?.table_id ? "DINE_IN" : "TAKEAWAY"))
+      const rawType = String(chk?.channel || chk?.order_type || (chk?.table_id ? "DINE_IN" : "TAKEAWAY"))
         .toUpperCase()
         .replace(/[-\s]/g, "_");
-      t = ["DINE_IN", "TAKEAWAY", "DELIVERY"].includes(rawType) ? rawType : (chk?.table_id ? "DINE_IN" : "TAKEAWAY");
+      t = ["DINE_IN", "DINEIN"].includes(rawType) ? "DINE_IN" : ["TAKEAWAY", "TAKE_AWAY", "PICKUP"].includes(rawType) ? "TAKEAWAY" : ["DELIVERY"].includes(rawType) ? "DELIVERY" : (chk?.table_id ? "DINE_IN" : "TAKEAWAY");
     } else if (e.orderId) {
       const o = mainOrders.find((ord) => ord.id === e.orderId);
-      const rawType = String(o?.order_type || (o?.table_id ? "DINE_IN" : "TAKEAWAY"))
+      const rawType = String(o?.channel || o?.order_type || o?.orderType || o?.type || (o?.table_id ? "DINE_IN" : "TAKEAWAY"))
         .toUpperCase()
         .replace(/[-\s]/g, "_");
-      t = ["DINE_IN", "TAKEAWAY", "DELIVERY"].includes(rawType) ? rawType : (o?.table_id ? "DINE_IN" : "TAKEAWAY");
+      t = ["DINE_IN", "DINEIN"].includes(rawType) ? "DINE_IN" : ["TAKEAWAY", "TAKE_AWAY", "PICKUP"].includes(rawType) ? "TAKEAWAY" : ["DELIVERY"].includes(rawType) ? "DELIVERY" : (o?.table_id ? "DINE_IN" : "TAKEAWAY");
     }
     if (!typeMap[t]) typeMap[t] = { count: 0, revenue: 0 };
     typeMap[t].revenue += e.amount;

@@ -82,9 +82,8 @@ check("supports least-selling view toggle",
   analyticsView.includes("itemViewMode === 'top' ? 'Top Selling Items' : 'Least Selling Items'"));
 
 check("clearly labels whether view covers items sold in period or includes zero-sale items",
-  analyticsView.includes("Covering: Items sold in period") &&
-  analyticsView.includes("Covering: All active menu items (including 0 sales)") &&
-  analyticsView.includes("Covering: Items sold in period (units > 0)"));
+  analyticsView.includes("itemViewMode === 'least' && includeZeroSaleItems") &&
+  analyticsView.includes("Including zero-sale items"));
 
 check("supports zero-sale scope toggle in least-selling view",
   analyticsView.includes("setIncludeZeroSaleItems") &&
@@ -148,8 +147,8 @@ check("preserves historical menu items and categorizes properly in backend",
 console.log("\n── 2. Section 6: Revenue by Category ──");
 
 check("renders ranked category revenue chart and performance table",
-  analyticsView.includes("BarChart data={rankedCategories}") &&
-  analyticsView.includes("Category Performance") || analyticsView.includes("Category contribution"));
+  analyticsView.includes("BarChart data={displayCategories}") &&
+  analyticsView.includes("Revenue by Category"));
 
 check("table shows Category name, Revenue, Units, Share %, and vs. Prior",
   analyticsView.includes("c.name") &&

@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import {
-  AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, Line,
+  ComposedChart, AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, Line,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LabelList,
 } from 'recharts'
 import { useApp, type AppData } from '@/components/app/data-context'
@@ -710,6 +710,10 @@ export function AnalyticsView() {
         (analytics.paymentMethods.other?.count ?? 0)
       push('Total Reconciled', totalTx, money(analytics.paymentMethods.totalCollected ?? resolvedPaymentTotals.collected), money(analytics.paymentMethods.totalRefunds ?? resolvedPaymentTotals.refunds), money(analytics.paymentMethods.totalNet ?? resolvedPaymentTotals.net))
       blank()
+    } else {
+      push('Payment Method Breakdown')
+      push('Payment reconciliation data unavailable for this period')
+      blank()
     }
 
     push('Daily revenue')
@@ -904,7 +908,18 @@ export function AnalyticsView() {
   // Section 6: Category Breakdown Computations
   const rawCategories = analytics?.categoryBreakdown ?? []
   const totalCategoryRev = rawCategories.reduce((s, c) => s + (c.revenue ?? c.value ?? 0), 0)
-  const rankedCategories = [...rawCategories].sort((a, b) => {
+  const rankedCategories = [...rawCategories].map((c) => {
+    const rev = c.revenue ?? c.value ?? 0
+    const calculatedShare = totalCategoryRev > 0 ? +((rev / totalCategoryRev) * 100).toFixed(1) : 0
+    const share = c.share !== undefined && c.share !== null && c.share > 0 ? c.share : calculatedShare
+    return {
+      ...c,
+      revenue: rev,
+      value: rev,
+      share,
+      units: c.units ?? 0,
+    }
+  }).sort((a, b) => {
     const revA = a.revenue ?? a.value ?? 0
     const revB = b.revenue ?? b.value ?? 0
     return (revB - revA) || a.name.localeCompare(b.name)
@@ -948,7 +963,9 @@ export function AnalyticsView() {
     : 'Excl. taxes / charges'
 
   const comparison = analytics?.comparison
-  const revenueChangeVal = comparison?.revenueChange ?? (analytics?.revenueChange !== undefined && analytics?.revenueChange !== null ? analytics.revenueChange : null)
+  const revenueChangeVal = comparison !== undefined && comparison !== null
+    ? (comparison.revenueChange ?? null)
+    : (analytics?.revenueChange !== undefined && analytics?.revenueChange !== null ? analytics.revenueChange : null)
   const ordersChangeVal = comparison?.ordersChange ?? null
   const avgOrderChangeVal = comparison?.avgOrderChange ?? null
   const netSalesChangeVal = comparison?.netSalesChange ?? null
@@ -966,7 +983,7 @@ export function AnalyticsView() {
             </span>
             <span className="hidden sm:inline opacity-40">·</span>
             <span className="truncate hidden sm:inline text-[11px] text-muted-foreground">
-              Gross settled revenue · {analytics?.range?.timezone || 'Asia/Kolkata'}
+              {analytics?.range?.timezone || 'Asia/Kolkata'}
             </span>
           </div>
 
@@ -1107,13 +1124,6 @@ export function AnalyticsView() {
               <h2 id="financial-overview-title" className="text-sm font-bold tracking-tight text-foreground flex items-center gap-1.5">
                 Financial Overview
               </h2>
-              <p className="text-[11px] text-muted-foreground">
-                Audited core revenue & sales metrics{isComparisonEnabled && compRangeLabel ? ` · Compared with ${compRangeLabel}` : ''}
-              </p>
-            </div>
-            <div className="hidden sm:flex items-center gap-1.5 text-[11px] text-muted-foreground">
-              <span className="inline-block size-1.5 rounded-full bg-emerald-500" />
-              <span>Settlement Basis</span>
             </div>
           </div>
 
@@ -1123,7 +1133,7 @@ export function AnalyticsView() {
               icon={IndianRupee}
               label="Revenue"
               value={totalRevFormatted}
-              subtext="Gross settled collections"
+              subtext="Gross settled collections (incl. taxes & charges)"
               comparisonDateLabel={compRangeLabel}
               change={revenueChangeVal}
               accent="coral"
@@ -1189,9 +1199,6 @@ export function AnalyticsView() {
                     <TrendingUp className="size-4 text-primary" />
                     Revenue Trend
                   </h3>
-                  <p className="text-[11px] text-muted-foreground">
-                    Settled revenue over time ({revenueGrouping}) · {rangeLabel}
-                  </p>
                 </div>
 
                 <div className="flex items-center gap-2 flex-wrap">
@@ -1256,7 +1263,7 @@ export function AnalyticsView() {
             ) : (
               <div className="h-[210px] w-full">
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={groupedRevenueData} margin={{ top: 8, right: 12, bottom: 0, left: -16 }}>
+                  <ComposedChart data={groupedRevenueData} margin={{ top: 8, right: 12, bottom: 0, left: -16 }}>
                     <defs>
                       <linearGradient id="revGradient" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stopColor={CORAL} stopOpacity={0.35} />
@@ -1291,7 +1298,7 @@ export function AnalyticsView() {
                         dot={false}
                       />
                     )}
-                  </AreaChart>
+                  </ComposedChart>
                 </ResponsiveContainer>
               </div>
             )}
@@ -1306,7 +1313,6 @@ export function AnalyticsView() {
                     <Utensils className="size-4 text-muted-foreground" />
                     Order Types
                   </h3>
-                  <p className="text-[11px] text-muted-foreground">Fulfillment channel comparison</p>
                 </div>
 
                 {/* Metric driver toggle */}
@@ -1336,13 +1342,6 @@ export function AnalyticsView() {
                     Orders
                   </button>
                 </div>
-              </div>
-
-              {/* Driver label */}
-              <div className="mb-2">
-                <span className="text-[10px] uppercase font-semibold tracking-wider text-muted-foreground bg-secondary/70 px-1.5 py-0.5 rounded">
-                  Driven by: {orderTypeMetric === 'revenue' ? 'Settled Revenue' : 'Completed Orders'}
-                </span>
               </div>
 
               {loading ? (
@@ -1450,14 +1449,9 @@ export function AnalyticsView() {
               ) : (
                 <div className="flex items-center gap-1.5 rounded-lg bg-secondary/50 border border-border/40 px-2.5 py-1 text-xs text-muted-foreground">
                   <Clock className="size-3.5 shrink-0 opacity-60" />
-                  <span>Peak: — (No activity recorded)</span>
+                  <span>Peak: —</span>
                 </div>
               )}
-
-              {/* Ranking label */}
-              <span className="text-[10px] uppercase font-semibold tracking-wider text-muted-foreground bg-secondary/70 px-2 py-1 rounded">
-                {hourlyRankMetric === 'orders' ? 'Ranked by Order Count' : 'Ranked by Settled Revenue'}
-              </span>
             </div>
           </div>
 
@@ -1504,15 +1498,11 @@ export function AnalyticsView() {
                     )}
                     <span>{itemViewMode === 'top' ? 'Top Selling Items' : 'Least Selling Items'}</span>
                   </h3>
-                  <p className="text-[11px] text-muted-foreground">
-                    Ranked by {itemRankMetric === 'qty' ? 'quantity sold' : 'settled revenue'} · {
-                      itemViewMode === 'top'
-                        ? 'Items sold in period'
-                        : includeZeroSaleItems
-                          ? 'Including zero-sale items'
-                          : 'Sold items only'
-                    }
-                  </p>
+                  {itemViewMode === 'least' && includeZeroSaleItems && (
+                    <p className="text-[11px] text-muted-foreground">
+                      Including zero-sale items
+                    </p>
+                  )}
                 </div>
 
                 <div className="flex items-center gap-1.5 flex-wrap">
@@ -1568,7 +1558,7 @@ export function AnalyticsView() {
                           : 'text-muted-foreground hover:text-foreground'
                       )}
                     >
-                      {sym}
+                      Revenue
                     </button>
                   </div>
 
@@ -1591,17 +1581,9 @@ export function AnalyticsView() {
                 </div>
               </div>
 
-              {/* Scope & Active Filter Pill Bar */}
-              <div className="flex items-center justify-between gap-2 flex-wrap mb-2 text-[10px]">
-                <span className="uppercase font-semibold tracking-wider text-muted-foreground bg-secondary/70 px-1.5 py-0.5 rounded">
-                  {itemViewMode === 'top'
-                    ? 'Covering: Items sold in period'
-                    : includeZeroSaleItems
-                      ? 'Covering: All active menu items (including 0 sales)'
-                      : 'Covering: Items sold in period (units > 0)'}
-                </span>
-
-                {selectedCategoryFilter !== 'ALL' && (
+              {/* Active Filter Pill Bar */}
+              {selectedCategoryFilter !== 'ALL' && (
+                <div className="flex items-center justify-between gap-2 flex-wrap mb-2 text-[10px]">
                   <div className="flex items-center gap-1 bg-primary/10 text-primary border border-primary/20 px-1.5 py-0.5 rounded">
                     <span>Category: {selectedCategoryFilter}</span>
                     <button
@@ -1613,8 +1595,8 @@ export function AnalyticsView() {
                       <X className="size-3" />
                     </button>
                   </div>
-                )}
-              </div>
+                </div>
+              )}
 
               {/* Chart */}
               {loading ? (
@@ -1728,9 +1710,6 @@ export function AnalyticsView() {
                     <Layers className="size-4 text-primary" />
                     <span>Revenue by Category</span>
                   </h3>
-                  <p className="text-[11px] text-muted-foreground">
-                    Category contribution · {isComparisonEnabled && compRangeLabel ? `Compared with ${compRangeLabel}` : rangeLabel}
-                  </p>
                 </div>
 
                 <div className="text-right">
@@ -1867,194 +1846,201 @@ export function AnalyticsView() {
                 <CreditCard className="size-4 text-primary" />
                 Payment Method Breakdown
               </h3>
-              <p className="text-[11px] text-muted-foreground">
-                Actual settled transactions reconciled against payment ledger and refund records
-              </p>
             </div>
             {/* Quick summary totals */}
             <div className="flex items-center gap-3 text-xs bg-secondary/30 px-3 py-1.5 rounded-lg border border-border/40">
               <div>
                 <span className="text-[10px] text-muted-foreground block">Total Collected</span>
-                <span className="font-semibold tabular-nums text-foreground">{sym}{resolvedPaymentTotals.collected.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span className="font-semibold tabular-nums text-foreground">
+                  {!pm ? '—' : `${sym}${resolvedPaymentTotals.collected.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+                </span>
               </div>
               <div className="h-6 w-px bg-border/60" />
               <div>
                 <span className="text-[10px] text-muted-foreground block">Refunds</span>
                 <span className="font-semibold tabular-nums text-red-500">
-                  {resolvedPaymentTotals.refunds > 0 ? `-${sym}${resolvedPaymentTotals.refunds.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
+                  {!pm ? '—' : (resolvedPaymentTotals.refunds > 0 ? `-${sym}${resolvedPaymentTotals.refunds.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`)}
                 </span>
               </div>
               <div className="h-6 w-px bg-border/60" />
               <div>
                 <span className="text-[10px] text-muted-foreground block">Net Settled</span>
-                <span className={cn('font-semibold tabular-nums', resolvedPaymentTotals.net < 0 ? 'text-red-500' : 'text-emerald-500')}>
-                  {resolvedPaymentTotals.net < 0
+                <span className={cn('font-semibold tabular-nums', !pm ? 'text-muted-foreground' : resolvedPaymentTotals.net < 0 ? 'text-red-500' : 'text-emerald-500')}>
+                  {!pm ? '—' : (resolvedPaymentTotals.net < 0
                     ? `-${sym}${Math.abs(resolvedPaymentTotals.net).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                    : `${sym}${resolvedPaymentTotals.net.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+                    : `${sym}${resolvedPaymentTotals.net.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)}
                 </span>
               </div>
             </div>
           </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-border/60 text-muted-foreground text-[11px]">
-                  <th className="text-left font-medium py-2 px-3">Payment Method</th>
-                  <th className="text-right font-medium py-2 px-3">Transactions</th>
-                  <th className="text-right font-medium py-2 px-3">Collected Amount</th>
-                  <th className="text-right font-medium py-2 px-3">Refunds</th>
-                  <th className="text-right font-medium py-2 px-3">Net Amount</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border/30">
-                {/* Cash */}
-                <tr className="hover:bg-secondary/20 transition-colors">
-                  <td className="py-2.5 px-3">
-                    <div className="flex items-center gap-2">
-                      <div className="size-6 rounded-md flex items-center justify-center bg-emerald-500/10 border border-emerald-500/20 text-emerald-500">
-                        <Banknote className="size-3.5" />
-                      </div>
-                      <span className="font-medium text-foreground">Cash</span>
-                    </div>
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums text-muted-foreground">
-                    {pm?.cash?.count ?? 0}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums font-medium text-foreground">
-                    {sym}{(pm?.cash?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
-                    {(pm?.cash?.refunds ?? 0) > 0 ? `-${sym}${(pm?.cash?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
-                    {sym}{((pm?.cash?.net ?? ((pm?.cash?.amount ?? 0) - (pm?.cash?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </td>
-                </tr>
-
-                {/* UPI */}
-                <tr className="hover:bg-secondary/20 transition-colors">
-                  <td className="py-2.5 px-3">
-                    <div className="flex items-center gap-2">
-                      <div className="size-6 rounded-md flex items-center justify-center bg-blue-500/10 border border-blue-500/20 text-blue-500">
-                        <Smartphone className="size-3.5" />
-                      </div>
-                      <span className="font-medium text-foreground">UPI / QR</span>
-                    </div>
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums text-muted-foreground">
-                    {pm?.upi?.count ?? 0}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums font-medium text-foreground">
-                    {sym}{(pm?.upi?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
-                    {(pm?.upi?.refunds ?? 0) > 0 ? `-${sym}${(pm?.upi?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
-                    {sym}{((pm?.upi?.net ?? ((pm?.upi?.amount ?? 0) - (pm?.upi?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </td>
-                </tr>
-
-                {/* Card */}
-                <tr className="hover:bg-secondary/20 transition-colors">
-                  <td className="py-2.5 px-3">
-                    <div className="flex items-center gap-2">
-                      <div className="size-6 rounded-md flex items-center justify-center bg-purple-500/10 border border-purple-500/20 text-purple-500">
-                        <CreditCard className="size-3.5" />
-                      </div>
-                      <span className="font-medium text-foreground">Card / POS</span>
-                    </div>
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums text-muted-foreground">
-                    {pm?.card?.count ?? 0}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums font-medium text-foreground">
-                    {sym}{(pm?.card?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
-                    {(pm?.card?.refunds ?? 0) > 0 ? `-${sym}${(pm?.card?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
-                    {sym}{((pm?.card?.net ?? ((pm?.card?.amount ?? 0) - (pm?.card?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </td>
-                </tr>
-
-                {/* Other / Legacy */}
-                {Boolean((pm?.other?.count ?? 0) > 0 || (pm?.other?.amount ?? 0) > 0 || (pm?.other?.refunds ?? 0) > 0) && (
+          {!pm ? (
+            <div className="py-8 text-center text-xs text-muted-foreground border border-dashed border-border/60 rounded-lg">
+              <AlertCircle className="size-5 mx-auto mb-1.5 text-muted-foreground/60" />
+              <p className="font-medium text-foreground">Payment reconciliation data unavailable</p>
+              <p className="text-[10px] text-muted-foreground/75 mt-0.5">Could not load payment ledger records for this period</p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-border/60 text-muted-foreground text-[11px]">
+                    <th className="text-left font-medium py-2 px-3">Payment Method</th>
+                    <th className="text-right font-medium py-2 px-3">Transactions</th>
+                    <th className="text-right font-medium py-2 px-3">Collected Amount</th>
+                    <th className="text-right font-medium py-2 px-3">Refunds</th>
+                    <th className="text-right font-medium py-2 px-3">Net Amount</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/30">
+                  {/* Cash */}
                   <tr className="hover:bg-secondary/20 transition-colors">
                     <td className="py-2.5 px-3">
                       <div className="flex items-center gap-2">
-                        <div className="size-6 rounded-md flex items-center justify-center bg-amber-500/10 border border-amber-500/20 text-amber-500">
-                          <Receipt className="size-3.5" />
+                        <div className="size-6 rounded-md flex items-center justify-center bg-emerald-500/10 border border-emerald-500/20 text-emerald-500">
+                          <Banknote className="size-3.5" />
                         </div>
-                        <span className="font-medium text-foreground">Other / Legacy</span>
+                        <span className="font-medium text-foreground">Cash</span>
                       </div>
                     </td>
                     <td className="text-right py-2.5 px-3 tabular-nums text-muted-foreground">
-                      {pm?.other?.count ?? 0}
+                      {pm?.cash?.count ?? 0}
                     </td>
                     <td className="text-right py-2.5 px-3 tabular-nums font-medium text-foreground">
-                      {sym}{(pm?.other?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      {sym}{(pm?.cash?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
                     <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
-                      {(pm?.other?.refunds ?? 0) > 0 ? `-${sym}${(pm?.other?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
+                      {(pm?.cash?.refunds ?? 0) > 0 ? `-${sym}${(pm?.cash?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
                     </td>
                     <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
-                      {sym}{((pm?.other?.net ?? ((pm?.other?.amount ?? 0) - (pm?.other?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      {sym}{((pm?.cash?.net ?? ((pm?.cash?.amount ?? 0) - (pm?.cash?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
                   </tr>
-                )}
 
-                {/* Unattributed Refunds (Refunds where payment method is unavailable) */}
-                {Boolean((pm?.unattributedRefunds?.amount ?? 0) > 0) && (
-                  <tr className="hover:bg-secondary/20 transition-colors bg-amber-500/5">
+                  {/* UPI */}
+                  <tr className="hover:bg-secondary/20 transition-colors">
                     <td className="py-2.5 px-3">
                       <div className="flex items-center gap-2">
-                        <div className="size-6 rounded-md flex items-center justify-center bg-amber-500/10 border border-amber-500/20 text-amber-500">
-                          <AlertCircle className="size-3.5" />
+                        <div className="size-6 rounded-md flex items-center justify-center bg-blue-500/10 border border-blue-500/20 text-blue-500">
+                          <Smartphone className="size-3.5" />
                         </div>
-                        <div>
-                          <span className="font-medium text-foreground">Refunds (Method Unavailable)</span>
-                          <span className="block text-[10px] text-muted-foreground">Check-level refund without attributed payment method</span>
-                        </div>
+                        <span className="font-medium text-foreground">UPI / QR</span>
                       </div>
                     </td>
                     <td className="text-right py-2.5 px-3 tabular-nums text-muted-foreground">
-                      {pm?.unattributedRefunds?.count ?? 0}
+                      {pm?.upi?.count ?? 0}
                     </td>
-                    <td className="text-right py-2.5 px-3 tabular-nums text-muted-foreground">—</td>
-                    <td className="text-right py-2.5 px-3 tabular-nums text-red-400 font-medium">
-                      -{sym}{(pm?.unattributedRefunds?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    <td className="text-right py-2.5 px-3 tabular-nums font-medium text-foreground">
+                      {sym}{(pm?.upi?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
-                    <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-red-400">
-                      -{sym}{(pm?.unattributedRefunds?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
+                      {(pm?.upi?.refunds ?? 0) > 0 ? `-${sym}${(pm?.upi?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
+                    </td>
+                    <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
+                      {sym}{((pm?.upi?.net ?? ((pm?.upi?.amount ?? 0) - (pm?.upi?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
                   </tr>
-                )}
-              </tbody>
-              <tfoot>
-                {/* Total Reconciled Footer */}
-                <tr className="border-t-2 border-border/80 font-semibold bg-secondary/15">
-                  <td className="py-2.5 px-3 text-foreground">Total (Reconciled)</td>
-                  <td className="text-right py-2.5 px-3 tabular-nums text-foreground">
-                    {(pm?.cash?.count ?? 0) + (pm?.upi?.count ?? 0) + (pm?.card?.count ?? 0) + (pm?.other?.count ?? 0)}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums text-foreground">
-                    {sym}{resolvedPaymentTotals.collected.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </td>
-                  <td className="text-right py-2.5 px-3 tabular-nums text-red-500">
-                    {resolvedPaymentTotals.refunds > 0 ? `-${sym}${resolvedPaymentTotals.refunds.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
-                  </td>
-                  <td className={cn('text-right py-2.5 px-3 tabular-nums font-bold', resolvedPaymentTotals.net < 0 ? 'text-red-500' : 'text-emerald-500')}>
-                    {resolvedPaymentTotals.net < 0
-                      ? `-${sym}${Math.abs(resolvedPaymentTotals.net).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                      : `${sym}${resolvedPaymentTotals.net.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-                  </td>
-                </tr>
-              </tfoot>
-            </table>
-          </div>
+
+                  {/* Card */}
+                  <tr className="hover:bg-secondary/20 transition-colors">
+                    <td className="py-2.5 px-3">
+                      <div className="flex items-center gap-2">
+                        <div className="size-6 rounded-md flex items-center justify-center bg-purple-500/10 border border-purple-500/20 text-purple-500">
+                          <CreditCard className="size-3.5" />
+                        </div>
+                        <span className="font-medium text-foreground">Card / POS</span>
+                      </div>
+                    </td>
+                    <td className="text-right py-2.5 px-3 tabular-nums text-muted-foreground">
+                      {pm?.card?.count ?? 0}
+                    </td>
+                    <td className="text-right py-2.5 px-3 tabular-nums font-medium text-foreground">
+                      {sym}{(pm?.card?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </td>
+                    <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
+                      {(pm?.card?.refunds ?? 0) > 0 ? `-${sym}${(pm?.card?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
+                    </td>
+                    <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
+                      {sym}{((pm?.card?.net ?? ((pm?.card?.amount ?? 0) - (pm?.card?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </td>
+                  </tr>
+
+                  {/* Other / Legacy */}
+                  {Boolean((pm?.other?.count ?? 0) > 0 || (pm?.other?.amount ?? 0) > 0 || (pm?.other?.refunds ?? 0) > 0) && (
+                    <tr className="hover:bg-secondary/20 transition-colors">
+                      <td className="py-2.5 px-3">
+                        <div className="flex items-center gap-2">
+                          <div className="size-6 rounded-md flex items-center justify-center bg-amber-500/10 border border-amber-500/20 text-amber-500">
+                            <Receipt className="size-3.5" />
+                          </div>
+                          <span className="font-medium text-foreground">Other / Legacy</span>
+                        </div>
+                      </td>
+                      <td className="text-right py-2.5 px-3 tabular-nums text-muted-foreground">
+                        {pm?.other?.count ?? 0}
+                      </td>
+                      <td className="text-right py-2.5 px-3 tabular-nums font-medium text-foreground">
+                        {sym}{(pm?.other?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                      <td className="text-right py-2.5 px-3 tabular-nums text-red-400">
+                        {(pm?.other?.refunds ?? 0) > 0 ? `-${sym}${(pm?.other?.refunds ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
+                      </td>
+                      <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-foreground">
+                        {sym}{((pm?.other?.net ?? ((pm?.other?.amount ?? 0) - (pm?.other?.refunds ?? 0)))).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                    </tr>
+                  )}
+
+                  {/* Unattributed Refunds (Refunds where payment method is unavailable) */}
+                  {Boolean((pm?.unattributedRefunds?.amount ?? 0) > 0) && (
+                    <tr className="hover:bg-secondary/20 transition-colors bg-amber-500/5">
+                      <td className="py-2.5 px-3">
+                        <div className="flex items-center gap-2">
+                          <div className="size-6 rounded-md flex items-center justify-center bg-amber-500/10 border border-amber-500/20 text-amber-500">
+                            <AlertCircle className="size-3.5" />
+                          </div>
+                          <div>
+                            <span className="font-medium text-foreground">Refunds (Method Unavailable)</span>
+                            <span className="block text-[10px] text-muted-foreground">Check-level refund without attributed payment method</span>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="text-right py-2.5 px-3 tabular-nums text-muted-foreground">
+                        {pm?.unattributedRefunds?.count ?? 0}
+                      </td>
+                      <td className="text-right py-2.5 px-3 tabular-nums text-muted-foreground">—</td>
+                      <td className="text-right py-2.5 px-3 tabular-nums text-red-400 font-medium">
+                        -{sym}{(pm?.unattributedRefunds?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                      <td className="text-right py-2.5 px-3 tabular-nums font-semibold text-red-400">
+                        -{sym}{(pm?.unattributedRefunds?.amount ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+                <tfoot>
+                  {/* Total Footer */}
+                  <tr className="border-t-2 border-border/80 font-semibold bg-secondary/15">
+                    <td className="py-2.5 px-3 text-foreground">Total</td>
+                    <td className="text-right py-2.5 px-3 tabular-nums text-foreground">
+                      {(pm?.cash?.count ?? 0) + (pm?.upi?.count ?? 0) + (pm?.card?.count ?? 0) + (pm?.other?.count ?? 0)}
+                    </td>
+                    <td className="text-right py-2.5 px-3 tabular-nums text-foreground">
+                      {sym}{resolvedPaymentTotals.collected.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </td>
+                    <td className="text-right py-2.5 px-3 tabular-nums text-red-500">
+                      {resolvedPaymentTotals.refunds > 0 ? `-${sym}${resolvedPaymentTotals.refunds.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${sym}0.00`}
+                    </td>
+                    <td className={cn('text-right py-2.5 px-3 tabular-nums font-bold', resolvedPaymentTotals.net < 0 ? 'text-red-500' : 'text-emerald-500')}>
+                      {resolvedPaymentTotals.net < 0
+                        ? `-${sym}${Math.abs(resolvedPaymentTotals.net).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                        : `${sym}${resolvedPaymentTotals.net.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          )}
           {Boolean((pm?.unknownDateRefunds?.count ?? 0) > 0) && (
             <div className="mt-3 flex items-center justify-between text-xs px-3 py-2 rounded-md bg-secondary/30 border border-border/40 text-muted-foreground">
               <div className="flex items-center gap-1.5">
@@ -2075,7 +2061,7 @@ export function AnalyticsView() {
                   Top Tables
                 </h3>
                 <p className="text-[11px] text-muted-foreground">
-                  Highest performing dine-in tables · Ranked by settled revenue across independent diner sessions
+                  Ranked by settled revenue
                 </p>
               </div>
             </div>
@@ -2088,7 +2074,7 @@ export function AnalyticsView() {
               </div>
             ) : (analytics?.topTables ?? []).length === 0 ? (
               <div className="flex h-[120px] items-center justify-center text-xs text-muted-foreground">
-                No table session data available for this period
+                No table sessions for these dates.
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -2160,9 +2146,6 @@ export function AnalyticsView() {
                 <Activity className="size-4 text-emerald-500" />
                 Operations Performance
               </h3>
-              <p className="text-[11px] text-muted-foreground">
-                Kitchen and service speed metrics · Only completed, chronological timings are included in averages
-              </p>
             </div>
           </div>
 
@@ -2173,10 +2156,7 @@ export function AnalyticsView() {
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
                     <Timer className="size-3.5 text-blue-500" />
-                    Preparation Time
-                  </span>
-                  <span className="text-[10px] text-muted-foreground bg-secondary px-2 py-0.5 rounded-full">
-                    Kitchen
+                    Average Preparation Time
                   </span>
                 </div>
                 <div className="mt-2.5 flex items-baseline gap-1.5">
@@ -2188,17 +2168,8 @@ export function AnalyticsView() {
                   )}
                 </div>
               </div>
-              <div className="mt-3 pt-2.5 border-t border-border/40 text-[11px] space-y-1 text-muted-foreground">
-                <div className="flex justify-between items-center">
-                  <span>Contributing records:</span>
-                  <span className="font-medium text-foreground tabular-nums">
-                    {loading ? '—' : analytics?.operationsPerformance?.preparationTime?.contributingRecords ?? 0}
-                  </span>
-                </div>
-                <div className="text-[10px] text-muted-foreground/80 leading-tight">
-                  <span className="font-medium text-muted-foreground">Start:</span> Order Placed (created_at)<br />
-                  <span className="font-medium text-muted-foreground">End:</span> Order Completed (completed_at)
-                </div>
+              <div className="mt-3 pt-2.5 border-t border-border/40 text-[11px] text-muted-foreground">
+                From order placed to completed
               </div>
             </div>
 
@@ -2208,10 +2179,7 @@ export function AnalyticsView() {
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
                     <Hourglass className="size-3.5 text-purple-500" />
-                    Service Time
-                  </span>
-                  <span className="text-[10px] text-muted-foreground bg-secondary px-2 py-0.5 rounded-full">
-                    Dine-in Sitting
+                    Average Dine-in Duration
                   </span>
                 </div>
                 <div className="mt-2.5 flex items-baseline gap-1.5">
@@ -2223,17 +2191,8 @@ export function AnalyticsView() {
                   )}
                 </div>
               </div>
-              <div className="mt-3 pt-2.5 border-t border-border/40 text-[11px] space-y-1 text-muted-foreground">
-                <div className="flex justify-between items-center">
-                  <span>Contributing records:</span>
-                  <span className="font-medium text-foreground tabular-nums">
-                    {loading ? '—' : analytics?.operationsPerformance?.serviceTime?.contributingRecords ?? 0}
-                  </span>
-                </div>
-                <div className="text-[10px] text-muted-foreground/80 leading-tight">
-                  <span className="font-medium text-muted-foreground">Start:</span> Table Check Opened (created_at)<br />
-                  <span className="font-medium text-muted-foreground">End:</span> Check Closed (closed_at)
-                </div>
+              <div className="mt-3 pt-2.5 border-t border-border/40 text-[11px] text-muted-foreground">
+                From check opened to closed
               </div>
             </div>
 
@@ -2243,27 +2202,18 @@ export function AnalyticsView() {
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
                     <ClipboardList className="size-3.5 text-amber-500" />
-                    Order Volume
-                  </span>
-                  <span className="text-[10px] text-muted-foreground bg-secondary px-2 py-0.5 rounded-full">
-                    Scope Total
+                    Settled Orders
                   </span>
                 </div>
                 <div className="mt-2.5 flex items-baseline gap-1.5">
                   <span className="text-2xl font-bold tabular-nums text-foreground">
                     {loading ? '—' : (analytics?.operationsPerformance?.orderVolume ?? analytics?.totalOrders ?? 0).toLocaleString()}
                   </span>
-                  <span className="text-xs text-muted-foreground">orders settled</span>
+                  <span className="text-xs text-muted-foreground">orders</span>
                 </div>
               </div>
-              <div className="mt-3 pt-2.5 border-t border-border/40 text-[11px] space-y-1 text-muted-foreground">
-                <div className="flex justify-between items-center">
-                  <span>Scope:</span>
-                  <span className="font-medium text-foreground">Settled in window</span>
-                </div>
-                <div className="text-[10px] text-muted-foreground/80 leading-tight">
-                  Excludes cancelled & void orders; includes all dine-in, takeaway, & delivery orders.
-                </div>
+              <div className="mt-3 pt-2.5 border-t border-border/40 text-[11px] text-muted-foreground">
+                Orders settled in this period
               </div>
             </div>
           </div>
@@ -2277,9 +2227,6 @@ export function AnalyticsView() {
                 <Percent className="size-4 text-rose-500" />
                 Discounts & Refunds
               </h3>
-              <p className="text-[11px] text-muted-foreground">
-                Reconciled discounts and refunds attributed to settled orders and ledger records
-              </p>
             </div>
             {/* Quick summary totals */}
             <div className="flex items-center gap-3 text-xs bg-secondary/30 px-3 py-1.5 rounded-lg border border-border/40">
@@ -2334,10 +2281,7 @@ export function AnalyticsView() {
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-semibold text-foreground flex items-center gap-1.5">
                     <RotateCcw className="size-3.5 text-red-400" />
-                    Refunds by Attribution
-                  </span>
-                  <span className="text-[11px] text-muted-foreground">
-                    {analytics?.discountsAndRefunds?.refundedTransactionsCount ?? (analytics?.paymentMethods?.unattributedRefunds ? 1 : 0)} transactions
+                    Refunds by Payment Method
                   </span>
                 </div>
                 <div className="space-y-1.5 text-xs">
@@ -2383,21 +2327,24 @@ export function AnalyticsView() {
                   </div>
                 </div>
                 <div className="h-[140px] w-full mt-2">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={analytics?.discountsAndRefunds?.trend ?? []} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#94a3b8" opacity={0.15} vertical={false} />
-                      <XAxis dataKey="label" tick={{ fontSize: 9, fill: '#94a3b8' }} tickLine={false} axisLine={false} />
-                      <YAxis tick={{ fontSize: 9, fill: '#94a3b8' }} tickLine={false} axisLine={false} tickFormatter={(v) => `${v}`} />
-                      <Tooltip content={<ChartTooltip currencySymbol={sym} />} />
-                      <Bar dataKey="discounts" name="Discounts" fill="#fb7185" radius={[2, 2, 0, 0]} />
-                      <Bar dataKey="refunds" name="Refunds" fill="#f87171" radius={[2, 2, 0, 0]} />
-                    </BarChart>
-                  </ResponsiveContainer>
+                  {analytics?.discountsAndRefunds?.trend && analytics.discountsAndRefunds.trend.some((t) => (t.discounts ?? 0) > 0 || (t.refunds ?? 0) > 0) ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={analytics.discountsAndRefunds.trend} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#94a3b8" opacity={0.15} vertical={false} />
+                        <XAxis dataKey="label" tick={{ fontSize: 9, fill: '#94a3b8' }} tickLine={false} axisLine={false} />
+                        <YAxis tick={{ fontSize: 9, fill: '#94a3b8' }} tickLine={false} axisLine={false} tickFormatter={(v) => `${v}`} />
+                        <Tooltip content={<ChartTooltip currencySymbol={sym} />} />
+                        <Bar dataKey="discounts" name="Discounts" fill="#fb7185" radius={[2, 2, 0, 0]} />
+                        <Bar dataKey="refunds" name="Refunds" fill="#f87171" radius={[2, 2, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <div className="flex h-full items-center justify-center text-xs text-muted-foreground border border-dashed border-border/60 rounded-md">
+                      No discounts or refunds for these dates
+                    </div>
+                  )}
                 </div>
               </div>
-              <p className="text-[10px] text-muted-foreground/70 text-right mt-2">
-                Reconciled with exact ledger settlement dates in {analytics?.range?.timezone || 'Asia/Kolkata'}
-              </p>
             </div>
           </div>
         </Card>
@@ -2410,9 +2357,6 @@ export function AnalyticsView() {
                 <Lightbulb className="size-4 text-amber-500" />
                 Business Insights
               </h3>
-              <p className="text-[11px] text-muted-foreground">
-                Automated rule-based observations from verified performance metrics and period comparisons
-              </p>
             </div>
             <Sparkles className="size-4 text-amber-500/70" />
           </div>
@@ -2445,11 +2389,14 @@ export function AnalyticsView() {
             const topCat = rankedCategories.length > 0 ? rankedCategories[0] : null
             if (topCat && (topCat.revenue ?? topCat.value) > 0) {
               const catRev = topCat.revenue ?? topCat.value
+              const topCatShare = topCat.share !== undefined && topCat.share !== null && topCat.share > 0
+                ? topCat.share
+                : (totalCategoryRev > 0 ? +((catRev / totalCategoryRev) * 100).toFixed(1) : 0)
               insights.push({
                 id: 'top-category',
-                title: 'Category Sales Driver',
-                observation: `${topCat.name} leads total catalog sales with ${sym}${catRev.toFixed(2)} (${topCat.share ?? 0}% revenue share).`,
-                badge: `${topCat.share ?? 0}% catalog share`,
+                title: 'Top Category',
+                observation: `${topCat.name} leads total catalog sales with ${sym}${catRev.toFixed(2)} (${topCatShare}% share).`,
+                badge: `${topCatShare}% catalog share`,
                 dateRange: rangeLabel,
                 targetSectionId: 'section-revenue-by-category',
                 targetSectionName: 'Revenue by Category',

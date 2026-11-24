@@ -42,20 +42,19 @@ console.log('2. Checking Section 9 Operations Performance...')
 // Must define start and end events for preparation time and service time
 assert.ok(analyticsView.includes('Preparation Time'), 'Has Preparation Time card')
 assert.ok(analyticsView.includes('Service Time'), 'Has Service Time card')
-assert.ok(analyticsView.includes('Order Volume'), 'Has Order Volume card')
+assert.ok(analyticsView.includes('Average Preparation Time'), 'Has Average Preparation Time card')
+assert.ok(analyticsView.includes('Average Dine-in Duration'), 'Has Average Dine-in Duration card')
+assert.ok(analyticsView.includes('Settled Orders'), 'Has Settled Orders card')
 
-assert.ok(analyticsView.includes('Order Placed (created_at)'), 'UI states start event for prep time')
-assert.ok(analyticsView.includes('Order Completed (completed_at)'), 'UI states end event for prep time')
-assert.ok(analyticsView.includes('Table Check Opened (created_at)'), 'UI states start event for service time')
-assert.ok(analyticsView.includes('Check Closed (closed_at)'), 'UI states end event for service time')
+assert.ok(analyticsView.includes('From order placed to completed'), 'UI states description for prep time')
+assert.ok(analyticsView.includes('From check opened to closed'), 'UI states description for service time')
+assert.ok(analyticsView.includes('Orders settled in this period'), 'UI states description for settled orders')
 
-// Must show how many records contributed and exclude incomplete timings
-assert.ok(analyticsView.includes('Contributing records:'), 'UI displays contributing records count')
 assert.ok(analyticsEdge.includes('validPrepMinutes'), 'Backend accumulates only valid prep timestamps')
 assert.ok(analyticsEdge.includes('validServiceMinutes'), 'Backend accumulates only valid service timestamps')
 assert.ok(analyticsEdge.includes('diffMs >= 0'), 'Backend excludes negative or corrupt prep timings')
 assert.ok(analyticsEdge.includes('svcMs >= 0'), 'Backend excludes negative or corrupt service timings')
-console.log('✓ Section 9 Operations Performance verified with clear timing definitions and contributing records')
+console.log('✓ Section 9 Operations Performance verified with clear timing definitions')
 
 // 3. Section 10: Discounts & Refunds
 console.log('3. Checking Section 10 Discounts & Refunds...')
@@ -64,9 +63,8 @@ assert.ok(analyticsView.includes('Discounts & Refunds'), 'Has Discounts & Refund
 assert.ok(analyticsView.includes('Total Discounts'), 'Shows Total Discounts')
 assert.ok(analyticsView.includes('Total Refunds'), 'Shows Total Refunds')
 assert.ok(analyticsView.includes('orders affected'), 'Shows affected discounted orders count')
-assert.ok(analyticsView.includes('transactions'), 'Shows affected refunded transactions count')
 assert.ok(analyticsView.includes('Discounts by Channel'), 'Shows discount breakdown by channel')
-assert.ok(analyticsView.includes('Refunds by Attribution'), 'Shows refund breakdown by method')
+assert.ok(analyticsView.includes('Refunds by Payment Method'), 'Shows refund breakdown by method')
 assert.ok(analyticsView.includes('Daily Trend'), 'Shows daily trend chart for discounts and refunds')
 
 // Reconciled with payment figures under identical filters

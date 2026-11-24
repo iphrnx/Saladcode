@@ -55,7 +55,8 @@ assert.ok(analyticsView.includes('UPI / QR'), 'UPI / QR row present')
 assert.ok(analyticsView.includes('Card / POS'), 'Card / POS row present')
 assert.ok(analyticsView.includes('Other / Legacy'), 'Other / Legacy row supported')
 assert.ok(analyticsView.includes('Refunds (Method Unavailable)'), 'Unattributed refunds clearly labeled')
-assert.ok(analyticsView.includes('Total (Reconciled)'), 'Total (Reconciled) summary row present')
+assert.ok(analyticsView.includes('Total') && analyticsView.includes('resolvedPaymentTotals'), 'Total summary row present')
+assert.ok(analyticsView.includes('No table sessions for these dates.'), 'Empty table state handled gracefully')
 
 // Backend reconciliation logic
 assert.ok(analyticsEdge.includes('cashRefunds'), 'Backend attributes cash refunds')
@@ -134,7 +135,7 @@ console.log('✓ Intra-session orders invariant verified')
 // 6. Currency Formatting & Robust Fallbacks
 console.log('6. Verifying currency formatting and null safety...')
 assert.ok(analyticsView.includes('toLocaleString(\'en-IN\''), 'Formatted with en-IN currency style')
-assert.ok(analyticsView.includes('No table session data available for this period'), 'Empty table state handled gracefully')
+assert.ok(analyticsView.includes('No table sessions for these dates.'), 'Empty table state handled gracefully')
 assert.ok(analyticsView.includes('unattributedRefunds?.amount'), 'Unattributed refunds handled gracefully when empty or populated')
 
 console.log('--- ALL SECTIONS 7 & 8 TESTS PASSED (100%) ---')

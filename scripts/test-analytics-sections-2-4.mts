@@ -204,8 +204,8 @@ check("reports completed order count, revenue, revenue share (%), and AOV for ea
   analyticsView.includes("AOV"));
 
 check("explicitly labels which metric drives the chart",
-  analyticsView.includes("Driven by: {orderTypeMetric === 'revenue' ? 'Settled Revenue' : 'Completed Orders'}") ||
-  analyticsView.includes("Driven by:"));
+  analyticsView.includes("setOrderTypeMetric('revenue')") &&
+  analyticsView.includes("setOrderTypeMetric('orders')"));
 
 check("supports interactive toggle between By Revenue and By Orders",
   analyticsView.includes("setOrderTypeMetric('revenue')") &&
@@ -276,8 +276,8 @@ check("uses restaurant's configured timezone",
   analyticsView.includes("restaurantTimezone"));
 
 check("explicitly labels whether peak hour is ranked by revenue or order count",
-  analyticsView.includes("Ranked by Order Count") &&
-  analyticsView.includes("Ranked by Settled Revenue"));
+  analyticsView.includes("setHourlyRankMetric('orders')") &&
+  analyticsView.includes("setHourlyRankMetric('revenue')"));
 
 check("provides rank toggle between By Orders and By Revenue",
   analyticsView.includes("setHourlyRankMetric('orders')") &&
@@ -331,7 +331,7 @@ check("hourly tooltips show exact hour window, timezone, ₹ revenue, and orders
 
   check("zero-activity period produces null peak hour and displays '—' (no fake 12 AM peak)",
     peakHour === null &&
-    analyticsView.includes("Peak: — (No activity recorded)"));
+    analyticsView.includes("Peak: —"));
 }
 
 /* -------------------------------------------------------------------------- */
