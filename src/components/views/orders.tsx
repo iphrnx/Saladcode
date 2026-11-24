@@ -2571,7 +2571,7 @@ function SittingCard({
               'flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl sm:rounded-2xl px-3.5 text-center text-xs sm:text-[13px] font-bold whitespace-nowrap transition-colors duration-200 border',
               sitting.allServed
                 ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800/60 dark:bg-emerald-950/40 dark:text-emerald-300'
-                : 'border-orange-300 bg-white dark:bg-card text-orange-600 dark:border-orange-500/50 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.03)]',
+                : 'border-orange-300 bg-white dark:bg-card text-orange-700 dark:border-orange-500/50 dark:text-orange-400 shadow-[0_1px_2px_rgba(0,0,0,0.03)]',
             )}
           >
             <ConciergeBell
@@ -2874,7 +2874,7 @@ function OrderRow({
                     <button
                       type="button"
                       onClick={() => setShowAllItems((prev) => !prev)}
-                      className="inline-flex items-center gap-1 text-xs font-semibold text-orange-600 hover:text-orange-700 dark:text-orange-400 dark:hover:text-orange-300 transition-colors cursor-pointer"
+                      className="inline-flex items-center gap-1 text-xs font-semibold text-orange-700 hover:text-orange-800 dark:text-orange-400 dark:hover:text-orange-300 transition-colors cursor-pointer"
                     >
                       <span>
                         {showAllItems
@@ -2904,7 +2904,7 @@ function OrderRow({
               <button
                 type="button"
                 onClick={onOpen}
-                className="inline-flex items-center gap-1 text-xs font-semibold text-orange-600 hover:text-orange-700 dark:text-orange-400 dark:hover:text-orange-300 transition-colors cursor-pointer"
+                className="inline-flex items-center gap-1 text-xs font-semibold text-orange-700 hover:text-orange-800 dark:text-orange-400 dark:hover:text-orange-300 transition-colors cursor-pointer"
               >
                 <span>Order details</span>
                 <ChevronRight aria-hidden className="size-3.5 stroke-[2.2]" />

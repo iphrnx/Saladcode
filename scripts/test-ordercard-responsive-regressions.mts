@@ -149,30 +149,59 @@ test('Session stats support compact count on narrow viewports (<350px) and full 
 // ── 4. Light-Mode Contrast Contracts ───────────────────────────────────────
 console.log('\n▶ 4. Financial Figures & Light-Mode Contrast Contracts...')
 
+// Contrast helper functions
+function lum(hex: string) {
+  const r = parseInt(hex.slice(1, 3), 16) / 255
+  const g = parseInt(hex.slice(3, 5), 16) / 255
+  const b = parseInt(hex.slice(5, 7), 16) / 255
+  const a = [r, g, b].map((v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)))
+  return 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]
+}
+function ratio(c1: string, c2: string) {
+  const l1 = lum(c1)
+  const l2 = lum(c2)
+  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)
+}
+
 test('Amount due has accessible light-mode contrast (>= 4.5:1) against #fff7ed', () => {
   assert.ok(
     ordersSrc.includes("tone === 'due' && 'text-orange-700 dark:text-orange-400'"),
     'Amount due must use a darker tone such as text-orange-700 for WCAG AA contrast against #fff7ed',
   )
-
-  // Verify contrast ratio against #fff7ed
-  function lum(hex: string) {
-    const r = parseInt(hex.slice(1, 3), 16) / 255
-    const g = parseInt(hex.slice(3, 5), 16) / 255
-    const b = parseInt(hex.slice(5, 7), 16) / 255
-    const a = [r, g, b].map((v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)))
-    return 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]
-  }
-  function ratio(c1: string, c2: string) {
-    const l1 = lum(c1)
-    const l2 = lum(c2)
-    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)
-  }
   // Tailwind orange-700 is #c2410c
   const contrast = ratio('#c2410c', '#fff7ed')
   assert.ok(
     contrast >= 4.5,
     `Contrast ratio of amount due against #fff7ed must be >= 4.5:1, got ${contrast.toFixed(2)}:1`,
+  )
+})
+
+test('Serving-status chip has accessible light-mode contrast (>= 4.5:1) against white card', () => {
+  assert.ok(
+    ordersSrc.includes("border-orange-300 bg-white dark:bg-card text-orange-700 dark:border-orange-500/50 dark:text-orange-400"),
+    'Serving chip must use text-orange-700 for WCAG AA contrast against white background',
+  )
+  const contrast = ratio('#c2410c', '#ffffff')
+  assert.ok(
+    contrast >= 4.5,
+    `Contrast ratio of serving-status chip against #ffffff must be >= 4.5:1, got ${contrast.toFixed(2)}:1`,
+  )
+})
+
+test('Expanded-order controls (+N items and Order details) have accessible light-mode contrast (>= 4.5:1) against white card', () => {
+  assert.ok(
+    ordersSrc.includes("text-xs font-semibold text-orange-700 hover:text-orange-800 dark:text-orange-400 dark:hover:text-orange-300"),
+    'Expanded controls must use text-orange-700 hover:text-orange-800 for WCAG AA contrast against white background',
+  )
+  const contrastNormal = ratio('#c2410c', '#ffffff')
+  const contrastHover = ratio('#9a3412', '#ffffff')
+  assert.ok(
+    contrastNormal >= 4.5,
+    `Contrast ratio of expanded controls against #ffffff must be >= 4.5:1, got ${contrastNormal.toFixed(2)}:1`,
+  )
+  assert.ok(
+    contrastHover >= 4.5,
+    `Contrast ratio of expanded controls on hover against #ffffff must be >= 4.5:1, got ${contrastHover.toFixed(2)}:1`,
   )
 })
 
