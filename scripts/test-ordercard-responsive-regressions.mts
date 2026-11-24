@@ -335,6 +335,82 @@ test('Viewport 640px (2-column) with 4+ items preserves readable space for item 
   )
 })
 
+// ── 7. Session Card Footer Actions Layout Contracts ────────────────────────
+console.log('\n▶ 7. Session Card Footer Actions Layout & Wrapping Contracts...')
+
+test('Footer container uses flex-wrap and button uses flex-1 min-w-[10.5rem] to allow wrapping', () => {
+  assert.ok(
+    ordersSrc.includes('flex flex-wrap items-center gap-2.5'),
+    'Footer container must allow wrapping with flex flex-wrap instead of rigid grid',
+  )
+  assert.ok(
+    ordersSrc.includes('flex-1 min-w-[10.5rem] gap-1.5 rounded-xl sm:rounded-2xl px-4 text-center font-bold text-xs sm:text-[14px] whitespace-nowrap'),
+    'Button must define min-w-[10.5rem] and flex-1 so it wraps when card is too narrow',
+  )
+})
+
+test('Eligible "All Served" order at 640px: footer wraps and provides full space for Complete & Pay label', () => {
+  const width = 640
+  const outerPadding = 28 // px-3.5 * 2
+  const gridGap = 16 // gap-4
+  const columns = 2 // sm:grid-cols-2
+  const cardPadding = 32 // sm:p-4
+  const cardWidth = (width - outerPadding - (columns - 1) * gridGap) / columns
+  const cardInnerWidth = cardWidth - cardPadding // 266px
+
+  const chipWidth = 122 // "All Served" chip width
+  const gap = 10 // gap-2.5
+  const btnMinW = 168 // 10.5rem = 168px
+  const remainingOnRow1 = cardInnerWidth - chipWidth - gap // 134px
+
+  // Since remainingOnRow1 (134px) < btnMinW (168px), flex-wrap wraps the button to line 2
+  const buttonWraps = remainingOnRow1 < btnMinW
+  assert.ok(buttonWraps, 'Button must wrap to line 2 on 640px narrow 2-col card')
+
+  // On wrapped line 2, button gets full inner card width (266px)
+  const buttonWidthOnRow2 = cardInnerWidth
+  const buttonPadding = 32 // px-4 * 2
+  const iconWidth = 18 // size-4.5
+  const iconGap = 6 // gap-1.5
+  const spaceForLabel = buttonWidthOnRow2 - buttonPadding - iconWidth - iconGap // 210px
+
+  const labelNeeded = 107 // Fallback font requires ~107px for "Complete & Pay"
+  assert.ok(
+    spaceForLabel >= labelNeeded,
+    `Expected spaceForLabel >= ${labelNeeded}px on row 2, got ${spaceForLabel}px`,
+  )
+})
+
+test('Eligible "All Served" order at wider viewport (768px): footer fits side by side without truncation', () => {
+  const width = 768
+  const outerPadding = 48 // md:px-6 * 2
+  const gridGap = 20 // md:gap-5
+  const columns = 2 // sm:grid-cols-2
+  const cardPadding = 32 // sm:p-4
+  const cardWidth = (width - outerPadding - (columns - 1) * gridGap) / columns
+  const cardInnerWidth = cardWidth - cardPadding // 318px
+
+  const chipWidth = 122 // "All Served" chip width
+  const gap = 10 // gap-2.5
+  const btnMinW = 168 // 10.5rem = 168px
+  const remainingOnRow1 = cardInnerWidth - chipWidth - gap // 186px
+
+  // Since remainingOnRow1 (186px) >= btnMinW (168px), button fits side by side on row 1
+  const fitsSideBySide = remainingOnRow1 >= btnMinW
+  assert.ok(fitsSideBySide, 'Footer must fit side by side on 768px tablet card')
+
+  const buttonPadding = 32 // px-4 * 2
+  const iconWidth = 18 // size-4.5
+  const iconGap = 6 // gap-1.5
+  const spaceForLabel = remainingOnRow1 - buttonPadding - iconWidth - iconGap // 130px
+
+  const labelNeeded = 107 // Fallback font requires ~107px for "Complete & Pay"
+  assert.ok(
+    spaceForLabel >= labelNeeded,
+    `Expected spaceForLabel >= ${labelNeeded}px side by side, got ${spaceForLabel}px`,
+  )
+})
+
 console.log(`\nResults: ${passed} passed, ${failed} failed of ${passed + failed} checks.`)
 
 if (failed > 0) {

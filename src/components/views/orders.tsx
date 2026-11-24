@@ -2564,7 +2564,7 @@ function SittingCard({
           </dl>
         </div>
 
-        <div className="mt-3 grid grid-cols-[auto_1fr] gap-2.5 items-center">
+        <div className="mt-3 flex flex-wrap items-center gap-2.5">
           <div
             data-serve-chip
             className={cn(
@@ -2594,7 +2594,7 @@ function SittingCard({
               else if (canPay) onPay(sitting.latest)
             }}
             className={cn(
-              'h-11 w-full gap-1.5 rounded-xl sm:rounded-2xl px-4 text-center font-bold text-xs sm:text-[14px] whitespace-nowrap transition-all duration-200',
+              'h-11 flex-1 min-w-[10.5rem] gap-1.5 rounded-xl sm:rounded-2xl px-4 text-center font-bold text-xs sm:text-[14px] whitespace-nowrap transition-all duration-200',
               active && canPay
                 ? 'bg-gradient-to-r from-[#f97316] to-[#ea580c] hover:from-[#ea580c] hover:to-[#c2410c] text-white shadow-md shadow-orange-500/20 active:scale-[0.99] cursor-pointer'
                 : active
