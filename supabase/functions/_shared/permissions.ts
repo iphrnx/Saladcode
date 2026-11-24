@@ -31,6 +31,192 @@ export const PERMISSION_KEYS = [
   "staff.view", "staff.manage",
 ] as const;
 
+export type PermissionKey = (typeof PERMISSION_KEYS)[number];
+
+export interface PermissionMeta {
+  key: PermissionKey;
+  label: string;
+  description: string;
+  module: string;
+}
+
+export const PERMISSION_METADATA: Readonly<Record<PermissionKey, PermissionMeta>> = {
+  "dashboard.view": {
+    key: "dashboard.view",
+    label: "View Dashboard & POS",
+    description: "Access the restaurant overview, live activity, and POS terminal",
+    module: "Dashboard",
+  },
+  "orders.view": {
+    key: "orders.view",
+    label: "View Orders",
+    description: "Read active and past orders, line items, and ticket status",
+    module: "Orders",
+  },
+  "orders.create": {
+    key: "orders.create",
+    label: "Create Orders",
+    description: "Create and submit new dine-in, takeaway, and delivery orders",
+    module: "Orders",
+  },
+  "orders.edit": {
+    key: "orders.edit",
+    label: "Edit Orders",
+    description: "Modify quantities, dish variants, and special instructions on open tickets",
+    module: "Orders",
+  },
+  "orders.cancel": {
+    key: "orders.cancel",
+    label: "Cancel Orders",
+    description: "Cancel unserved orders with an audit cancellation reason",
+    module: "Orders",
+  },
+  "orders.complete": {
+    key: "orders.complete",
+    label: "Complete Orders",
+    description: "Mark fulfilled orders as complete and archive tickets",
+    module: "Orders",
+  },
+  "orders.prepare": {
+    key: "orders.prepare",
+    label: "Prepare Orders (Kitchen)",
+    description: "Advance pending orders to preparing status on the kitchen display",
+    module: "Orders",
+  },
+  "orders.ready": {
+    key: "orders.ready",
+    label: "Mark Orders Ready",
+    description: "Advance preparing orders to ready for server delivery or customer pickup",
+    module: "Orders",
+  },
+  "orders.serve": {
+    key: "orders.serve",
+    label: "Serve Orders",
+    description: "Deliver prepared orders to dining tables and mark them served",
+    module: "Orders",
+  },
+  "orders.discount": {
+    key: "orders.discount",
+    label: "Apply Discounts",
+    description: "Apply authorized line-item or order-level percentage and flat discounts",
+    module: "Orders",
+  },
+  "payments.collect": {
+    key: "payments.collect",
+    label: "Collect Payments",
+    description: "Settle customer checks and record cash, card, and UPI payments",
+    module: "Payments",
+  },
+  "payments.refund": {
+    key: "payments.refund",
+    label: "Issue Refunds",
+    description: "Refund collected payments and void settled check transactions",
+    module: "Payments",
+  },
+  "menu.view": {
+    key: "menu.view",
+    label: "View Menu",
+    description: "Browse menu categories, items, dietary tags, and price points",
+    module: "Menu",
+  },
+  "menu.manage": {
+    key: "menu.manage",
+    label: "Manage Menu",
+    description: "Add, edit, reprice, or remove dishes, portions, and categories",
+    module: "Menu",
+  },
+  "tables.view": {
+    key: "tables.view",
+    label: "View Tables",
+    description: "View dining hall layouts, table occupancy, and section status",
+    module: "Tables & QR",
+  },
+  "tables.manage": {
+    key: "tables.manage",
+    label: "Manage Tables",
+    description: "Add, edit, rearrange, or delete dining tables and seating sections",
+    module: "Tables & QR",
+  },
+  "table-sessions.manage": {
+    key: "table-sessions.manage",
+    label: "Manage Table Sessions",
+    description: "Open, transfer, merge, or terminate diner table sessions",
+    module: "Tables & QR",
+  },
+  "qr.manage": {
+    key: "qr.manage",
+    label: "Manage QR Codes",
+    description: "Generate, customize, and print digital menu table QR codes",
+    module: "Tables & QR",
+  },
+  "promos.view": {
+    key: "promos.view",
+    label: "View Promo Codes",
+    description: "Inspect active promo codes, discount levels, and redemption limits",
+    module: "Promo Codes",
+  },
+  "promos.manage": {
+    key: "promos.manage",
+    label: "Manage Promo Codes",
+    description: "Create, configure, pause, and delete promotional discount rules",
+    module: "Promo Codes",
+  },
+  "analytics.view": {
+    key: "analytics.view",
+    label: "View Analytics",
+    description: "Access sales reports, popular dishes, revenue trends, and metrics",
+    module: "Analytics",
+  },
+  "settings.view": {
+    key: "settings.view",
+    label: "View Settings",
+    description: "Read restaurant profile, tax rates, and operating preferences",
+    module: "Settings",
+  },
+  "settings.manage": {
+    key: "settings.manage",
+    label: "Manage Settings",
+    description: "Modify restaurant details, tax configurations, and subscription plan",
+    module: "Settings",
+  },
+  "security.view": {
+    key: "security.view",
+    label: "View Security",
+    description: "Audit active sessions, staff logins, IP addresses, and 2FA status",
+    module: "Security",
+  },
+  "security.manage": {
+    key: "security.manage",
+    label: "Manage Security",
+    description: "Revoke active devices, force session logouts, and enforce 2FA",
+    module: "Security",
+  },
+  "roles.view": {
+    key: "roles.view",
+    label: "View Roles",
+    description: "Review staff roles, permission matrices, and role assignments",
+    module: "Roles & Staff",
+  },
+  "roles.manage": {
+    key: "roles.manage",
+    label: "Manage Roles",
+    description: "Create, customize, and configure staff roles and permission grants",
+    module: "Roles & Staff",
+  },
+  "staff.view": {
+    key: "staff.view",
+    label: "View Staff",
+    description: "Browse staff accounts, employee IDs, roles, and activity records",
+    module: "Roles & Staff",
+  },
+  "staff.manage": {
+    key: "staff.manage",
+    label: "Manage Staff",
+    description: "Create accounts, reassign roles, reset PINs, and toggle active status",
+    module: "Roles & Staff",
+  },
+};
+
 /**
  * How the matrix groups the keys, and how the page labels each section.
  */
