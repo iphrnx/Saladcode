@@ -205,6 +205,22 @@ test('Expanded-order controls (+N items and Order details) have accessible light
   )
 })
 
+test('Collapsed overflow badges (+N and +1) have accessible light-mode contrast (>= 4.5:1) against orange-50', () => {
+  assert.ok(
+    ordersSrc.includes("bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs sm:text-[13px] font-bold text-orange-700 dark:text-orange-400"),
+    '+N badge must use text-orange-700 for WCAG AA contrast against bg-orange-50',
+  )
+  assert.ok(
+    ordersSrc.includes("bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs font-bold text-orange-700 dark:text-orange-400"),
+    '+1 badge must use text-orange-700 for WCAG AA contrast against bg-orange-50',
+  )
+  const contrast = ratio('#c2410c', '#fff7ed')
+  assert.ok(
+    contrast >= 4.5,
+    `Contrast ratio of overflow badges against #fff7ed must be >= 4.5:1, got ${contrast.toFixed(2)}:1`,
+  )
+})
+
 // ── 5. Order Expansion Logic Invariance ────────────────────────────────────
 console.log('\n▶ 5. Order Expansion Logic Preservation...')
 
