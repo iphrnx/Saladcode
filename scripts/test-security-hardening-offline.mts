@@ -12,6 +12,12 @@ const check = (l: string, ok: boolean, d?: string) => {
 };
 const read = (p: string) => {
   if (existsSync(p)) return readFileSync(p, "utf8");
+  if (existsSync("supabase/migrations/20261125000004_security_hardening_and_core_invariants_fix.sql")) {
+    return [
+      readFileSync("supabase/migrations/20261113000000_baseline_schema.sql", "utf8"),
+      readFileSync("supabase/migrations/20261125000004_security_hardening_and_core_invariants_fix.sql", "utf8"),
+    ].join("\n");
+  }
   return readFileSync("supabase/migrations/20261113000000_baseline_schema.sql", "utf8");
 };
 
