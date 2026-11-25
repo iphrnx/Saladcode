@@ -128,14 +128,26 @@ export function hasServiceRole(): boolean {
  * otherwise be able to have the sign-in token mailed to somewhere else.
  * Only the known origins are used.
  */
-const ADMIN_ORIGINS = [
+const PROD_ADMIN_ORIGINS = [
   'https://www.thesalad.in',
   'https://thesalad.in',
+]
+
+const DEV_ADMIN_ORIGINS = [
+  'http://localhost:3001',
+  'http://127.0.0.1:3001',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
 ]
 
-export function resolveAdminOrigin(req: Request): string {
+export function allowedAdminOrigins(nodeEnv = process.env.NODE_ENV): readonly string[] {
+  return nodeEnv !== 'production'
+    ? [...PROD_ADMIN_ORIGINS, ...DEV_ADMIN_ORIGINS]
+    : PROD_ADMIN_ORIGINS
+}
+
+export function resolveAdminOrigin(req: Request, nodeEnv = process.env.NODE_ENV): string {
+  const allowed = allowedAdminOrigins(nodeEnv)
   const forwardedHost = req.headers.get('x-forwarded-host') ?? req.headers.get('host') ?? ''
   const forwardedProto = req.headers.get('x-forwarded-proto') ?? ''
 
@@ -148,11 +160,14 @@ export function resolveAdminOrigin(req: Request): string {
   ].filter(Boolean)
 
   for (const candidate of candidates) {
-    const match = ADMIN_ORIGINS.find(
-      (origin) => candidate.toLowerCase().startsWith(origin.toLowerCase()),
-    )
-    if (match) return match
+    try {
+      const origin = new URL(candidate).origin.toLowerCase()
+      const match = allowed.find((o) => o.toLowerCase() === origin)
+      if (match) return match
+    } catch {
+      // Ignore malformed candidate origin
+    }
   }
 
-  return ADMIN_ORIGINS[0]
+  return allowed[0]
 }

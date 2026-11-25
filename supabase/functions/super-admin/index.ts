@@ -90,7 +90,7 @@ async function loadCore() {
         "id, name, slug, plan, active, onboarding_done, created_at, subscription_status, trial_ends_at, current_period_end",
       )
       .order("created_at", { ascending: false }),
-    db.from("profiles").select("id, email, name, tenant_id, last_login, is_super_admin"),
+    db.from("profiles").select("id, email, name, tenant_id, last_login"),
     db.from("subscription_plans").select("*").order("sort_order"),
     db
       .from("subscription_payments")
