@@ -11,6 +11,7 @@
 import {
   checkoutMatches,
   entitlementAction,
+  evaluateOrderRecovery,
   eventCreatedAt,
   fromMinorUnits,
   isStaleEvent,
@@ -313,6 +314,47 @@ console.log("\n── a plan change needs paid proof for the exact subscription 
     !mayChangePlanOnSubscription({ linkedSubscriptionId: "sub_paid", subscriptionStatus: "past_due", paidEvidence: paid }));
   check("a pending subscription is not changeable mid-retry",
     !mayChangePlanOnSubscription({ linkedSubscriptionId: "sub_paid", subscriptionStatus: "pending", paidEvidence: paid }));
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n── annual payment recovery when customer closes browser before /verify ──");
+{
+  const annualCheckout = {
+    id: "chk_annual",
+    tenantId: "tenant-1",
+    planId: "pro",
+    amount: 24990,
+    currency: "INR",
+    razorpayOrderId: "order_annual_1",
+    razorpaySubscriptionId: null,
+    razorpayPaymentId: null,
+    status: "pending",
+    paymentMode: "pay_once",
+  };
+  const capturedAnnual = {
+    id: "pay_annual_1",
+    order_id: "order_annual_1",
+    amount: 2499000,
+    currency: "INR",
+    status: "captured",
+  };
+
+  check("pending annual checkout recovers via order.paid / payment.captured webhook",
+    evaluateOrderRecovery({ checkout: annualCheckout, tenantId: "tenant-1", payment: capturedAnnual, existingPaymentRecorded: false }).kind === "activate");
+  check("browser /verify racing with duplicate webhook resolves as already (no double activation)",
+    evaluateOrderRecovery({ checkout: { ...annualCheckout, status: "paid", razorpayPaymentId: "pay_annual_1" }, tenantId: "tenant-1", payment: capturedAnnual, existingPaymentRecorded: false }).kind === "already");
+  check("existing succeeded payment row in ledger resolves as already",
+    evaluateOrderRecovery({ checkout: annualCheckout, tenantId: "tenant-1", payment: capturedAnnual, existingPaymentRecorded: true }).kind === "already");
+  check("incorrect payment amount is rejected",
+    evaluateOrderRecovery({ checkout: annualCheckout, tenantId: "tenant-1", payment: { ...capturedAnnual, amount: 99900 }, existingPaymentRecorded: false }).kind === "reject");
+  check("incorrect currency is rejected",
+    evaluateOrderRecovery({ checkout: annualCheckout, tenantId: "tenant-1", payment: { ...capturedAnnual, currency: "USD" }, existingPaymentRecorded: false }).kind === "reject");
+  check("uncaptured payment is rejected",
+    evaluateOrderRecovery({ checkout: annualCheckout, tenantId: "tenant-1", payment: { ...capturedAnnual, status: "authorized" }, existingPaymentRecorded: false }).kind === "reject");
+  check("missing checkout record is ignored without activating",
+    evaluateOrderRecovery({ checkout: null, tenantId: "tenant-1", payment: capturedAnnual, existingPaymentRecorded: false }).kind === "ignore");
+  check("non-pay_once checkout is ignored by order recovery",
+    evaluateOrderRecovery({ checkout: { ...annualCheckout, paymentMode: "autopay" }, tenantId: "tenant-1", payment: capturedAnnual, existingPaymentRecorded: false }).kind === "ignore");
 }
 
 console.log(`\n${pass}/${pass + fail} checks passed${fail ? ` — ${fail} FAILED` : ""}`);

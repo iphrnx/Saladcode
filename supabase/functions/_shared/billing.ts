@@ -306,3 +306,31 @@ export function mayChangePlanOnSubscription(args: {
   if (!["active", "cancelled"].includes(String(args.subscriptionStatus))) return false;
   return Boolean(args.paidEvidence);
 }
+
+/**
+ * Decide whether an `order.paid` or `payment.captured` webhook should recover
+ * and activate an annual (`pay_once`) checkout when the customer closed the
+ * browser before calling `/subscriptions/verify`.
+ */
+export function evaluateOrderRecovery(args: {
+  checkout: (CheckoutRecord & { paymentMode: string }) | null;
+  tenantId: string;
+  payment: PaymentProof;
+  existingPaymentRecorded: boolean;
+}): { kind: "activate" } | { kind: "already" } | { kind: "ignore"; reason: string } | { kind: "reject"; reason: string } {
+  const { checkout, tenantId, payment, existingPaymentRecorded } = args;
+  if (!checkout) {
+    return { kind: "ignore", reason: "no matching checkout for order" };
+  }
+  if (checkout.paymentMode !== "pay_once") {
+    return { kind: "ignore", reason: "non-pay_once checkout handled by subscription events" };
+  }
+  if (existingPaymentRecorded || entitlementAction({ checkout, paymentId: payment.id }) === "already") {
+    return { kind: "already" };
+  }
+  const match = checkoutMatches({ checkout, tenantId, planId: checkout.planId, payment });
+  if (!match.ok) {
+    return { kind: "reject", reason: match.reason };
+  }
+  return { kind: "activate" };
+}
