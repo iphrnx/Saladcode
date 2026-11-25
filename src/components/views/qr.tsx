@@ -71,6 +71,16 @@ function statusMeta(status?: string) {
   return TABLE_STATUS_META[norm] || { label: status, color: '#9aa3b2' }
 }
 
+function resolveQrUrl(qrUrl: string, qrToken: string): string {
+  const configured = (process.env.NEXT_PUBLIC_APP_URL ?? '').trim().replace(/\/+$/, '')
+  if (configured && qrToken) {
+    return `${configured}/?view=public-menu&table=${encodeURIComponent(qrToken)}`
+  }
+  if (qrUrl.startsWith('http')) return qrUrl
+  const origin = typeof window !== 'undefined' ? window.location.origin : ''
+  return `${origin}${qrUrl}`
+}
+
 export function QrView() {
   const { data, refresh } = useApp()
   const { denied, handleLoad, handleAction } = useAccessDenied()
@@ -112,8 +122,12 @@ export function QrView() {
       })
       await failIfNotOk(res, 'QR codes')
       const json = await res.json()
+      const normalized = (Array.isArray(json) ? json : []).map((it: QrTableItem) => ({
+        ...it,
+        qrUrl: resolveQrUrl(it.qrUrl, it.qrToken),
+      }))
       // The API sorts by name, which puts "Table 10" before "Table 2".
-      setItems(sortTables(Array.isArray(json) ? json : []))
+      setItems(sortTables(normalized))
     } catch (err) {
       // A 403 here is a permission the role does not hold, not a broken page:
       // say so, instead of emptying the grid and claiming there are no tables.

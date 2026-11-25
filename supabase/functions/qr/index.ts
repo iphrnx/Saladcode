@@ -39,10 +39,14 @@ Deno.serve(async (req: Request) => {
       ? Math.min(1200, Math.max(200, Math.round(requestedWidth)))
       : null;
 
-  // Where the QR should point. SITE_URL is the canonical deployment origin;
-  // fall back to the caller's own origin so local development works untouched.
-  const origin =
-    Deno.env.get("SITE_URL") ?? req.headers.get("origin") ?? url.origin;
+  // Where the QR should point. NEXT_PUBLIC_APP_URL / SITE_URL is the canonical
+  // deployment origin; fall back to the caller's own origin so local dev works.
+  const origin = (
+    Deno.env.get("NEXT_PUBLIC_APP_URL") ??
+    Deno.env.get("SITE_URL") ??
+    req.headers.get("origin") ??
+    url.origin
+  ).replace(/\/+$/, "");
 
   const db = admin();
 
