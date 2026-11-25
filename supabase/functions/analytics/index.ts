@@ -34,7 +34,34 @@ function zonedStart(dateStr: string, timeZone: string): Date {
     if (refined.getTime() === current.getTime()) break;
     current = refined;
   }
-  return current;
+  // Fast path: verify `current` is the exact first instant of `dateStr` in `timeZone`.
+  if (
+    zonedDateStr(current, timeZone) === dateStr &&
+    zonedDateStr(new Date(current.getTime() - 1000), timeZone) < dateStr
+  ) {
+    return current;
+  }
+  // Skipped or repeated local midnight (e.g., America/Santiago spring-forward):
+  // binary-search for the first valid instant (1-second resolution) on `dateStr`.
+  let lo = targetUtcMidnight - 15 * 3600_000;
+  let hi = targetUtcMidnight + 15 * 3600_000;
+  while (hi - lo > 1000) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (zonedDateStr(new Date(mid), timeZone) >= dateStr) {
+      hi = mid;
+    } else {
+      lo = mid;
+    }
+  }
+  // Snap to exact second boundary
+  const hiSec = Math.ceil(hi / 1000) * 1000;
+  const loSec = Math.floor(lo / 1000) * 1000;
+  for (let t = loSec; t <= hiSec; t += 1000) {
+    if (zonedDateStr(new Date(t), timeZone) >= dateStr) {
+      return new Date(t);
+    }
+  }
+  return new Date(hi);
 }
 
 function zonedDateStr(at: Date, timeZone: string): string {
@@ -695,6 +722,36 @@ serve(async (req: Request) => {
       }
     }
 
+    // Also look up referenced authoritative ledger voids linked only by idempotency_key
+    const seenVoidIdempotencyKeys = new Set(
+      Array.from(voidPaymentMap.values())
+        .map((p) => (p.idempotency_key ? String(p.idempotency_key) : null))
+        .filter(Boolean) as string[]
+    );
+    const missingReferencedIdempotencyKeys = Array.from(
+      new Set(
+        orderRefunds
+          .map((o) => (o.idempotency_key ? String(o.idempotency_key) : null))
+          .filter((k): k is string => Boolean(k) && !seenVoidIdempotencyKeys.has(k))
+      )
+    );
+    if (missingReferencedIdempotencyKeys.length > 0) {
+      for (let i = 0; i < missingReferencedIdempotencyKeys.length; i += 100) {
+        const chunk = missingReferencedIdempotencyKeys.slice(i, i + 100);
+        const refVoidByIdemp = await fetchAllPages<any>(async (from, to) => {
+          return await db
+            .from("check_payments")
+            .select("id, check_id, amount, method, status, staff_id, location_id, created_at, voided_at, note, idempotency_key")
+            .eq("tenant_id", tenantId)
+            .eq("status", "VOID")
+            .in("idempotency_key", chunk)
+            .order("id", { ascending: true })
+            .range(from, to);
+        });
+        for (const p of refVoidByIdemp) voidPaymentMap.set(String(p.id), p);
+      }
+    }
+
     const voidPayments = Array.from(voidPaymentMap.values());
 
     // Load missing check metadata for relevant reversals (void payments and legacy order refunds)
@@ -1351,7 +1408,7 @@ serve(async (req: Request) => {
       }
     }
 
-    if (o.checkId && !processedServiceChecks.has(o.checkId)) {
+    if (o.orderType === "DINE_IN" && o.checkId && !processedServiceChecks.has(o.checkId)) {
       processedServiceChecks.add(o.checkId);
       const chk = mainCheckMap.get(o.checkId);
       const openTime = chk?.created_at ? new Date(chk.created_at) : null;

@@ -584,8 +584,8 @@ try {
     `actual: ${augPt.prevRevenue}`
   );
   check(
-    "August point carries prior date label for August 11–17",
-    augPt.prevPeriod.includes("August 11") && augPt.prevPeriod.includes("August 17"),
+    "August point carries exact prior date label August 11–17 (no current-month prefix)",
+    augPt.prevPeriod === "August 11–17",
     `actual: ${augPt.prevPeriod}`
   );
 
@@ -600,8 +600,8 @@ try {
     `actual: ${sepPt.prevRevenue}`
   );
   check(
-    "September point carries prior date label for August 18–24",
-    sepPt.prevPeriod.includes("August 18") && sepPt.prevPeriod.includes("August 24"),
+    "September point carries exact prior date label August 18–24 (no current-month prefix)",
+    sepPt.prevPeriod === "August 18–24",
     `actual: ${sepPt.prevPeriod}`
   );
 
@@ -612,13 +612,13 @@ try {
   const sepPriorLabel = sepPt.prevPeriod;
 
   check(
-    "Production tooltip path for August displays Prior with range August 11–17",
-    augPriorLabel.includes("August 11") && augPriorLabel.includes("August 17"),
+    "Production tooltip path for August displays Prior with exact range August 11–17",
+    augPriorLabel === "August 11–17",
     `actual: ${augPriorLabel}`
   );
   check(
-    "Production tooltip path for September displays Prior with range August 18–24",
-    sepPriorLabel.includes("August 18") && sepPriorLabel.includes("August 24"),
+    "Production tooltip path for September displays Prior with exact range August 18–24",
+    sepPriorLabel === "August 18–24",
     `actual: ${sepPriorLabel}`
   );
 
