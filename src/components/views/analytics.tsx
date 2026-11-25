@@ -232,12 +232,12 @@ function RevenueTrendTooltip({ active, payload, label, currencySymbol = '₹', c
           </div>
         </div>
         {isComparisonEnabled && prevItem && (
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-1.5">
-              <span className="inline-block size-2 rounded-full bg-slate-400" />
-              <span className="text-muted-foreground truncate max-w-[130px]">{priorLabel ? `Prior (${priorLabel}):` : 'Prior:'}</span>
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-1.5 min-w-0">
+              <span className="inline-block size-2 rounded-full bg-slate-400 shrink-0 mt-1" />
+              <span className="text-muted-foreground whitespace-normal break-words">{priorLabel ? `Prior (${priorLabel}):` : 'Prior:'}</span>
             </div>
-            <div className="text-right tabular-nums">
+            <div className="text-right tabular-nums shrink-0">
               <span className="font-medium text-muted-foreground">{currencySymbol}{(prevVal ?? 0).toFixed(2)}</span>
               {prevOrders !== undefined && (
                 <span className="text-[10px] text-muted-foreground/75 ml-1.5">({prevOrders} {prevOrders === 1 ? 'order' : 'orders'})</span>
@@ -400,6 +400,35 @@ function groupRevenueData(
   prevDaily: DailyRevenue[] = [],
   grouping: 'daily' | 'weekly' | 'monthly'
 ) {
+  const _monthNames = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+  ]
+
+  /** Format a pair of YYYY-MM-DD dates into a human label like "August 11\u201317". */
+  const formatDateRange = (startDate: string, endDate: string): string => {
+    if (!startDate || !endDate) return startDate || endDate || ''
+    if (/^\d{4}-\d{2}-\d{2}$/.test(startDate) && /^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+      const [sy, sm, sd] = startDate.split('-').map(Number)
+      const [ey, em, ed] = endDate.split('-').map(Number)
+      if (sy === ey && sm === em) {
+        const monthName = _monthNames[sm - 1]
+        if (sd === ed) return `${monthName} ${sd}`
+        return `${monthName} ${sd}\u2013${ed}`
+      }
+      return `${_monthNames[sm - 1]} ${sd} \u2013 ${_monthNames[em - 1]} ${ed}`
+    }
+    if (startDate === endDate) return startDate
+    if (startDate.includes(' ') && endDate.includes(' ')) {
+      const [sMonth, sDay] = startDate.split(' ')
+      const [eMonth, eDay] = endDate.split(' ')
+      if (sMonth === eMonth && sDay && eDay) {
+        return `${sMonth} ${sDay}\u2013${eDay}`
+      }
+    }
+    return `${startDate} \u2013 ${endDate}`
+  }
+
   if (grouping === 'daily') {
     return daily.map((d, i) => {
       const p = prevDaily[i]
@@ -475,10 +504,15 @@ function groupRevenueData(
       : 'all'
     const p = prevDaily[i]
     if (!monthMap.has(monthKey)) {
+      let label = monthKey
+      if (/^\d{4}-\d{2}$/.test(monthKey)) {
+        const mNum = parseInt(monthKey.slice(5, 7), 10)
+        if (mNum >= 1 && mNum <= 12) label = _monthNames[mNum - 1]
+      }
       monthMap.set(monthKey, {
         key: monthKey,
-        label: monthKey,
-        period: monthKey,
+        label,
+        period: label,
         currentRevenue: 0,
         currentOrders: 0,
         prevRevenue: 0,
@@ -503,21 +537,13 @@ function groupRevenueData(
   })
 
   return Array.from(monthMap.values()).map((entry) => {
-    const startLabel = entry.firstDate || ''
-    const endLabel = entry.lastDate || ''
-    const prevStartLabel = entry.firstPrevDate || ''
-    const prevEndLabel = entry.lastPrevDate || ''
-    const curPeriod = startLabel && endLabel
-      ? (startLabel === endLabel ? startLabel : `${startLabel} – ${endLabel}`)
-      : entry.period
-    const prevPeriod = prevStartLabel && prevEndLabel
-      ? (prevStartLabel === prevEndLabel ? prevStartLabel : `${prevStartLabel} – ${prevEndLabel}`)
-      : ''
+    const curPeriod = formatDateRange(entry.firstDate || '', entry.lastDate || '') || entry.period
+    const prevPeriod = formatDateRange(entry.firstPrevDate || '', entry.lastPrevDate || '')
     return {
       key: entry.key,
       label: entry.label,
       period: entry.label && curPeriod ? `${entry.label} (${curPeriod})` : entry.label,
-      prevPeriod: prevPeriod ? (entry.label ? `${entry.label} (${prevPeriod})` : prevPeriod) : '',
+      prevPeriod: prevPeriod || '',
       currentRevenue: entry.currentRevenue,
       currentOrders: entry.currentOrders,
       prevRevenue: entry.prevRevenue,
@@ -2659,3 +2685,6 @@ function KpiCard({
     />
   )
 }
+
+
+export { RevenueTrendTooltip, groupRevenueData }
