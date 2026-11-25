@@ -70,7 +70,8 @@ export function webhookEventId(
 
   const type = String(event?.event ?? "").trim();
   const entityId = String(
-    event?.payload?.subscription?.entity?.id ??
+    event?.payload?.refund?.entity?.id ??
+      event?.payload?.subscription?.entity?.id ??
       event?.payload?.payment?.entity?.id ??
       event?.payload?.order?.entity?.id ??
       "",
@@ -126,7 +127,7 @@ export function checkoutMatches(args: {
   if (!payment) {
     return { ok: false, code: "unverified", reason: "The payment could not be confirmed with Razorpay." };
   }
-  if (payment.orderId && payment.orderId !== checkout.razorpayOrderId) {
+  if (!payment.orderId || payment.orderId !== checkout.razorpayOrderId) {
     return { ok: false, code: "mismatch", reason: "That payment is for a different order." };
   }
   if (payment.currency && payment.currency.toUpperCase() !== checkout.currency.toUpperCase()) {
@@ -305,4 +306,32 @@ export function mayChangePlanOnSubscription(args: {
   // not a PATCH on a dead subscription.
   if (!["active", "cancelled"].includes(String(args.subscriptionStatus))) return false;
   return Boolean(args.paidEvidence);
+}
+
+/**
+ * Decide whether an `order.paid` or `payment.captured` webhook should recover
+ * and activate an annual (`pay_once`) checkout when the customer closed the
+ * browser before calling `/subscriptions/verify`.
+ */
+export function evaluateOrderRecovery(args: {
+  checkout: (CheckoutRecord & { paymentMode: string }) | null;
+  tenantId: string;
+  payment: PaymentFacts;
+  existingPaymentRecorded?: boolean;
+}): { kind: "activate" } | { kind: "already" } | { kind: "ignore"; reason: string } | { kind: "reject"; reason: string } {
+  const { checkout, tenantId, payment } = args;
+  if (!checkout) {
+    return { kind: "ignore", reason: "no matching checkout for order" };
+  }
+  if (checkout.paymentMode !== "pay_once") {
+    return { kind: "ignore", reason: "non-pay_once checkout handled by subscription events" };
+  }
+  if (entitlementAction({ checkout, paymentId: payment.id }) === "already") {
+    return { kind: "already" };
+  }
+  const match = checkoutMatches({ checkout, tenantId, planId: checkout.planId, payment });
+  if (!match.ok) {
+    return { kind: "reject", reason: match.reason };
+  }
+  return { kind: "activate" };
 }

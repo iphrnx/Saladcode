@@ -1485,6 +1485,133 @@ async function verify(req: Request, tenantId: string): Promise<Response> {
   }
 
   const now = new Date();
+  const interval = checkout.billingInterval ?? "monthly";
+  const subscriptionId = checkout.razorpaySubscriptionId;
+  const paymentMode = checkout.paymentMode ?? "pay_once";
+
+  if (paymentMode === "pay_once") {
+    const { data: rpcRes, error: rpcErr } = await db.rpc("finalize_annual_order_payment", {
+      p_tenant_id: tenantId,
+      p_razorpay_order_id: checkout.razorpayOrderId,
+      p_razorpay_payment_id: payment.id,
+      p_payment_order_id: payment.orderId ?? null,
+      p_amount_minor: payment.amount,
+      p_currency: payment.currency,
+      p_payment_status: payment.status,
+      p_payment_method: (fetched.data as any).method ?? "razorpay",
+      p_razorpay_signature: razorpaySignature,
+      p_webhook_event_id: null,
+    });
+    if (rpcErr || !rpcRes) {
+      console.error("subscriptions verify: atomic annual finalization failed", rpcErr?.message);
+      return json(
+        req,
+        {
+          error: "The payment was verified but could not be recorded. Nothing was activated — please try again in a moment.",
+          activated: false,
+          retryable: true,
+        },
+        503,
+      );
+    }
+    const outcome = String((rpcRes as any).outcome ?? "");
+    if (outcome === "already") {
+      const plan = await resolvePlan(tenantId);
+      return json(req, { ok: true, activated: true, alreadyVerified: true, plan: publicPlan(plan) });
+    }
+    if (outcome === "reject" || outcome === "ignore") {
+      const code = String((rpcRes as any).code ?? "mismatch");
+      return json(req, { error: String((rpcRes as any).reason ?? "Verification failed"), activated: false }, code === "not_found" ? 403 : 400);
+    }
+
+    const periodBase = new Date(String((rpcRes as any).period_base ?? now.toISOString()));
+    const periodEnd = new Date(String((rpcRes as any).period_end ?? purchasedPeriodEnd(periodBase, "annual").toISOString()));
+    const amountPaid = Number((rpcRes as any).amount_paid ?? fromMinorUnits(payment.amount, payment.currency));
+    const previousSubscriptionId = ((rpcRes as any).previous_subscription_id as string | null) ?? null;
+    const previousPlan = ((rpcRes as any).previous_plan as string | null) ?? null;
+
+    try {
+      const switched = await cancelSupersededLink(db, {
+        tenantId,
+        previousSubscriptionId,
+        newSubscriptionId: null,
+        source: "verify",
+        oldPlan: previousPlan,
+        newPlan: checkout.planId,
+      });
+      if (switched.kind === "cancelled" || switched.kind === "unknown") {
+        console.log("subscriptions verify: previous mandate", switched.kind, switched);
+      }
+    } catch (e) {
+      console.error("subscriptions verify: mandate switch check failed", (e as Error)?.message);
+    }
+
+    try {
+      const stranded = await pendingMandateCheckouts(db, tenantId);
+      for (const m of stranded) {
+        if (!mandateSupersededByPeriod(m.scheduledStartAt, periodEnd.toISOString())) continue;
+        const live = await liveSubscription(m.razorpaySubscriptionId);
+        await retirePendingMandate(db, {
+          tenantId,
+          checkoutId: m.id,
+          razorpaySubscriptionId: m.razorpaySubscriptionId,
+          reason: "superseded-by-purchase",
+          live,
+        });
+      }
+    } catch (e) {
+      console.error("subscriptions verify: stranded mandate sweep failed", (e as Error)?.message);
+    }
+
+    try {
+      await queueForTenant(db, tenantId, {
+        eventKey: `subscription_activated:${tenantId}:${payment.id}`,
+        eventType: "subscription_activated",
+        planName: checkout.planId,
+        amount: amountPaid,
+        currency: payment.currency,
+        billingInterval: "annual",
+        payload: { periodEnd, paymentRef: payment.id, mode: "pay_once" },
+      });
+      await dispatchPending(db, 5);
+    } catch (e) {
+      console.error("subscriptions: activation email failed", (e as Error)?.message);
+    }
+
+    await db.from("subscription_audit_logs").insert({
+      tenant_id: tenantId,
+      old_plan: previousPlan,
+      new_plan: checkout.planId,
+      change_type: "activated",
+      razorpay_event_id: payment.id,
+      detail: {
+        razorpayPaymentId: payment.id,
+        razorpayOrderId,
+        razorpaySubscriptionId: null,
+        amountPaid,
+        currency: payment.currency,
+      },
+    });
+
+    try {
+      const { data: ledgerRow } = await db
+        .from("subscription_payments")
+        .select(
+          "id, amount, currency, status, payment_method, plan_id, billing_period, created_at, razorpay_payment_id, razorpay_order_id",
+        )
+        .eq("razorpay_payment_id", payment.id)
+        .maybeSingle();
+      if (ledgerRow) {
+        await issueInvoiceDocument(db, tenantId, ledgerRow, { periodStart: periodBase, periodEnd });
+      }
+    } catch (e) {
+      console.error("subscriptions verify: invoice issuance failed", (e as Error)?.message);
+    }
+
+    const plan = await resolvePlan(tenantId);
+    return json(req, { ok: true, activated: true, plan: publicPlan(plan) });
+  }
+
   /**
    * The period starts at the later of now and the end of what the
    * restaurant has already paid for. A one-time month bought with days
@@ -1498,11 +1625,8 @@ async function verify(req: Request, tenantId: string): Promise<Response> {
     .maybeSingle();
   const paidUntil = tRow?.current_period_end ? new Date(tRow.current_period_end) : null;
   const periodBase = paidUntil && paidUntil > now ? paidUntil : now;
-  const interval = checkout.billingInterval ?? "monthly";
   const periodEnd = purchasedPeriodEnd(periodBase, interval);
   const amountPaid = fromMinorUnits(payment.amount, payment.currency);
-  const subscriptionId = checkout.razorpaySubscriptionId;
-  const paymentMode = checkout.paymentMode ?? "pay_once";
   const mandateId = paymentMode === "autopay" ? (checkout.mandateId ?? subscriptionId) : null;
   const mandateExpiresAt = paymentMode === "autopay" ? checkout.mandateExpiresAt : null;
 
