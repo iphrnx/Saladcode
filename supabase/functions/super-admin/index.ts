@@ -5,7 +5,6 @@ import { admin } from "../_shared/db.ts";
 import { superGuard, logAdminAction } from "../_shared/super_admin.ts";
 import {
   getGeminiConfig,
-  maskKey,
   testGeminiConnection,
   DEFAULT_TEXT_MODEL,
   DEFAULT_IMAGE_MODEL,

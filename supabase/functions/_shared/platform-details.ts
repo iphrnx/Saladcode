@@ -21,18 +21,6 @@ export type PlatformBusinessDetails = {
   gstin: string;
 };
 
-export const EMPTY_BUSINESS_DETAILS: PlatformBusinessDetails = {
-  legalName: "",
-  street: "",
-  city: "",
-  state: "",
-  pinCode: "",
-  country: "India",
-  email: "",
-  phone: "",
-  gstin: "",
-};
-
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const PIN_INDIA_RE = /^\d{6}$/;
 const PIN_GENERAL_RE = /^[A-Za-z0-9][A-Za-z0-9\- ]{1,11}$/;

@@ -66,9 +66,6 @@ export async function getGeminiConfig(provider = "gemini"): Promise<GeminiConfig
  * database and through every response. It now lives in the function's
  * environment, and the dashboard is told only whether one is configured.
  */
-export function maskKey(_key: string | null | undefined): string {
-  return "";
-}
 
 /** Split a `data:<mime>;base64,<payload>` URL into its parts. */
 export function parseDataUrl(dataUrl: string): { mimeType: string; data: string } | null {

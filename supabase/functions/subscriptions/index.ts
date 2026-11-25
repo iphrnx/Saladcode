@@ -53,7 +53,6 @@ import { buildInvoicePdf, buildRefundPdf } from "../_shared/pdf.ts";
 import {
   decideScheduledCancel,
   decideCheckoutAction,
-  decideSwitchAction,
   mandateSupersededByPeriod,
   mandateVerdict,
   type LiveSubscription,

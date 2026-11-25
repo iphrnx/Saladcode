@@ -45,7 +45,7 @@ console.log("\n── money movements are audited ──");
   check("reversing it", /CHECK_PAYMENT_REVERSED/.test(bill));
   check("invoicing the bill", /CHECK_FINALISED/.test(bill));
   check("with the actor and the amount", /amount\} (\$\{method\}|CASH) on check/.test(bill));
-  check("audit failures never fail the operation", /\.catch\(\(\) => \{\}\)/.test(bill));
+  check("audit failures never fail the operation", /try\s*\{[\s\S]*?security_logs[\s\S]*?\}\s*catch\s*\{\s*\}/.test(bill));
 }
 
 console.log("\n── RBAC holds where the money is ──");

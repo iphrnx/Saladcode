@@ -73,7 +73,8 @@ console.log("\n── a held order is not kitchen work ──");
     /\.neq\("status", "PENDING_ACTIVATION"\)/.test(session));
 
   const analytics = read("supabase/functions/analytics/index.ts");
-  check("revenue only counts COMPLETED orders", /\.eq\("status", "COMPLETED"\)/.test(analytics));
+  check("revenue excludes cancelled, rejected and refunded orders (settlement-based)",
+    /\.neq\("status", "CANCELLED"\)/.test(analytics) && /\.neq\("status", "REJECTED"\)/.test(analytics) && /\.neq\("payment_status", "REFUNDED"\)/.test(analytics));
 }
 
 console.log("\n── approval is atomic, idempotent and re-validated ──");

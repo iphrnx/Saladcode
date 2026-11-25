@@ -38,7 +38,8 @@ console.log("\n── totals are the orders, not a second calculation ──");
   check("held orders never count", /status not in \('PENDING_ACTIVATION', 'CANCELLED'\)/.test(mig));
   check("the endpoint adds up the same rows and no tax of its own",
     /const tax = \+live\.reduce\(\(s: number, o: any\) => s \+ Number\(o\.tax\)/.test(bill));
-  check("GST is shown as the CGST/SGST halves the orders were charged", /cgst: \+\(tax \/ 2\)/.test(bill));
+  check("GST is shown as the CGST/SGST halves the orders were charged",
+    /const gstTotalPaise = Math\.round\(tax \* 100\)[\s\S]{0,120}cgstPaise[\s\S]{0,120}sgstPaise[\s\S]{0,120}cgst/.test(bill));
 }
 
 console.log("\n── money cannot be double-taken ──");

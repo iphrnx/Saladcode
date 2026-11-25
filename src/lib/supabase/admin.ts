@@ -27,8 +27,3 @@ export function supabaseAdmin(): SupabaseClient {
   })
   return cached
 }
-
-/** True when the server has everything it needs to talk to the database. */
-export function hasServiceRole(): boolean {
-  return Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY)
-}
