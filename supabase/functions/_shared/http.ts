@@ -56,8 +56,14 @@ export function corsHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin") ?? "";
   const allowed = allowedOrigins();
   const permitted = isLoopback(origin) || allowed.includes(origin);
+  const site = Deno.env.get("SITE_URL");
+  const extra = (Deno.env.get("ALLOWED_ORIGINS") ?? "")
+    .split(",")
+    .map(normalizeOrigin)
+    .filter(Boolean);
+  const fallback = (site ? normalizeOrigin(site) : "") || extra[0] || LOCAL_ORIGINS[0];
   return {
-    "Access-Control-Allow-Origin": permitted ? origin : allowed[0],
+    "Access-Control-Allow-Origin": permitted ? origin : fallback,
     "Access-Control-Allow-Credentials": "true",
     "Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers":
