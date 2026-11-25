@@ -331,9 +331,9 @@ console.log("\n── annual payment recovery when customer closes browser befor
     status: "pending",
     paymentMode: "pay_once",
   };
-  const capturedAnnual = {
+  const capturedAnnual: PaymentFacts = {
     id: "pay_annual_1",
-    order_id: "order_annual_1",
+    orderId: "order_annual_1",
     amount: 2499000,
     currency: "INR",
     status: "captured",
@@ -343,8 +343,13 @@ console.log("\n── annual payment recovery when customer closes browser befor
     evaluateOrderRecovery({ checkout: annualCheckout, tenantId: "tenant-1", payment: capturedAnnual, existingPaymentRecorded: false }).kind === "activate");
   check("browser /verify racing with duplicate webhook resolves as already (no double activation)",
     evaluateOrderRecovery({ checkout: { ...annualCheckout, status: "paid", razorpayPaymentId: "pay_annual_1" }, tenantId: "tenant-1", payment: capturedAnnual, existingPaymentRecorded: false }).kind === "already");
-  check("existing succeeded payment row in ledger resolves as already",
-    evaluateOrderRecovery({ checkout: annualCheckout, tenantId: "tenant-1", payment: capturedAnnual, existingPaymentRecorded: true }).kind === "already");
+  check("existing succeeded payment row with pending checkout still recovers (partial-failure safe)",
+    evaluateOrderRecovery({ checkout: annualCheckout, tenantId: "tenant-1", payment: capturedAnnual, existingPaymentRecorded: true }).kind === "activate");
+  check("missing orderId on payment is rejected",
+    evaluateOrderRecovery({ checkout: annualCheckout, tenantId: "tenant-1", payment: { ...capturedAnnual, orderId: null }, existingPaymentRecorded: false }).kind === "reject");
+  check("refund.created and refund.processed have distinct fallback webhookEventId values",
+    webhookEventId(null, { event: "refund.created", created_at: 1700000000, payload: { refund: { entity: { id: "rfnd_1" } }, payment: { entity: { id: "pay_1" } } } }) === "refund.created:rfnd_1:1700000000" &&
+    webhookEventId(null, { event: "refund.processed", created_at: 1700000000, payload: { refund: { entity: { id: "rfnd_1" } }, payment: { entity: { id: "pay_1" } } } }) === "refund.processed:rfnd_1:1700000000");
   check("incorrect payment amount is rejected",
     evaluateOrderRecovery({ checkout: annualCheckout, tenantId: "tenant-1", payment: { ...capturedAnnual, amount: 99900 }, existingPaymentRecorded: false }).kind === "reject");
   check("incorrect currency is rejected",

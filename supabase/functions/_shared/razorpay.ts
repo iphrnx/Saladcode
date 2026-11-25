@@ -344,3 +344,27 @@ export async function fetchPayment(
     {},
   );
 }
+
+export type RazorpayRefund = {
+  id: string;
+  payment_id: string;
+  amount: number;
+  currency: string;
+  status: "pending" | "processed" | "failed" | string;
+  created_at?: number;
+};
+
+/**
+ * Fetch a refund from Razorpay to verify its authoritative status before
+ * finalizing refund accounting or issuing refund documents.
+ */
+export async function fetchRefund(
+  refundId: string,
+): Promise<
+  { ok: true; data: RazorpayRefund } | { ok: false; error: string; status: number }
+> {
+  return await razorpayRequest<RazorpayRefund>(
+    `/refunds/${encodeURIComponent(refundId)}`,
+    {},
+  );
+}

@@ -3,8 +3,8 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { admin } from "../_shared/db.ts";
 import { json, preflight } from "../_shared/http.ts";
 import { dispatchPending, queueForTenant } from "../_shared/email.ts";
-import { cancelSubscription, fetchPayment, fetchSubscription, verifyWebhookSignature } from "../_shared/razorpay.ts";
-import { evaluateOrderRecovery, eventCreatedAt, fromMinorUnits, purchasedPeriodEnd, webhookEventId } from "../_shared/billing.ts";
+import { cancelSubscription, fetchPayment, fetchRefund, fetchSubscription, verifyWebhookSignature } from "../_shared/razorpay.ts";
+import { eventCreatedAt, fromMinorUnits, webhookEventId } from "../_shared/billing.ts";
 import { issueInvoiceDocument, issueRefundDocument } from "../_shared/billing-documents.ts";
 import { cancelSupersededLink } from "../_shared/mandate-switch.ts";
 import { decideChargeLink, type LiveSubscription } from "../_shared/subscription-guard.ts";
@@ -751,159 +751,69 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
         return { summary: `${eventType} missing order_id or payment_id`, tenantId };
       }
 
-      const { data: checkoutRow } = await db
-        .from("subscription_checkouts")
-        .select("id, tenant_id, plan_id, amount, currency, billing_interval, payment_mode, razorpay_order_id, razorpay_subscription_id, razorpay_payment_id, status")
-        .eq("razorpay_order_id", String(razorpayOrderId))
-        .eq("tenant_id", tenantId)
-        .maybeSingle();
-
       const livePaymentRes = await fetchPayment(String(rawPaymentId));
       if (!livePaymentRes.ok) {
         throw new Error(`could not confirm payment ${rawPaymentId} with Razorpay: ${livePaymentRes.error}`);
       }
       const livePay = livePaymentRes.data;
 
-      const { data: existingPay } = await db
-        .from("subscription_payments")
-        .select("id")
-        .eq("razorpay_payment_id", String(livePay.id))
-        .eq("status", "succeeded")
-        .maybeSingle();
-
-      const decision = evaluateOrderRecovery({
-        checkout: checkoutRow
-          ? {
-            id: checkoutRow.id,
-            tenantId: checkoutRow.tenant_id,
-            planId: checkoutRow.plan_id,
-            amount: Number(checkoutRow.amount),
-            currency: checkoutRow.currency ?? "INR",
-            razorpayOrderId: checkoutRow.razorpay_order_id,
-            razorpaySubscriptionId: checkoutRow.razorpay_subscription_id,
-            razorpayPaymentId: checkoutRow.razorpay_payment_id,
-            status: checkoutRow.status,
-            paymentMode: checkoutRow.payment_mode ?? "pay_once",
-          }
-          : null,
-        tenantId,
-        payment: {
-          id: String(livePay.id),
-          order_id: livePay.order_id ?? null,
-          amount: Number(livePay.amount),
-          currency: String(livePay.currency ?? "INR"),
-          status: String(livePay.status ?? ""),
-        },
-        existingPaymentRecorded: Boolean(existingPay),
+      const { data: rpcRes, error: rpcErr } = await db.rpc("finalize_annual_order_payment", {
+        p_tenant_id: tenantId,
+        p_razorpay_order_id: String(razorpayOrderId),
+        p_razorpay_payment_id: String(livePay.id),
+        p_payment_order_id: livePay.order_id ?? null,
+        p_amount_minor: Number(livePay.amount),
+        p_currency: String(livePay.currency ?? "INR"),
+        p_payment_status: String(livePay.status ?? ""),
+        p_payment_method: livePay.method ?? "razorpay",
+        p_razorpay_signature: null,
+        p_webhook_event_id: eventId,
       });
+      if (rpcErr || !rpcRes) {
+        throw new Error(`could not finalize annual payment: ${rpcErr?.message ?? "empty RPC result"}`);
+      }
 
-      if (decision.kind === "already") {
+      const outcome = String((rpcRes as any).outcome ?? "");
+      if (outcome === "already") {
         return { summary: "annual checkout already verified/paid", tenantId };
       }
-      if (decision.kind === "ignore") {
-        return { summary: decision.reason, tenantId };
+      if (outcome === "ignore") {
+        return { summary: String((rpcRes as any).reason ?? "ignored"), tenantId };
       }
-      if (decision.kind === "reject") {
+      if (outcome === "reject") {
+        const reason = String((rpcRes as any).reason ?? "rejected");
         await audit(db, tenantId, tenant.plan, planId, "order_recovery_rejected", eventId, {
-          reason: decision.reason,
+          reason,
           razorpayOrderId,
           paymentId: livePay.id,
         });
-        return { summary: `rejected: ${decision.reason}`, tenantId };
+        return { summary: `rejected: ${reason}`, tenantId };
       }
 
-      const { data: tCurrent } = await db
-        .from("tenants")
-        .select("current_period_end, razorpay_subscription_id")
-        .eq("id", tenantId)
-        .maybeSingle();
-      const nowDate = new Date();
-      const paidUntil = tCurrent?.current_period_end ? new Date(tCurrent.current_period_end) : null;
-      const periodBase = paidUntil && paidUntil > nowDate ? paidUntil : nowDate;
-      const recoveredPeriodEnd = purchasedPeriodEnd(periodBase, "annual");
-      const amountPaid = fromMinorUnits(Number(livePay.amount), String(livePay.currency ?? "INR"));
-
-      const { error: ledgerError } = await db
-        .from("subscription_payments")
-        .upsert(
-          {
-            tenant_id: tenantId,
-            amount: amountPaid,
-            currency: String(livePay.currency ?? "INR"),
-            status: "succeeded",
-            payment_method: livePay.method ?? "razorpay",
-            transaction_id: String(livePay.id),
-            plan_id: checkoutRow!.plan_id,
-            billing_period: "annual",
-            payment_mode: "pay_once",
-            mandate_id: null,
-            mandate_expires_at: null,
-            renewal_status: "not_applicable",
-            razorpay_payment_id: String(livePay.id),
-            razorpay_order_id: String(razorpayOrderId),
-            razorpay_subscription_id: null,
-            webhook_event_id: eventId,
-            created_at: now,
-            updated_at: now,
-          },
-          { onConflict: "razorpay_payment_id" },
-        );
-      if (ledgerError) {
-        throw new Error(`could not record recovered annual payment: ${ledgerError.message}`);
-      }
-
-      await db
-        .from("tenants")
-        .update({
-          plan: checkoutRow!.plan_id,
-          subscription_plan: checkoutRow!.plan_id,
-          subscription_status: "active",
-          subscription_started_at: now,
-          current_period_end: recoveredPeriodEnd,
-          cancel_at_period_end: false,
-          razorpay_subscription_id: null,
-          subscription_razorpay_payment_id: String(livePay.id),
-          billing_interval: "annual",
-          payment_mode: "pay_once",
-        })
-        .eq("id", tenantId);
-
-      await db
-        .from("subscription_checkouts")
-        .update({ status: "paid", razorpay_payment_id: String(livePay.id), updated_at: now })
-        .eq("id", checkoutRow!.id)
-        .eq("status", "pending");
+      const activatedPlanId = String((rpcRes as any).plan_id ?? planId);
+      const amountPaid = Number((rpcRes as any).amount_paid ?? fromMinorUnits(Number(livePay.amount), String(livePay.currency ?? "INR")));
+      const recoveredPeriodEnd = String((rpcRes as any).period_end ?? "");
+      const periodBase = new Date(String((rpcRes as any).period_base ?? now));
+      const previousSubscriptionId = ((rpcRes as any).previous_subscription_id as string | null) ?? null;
 
       try {
         await cancelSupersededLink(db, {
           tenantId,
-          previousSubscriptionId: (tCurrent?.razorpay_subscription_id as string | null) ?? null,
+          previousSubscriptionId,
           newSubscriptionId: null,
           source: `webhook:${eventType}`,
           oldPlan: tenant.plan,
-          newPlan: checkoutRow!.plan_id,
+          newPlan: activatedPlanId,
         });
       } catch (e) {
         console.error("webhook: mandate switch check failed on order recovery", (e as Error)?.message);
       }
 
       try {
-        await db
-          .from("subscription_checkouts")
-          .update({ status: "expired", updated_at: now })
-          .eq("tenant_id", tenantId)
-          .eq("status", "pending")
-          .is("razorpay_subscription_id", null)
-          .neq("razorpay_order_id", String(razorpayOrderId));
-      } catch (e) {
-        console.error("webhook: stale order sweep failed on order recovery", (e as Error)?.message);
-      }
-
-      try {
         await queueForTenant(db, tenantId, {
           eventKey: `subscription_activated:${tenantId}:${String(livePay.id)}`,
           eventType: "subscription_activated",
-          planName: checkoutRow!.plan_id,
+          planName: activatedPlanId,
           amount: amountPaid,
           currency: String(livePay.currency ?? "INR"),
           billingInterval: "annual",
@@ -920,7 +830,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
           .select("id, amount, currency, status, payment_method, plan_id, billing_period, created_at, razorpay_payment_id, razorpay_order_id")
           .eq("razorpay_payment_id", String(livePay.id))
           .maybeSingle();
-        if (ledgerRow) {
+        if (ledgerRow && recoveredPeriodEnd) {
           await issueInvoiceDocument(db, tenantId, ledgerRow, {
             periodStart: periodBase,
             periodEnd: new Date(recoveredPeriodEnd),
@@ -930,32 +840,124 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
         console.error("webhook: order recovery invoice issuance failed", (e as Error)?.message);
       }
 
-      await audit(db, tenantId, tenant.plan, checkoutRow!.plan_id, "activated_via_webhook", eventId, {
+      await audit(db, tenantId, tenant.plan, activatedPlanId, "activated_via_webhook", eventId, {
         razorpayOrderId,
         paymentId: livePay.id,
         periodEnd: recoveredPeriodEnd,
       });
-      return { summary: `recovered annual payment on ${checkoutRow!.plan_id}`, tenantId };
+      return { summary: `recovered annual payment on ${activatedPlanId}`, tenantId };
+    }
+
+    case "refund.created": {
+      const targetPaymentId = payment?.id ?? refundEntity?.payment_id ?? null;
+      const refundId = refundEntity?.id ? String(refundEntity.id) : null;
+      if (!targetPaymentId) {
+        return { summary: "refund.created missing payment id", tenantId };
+      }
+      // refund.created indicates an initiated/pending refund unless Razorpay
+      // explicitly marks it processed; do NOT mark payment refunded or issue
+      // refund documents/emails while pending.
+      const refundStatus = refundEntity?.status === "processed" ? "processed" : "pending";
+      const refundAmt = refundEntity?.amount
+        ? fromMinorUnits(Number(refundEntity.amount), String(refundEntity.currency ?? "INR"))
+        : 0;
+      const { error: refundRpcErr } = await db.rpc("record_subscription_refund", {
+        p_tenant_id: tenantId,
+        p_razorpay_payment_id: String(targetPaymentId),
+        p_razorpay_refund_id: refundId,
+        p_refund_amount: refundAmt,
+        p_currency: String(refundEntity?.currency ?? "INR"),
+        p_refund_status: refundStatus,
+        p_webhook_event_id: eventId,
+      });
+      if (refundRpcErr) {
+        throw new Error(`could not record refund.created: ${refundRpcErr.message}`);
+      }
+      return { summary: `refund created (${refundStatus})`, tenantId };
+    }
+
+    case "refund.failed": {
+      const targetPaymentId = payment?.id ?? refundEntity?.payment_id ?? null;
+      const refundId = refundEntity?.id ? String(refundEntity.id) : null;
+      if (!targetPaymentId) {
+        return { summary: "refund.failed missing payment id", tenantId };
+      }
+      const refundAmt = refundEntity?.amount
+        ? fromMinorUnits(Number(refundEntity.amount), String(refundEntity.currency ?? "INR"))
+        : 0;
+      const { error: refundRpcErr } = await db.rpc("record_subscription_refund", {
+        p_tenant_id: tenantId,
+        p_razorpay_payment_id: String(targetPaymentId),
+        p_razorpay_refund_id: refundId,
+        p_refund_amount: refundAmt,
+        p_currency: String(refundEntity?.currency ?? "INR"),
+        p_refund_status: "failed",
+        p_webhook_event_id: eventId,
+      });
+      if (refundRpcErr) {
+        throw new Error(`could not record refund.failed: ${refundRpcErr.message}`);
+      }
+      await audit(db, tenantId, tenant.plan, planId, "refund_failed", eventId, {
+        paymentId: targetPaymentId,
+        refundId,
+      });
+      return { summary: "refund failed", tenantId };
     }
 
     case "refund.processed":
-    case "refund.created":
     case "payment.refunded": {
       const targetPaymentId = payment?.id ?? refundEntity?.payment_id ?? null;
-      // Money went back to the customer. The payment stays in the history —
-      // deleting it would rewrite the books — but its status moves to
-      // refunded so the record tells the truth. Access is NOT touched here:
-      // a refund does not by itself prove the subscription should end.
-      if (targetPaymentId) {
-        const { error: refundError } = await db
-          .from("subscription_payments")
-          .update({ status: "refunded", updated_at: now })
-          .eq("razorpay_payment_id", String(targetPaymentId))
-          .eq("tenant_id", tenantId);
-        if (refundError) {
-          throw new Error(`could not record the refund: ${refundError.message}`);
-        }
+      if (!targetPaymentId) {
+        return { summary: `${eventType} missing payment id`, tenantId };
+      }
 
+      const verifiedRefundId: string | null = refundEntity?.id ? String(refundEntity.id) : null;
+      let verifiedRefundStatus: "pending" | "processed" | "failed" = "processed";
+      let verifiedRefundAmount = refundEntity?.amount
+        ? fromMinorUnits(Number(refundEntity.amount), String(refundEntity.currency ?? "INR"))
+        : 0;
+      let verifiedCurrency = String(refundEntity?.currency ?? payment?.currency ?? "INR");
+
+      if (verifiedRefundId) {
+        const liveRefund = await fetchRefund(verifiedRefundId);
+        if (!liveRefund.ok) {
+          throw new Error(`could not confirm refund ${verifiedRefundId} with Razorpay: ${liveRefund.error}`);
+        }
+        const liveStatus = String(liveRefund.data.status ?? "");
+        verifiedRefundStatus = liveStatus === "processed"
+          ? "processed"
+          : liveStatus === "failed"
+            ? "failed"
+            : "pending";
+        verifiedRefundAmount = fromMinorUnits(
+          Number(liveRefund.data.amount ?? 0),
+          String(liveRefund.data.currency ?? verifiedCurrency),
+        );
+        verifiedCurrency = String(liveRefund.data.currency ?? verifiedCurrency);
+      }
+
+      const { data: refundRpcRes, error: refundRpcErr } = await db.rpc("record_subscription_refund", {
+        p_tenant_id: tenantId,
+        p_razorpay_payment_id: String(targetPaymentId),
+        p_razorpay_refund_id: verifiedRefundId,
+        p_refund_amount: verifiedRefundAmount,
+        p_currency: verifiedCurrency,
+        p_refund_status: verifiedRefundStatus,
+        p_webhook_event_id: eventId,
+      });
+      if (refundRpcErr) {
+        throw new Error(`could not record the refund: ${refundRpcErr.message}`);
+      }
+
+      const refundOutcome = String((refundRpcRes as any)?.outcome ?? "");
+      if (refundOutcome === "pending_recorded" || refundOutcome === "failed_recorded") {
+        return { summary: `refund ${verifiedRefundStatus} (not finalized)`, tenantId };
+      }
+      if (refundOutcome === "already_processed") {
+        return { summary: "refund already processed", tenantId };
+      }
+
+      if (refundOutcome === "processed") {
         // The refund document, linked to the original invoice (issuing
         // that invoice first if needed — the payment succeeded at some
         // point, so the invoice is a fact). Best-effort like the renewal
@@ -970,21 +972,22 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
             .eq("razorpay_payment_id", String(targetPaymentId))
             .maybeSingle();
           if (ledgerRow) {
+            const docAmount = verifiedRefundAmount > 0 ? verifiedRefundAmount : Number((ledgerRow as any).amount ?? 0);
             const refundDoc = await issueRefundDocument(db, tenantId, ledgerRow, {
               refundedAt: refund?.created_at ? new Date(refund.created_at * 1000) : undefined,
-              razorpayRefundId: refund?.id ?? null,
-              amount: refund?.amount ? Number(refund.amount) / 100 : undefined,
+              razorpayRefundId: verifiedRefundId,
+              amount: docAmount,
             });
             try {
               await queueForTenant(db, tenantId, {
-                eventKey: `payment_refunded:${String(targetPaymentId)}:${refund?.id ?? "doc"}`,
+                eventKey: `payment_refunded:${String(targetPaymentId)}:${verifiedRefundId ?? "doc"}`,
                 eventType: "payment_refunded",
                 planName: (ledgerRow as any).plan_id,
-                amount: refund?.amount ? Number(refund.amount) / 100 : Number((ledgerRow as any).amount ?? 0),
-                currency: (ledgerRow as any).currency ?? "INR",
+                amount: docAmount,
+                currency: (ledgerRow as any).currency ?? verifiedCurrency,
                 payload: {
                   refundedAt: refund?.created_at ? new Date(refund.created_at * 1000).toISOString() : now,
-                  refundId: refund?.id ?? null,
+                  refundId: verifiedRefundId,
                   refundNumber: (refundDoc as any)?.refund_number ?? null,
                   paymentRef: String(targetPaymentId),
                 },
@@ -998,8 +1001,12 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
           console.error("razorpay webhook: refund document issuance failed", (e as Error)?.message);
         }
       }
+
       await audit(db, tenantId, tenant.plan, planId, "refunded", eventId, {
         paymentId: targetPaymentId,
+        refundId: verifiedRefundId,
+        totalRefunded: (refundRpcRes as any)?.total_refunded ?? null,
+        isFullyRefunded: (refundRpcRes as any)?.is_fully_refunded ?? null,
       });
       return { summary: "payment refunded", tenantId };
     }

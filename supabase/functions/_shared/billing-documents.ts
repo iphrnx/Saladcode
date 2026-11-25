@@ -323,11 +323,10 @@ export async function issueRefundDocument(
     .single();
   if (error) {
     if (String(error.code) === "23505") {
-      const { data: raced } = await db
-        .from("billing_refunds")
-        .select("*")
-        .eq("payment_id", payment.id)
-        .maybeSingle();
+      const racedQuery = db.from("billing_refunds").select("*");
+      const { data: raced } = details.razorpayRefundId
+        ? await racedQuery.eq("razorpay_refund_id", details.razorpayRefundId).maybeSingle()
+        : await racedQuery.eq("payment_id", payment.id).maybeSingle();
       return raced ?? null;
     }
     console.error("billing documents: could not issue the refund document", error.message);
