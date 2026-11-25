@@ -64,7 +64,7 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
  * Draw the card onto a fresh canvas and return it. Exposed so the preview can
  * show the exact pixels the download will contain.
  */
-export async function drawQrCard(input: QrCardInput, scale = 2): Promise<HTMLCanvasElement | null> {
+async function drawQrCard(input: QrCardInput, scale = 2): Promise<HTMLCanvasElement | null> {
   const qr = await loadImage(input.qrData)
   if (!qr) return null
 

@@ -595,14 +595,6 @@ export async function dispatchPending(
   return { sent, failed, skipped };
 }
 
-/** Queue and send in one step, for events where waiting for a job is wrong. */
-export async function sendNow(db: SupabaseClient, event: EmailEvent): Promise<boolean> {
-  const id = await queueEmail(db, event);
-  if (!id) return false;
-  const result = await dispatchPending(db, 5);
-  return result.sent > 0;
-}
-
 /**
  * Queue an email for a restaurant, resolving who to write to.
  *

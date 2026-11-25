@@ -201,8 +201,7 @@ try {
   }
 } finally {
   // Usage and billing tables reference tenants without a cascade; clear the
-  // scratch rows so the tenant delete can go through (reset-to-empty.sql
-  // does the same).
+  // scratch rows so the tenant delete can go through.
   for (const t of ["feature_usage", "subscription_payments", "subscription_audit_logs", "subscription_webhook_events", "ai_request_logs"]) {
     await admin.from(t).delete().eq("tenant_id", tenant!.id);
   }

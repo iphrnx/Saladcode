@@ -387,30 +387,35 @@ $$;
 
 grant execute on function public.create_order_tx(jsonb, jsonb, uuid, text, text) to authenticated, anon, service_role;
 
--- 7. Restore Table 3 historical check clean boundary
-update public.table_checks
-   set session_id = 'f73a4f5f-cdfe-4752-838f-ea3180bc85d3',
-       anchor_session_id = 'f73a4f5f-cdfe-4752-838f-ea3180bc85d3'
- where id = 'fa406d1b-3f49-40ab-803c-db5c4ea5590b';
+-- 7. Restore Table 3 historical check clean boundary (only when historical tenant exists)
+do $$
+begin
+  if exists (select 1 from public.tenants where id = '33052d21-1625-4831-a5ed-56e40b6e9f2b'::uuid) then
+    update public.table_checks
+       set session_id = 'f73a4f5f-cdfe-4752-838f-ea3180bc85d3',
+           anchor_session_id = 'f73a4f5f-cdfe-4752-838f-ea3180bc85d3'
+     where id = 'fa406d1b-3f49-40ab-803c-db5c4ea5590b';
 
--- Create independent check for session cccc8850
-insert into public.table_checks (
-  id, tenant_id, table_id, session_id, anchor_session_id, status, opened_at
-) values (
-  'e0000000-0000-0000-0000-000000000001'::uuid,
-  '33052d21-1625-4831-a5ed-56e40b6e9f2b'::uuid,
-  'b5ecf5d4-0cef-47d9-a96e-b3d32271c6bf'::uuid,
-  'cccc8850-bf0d-4620-94a8-75e51f04c87c'::uuid,
-  'cccc8850-bf0d-4620-94a8-75e51f04c87c'::uuid,
-  'OPEN',
-  now()
-)
-on conflict (id) do nothing;
+    -- Create independent check for session cccc8850
+    insert into public.table_checks (
+      id, tenant_id, table_id, session_id, anchor_session_id, status, opened_at
+    ) values (
+      'e0000000-0000-0000-0000-000000000001'::uuid,
+      '33052d21-1625-4831-a5ed-56e40b6e9f2b'::uuid,
+      'b5ecf5d4-0cef-47d9-a96e-b3d32271c6bf'::uuid,
+      'cccc8850-bf0d-4620-94a8-75e51f04c87c'::uuid,
+      'cccc8850-bf0d-4620-94a8-75e51f04c87c'::uuid,
+      'OPEN',
+      now()
+    )
+    on conflict (id) do nothing;
 
--- Move session cccc8850 orders to its independent check
-update public.orders
-   set check_id = 'e0000000-0000-0000-0000-000000000001'::uuid
- where table_session_id = 'cccc8850-bf0d-4620-94a8-75e51f04c87c';
+    -- Move session cccc8850 orders to its independent check
+    update public.orders
+       set check_id = 'e0000000-0000-0000-0000-000000000001'::uuid
+     where table_session_id = 'cccc8850-bf0d-4620-94a8-75e51f04c87c';
+  end if;
+end $$;
 
 -- Record migration in schema_migrations
 insert into supabase_migrations.schema_migrations (version, name)

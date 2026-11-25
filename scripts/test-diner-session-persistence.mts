@@ -59,10 +59,9 @@ assert(
 
 // 3. First order creates session and returns sessionToken + sessionId
 assert(
-  ordersSrc.includes('else if (qrToken)') &&
-  ordersSrc.includes('table_sessions') &&
-  ordersSrc.includes('sessionToken: newSession.token') &&
-  ordersSrc.includes('sessionId: newSession.id'),
+  ordersSrc.includes('create_order_tx') &&
+  ordersSrc.includes('sessionToken: finalSessionToken') &&
+  ordersSrc.includes('sessionId'),
   'First order via scanned QR table atomically creates active session and returns unguessable token and sessionId',
 );
 

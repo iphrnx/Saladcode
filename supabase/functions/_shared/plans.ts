@@ -354,48 +354,7 @@ export async function planCatalogue() {
 }
 
 /**
- * Check a limit before a write.
- *
- * The count is passed in rather than counted here, so the caller counts
- * exactly the rows it is about to add to and the check is on the same
- * transaction's view of the world.
- */
-export function checkLimit(
-  plan: EffectivePlan,
-  kind: "locations" | "staff" | "menuItems" | "tables" | "qrCodes",
-  currentCount: number,
-): { ok: true } | { ok: false; error: string; limit: number } {
-  const limit =
-    (kind === "qrCodes" ? plan.limits.tables : plan.limits[kind]) ??
-    (kind === "tables" || kind === "qrCodes" ? (plan.planId === "pro" ? 100 : 50) : null);
-  if (limit === null || limit === undefined) return { ok: true };
-  if (currentCount < limit) return { ok: true };
-
-  const noun =
-    kind === "staff"
-      ? "staff members"
-      : kind === "menuItems"
-        ? "menu items"
-        : kind === "tables" || kind === "qrCodes"
-          ? "QR codes"
-          : "locations";
-  return {
-    ok: false,
-    limit,
-    error:
-      `Your ${plan.planName} plan includes up to ${limit} ${noun}. ` +
-      `Upgrade your plan to add more.`,
-  };
-}
-
-/**
  * Whether a feature is available on the plan in force.
- *
- * Decided by the plan's own entitlements, never by its name. The previous
- * version compared plan ids (`pro` or `enterprise`), which meant the
- * catalogue could advertise a feature on Starter while the server refused it —
- * changing what a plan includes was a code change nobody could see from the
- * plan row. `feature_keys` is that row's answer.
  *
  * A plan with no entitlement list grants nothing gated, which is the safe
  * direction for an unknown or half-written row.

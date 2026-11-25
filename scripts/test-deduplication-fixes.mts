@@ -11,7 +11,7 @@
  *
  * Usage: npx tsx scripts/test-deduplication-fixes.mts
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 let pass = 0, fail = 0;
 const check = (label: string, ok: boolean, detail?: string) => {
@@ -30,8 +30,6 @@ const ordersView = readFileSync("src/components/views/orders.tsx", "utf8");
 const sessionDrawer = readFileSync("src/components/shared/session-orders-drawer.tsx", "utf8");
 const constantsTs = readFileSync("src/lib/constants.ts", "utf8");
 const permissionsTs = readFileSync("src/lib/permissions.ts", "utf8");
-const tableSessionLib = readFileSync("src/lib/table-session.ts", "utf8");
-const staffAuthLib = readFileSync("src/lib/staff-auth.ts", "utf8");
 
 console.log("── 1. Pricing & Portions: SQL add_items_to_order_tx ──");
 {
@@ -105,15 +103,15 @@ console.log("\n── 5. Permissions & RBAC: Unified Evaluation ──");
   );
 }
 
-console.log("\n── 6. Legacy Adapter Deprecation ──");
+console.log("\n── 6. Legacy Adapter Removal ──");
 {
   check(
-    "src/lib/table-session.ts is marked as deprecated pointing to Edge Function",
-    tableSessionLib.includes("@deprecated") && tableSessionLib.includes("supabase/functions/table-session/index.ts")
+    "legacy src/lib/table-session.ts adapter is removed",
+    !existsSync("src/lib/table-session.ts")
   );
   check(
-    "src/lib/staff-auth.ts is marked as deprecated pointing to Edge Function",
-    staffAuthLib.includes("@deprecated") && staffAuthLib.includes("supabase/functions/staff/index.ts")
+    "legacy src/lib/staff-auth.ts adapter is removed",
+    !existsSync("src/lib/staff-auth.ts")
   );
 }
 

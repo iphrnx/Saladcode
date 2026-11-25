@@ -192,16 +192,19 @@ console.log("\n── concurrent writes ──");
   // lock — an integration test after it is applied is the real proof.
   const sqlPath = fs.existsSync("supabase/migrations/0044_billing_integrity.sql")
     ? "supabase/migrations/0044_billing_integrity.sql"
-    : "supabase/legacy_migrations_archive/0044_billing_integrity.sql";
+    : "supabase/migrations/20261113000000_baseline_schema.sql";
   const sql = fs.readFileSync(sqlPath, "utf8");
   check("the menu write counts and inserts in one function",
     /create_menu_item_within_limit[\s\S]*?select count\(\*\)[\s\S]*?insert into public\.menu_items/.test(sql));
   check("the staff write counts and inserts in one function",
     /create_staff_within_limit[\s\S]*?select count\(\*\)[\s\S]*?insert into public\.staff/.test(sql));
+  const menuFn = sql.match(/create or replace function public\.create_menu_item_within_limit[\s\S]*?\$\$;/i)?.[0] ?? "";
+  const staffFn = sql.match(/create or replace function public\.create_staff_within_limit[\s\S]*?\$\$;/i)?.[0] ?? "";
   check("both take a lock on the restaurant first",
-    (sql.match(/pg_advisory_xact_lock/g) ?? []).length === 2);
+    /pg_advisory_xact_lock/.test(menuFn) && /pg_advisory_xact_lock/.test(staffFn));
   check("neither swallows an error into a success",
-    !/exception[\s\S]{0,120}return jsonb_build_object\('ok', true/.test(sql));
+    !/exception[\s\S]{0,120}return jsonb_build_object\('ok', true/.test(menuFn)
+    && !/exception[\s\S]{0,120}return jsonb_build_object\('ok', true/.test(staffFn));
   check("the event gate inserts the delivery and reads the cursor in one function",
     /apply_subscription_event[\s\S]*?insert into public\.subscription_webhook_events[\s\S]*?for update/.test(sql));
   check("the new functions are not executable by the public",

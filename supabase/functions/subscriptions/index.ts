@@ -53,7 +53,6 @@ import { buildInvoicePdf, buildRefundPdf } from "../_shared/pdf.ts";
 import {
   decideScheduledCancel,
   decideCheckoutAction,
-  decideSwitchAction,
   mandateSupersededByPeriod,
   mandateVerdict,
   type LiveSubscription,
@@ -933,7 +932,7 @@ async function checkout(
     .maybeSingle();
   const { data: profile } = await db
     .from("profiles")
-    .select("email, full_name")
+    .select("email, name")
     .eq("tenant_id", tenantId)
     .limit(1)
     .maybeSingle();
@@ -1212,7 +1211,7 @@ async function checkout(
     razorpayPlanId,
     totalCount,
     customer: {
-      name: tenant?.name ?? profile?.full_name ?? "Restaurant",
+      name: tenant?.name ?? profile?.name ?? "Restaurant",
       email: profile?.email ?? tenant?.email ?? "",
     },
     notes,

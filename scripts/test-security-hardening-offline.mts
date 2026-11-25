@@ -12,8 +12,13 @@ const check = (l: string, ok: boolean, d?: string) => {
 };
 const read = (p: string) => {
   if (existsSync(p)) return readFileSync(p, "utf8");
-  const fallback = p.replace("supabase/migrations/", "supabase/legacy_migrations_archive/");
-  return readFileSync(fallback, "utf8");
+  if (existsSync("supabase/migrations/20261125000004_security_hardening_and_core_invariants_fix.sql")) {
+    return [
+      readFileSync("supabase/migrations/20261113000000_baseline_schema.sql", "utf8"),
+      readFileSync("supabase/migrations/20261125000004_security_hardening_and_core_invariants_fix.sql", "utf8"),
+    ].join("\n");
+  }
+  return readFileSync("supabase/migrations/20261113000000_baseline_schema.sql", "utf8");
 };
 
 const mig = read("supabase/migrations/0080_rate_limits_and_audit.sql");
@@ -45,7 +50,7 @@ console.log("\n── money movements are audited ──");
   check("reversing it", /CHECK_PAYMENT_REVERSED/.test(bill));
   check("invoicing the bill", /CHECK_FINALISED/.test(bill));
   check("with the actor and the amount", /amount\} (\$\{method\}|CASH) on check/.test(bill));
-  check("audit failures never fail the operation", /\.catch\(\(\) => \{\}\)/.test(bill));
+  check("audit failures never fail the operation", /try\s*\{[\s\S]*?security_logs[\s\S]*?\}\s*catch\s*\{\s*\}/.test(bill));
 }
 
 console.log("\n── RBAC holds where the money is ──");

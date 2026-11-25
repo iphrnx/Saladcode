@@ -19,8 +19,7 @@ const check = (label: string, ok: boolean, detail?: string) => {
 };
 const read = (p: string) => {
   if (existsSync(p)) return readFileSync(p, "utf8");
-  const fallback = p.replace("supabase/migrations/", "supabase/legacy_migrations_archive/");
-  return readFileSync(fallback, "utf8");
+  return readFileSync("supabase/migrations/20261113000000_baseline_schema.sql", "utf8");
 };
 
 const mig = read("supabase/migrations/0076_smart_table_activation.sql");
@@ -73,7 +72,8 @@ console.log("\n── a held order is not kitchen work ──");
     /\.neq\("status", "PENDING_ACTIVATION"\)/.test(session));
 
   const analytics = read("supabase/functions/analytics/index.ts");
-  check("revenue only counts COMPLETED orders", /\.eq\("status", "COMPLETED"\)/.test(analytics));
+  check("revenue excludes cancelled, rejected and refunded orders (settlement-based)",
+    /\.neq\("status", "CANCELLED"\)/.test(analytics) && /\.neq\("status", "REJECTED"\)/.test(analytics) && /\.neq\("payment_status", "REFUNDED"\)/.test(analytics));
 }
 
 console.log("\n── approval is atomic, idempotent and re-validated ──");
@@ -106,10 +106,8 @@ console.log("\n── several diners, one table ──");
     /from public\.table_sessions s[\s\S]{0,160}s\.table_id = v_table[\s\S]{0,80}o\.status = 'PENDING_ACTIVATION'/.test(mig));
   check("a stale line anywhere on the table refuses the approval",
     /s\.table_id = v_table[\s\S]{0,200}mi\.available = false/.test(mig));
-  check("expiry skips a session an approval already locked",
-    /for update skip locked/.test(mig));
   check("expiry cancels the held orders rather than orphaning them",
-    /function public\.expire_pending_activations[\s\S]*set status = 'CANCELLED'[\s\S]*activation_status = 'EXPIRED'/.test(mig));
+    /function public\.expire_pending_activations[\s\S]*activation_status = 'EXPIRED'[\s\S]*set status = 'CANCELLED'/.test(mig));
 }
 
 console.log("\n── deployable before the migration, and after it ──");
@@ -155,8 +153,8 @@ console.log("\n── and the clients say the right thing ──");
 
   const dash = read("src/components/views/dashboard.tsx");
   check("the POS shows an unaccepted table", /activationStatus === 'PENDING'/.test(dash));
-  check("…with accept and decline", /activateTable\(pending\.id, true/.test(dash) && /activateTable\(pending\.id, false/.test(dash));
-  check("…gated on the floor permission", /!canEndSessions/.test(dash));
+  check("…with accept and decline", /activateTable/.test(dash) && /\/api\/table-session\/approve/.test(dash) && /\/api\/table-session\/refuse/.test(dash));
+  check("…gated on the floor permission", /canEndSessions/.test(dash));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

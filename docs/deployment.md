@@ -4,30 +4,20 @@ Two things get deployed:
 
 | Piece | Where | How |
 |---|---|---|
-| The Next.js app | Vercel | import the GitHub repo |
+| The Next.js app | Cloudflare Workers | `npm run deploy` (`opennextjs-cloudflare build && wrangler deploy`) |
 | The API | Supabase Edge Functions | `node scripts/deploy-all-fns.mjs` |
 | The database | Supabase Postgres | migrations in `supabase/migrations/` |
 
 The browser app talks to Supabase for data **and** calls the edge functions for
 the API. Because those calls are cross-origin, each edge function answers CORS
-with an explicit origin — set `ALLOWED_ORIGINS` to the Vercel domain or the
+with an explicit origin — set `ALLOWED_ORIGINS` to the deployed domain or the
 browser will block the responses.
 
 ---
 
 ## 1. Database
 
-Migrations are applied in filename order. If you are reusing the existing
-`supaletta` project, **nothing to do** — `0001`–`0007` are already applied.
-
-For a fresh project, apply them in order. Then decide whether you want the demo
-restaurant: `0004_seed_demo_tenant.sql` creates "Jaegar Resto" for development
-only. A real restaurant should start empty:
-
-```bash
-psql "$DATABASE_URL?sslmode=verify-full&sslrootcert=$SUPABASE_CA_CERT" \
-  -f supabase/reset-to-empty.sql
-```
+Migrations live in `supabase/migrations/` (starting from `20261113000000_baseline_schema.sql`) and are applied in filename order via `supabase db push` or the Supabase SQL editor. For local development seed data, use `supabase/seed.sql` (never run seed fixtures against a production database).
 
 ### Database connection security — SSL is enforced
 
@@ -66,10 +56,8 @@ Set these secrets on the project first:
 
 | Secret | Value | Needed by |
 |---|---|---|
-| `ALLOWED_ORIGINS` | your Vercel origin, e.g. `https://the-salad.vercel.app` | every function |
+| `ALLOWED_ORIGINS` | your deployed origin, e.g. `https://www.thesalad.in` | every function |
 | `GEMINI_API_KEY` | the Google AI Studio key | `ai-extract-menu`, `ai-generate-image` |
-| `GOOGLE_CLIENT_ID` | the OAuth client id of a **Web application** | `google-reviews` |
-| `GOOGLE_CLIENT_SECRET` | the matching client secret | `google-reviews` |
 | `RAZORPAY_KEY_ID` | the Razorpay key id (test mode first) | `subscriptions`, `razorpay-webhook` |
 | `RAZORPAY_KEY_SECRET` | the matching key secret | `subscriptions`, `razorpay-webhook` |
 | `RAZORPAY_WEBHOOK_SECRET` | optional; falls back to the key secret | `razorpay-webhook` |
@@ -92,22 +80,10 @@ What lives in the database instead:
 | Table | What it holds | Who can read it |
 |---|---|---|
 | `ai_provider_settings` | which Gemini models to use | the service role only |
-| `google_oauth_config` | the redirect URI to register | the service role only |
-| `google_oauth_tokens` | a restaurant's Google access and refresh tokens | the service role only |
-| `google_oauth_states` | single-use sign-in states | the service role only |
 | `ai_request_logs` | the shape of each AI call | the service role only |
-
-The last three have **no row level security policy at all**, so no signed-in
-user — restaurant owner or staff — can read them with PostgREST and their own
-session. A restaurant's refresh token is a credential for their Google
-account, and it is not theirs to read.
 
 ### What else the dashboard needs
 
-- **Google**: create an OAuth client of type *Web application* and add the
-  redirect URI from Super Admin → Settings. The Business Profile APIs are not
-  self-service: request access per project, and approval needs a Business
-  Profile that has been verified and active for 60+ days.
 - **Razorpay**: create two recurring monthly plans and put their plan ids in
   Super Admin → Payments → Plans. Point the webhook at
   `https://<ref>.supabase.co/functions/v1/razorpay-webhook`.
@@ -120,10 +96,9 @@ node scripts/deploy-all-fns.mjs
 node scripts/deploy-fn.mjs menu
 ```
 
-## 3. Vercel
+## 3. Cloudflare Workers
 
-Import `iphrnx/Saladcode` and set these environment variables (Production and
-Preview):
+Configure `wrangler.jsonc` and set these environment variables / secrets:
 
 | Variable | Notes |
 |---|---|
@@ -132,16 +107,15 @@ Preview):
 | `SUPABASE_SERVICE_ROLE_KEY` | **server only**, never `NEXT_PUBLIC_` |
 | `NEXT_PUBLIC_SITE_URL` | the deployed origin, used for metadata and OG tags |
 
-`next.config.ts` uses `output: 'standalone'`, which Vercel detects on its own.
-No `vercel.json` is needed.
+`open-next.config.ts` uses `npm run build:next` (`output: 'standalone'`) and `wrangler.jsonc` points to `.open-next/worker.js` with `nodejs_compat`. Deploy with `npm run deploy`.
 
 ## 4. Supabase Auth URLs
 
 In **Authentication → URL Configuration**:
 
-- **Site URL**: your Vercel origin.
+- **Site URL**: your deployed origin.
 - **Redirect URLs**: add `https://<your-domain>/**` and
-  `http://localhost:3000/**` for local development.
+  `http://localhost:3001/**` for local development.
 
 Also in **Authentication → Providers / Settings**, enable **leaked password
 protection** — Supabase's own advisor flags it as off, and it is not reachable
@@ -158,8 +132,8 @@ through the API.
 
 ## Post-deploy checklist
 
-- [ ] `npm run lint`, `npx tsc --noEmit`, `npm run build` all clean locally
-- [ ] `ALLOWED_ORIGINS` set to the real Vercel origin
+- [ ] `npm run lint`, `npm run typecheck`, `npm run build` all clean locally
+- [ ] `ALLOWED_ORIGINS` set to the real deployed origin
 - [ ] Leaked password protection enabled
 - [ ] Auth redirect URLs include the production origin
 - [ ] Supabase advisors re-checked (Database → Advisors) with no new warnings

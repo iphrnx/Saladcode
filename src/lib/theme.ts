@@ -46,7 +46,7 @@ export function applyTheme(theme: Theme) {
 /**
  * Get the stored theme (or default 'dark').
  */
-export function getStoredTheme(): Theme {
+function getStoredTheme(): Theme {
   try {
     const stored = readStored('theme')
     if (stored === 'light' || stored === 'dark' || stored === 'system') {

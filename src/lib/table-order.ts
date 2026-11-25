@@ -8,7 +8,7 @@
  */
 
 /** Compare two names the way a person reads them: "Table 2" before "Table 10". */
-export function naturalCompare(a: string, b: string): number {
+function naturalCompare(a: string, b: string): number {
   const ax = String(a ?? '').match(/(\d+|\D+)/g) ?? []
   const bx = String(b ?? '').match(/(\d+|\D+)/g) ?? []
 

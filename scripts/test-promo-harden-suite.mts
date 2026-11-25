@@ -218,7 +218,7 @@ console.log('\n── 4. Cross-Tenant Isolation & Input Normalization ──')
 console.log('\n── 5. Concurrency & Database RPC Invariants ──')
 
 {
-  const mig = fs.readFileSync('supabase/migrations/20261121000001_harden_promo_codes.sql', 'utf-8')
+  const mig = fs.readFileSync('supabase/migrations/20261121000002_harden_promo_codes.sql', 'utf-8')
 
   check('Migration defines atomic update on used_count', mig.includes('update public.promo_codes') && mig.includes('set used_count = used_count + 1'))
   check('Migration enforces usage_limit conditionally', mig.includes('(usage_limit = 0 or usage_limit is null or used_count < usage_limit)'))
@@ -286,7 +286,7 @@ console.log('\n── 6. Frontend & API Validation Contracts ──')
 console.log('\n── 7. Review Finding 1: Order Creation & create_order_tx Invariants ──')
 
 {
-  const mig = fs.readFileSync('supabase/migrations/20261121000001_harden_promo_codes.sql', 'utf-8')
+  const mig = fs.readFileSync('supabase/migrations/20261121000002_harden_promo_codes.sql', 'utf-8')
 
   check(
     'create_order_tx preserves order_items.name in insert statement',
@@ -621,7 +621,7 @@ console.log('\n── 11. Issue 1 [P1]: Return Original Order on Authorized Retr
 console.log('\n── 12. Issue 2 [P1]: Prevent Stale Promo Pricing at Commit with Real Transactions ──')
 
 {
-  const mig = fs.readFileSync('supabase/migrations/20261121000001_harden_promo_codes.sql', 'utf-8')
+  const mig = fs.readFileSync('supabase/migrations/20261121000002_harden_promo_codes.sql', 'utf-8')
 
   check(
     'Migration locks promo row FOR UPDATE before order insertion',
@@ -980,7 +980,7 @@ console.log('\n── 16. Issue 1 [P1]: Concurrent First-Order QR Retries & Tran
 
 {
   const ordersApi = fs.readFileSync('supabase/functions/orders/index.ts', 'utf-8')
-  const mig = fs.readFileSync('supabase/migrations/20261121000001_harden_promo_codes.sql', 'utf-8')
+  const mig = fs.readFileSync('supabase/migrations/20261121000002_harden_promo_codes.sql', 'utf-8')
 
   check(
     'Migration serializes concurrent idempotency keys with advisory xact lock',

@@ -13,28 +13,33 @@
 revoke execute on function public.create_order_tx(jsonb, jsonb, uuid, text, text) from public, anon, authenticated;
 grant execute on function public.create_order_tx(jsonb, jsonb, uuid, text, text) to service_role;
 
--- 2. DEF-02: Revoke public execution of test and trigger functions
-revoke execute on function public.test_independent_diner_billing() from public, anon, authenticated;
-grant execute on function public.test_independent_diner_billing() to service_role;
+-- 2. DEF-02: Revoke public execution of test and trigger functions (guarded for clean replay)
+do $$
+declare
+  v_sig text;
+begin
+  foreach v_sig in array array[
+    'public.test_independent_diner_billing()',
+    'public.test_pos_session_selection_and_reconciliation()',
+    'public.execute_core_invariants_tests()',
+    'public.guard_order_items_order_status()',
+    'public.validate_check_payment_tenant_consistency()',
+    'public.validate_order_tenant_consistency()'
+  ] loop
+    if to_regprocedure(v_sig) is not null then
+      execute format('revoke execute on function %s from public, anon, authenticated', v_sig);
+      execute format('grant execute on function %s to service_role', v_sig);
+    end if;
+  end loop;
 
-revoke execute on function public.test_pos_session_selection_and_reconciliation() from public, anon, authenticated;
-grant execute on function public.test_pos_session_selection_and_reconciliation() to service_role;
-
-revoke execute on function public.execute_core_invariants_tests() from public, anon, authenticated;
-grant execute on function public.execute_core_invariants_tests() to service_role;
-
-revoke execute on function public.guard_order_items_order_status() from public, anon, authenticated;
-grant execute on function public.guard_order_items_order_status() to service_role;
-
-revoke execute on function public.validate_check_payment_tenant_consistency() from public, anon, authenticated;
-grant execute on function public.validate_check_payment_tenant_consistency() to service_role;
-
-revoke execute on function public.validate_order_tenant_consistency() from public, anon, authenticated;
-grant execute on function public.validate_order_tenant_consistency() to service_role;
-
--- 3. DEF-04: Enforce immutable search_path on functions missing it
-alter function public.guard_finalised_check() set search_path = public, extensions, pg_temp;
-alter function public.execute_core_invariants_tests() set search_path = public, extensions, pg_temp;
+  -- 3. DEF-04: Enforce immutable search_path on functions missing it
+  if to_regprocedure('public.guard_finalised_check()') is not null then
+    alter function public.guard_finalised_check() set search_path = public, extensions, pg_temp;
+  end if;
+  if to_regprocedure('public.execute_core_invariants_tests()') is not null then
+    alter function public.execute_core_invariants_tests() set search_path = public, extensions, pg_temp;
+  end if;
+end $$;
 
 -- 4. Reconcile test_pos_session_selection_and_reconciliation to reflect legitimate settlement of Sitting 2
 create or replace function public.test_pos_session_selection_and_reconciliation()

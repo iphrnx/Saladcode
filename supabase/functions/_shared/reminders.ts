@@ -176,13 +176,13 @@ export async function queueDailyDigests(db: SupabaseClient): Promise<{ queued: n
     // Aggregate orders in the last 24h
     const { data: orders } = await db
       .from("orders")
-      .select("id, total_amount, status")
+      .select("id, total, status")
       .eq("tenant_id", t.id)
       .gte("created_at", yesterday)
       .neq("status", "CANCELLED");
 
     const ordersCount = orders?.length ?? 0;
-    const revenue = (orders ?? []).reduce((acc: number, o: any) => acc + (Number(o.total_amount) || 0), 0);
+    const revenue = (orders ?? []).reduce((acc: number, o: any) => acc + (Number(o.total) || 0), 0);
 
     const { data: owner } = await db
       .from("profiles")

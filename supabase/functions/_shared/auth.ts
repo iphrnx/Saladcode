@@ -255,22 +255,6 @@ export async function guard(
   return { ok: true, session };
 }
 
-/**
- * Resolve a tenant for a genuinely public route from an explicit
- * `?tenant=` / `x-tenant-id` value only — never a "pick one for me" fallback.
- */
-export async function publicTenantId(req: Request): Promise<string | null> {
-  const key = claimedTenant(req);
-  if (!key) return null;
-  const db = admin();
-  if (UUID_RE.test(key)) {
-    const { data } = await db.from("tenants").select("id").eq("id", key).maybeSingle();
-    if (data?.id) return data.id;
-  }
-  const { data } = await db.from("tenants").select("id").eq("slug", key).maybeSingle();
-  return data?.id ?? null;
-}
-
 /** Validate a diner's table-session token. Public route helper. */
 export async function tableSession(token: string): Promise<{
   id: string;

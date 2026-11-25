@@ -359,5 +359,9 @@ grant execute on function public.validate_check_payment_tenant_consistency() to 
 grant execute on function public.guard_order_items_order_status() to service_role;
 grant execute on function public.guard_finalised_check() to service_role;
 grant execute on function public.create_order_tx(jsonb, jsonb, uuid, text, text) to authenticated, anon, service_role;
-grant execute on function public.execute_core_invariants_tests() to anon, authenticated, service_role;
+do $$ begin
+  if to_regprocedure('public.execute_core_invariants_tests()') is not null then
+    grant execute on function public.execute_core_invariants_tests() to anon, authenticated, service_role;
+  end if;
+end $$;
 

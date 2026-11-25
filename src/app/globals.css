@@ -372,27 +372,6 @@
  * When enabled, cards, lists, table cells, and order rows reduce padding
  * and gap spacing for higher information density on POS/KDS screens.
  * ------------------------------------------------------------------------- */
-[data-compact="true"] {
-  --compact-density: 0.75;
-}
-
-[data-compact="true"] .compact-p {
-  padding: 0.5rem !important;
-}
-
-[data-compact="true"] .compact-py {
-  padding-top: 0.35rem !important;
-  padding-bottom: 0.35rem !important;
-}
-
-[data-compact="true"] .compact-gap {
-  gap: 0.375rem !important;
-}
-
-[data-compact="true"] .compact-text {
-  font-size: 0.8125rem !important;
-}
-
 [data-compact="true"] [data-order-card] {
   min-height: 440px !important;
 }
