@@ -1,7 +1,6 @@
 -- ============================================================================
--- Migration: 20261125000001_cleanup_obsolete_objects.sql
+-- Migration: 20261125000005_cleanup_obsolete_objects.sql
 -- Purpose: Minimal cleanup of confirmed obsolete live DB objects.
--- Status: PREPARED ONLY — DO NOT APPLY WITHOUT EXPLICIT APPROVAL.
 --
 -- Pre-checks verified against live Supabase project (jeuixphibaasbxgaexfg):
 --   1. public.open_session_check_with_type: 0 refs in src/, supabase/functions/,

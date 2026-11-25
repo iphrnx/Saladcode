@@ -29,9 +29,10 @@ if (!existsSync(entrypoint)) {
   process.exit(1);
 }
 
+const yesFlag = process.argv.includes("--yes") ? ["--yes"] : [];
 console.log(`Deploying "${name}" to project ${PROJECT_ID} via Supabase CLI...`);
 execFileSync(
   "npx",
-  ["supabase", "functions", "deploy", name, "--no-verify-jwt", "--project-ref", PROJECT_ID],
+  ["supabase", "functions", "deploy", name, "--no-verify-jwt", `--remote=${PROJECT_ID}`, ...yesFlag],
   { stdio: "inherit" },
 );
