@@ -19,7 +19,7 @@ const billEdgeSrc = fs.readFileSync(path.join(process.cwd(), "supabase/functions
 const resolveMig = (file: string) => {
   const p1 = path.join(process.cwd(), "supabase/migrations", file);
   if (fs.existsSync(p1)) return p1;
-  return path.join(process.cwd(), "supabase/legacy_migrations_archive", file);
+  return path.join(process.cwd(), "supabase/migrations/20261113000000_baseline_schema.sql");
 };
 const sqlMigrationSrc = fs.readFileSync(resolveMig("0078_check_sitting_binding.sql"), "utf8");
 const sqlFinalizeSrc = fs.readFileSync(resolveMig("0084_settle_completes_orders.sql"), "utf8");

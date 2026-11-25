@@ -80,7 +80,7 @@ function sessionDraftKey(sessionKey?: string | null): string {
 }
 
 /** Read all session drafts for this tenant+user. */
-export function getPosSessionDrafts(
+function getPosSessionDrafts(
   tenantId: string,
   userId: string,
 ): Record<string, PosCartSnapshot> {

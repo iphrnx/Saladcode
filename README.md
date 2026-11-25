@@ -6,12 +6,12 @@ A multitenant restaurant platform: point-of-sale (POS), live order flow, QR tabl
 
 | Layer | Choice |
 |---|---|
-| Framework | Next.js 16 (`16.4.3`, App Router, standalone output) |
+| Framework | Next.js 16 (`16.4.6`, App Router, standalone output via `@opennextjs/cloudflare`) |
 | UI | React 19, Tailwind CSS v4, shadcn/ui, Radix UI, Recharts, Framer Motion |
 | Database & Auth | Supabase Postgres, Supabase Auth (owners & super admins), Supabase Realtime |
 | API | 27 Supabase Edge Functions (Deno) + Next.js `/api/auth/*` & `/api/superadmin/*` proxy routes |
 | Billing & AI | Razorpay Subscriptions & Webhooks, Google Gemini (menu extraction & image generation) |
-| Hosting | Vercel (Next.js) + Supabase (Postgres + Edge Functions + Storage) |
+| Hosting | Cloudflare Workers (`@opennextjs/cloudflare` + `wrangler.jsonc`) + Supabase (Postgres + Edge Functions + Storage) |
 
 > **Note:** There is no Prisma at runtime. `docs/legacy-prisma-schema.txt` is kept for historical reference only.
 
@@ -66,18 +66,19 @@ node scripts/deploy-fn.mjs menu      # deploy a single function
 
 ## Database & Migrations
 
-Migrations live in `supabase/migrations/` (`0001_swixo_init.sql` through `0085_payment_methods.sql`).
+Migrations live in `supabase/migrations/` (starting from `20261113000000_baseline_schema.sql`).
 
 - Apply migrations in filename order via Supabase CLI (`supabase db push`) or the Supabase MCP/SQL editor.
-- `0004_seed_demo_tenant.sql` seeds a development demo restaurant (**Jaegar Resto**). For a clean production database, run `supabase/reset-to-empty.sql` over verified TLS (`sslmode=verify-full`).
+- `supabase/seed.sql` provides synthetic development seed fixtures for local testing only (never run against production).
 
 ## Common Commands
 
 | Command | Purpose |
 |---|---|
-| `npm run dev` | Start Next.js dev server on `:3000` |
-| `npm run build` | Production build + standalone asset copy |
-| `npm start` | Run standalone production server |
+| `npm run dev` | Start Next.js dev server on `:${PORT:-3001}` |
+| `npm run build` | Production Cloudflare Workers build (`opennextjs-cloudflare build`) |
+| `npm run preview` | Build and preview locally with `wrangler dev` |
+| `npm run deploy` | Build and deploy to Cloudflare Workers (`wrangler deploy`) |
 | `npm run typecheck` | Run `tsc --noEmit` |
 | `npm run lint` | Run ESLint across the repository |
 | `npm run smoke` | Run preflight smoke checks (`scripts/smoke-preflight.mts`) |
@@ -85,6 +86,5 @@ Migrations live in `supabase/migrations/` (`0001_swixo_init.sql` through `0085_p
 ## Project Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — Codebase structure, routes, views, libraries, and Edge Functions
-- [`docs/audit-report.md`](docs/audit-report.md) — Codebase audit, dead-code findings, and production-readiness checklist
-- [`docs/deployment.md`](docs/deployment.md) — Production deployment, SSL, and Edge Function secrets guide
+- [`docs/deployment.md`](docs/deployment.md) — Production deployment (Cloudflare Workers), SSL, and Edge Function secrets guide
 - [`docs/supabase-migration-guide.md`](docs/supabase-migration-guide.md) — Notes on the Supabase migration

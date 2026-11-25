@@ -3,7 +3,7 @@
  *
  * Usage: npx tsx scripts/test-audit-fixes-p0-p3.mts
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 let pass = 0, fail = 0;
 const check = (label: string, ok: boolean, detail?: string) => {
@@ -20,8 +20,6 @@ const settingsFn = readFileSync("supabase/functions/settings/index.ts", "utf8");
 const ordersFn = readFileSync("supabase/functions/orders/index.ts", "utf8");
 const staffFn = readFileSync("supabase/functions/staff/index.ts", "utf8");
 const billFn = readFileSync("supabase/functions/bill/index.ts", "utf8");
-const tableSessionLib = readFileSync("src/lib/table-session.ts", "utf8");
-const staffAuthLib = readFileSync("src/lib/staff-auth.ts", "utf8");
 const publicMenu = readFileSync("src/components/public/public-menu.tsx", "utf8");
 const sessionPaymentDlg = readFileSync("src/components/shared/session-payment-dialog.tsx", "utf8");
 const billDlg = readFileSync("src/components/shared/bill-dialog.tsx", "utf8");
@@ -132,8 +130,8 @@ console.log("\n── P1 Findings (High / Security / Stability) ──");
   check("P1-4: staff Edge Function delegates failed/success attempts to atomic record_staff_login_attempt RPC",
     staffFn.includes('.rpc("record_staff_login_attempt"')
   );
-  check("P1-4: src/lib/staff-auth.ts delegates failed/success attempts to atomic record_staff_login_attempt RPC",
-    staffAuthLib.includes('.rpc("record_staff_login_attempt"')
+  check("P1-4: legacy src/lib/staff-auth.ts adapter is removed",
+    !existsSync("src/lib/staff-auth.ts")
   );
 }
 
@@ -151,8 +149,8 @@ console.log("\n── P1 Findings (High / Security / Stability) ──");
   check("P1-6: endTableSession in orders Edge Function has guard (!sessionId && !tableId)",
     ordersFn.includes("async function endTableSession(tenantId: string, tableId?: string, sessionId?: string) {\n  if (!sessionId && !tableId) return;")
   );
-  check("P1-6: endTableSession in src/lib/table-session.ts has guard (!sessionId && !tableId)",
-    tableSessionLib.includes("if (!sessionId && !tableId) {\n    return { ok: false, error: 'sessionId or tableId is required to end a table session.', status: 400 }")
+  check("P1-6: legacy src/lib/table-session.ts adapter is removed",
+    !existsSync("src/lib/table-session.ts")
   );
 }
 

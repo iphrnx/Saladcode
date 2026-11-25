@@ -39,9 +39,7 @@
   "exclude": [
     "node_modules",
     "supabase/functions",
-    "examples",
-    ".letta",
-    "upload",
-    "tool-results"
+    ".open-next",
+    ".wrangler"
   ]
 }

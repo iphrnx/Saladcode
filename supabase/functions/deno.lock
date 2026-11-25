@@ -1,0 +1,89 @@
+{
+  "version": "3",
+  "packages": {
+    "specifiers": {
+      "jsr:@supabase/supabase-js@2": "jsr:@supabase/supabase-js@2.118.0",
+      "npm:@supabase/auth-js@2.118.0": "npm:@supabase/auth-js@2.118.0",
+      "npm:@supabase/functions-js@2.118.0": "npm:@supabase/functions-js@2.118.0",
+      "npm:@supabase/postgrest-js@2.118.0": "npm:@supabase/postgrest-js@2.118.0",
+      "npm:@supabase/realtime-js@2.118.0": "npm:@supabase/realtime-js@2.118.0",
+      "npm:@supabase/storage-js@2.118.0": "npm:@supabase/storage-js@2.118.0"
+    },
+    "jsr": {
+      "@supabase/supabase-js@2.118.0": {
+        "integrity": "42009f9d5b35997f35bba560d509f42608057cae647bd5a25b9b4a06ec3ffad0",
+        "dependencies": [
+          "npm:@supabase/auth-js@2.118.0",
+          "npm:@supabase/functions-js@2.118.0",
+          "npm:@supabase/postgrest-js@2.118.0",
+          "npm:@supabase/realtime-js@2.118.0",
+          "npm:@supabase/storage-js@2.118.0"
+        ]
+      }
+    },
+    "npm": {
+      "@supabase/auth-js@2.118.0": {
+        "integrity": "sha512-xWfPXyhS2KDSfAneMtI6p/tBnbdiz/5vaRKXEqUfzfC9WCniKr2Ds5o5G7RIGig0bom4z6wUY9zaV07WDVTfnQ==",
+        "dependencies": {
+          "tslib": "tslib@2.8.1"
+        }
+      },
+      "@supabase/functions-js@2.118.0": {
+        "integrity": "sha512-4ofletPa/noKAU6KHeqsd3FztGzRPUEJRey1MKY0o+PIHaVePqRPShIXtl37gcVyIWaFM+zNg6r9zh0uUSFOSA==",
+        "dependencies": {
+          "tslib": "tslib@2.8.1"
+        }
+      },
+      "@supabase/phoenix@0.4.5": {
+        "integrity": "sha512-aAn9H9ovVyeApKy11OWOrrOGq8DV68yWeH4ud2lN9fzn4aO8Zb5GLL9m1pUg9nLqIcT+ZDfAcsZe0E/nqdv2lw==",
+        "dependencies": {}
+      },
+      "@supabase/postgrest-js@2.118.0": {
+        "integrity": "sha512-JXy+37KPApHsyotaQACovv/Jy9E22rfiWLRuT+2UjoEAcAIelDFIrsF/FY47Dy19mO7lI0Tq+zDCX8oJ2Ozfiw==",
+        "dependencies": {
+          "tslib": "tslib@2.8.1"
+        }
+      },
+      "@supabase/realtime-js@2.118.0": {
+        "integrity": "sha512-pzCIEWjqD5/xqEZQerpt+q9rsgYkcrkgCJgf0W2ULqC4fYUeB/p9CFa3t9vn+IVh6dMN9r4ZCE262lZvUC+Bfw==",
+        "dependencies": {
+          "@supabase/phoenix": "@supabase/phoenix@0.4.5",
+          "tslib": "tslib@2.8.1"
+        }
+      },
+      "@supabase/storage-js@2.118.0": {
+        "integrity": "sha512-5MNkKt2Moy7Jud/sPX7/28BwdDxZMCVHGJT00b8op3KRa9LKSjOAYU5IcfGWIstaasAqY8GkbA6oI3IRDgB1YQ==",
+        "dependencies": {
+          "iceberg-js": "iceberg-js@0.8.1",
+          "tslib": "tslib@2.8.1"
+        }
+      },
+      "iceberg-js@0.8.1": {
+        "integrity": "sha512-1dhVQZXhcHje7798IVM+xoo/1ZdVfzOMIc8/rgVSijRK38EDqOJoGula9N/8ZI5RD8QTxNQtK/Gozpr+qUqRRA==",
+        "dependencies": {}
+      },
+      "tslib@2.8.1": {
+        "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==",
+        "dependencies": {}
+      }
+    }
+  },
+  "remote": {
+    "https://deno.land/std@0.168.0/async/abortable.ts": "80b2ac399f142cc528f95a037a7d0e653296352d95c681e284533765961de409",
+    "https://deno.land/std@0.168.0/async/deadline.ts": "2c2deb53c7c28ca1dda7a3ad81e70508b1ebc25db52559de6b8636c9278fd41f",
+    "https://deno.land/std@0.168.0/async/debounce.ts": "60301ffb37e730cd2d6f9dadfd0ecb2a38857681bd7aaf6b0a106b06e5210a98",
+    "https://deno.land/std@0.168.0/async/deferred.ts": "77d3f84255c3627f1cc88699d8472b664d7635990d5358c4351623e098e917d6",
+    "https://deno.land/std@0.168.0/async/delay.ts": "5a9bfba8de38840308a7a33786a0155a7f6c1f7a859558ddcec5fe06e16daf57",
+    "https://deno.land/std@0.168.0/async/mod.ts": "7809ad4bb223e40f5fdc043e5c7ca04e0e25eed35c32c3c32e28697c553fa6d9",
+    "https://deno.land/std@0.168.0/async/mux_async_iterator.ts": "770a0ff26c59f8bbbda6b703a2235f04e379f73238e8d66a087edc68c2a2c35f",
+    "https://deno.land/std@0.168.0/async/pool.ts": "6854d8cd675a74c73391c82005cbbe4cc58183bddcd1fbbd7c2bcda42b61cf69",
+    "https://deno.land/std@0.168.0/async/retry.ts": "e8e5173623915bbc0ddc537698fa418cf875456c347eda1ed453528645b42e67",
+    "https://deno.land/std@0.168.0/async/tee.ts": "3a47cc4e9a940904fd4341f0224907e199121c80b831faa5ec2b054c6d2eff5e",
+    "https://deno.land/std@0.168.0/http/server.ts": "e99c1bee8a3f6571ee4cdeb2966efad465b8f6fe62bec1bdb59c1f007cc4d155"
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@supabase/supabase-js@2"
+    ]
+  }
+}

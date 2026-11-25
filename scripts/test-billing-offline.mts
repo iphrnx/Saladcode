@@ -192,7 +192,7 @@ console.log("\n── concurrent writes ──");
   // lock — an integration test after it is applied is the real proof.
   const sqlPath = fs.existsSync("supabase/migrations/0044_billing_integrity.sql")
     ? "supabase/migrations/0044_billing_integrity.sql"
-    : "supabase/legacy_migrations_archive/0044_billing_integrity.sql";
+    : "supabase/migrations/20261113000000_baseline_schema.sql";
   const sql = fs.readFileSync(sqlPath, "utf8");
   check("the menu write counts and inserts in one function",
     /create_menu_item_within_limit[\s\S]*?select count\(\*\)[\s\S]*?insert into public\.menu_items/.test(sql));

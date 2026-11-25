@@ -24,8 +24,8 @@ Saladcode/
 │   └── lib/                    # Client utilities, permissions, pricing, cart, Supabase clients, hooks
 └── supabase/
     ├── functions/              # 27 Deno Edge Functions + _shared/ (40 modules)
-    ├── migrations/             # 85 SQL migrations (0001–0085)
-    └── reset-to-empty.sql      # Strips demo seed data for clean production starts
+    ├── migrations/             # Consolidated baseline + incremental SQL migrations
+    └── seed.sql                # Synthetic development seed data
 ```
 
 ## Routing Model (`src/app/`)

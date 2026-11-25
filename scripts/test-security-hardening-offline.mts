@@ -12,8 +12,7 @@ const check = (l: string, ok: boolean, d?: string) => {
 };
 const read = (p: string) => {
   if (existsSync(p)) return readFileSync(p, "utf8");
-  const fallback = p.replace("supabase/migrations/", "supabase/legacy_migrations_archive/");
-  return readFileSync(fallback, "utf8");
+  return readFileSync("supabase/migrations/20261113000000_baseline_schema.sql", "utf8");
 };
 
 const mig = read("supabase/migrations/0080_rate_limits_and_audit.sql");

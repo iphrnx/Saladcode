@@ -17,7 +17,7 @@ const check = (label: string, ok: boolean, detail?: string) => {
 };
 const migPath = existsSync("supabase/migrations/0077_table_checks.sql")
   ? "supabase/migrations/0077_table_checks.sql"
-  : "supabase/legacy_migrations_archive/0077_table_checks.sql";
+  : "supabase/migrations/20261113000000_baseline_schema.sql";
 const mig = readFileSync(migPath, "utf8");
 const bill = readFileSync("supabase/functions/bill/index.ts", "utf8");
 const dial = readFileSync("src/components/shared/table-check-dialog.tsx", "utf8");
