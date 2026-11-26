@@ -963,7 +963,7 @@ await check('P2-11: QR reload imports browsing cart into active session once wit
   const sessionKey = keyName('cart', sessionToken)
 
   // Verify public-menu.tsx activateAndLoad performs this merge on data?.session.
-  assert.ok(publicMenuSrc.includes("readStored('cart', `browsing:${tableId}`)"))
+  assert.ok(publicMenuSrc.includes("readStoredStrict('cart', `browsing:${tableId}`)"))
   assert.ok(publicMenuSrc.includes("removeStoredStrict('cart', `browsing:${tableId}`)"))
 
   // Tab A has an item in session cart; Tab B has qty 2 in browsing cart.
@@ -1416,9 +1416,9 @@ await check('P2-20: withCrossTabCheckoutLock without Web Locks rejects contender
     () => nowMs,
   )
 
-  // Advance clock by 2.5s (beyond the old 2_000ms lease expiry) while owner is still active.
+  // Advance clock by 35s (beyond the old 30_000ms lease expiry) while owner heartbeat is active.
   await new Promise((r) => setTimeout(r, 80))
-  nowMs += 2_500
+  nowMs += 35_000
 
   let contenderRan = false
   await assert.rejects(
@@ -1449,6 +1449,87 @@ await check('P2-20: withCrossTabCheckoutLock without Web Locks rejects contender
     () => nowMs,
   )
   assert.equal(singleRes, 'single-ok')
+})
+
+// ---------------------------------------------------------------------------
+// 21. P1/P2: Failed queue reads preserve unrelated entries and block adoption
+// ---------------------------------------------------------------------------
+await check('P1/P2-21: failed queue read before confirm preserves unrelated entries; failed read blocks migration', async () => {
+  const store = new MemoryStorage()
+  let nowMs = 5_000_000
+  const queueKey = keyName('orderQueue', 'tenant-1-tok-1')
+  const entry1 = {
+    key: 'k-confirm-1',
+    kind: 'diner' as const,
+    payload: { orderType: 'DINE_IN', tableSessionToken: 'tok-1', items: [{ menuItemId: 'd1', quantity: 1 }] },
+    state: 'pending' as const,
+    attempts: 0,
+    nextAttemptAt: 0,
+    createdAt: 0,
+    itemCount: 1,
+  }
+  const entry2 = {
+    key: 'k-keep-2',
+    kind: 'diner' as const,
+    payload: { orderType: 'DINE_IN', tableSessionToken: 'tok-1', items: [{ menuItemId: 'd2', quantity: 1 }] },
+    state: 'pending' as const,
+    attempts: 0,
+    nextAttemptAt: nowMs + 60_000,
+    createdAt: 0,
+    itemCount: 1,
+  }
+  store.setItem(queueKey, JSON.stringify([entry1, entry2]))
+
+  let failReadOnFinalize = false
+  const guardedStore: StorageLike = {
+    getItem: (k) => {
+      if (failReadOnFinalize && k === queueKey) throw new Error('Read failed')
+      return store.getItem(k)
+    },
+    setItem: (k, v) => store.setItem(k, v),
+    removeItem: (k) => store.removeItem(k),
+  }
+
+  const q = new OrderQueue(
+    guardedStore,
+    queueKey,
+    (async (url: string) => {
+      if (url === '/api/orders') {
+        return new Response(JSON.stringify({ id: 'ord-1', orderNumber: 1, total: 100, sessionId: 's1', sessionToken: 'tok-1' }), {
+          status: 201,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 })
+    }) as any,
+    {
+      onConfirmed: () => {
+        // Inject read failure immediately before confirm() retires entry1.
+        failReadOnFinalize = true
+      },
+    },
+    () => nowMs,
+  )
+
+  await q.process()
+  failReadOnFinalize = false
+  // Both entries must still be intact in storage because the read failed before retirement.
+  const afterReadFail = JSON.parse(store.getItem(queueKey) || '[]')
+  assert.equal(afterReadFail.length, 2, 'unrelated reservation preserved when finalize read fails')
+
+  // Also verify migratePendingTableQueueToSession throws on source queue read error.
+  const failingMigrationStore: StorageLike = {
+    getItem: (k) => {
+      if (k.includes('table_tbl-1')) throw new Error('Source queue read error')
+      return store.getItem(k)
+    },
+    setItem: (k, v) => store.setItem(k, v),
+    removeItem: (k) => store.removeItem(k),
+  }
+  assert.throws(
+    () => migratePendingTableQueueToSession(failingMigrationStore, 'tenant-1', 'tbl-1', 'tok-1', 'qr-1'),
+    /Source queue read error/,
+  )
 })
 
 console.log(`\n${pass} passed, ${fail} failed`)

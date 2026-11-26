@@ -622,7 +622,7 @@ try {
   // A adds 1 Masala Dosa and holds its follow-up checkout response.
   await send('Page.reload', {}, sidA)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
-  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')].find(b => b.getAttribute('aria-label')?.includes('Masala Dosa'))?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
@@ -785,7 +785,7 @@ try {
   // A adds 1 Masala Dosa and holds its session order unresolved.
   await send('Page.reload', {}, sidA)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
-  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')].find(b => b.getAttribute('aria-label')?.includes('Masala Dosa'))?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
@@ -832,7 +832,7 @@ try {
 
   // 7. Reservation & confirmation races + no-Web-Locks contention/storage error:
   // (a) Pause A after backend commits and before cart deduction is saved, then attempt checkout from stale Tab B -> 1 key, 1 order.
-  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')].find(b => b.getAttribute('aria-label')?.includes('Masala Dosa'))?.click()`)
   await waitFor(async () => {
     const raw = await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-5')`)
     return JSON.parse(raw || '[]').some((c: any) => c.menuItemId === MENU_ITEMS[1].id)
@@ -916,7 +916,7 @@ try {
   // Give A 1 unsubmitted Masala Dosa in tok-browser-6.
   await send('Page.reload', {}, sidA)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
-  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')].find(b => b.getAttribute('aria-label')?.includes('Masala Dosa'))?.click()`)
   await waitFor(async () => {
     const raw = await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-6')`)
     return JSON.parse(raw || '[]').some((c: any) => c.menuItemId === MENU_ITEMS[1].id && c.quantity === 1)
@@ -1167,23 +1167,31 @@ try {
     })()`,
   )
 
-  // Arm QuotaExceededError on destination session queue write before reloading B via QR.
+  // Arm QuotaExceededError on destination cart write AND a one-shot source-cart deletion failure before reloading B via QR.
   const quotaScriptB = await send(
     'Page.addScriptToEvaluateOnNewDocument',
     {
       source: `(() => {
         const origSet = Storage.prototype.setItem;
+        const origRm = Storage.prototype.removeItem;
         Storage.prototype.setItem = function(k, v) {
-          if (this.getItem('__quota_armed') === '1' && String(k).includes('the-salad-order-queue-${TENANT.id}-tok-browser-10')) {
+          if (this.getItem('__quota_armed') === '1' && String(k).includes('the-salad-cart-session-tok-browser-10')) {
             throw new DOMException('QuotaExceededError', 'QuotaExceededError');
           }
           return origSet.call(this, k, v);
+        };
+        Storage.prototype.removeItem = function(k) {
+          if (this.getItem('__quota_rm_once') === '1' && String(k).includes('browsing:')) {
+            this.removeItem('__quota_rm_once');
+            throw new Error('Source cart delete failed');
+          }
+          return origRm.call(this, k);
         };
       })();`,
     },
     sidB,
   )
-  await evalIn(sidB, `localStorage.setItem('__quota_armed', '1')`)
+  await evalIn(sidB, `localStorage.setItem('__quota_armed', '1'); localStorage.setItem('__quota_rm_once', '1')`)
   await send('Page.navigate', { url: QR_URL }, sidB)
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
 
@@ -1238,12 +1246,19 @@ try {
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
   await waitFor(() => (state.orders.length === ordersBeforeInterrupt + 1 ? true : false))
   const firstInterruptKey = state.orders[state.orders.length - 1].idempotencyKey
-  // Add unrelated 1 Mango Lassi to browsing cart before sidA reloads for confirmation recovery.
+
+  // Stale Tab B attempts checkout while A's 1 Paneer Tikka is reserved -> must send NO POST.
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await sleep(200)
+
+  // Add 1 unsubmitted unit of the SAME dish (Paneer Tikka) + unrelated 1 Mango Lassi to browsing cart before sidA reloads.
   await evalIn(
     sidA,
     `(() => {
       const k = 'the-salad-cart-session-browsing:${TABLE.id}';
       const cur = JSON.parse(localStorage.getItem(k) || '[]');
+      const pt = cur.find((c) => c.menuItemId === '${MENU_ITEMS[0].id}');
+      if (pt) pt.quantity += 1;
       cur.push({ menuItemId: '${MENU_ITEMS[2].id}', name: 'Mango Lassi', price: 90, quantity: 1 });
       localStorage.setItem(k, JSON.stringify(cur));
     })()`,
@@ -1282,15 +1297,6 @@ try {
   await send('Page.reload', {}, sidA)
   await waitFor(() => (state.byKeyCalls.some((c) => c.key === firstInterruptKey) ? true : false))
   await sleep(200)
-  // Stale Tab B attempts checkout while A is recovering -> must not submit Paneer Tikka under a fresh key.
-  state.holdNextPost = true
-  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
-  await sleep(200)
-  state.holdNextPost = false
-  if (state.releaseHeldPost) {
-    state.orders.pop()
-    state.releaseHeldPost = null
-  }
 
   // Reload sidA to resume confirmation cleanly without failures.
   await send('Page.reload', {}, sidA)
@@ -1300,22 +1306,37 @@ try {
     return (!qRaw || JSON.parse(qRaw).length === 0) && (!qTable || JSON.parse(qTable).length === 0)
   })
   const interruptCart1 = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-11')`)) || '[]')
-  assert.equal(interruptCart1.find((c: any) => c.menuItemId === MENU_ITEMS[0].id), undefined, 'first-order Paneer Tikka deducted once')
+  assert.equal(interruptCart1.find((c: any) => c.menuItemId === MENU_ITEMS[0].id)?.quantity, 1, 'first-order Paneer Tikka deducted once leaving 1 unsubmitted unit')
   assert.equal(interruptCart1.find((c: any) => c.menuItemId === MENU_ITEMS[2].id)?.quantity, 1, 'unrelated Mango Lassi merged once')
   const paneerAttempts = state.postAttempts.slice(attemptsBeforeInterrupt).filter((a) => a.items.some((i: any) => i.menuItemId === MENU_ITEMS[0].id))
   assert.equal(paneerAttempts.length, 1, 'stale Tab B sent no duplicate POST for reserved Paneer Tikka')
 
-  // Follow-up order: interrupt queue retirement once, reload & resume with original key -> deducted once.
+  // Follow-up order: submit 1 Masala Dosa while an extra unsubmitted Masala Dosa is added before confirm,
+  // interrupt queue retirement once, reload & resume -> deducted once (leaving 1).
   await send('Page.reload', {}, sidA)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
-  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')].find(b => b.getAttribute('aria-label')?.includes('Masala Dosa'))?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
   await evalIn(sidA, `localStorage.setItem('__fail_retire_once', '1')`)
+  state.holdNextPost = true
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
-  await waitFor(() => (state.orders.length === ordersBeforeInterrupt + 2 ? true : false))
+  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
   const followUpKey = state.orders[state.orders.length - 1].idempotencyKey
+  // Add 1 unsubmitted Masala Dosa to session cart before confirmation runs so a second deduction would be observable.
+  await evalIn(
+    sidA,
+    `(() => {
+      const k = 'the-salad-cart-session-tok-browser-11';
+      const cur = JSON.parse(localStorage.getItem(k) || '[]');
+      const md = cur.find((c) => c.menuItemId === '${MENU_ITEMS[1].id}');
+      if (md) md.quantity += 1;
+      localStorage.setItem(k, JSON.stringify(cur));
+    })()`,
+  )
+  state.releaseHeldPost!()
+  state.releaseHeldPost = null
   await sleep(200)
   await send('Page.reload', {}, sidA)
   await waitFor(() => (state.byKeyCalls.some((c) => c.key === followUpKey) ? true : false))
@@ -1324,8 +1345,7 @@ try {
     return !qRaw || JSON.parse(qRaw).length === 0
   })
   const interruptCart2 = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-11')`)) || '[]')
-  assert.equal(interruptCart2.find((c: any) => c.menuItemId === MENU_ITEMS[1].id), undefined, 'follow-up Masala Dosa deducted once')
-  assert.equal(interruptCart2.find((c: any) => c.menuItemId === MENU_ITEMS[2].id)?.quantity, 1, 'unrelated Mango Lassi preserved across follow-up replay')
+  assert.equal(interruptCart2.find((c: any) => c.menuItemId === MENU_ITEMS[1].id)?.quantity, 1, 'follow-up Masala Dosa deducted once leaving 1 unsubmitted unit')
   await send('Page.removeScriptToEvaluateOnNewDocument', { identifier: interruptScriptA.identifier }, sidA)
   console.log('  ok    Browser test 13: Interrupted first & follow-up confirmations replay idempotently without double deduction')
 

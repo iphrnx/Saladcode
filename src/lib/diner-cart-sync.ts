@@ -197,14 +197,13 @@ export function migratePendingTableQueueToSession(
 ): MigrationResult {
   const sessionQueueKey = keyName('orderQueue', `${tenantId}-${sessionToken}`)
   const readEntries = (k: string): QueueEntry[] => {
-    try {
-      const raw = storage.getItem(k)
-      if (!raw) return []
-      const parsed = JSON.parse(raw)
-      return Array.isArray(parsed) ? parsed : []
-    } catch {
-      return []
+    const raw = storage.getItem(k)
+    if (raw === null || raw === '') return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) {
+      throw new Error(`Invalid queue state for ${k}`)
     }
+    return parsed
   }
 
   let sessionEntries = readEntries(sessionQueueKey)
@@ -328,13 +327,16 @@ export class CheckoutLockError extends Error {
 
 const CHECKOUT_LOCK_TTL_MS = 30_000
 const CHECKOUT_LOCK_SETTLE_MS = 45
+const CHECKOUT_LOCK_HEARTBEAT_MS = 150
+const CHECKOUT_LOCK_CHANNEL = 'the_salad_checkout_lock_ping'
 
 /**
  * Acquire an exclusive cross-tab lock for a given cart scope so two tabs
  * cannot read the same cart snapshot and enqueue duplicate idempotency keys.
- * Uses navigator.locks when available and a non-stealing settle-and-verify
- * localStorage lock fallback when Web Locks are unavailable; fails closed
- * with a retryable CheckoutLockError if exclusive ownership cannot be established.
+ * Uses navigator.locks when available and a heartbeat + BroadcastChannel +
+ * settle-and-verify localStorage lock fallback when Web Locks are unavailable;
+ * fails closed with a retryable CheckoutLockError if exclusive ownership
+ * cannot be established.
  */
 export async function withCrossTabCheckoutLock<T>(
   storage: StorageLike | null | undefined,
@@ -358,22 +360,85 @@ export async function withCrossTabCheckoutLock<T>(
     return navigator.locks.request(lockKey, async () => fn())
   }
 
+  const pingOwnerAlive = (ownerNonce: string): Promise<boolean> => {
+    if (typeof BroadcastChannel === 'undefined') return Promise.resolve(false)
+    return new Promise((resolve) => {
+      let settled = false
+      const bc = new BroadcastChannel(CHECKOUT_LOCK_CHANNEL)
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true
+          try {
+            bc.close()
+          } catch {}
+          resolve(false)
+        }
+      }, 30)
+      bc.onmessage = (ev) => {
+        if (
+          !settled &&
+          ev.data?.type === 'LOCK_ALIVE' &&
+          ev.data?.lockKey === lockKey &&
+          ev.data?.nonce === ownerNonce
+        ) {
+          settled = true
+          clearTimeout(timer)
+          try {
+            bc.close()
+          } catch {}
+          resolve(true)
+        }
+      }
+      try {
+        bc.postMessage({ type: 'LOCK_PING', lockKey, nonce: ownerNonce })
+      } catch {
+        settled = true
+        clearTimeout(timer)
+        try {
+          bc.close()
+        } catch {}
+        resolve(false)
+      }
+    })
+  }
+
   const nonce = `${now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   let acquired = false
   for (let attempt = 0; attempt < 25; attempt++) {
     let shouldSettle = false
+    let activeOwnerNonce: string | null = null
     try {
       const raw = storage.getItem(lockKey)
       const parsed = raw ? JSON.parse(raw) : null
       const expired =
         !parsed || typeof parsed.ts !== 'number' || now() - parsed.ts > CHECKOUT_LOCK_TTL_MS
-      // Never overwrite an active owner's lock; only claim when empty/expired or already ours.
       if (expired || parsed.nonce === nonce) {
-        storage.setItem(lockKey, JSON.stringify({ nonce, ts: now() }))
-        shouldSettle = true
+        if (parsed && parsed.nonce && parsed.nonce !== nonce) {
+          activeOwnerNonce = parsed.nonce
+        } else {
+          storage.setItem(lockKey, JSON.stringify({ nonce, ts: now() }))
+          shouldSettle = true
+        }
       }
     } catch {
       throw new CheckoutLockError('Unable to access cart storage. Please try again.')
+    }
+    if (activeOwnerNonce) {
+      const alive = await pingOwnerAlive(activeOwnerNonce)
+      if (!alive) {
+        try {
+          const raw = storage.getItem(lockKey)
+          const parsed = raw ? JSON.parse(raw) : null
+          const stillExpired =
+            !parsed || typeof parsed.ts !== 'number' || now() - parsed.ts > CHECKOUT_LOCK_TTL_MS
+          if (stillExpired) {
+            storage.setItem(lockKey, JSON.stringify({ nonce, ts: now() }))
+            shouldSettle = true
+          }
+        } catch {
+          throw new CheckoutLockError('Unable to access cart storage. Please try again.')
+        }
+      }
     }
     if (shouldSettle) {
       // Wait for cross-tab storage IPC to settle before verifying exclusive ownership.
@@ -397,9 +462,43 @@ export async function withCrossTabCheckoutLock<T>(
     )
   }
 
-  try {
-    return await fn()
-  } finally {
+  const refreshLock = () => {
+    try {
+      const cur = storage.getItem(lockKey)
+      if (cur && JSON.parse(cur)?.nonce === nonce) {
+        storage.setItem(lockKey, JSON.stringify({ nonce, ts: now() }))
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  const heartbeat = setInterval(refreshLock, CHECKOUT_LOCK_HEARTBEAT_MS)
+  if (typeof (heartbeat as { unref?: () => void }).unref === 'function') {
+    (heartbeat as { unref: () => void }).unref()
+  }
+
+  let ownerBc: BroadcastChannel | null = null
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      ownerBc = new BroadcastChannel(CHECKOUT_LOCK_CHANNEL)
+      ownerBc.onmessage = (ev) => {
+        if (
+          ev.data?.type === 'LOCK_PING' &&
+          ev.data?.lockKey === lockKey &&
+          ev.data?.nonce === nonce
+        ) {
+          refreshLock()
+          try {
+            ownerBc?.postMessage({ type: 'LOCK_ALIVE', lockKey, nonce })
+          } catch {}
+        }
+      }
+    } catch {
+      ownerBc = null
+    }
+  }
+
+  const releaseLock = () => {
     try {
       const cur = storage.getItem(lockKey)
       if (cur && JSON.parse(cur)?.nonce === nonce) {
@@ -408,6 +507,24 @@ export async function withCrossTabCheckoutLock<T>(
     } catch {
       /* ignore */
     }
+  }
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('pagehide', releaseLock)
+  }
+
+  try {
+    return await fn()
+  } finally {
+    clearInterval(heartbeat)
+    if (ownerBc) {
+      try {
+        ownerBc.close()
+      } catch {}
+    }
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('pagehide', releaseLock)
+    }
+    releaseLock()
   }
 }
 

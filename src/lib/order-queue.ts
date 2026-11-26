@@ -325,6 +325,27 @@ export class OrderQueue {
     }
   }
 
+  private loadStrict(): QueueEntry[] {
+    const reader =
+      (this.storage as { getItemStrict?: (k: string) => string | null }).getItemStrict ??
+      this.storage.getItem
+    const raw = reader.call(this.storage, this.storageKey)
+    if (raw === null || raw === '') return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) {
+      throw new Error('Corrupt order queue state')
+    }
+    const now = this.now()
+    return parsed.map((e: QueueEntry) => {
+      if (e.state === 'submitting') {
+        if (!this.processing && (e.claimAt == null || now - e.claimAt > CLAIM_STALE_MS)) {
+          return { ...e, state: 'pending', claimId: null, claimAt: null }
+        }
+      }
+      return e
+    })
+  }
+
   private save(entries: QueueEntry[]) {
     try {
       this.storage.setItem(this.storageKey, JSON.stringify(entries))
@@ -370,21 +391,25 @@ export class OrderQueue {
 
   /** Human retry of a failed entry: reset the clock, keep the key. */
   retry(key: string) {
-    const entries = this.load().map((e) =>
-      e.key === key
-        ? {
-            ...e,
-            state: 'pending' as const,
-            attempts: 0,
-            nextAttemptAt: this.now(),
-            lastError: undefined,
-            claimId: null,
-            claimAt: null,
-          }
-        : e,
-    )
-    this.save(entries)
-    void this.process()
+    try {
+      const entries = this.loadStrict().map((e) =>
+        e.key === key
+          ? {
+              ...e,
+              state: 'pending' as const,
+              attempts: 0,
+              nextAttemptAt: this.now(),
+              lastError: undefined,
+              claimId: null,
+              claimAt: null,
+            }
+          : e,
+      )
+      this.saveStrict(entries)
+      void this.process()
+    } catch {
+      /* read/write failed — leave stored entries intact and defer */
+    }
   }
 
   /** Retry all failed entries in the queue. */
@@ -421,7 +446,7 @@ export class OrderQueue {
       }
       if (lookup.status === 404 || lookup.status === 401 || lookup.status === 403) {
         // The server definitely does not have this order; dropping is safe.
-        this.save(this.load().filter((e) => e.key !== key))
+        this.saveStrict(this.loadStrict().filter((e) => e.key !== key))
         return 'removed'
       }
       // 5xx means the server is unstable — we still cannot be sure the order committed.
@@ -441,7 +466,12 @@ export class OrderQueue {
 
   /** Safely retire a failed entry after user notification, moving it to historical error log. */
   retire(key: string) {
-    const entries = this.load()
+    let entries: QueueEntry[]
+    try {
+      entries = this.loadStrict()
+    } catch {
+      return
+    }
     const entry = entries.find((e) => e.key === key)
     if (!entry) return
     try {
@@ -451,7 +481,11 @@ export class OrderQueue {
       history.unshift({ ...entry, retiredAt: this.now() })
       this.storage.setItem(historyKey, JSON.stringify(history.slice(0, 30)))
     } catch {}
-    this.save(entries.filter((e) => e.key !== key))
+    try {
+      this.saveStrict(entries.filter((e) => e.key !== key))
+    } catch {
+      /* defer retirement if write fails */
+    }
   }
 
   /** Safely retire all failed entries from active queue to history. */
@@ -463,41 +497,27 @@ export class OrderQueue {
   }
 
   private async confirm(key: string, order: any) {
-    const entries = this.load()
+    let entries: QueueEntry[]
+    try {
+      entries = this.loadStrict()
+    } catch {
+      return
+    }
     const entry = entries.find((e) => e.key === key)
     if (!entry) return
     let finalized = false
     const finalize = () => {
       if (finalized) return
-      this.saveStrict(this.load().filter((e) => e.key !== key))
+      const latest = this.loadStrict()
+      this.saveStrict(latest.filter((e) => e.key !== key))
       finalized = true
     }
-    try {
-      const res = await this.hooks.onConfirmed?.(order, entry, finalize)
-      if (res === false) {
-        if (!finalized) {
-          this.save(
-            this.load().map((e) =>
-              e.key === key
-                ? {
-                    ...e,
-                    state: 'pending' as const,
-                    attempts: Math.max(1, e.attempts || 1),
-                    nextAttemptAt: this.now() + 1000,
-                    claimId: null,
-                    claimAt: null,
-                  }
-                : e,
-            ),
-          )
-        }
-        return
-      }
-      finalize()
-    } catch {
-      if (!finalized) {
-        this.save(
-          this.load().map((e) =>
+    const deferPending = () => {
+      if (finalized) return
+      try {
+        const latest = this.loadStrict()
+        this.saveStrict(
+          latest.map((e) =>
             e.key === key
               ? {
                   ...e,
@@ -510,7 +530,19 @@ export class OrderQueue {
               : e,
           ),
         )
+      } catch {
+        /* read/write failed — leave stored entries intact */
       }
+    }
+    try {
+      const res = await this.hooks.onConfirmed?.(order, entry, finalize)
+      if (res === false) {
+        deferPending()
+        return
+      }
+      finalize()
+    } catch {
+      deferPending()
     }
   }
 
@@ -525,7 +557,12 @@ export class OrderQueue {
     try {
       for (;;) {
         const now = this.now()
-        const entries = this.load()
+        let entries: QueueEntry[]
+        try {
+          entries = this.loadStrict()
+        } catch {
+          return
+        }
         const due = entries.find(
           (e) =>
             (e.state === 'pending' || (e.state === 'submitting' && (e.claimAt == null || now - e.claimAt > CLAIM_STALE_MS))) &&
@@ -535,17 +572,27 @@ export class OrderQueue {
         if (!due) return
 
         const claimId = newClaimId()
-        let claimed = entries.map((e) =>
+        const claimed = entries.map((e) =>
           e.key === due.key ? { ...e, state: 'submitting' as const, claimId, claimAt: now } : e,
         )
         this.save(claimed)
 
         // Readback: the last writer holds the claim.
-        const held = this.load().find((e) => e.key === due.key)
+        let held: QueueEntry | undefined
+        try {
+          held = this.loadStrict().find((e) => e.key === due.key)
+        } catch {
+          return
+        }
         if (!held || held.claimId !== claimId) continue
 
         const result = await submitEntry(held, this.fetcher)
-        const currentEntries = this.load()
+        let currentEntries: QueueEntry[]
+        try {
+          currentEntries = this.loadStrict()
+        } catch {
+          return
+        }
         const stolen = currentEntries.some(
           (e) =>
             e.key === due.key &&
@@ -560,11 +607,15 @@ export class OrderQueue {
           await this.confirm(due.key, result.order)
         } else if (result.outcome === 'rejected') {
           const failedEntry = { ...held, state: 'failed' as const, lastError: result.error, errorCode: result.code, claimId: null, claimAt: null }
-          this.save(
-            currentEntries.map((e) =>
-              e.key === due.key ? failedEntry : e,
-            ),
-          )
+          try {
+            this.saveStrict(
+              currentEntries.map((e) =>
+                e.key === due.key ? failedEntry : e,
+              ),
+            )
+          } catch {
+            return
+          }
           this.hooks.onFailed?.(result.error, failedEntry, result.code)
         } else {
           const attempts = held.attempts + 1
@@ -579,11 +630,15 @@ export class OrderQueue {
             claimId: null,
             claimAt: null,
           }
-          this.save(
-            currentEntries.map((e) =>
-              e.key === due.key ? updatedEntry : e,
-            ),
-          )
+          try {
+            this.saveStrict(
+              currentEntries.map((e) =>
+                e.key === due.key ? updatedEntry : e,
+              ),
+            )
+          } catch {
+            return
+          }
           if (isFailed) {
             this.hooks.onFailed?.(result.error, updatedEntry, result.code)
           }
@@ -632,8 +687,12 @@ export function orderQueue(tenantId: string, actorId: string, hooks: QueueHooks 
   if (!q) {
     // Scoped by restaurant AND actor: a queue never crosses either boundary.
     const suffix = `${tenantId}-${actorId}`
-    const storage: StorageLike & { setItemStrict?: (k: string, v: string) => void } = {
+    const storage: StorageLike & {
+      getItemStrict?: (k: string) => string | null
+      setItemStrict?: (k: string, v: string) => void
+    } = {
       getItem: () => readStored('orderQueue', suffix),
+      getItemStrict: () => readStoredStrict('orderQueue', suffix),
       setItem: (_k, v) => writeStored('orderQueue', v, suffix),
       setItemStrict: (_k, v) => writeStoredStrict('orderQueue', v, suffix),
       removeItem: () => removeStored('orderQueue', suffix),

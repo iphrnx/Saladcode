@@ -40,7 +40,7 @@ import {
   subtractUnresolvedQueueQuantities,
   withCrossTabCheckoutLock,
 } from '@/lib/diner-cart-sync'
-import { keyName, readStored, removeStored, removeStoredStrict, writeStored, writeStoredStrict } from '@/lib/storage-keys'
+import { keyName, readStored, readStoredStrict, removeStored, removeStoredStrict, writeStored, writeStoredStrict } from '@/lib/storage-keys'
 import { DinerOrderTracker } from '@/components/public/diner-order-tracker'
 import {
   canonicalPortionName,
@@ -256,27 +256,35 @@ function setStoredDinerSessionStrict(restaurantId: string, tableId: string, sess
   )
 }
 
-function hasAppliedCartConfirmation(tenantId: string, entryKey: string): boolean {
-  try {
-    const raw = localStorage.getItem(`the-salad-confirmed-keys-${tenantId}`)
-    if (!raw) return false
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) && parsed.includes(entryKey)
-  } catch {
-    return false
+class QueueReadError extends Error {
+  constructor(message = 'Unable to read reservation state.') {
+    super(message)
+    this.name = 'QueueReadError'
   }
 }
 
-function markCartConfirmationApplied(tenantId: string, entryKey: string): void {
-  const key = `the-salad-confirmed-keys-${tenantId}`
-  let existing: string[] = []
+function getPendingConfirmationTarget(tenantId: string, entryKey: string): CartItem[] | null {
+  try {
+    const raw = localStorage.getItem(`the-salad-confirmed-targets-${tenantId}`)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return null
+    const found = parsed.find((x: any) => x && x.key === entryKey)
+    return found && Array.isArray(found.targetCart) ? found.targetCart : null
+  } catch {
+    return null
+  }
+}
+
+function savePendingConfirmationTarget(tenantId: string, entryKey: string, targetCart: CartItem[]): void {
+  const key = `the-salad-confirmed-targets-${tenantId}`
+  let existing: Array<{ key: string; targetCart: CartItem[] }> = []
   try {
     const raw = localStorage.getItem(key)
     const parsed = raw ? JSON.parse(raw) : []
-    if (Array.isArray(parsed)) existing = parsed
+    if (Array.isArray(parsed)) existing = parsed.filter((x: any) => x && x.key !== entryKey)
   } catch {}
-  if (existing.includes(entryKey)) return
-  const next = [entryKey, ...existing].slice(0, 30)
+  const next = [{ key: entryKey, targetCart }, ...existing].slice(0, 20)
   localStorage.setItem(key, JSON.stringify(next))
 }
 
@@ -286,28 +294,54 @@ function performBrowsingTransferToSession(
   adoptedToken: string,
   qrToken: string | null,
 ): CartItem[] | null {
-  const browsingRaw = tableId ? readStored('cart', `browsing:${tableId}`) : null
-  let browsingItems: CartItem[] = []
+  let browsingRaw: string | null = null
   try {
-    const parsed = browsingRaw ? JSON.parse(browsingRaw) : []
-    if (Array.isArray(parsed)) browsingItems = parsed
+    browsingRaw = tableId ? readStoredStrict('cart', `browsing:${tableId}`) : null
+  } catch {
+    throw new QueueReadError('Unable to read browsing cart.')
+  }
+  let browsingItems: CartItem[] = []
+  if (browsingRaw !== null && browsingRaw !== '') {
+    try {
+      const parsed = JSON.parse(browsingRaw)
+      if (!Array.isArray(parsed)) throw new Error('Corrupt browsing cart')
+      browsingItems = parsed
+    } catch {
+      throw new QueueReadError('Corrupt browsing cart.')
+    }
+  }
+
+  let sessionEntries: QueueEntry[] = []
+  let sourcePendingEntries: QueueEntry[] = []
+  try {
+    sessionEntries = readQueueStrict(tenantId, adoptedToken)
+    if (tableId) {
+      sourcePendingEntries = [...sourcePendingEntries, ...readQueueStrict(tenantId, `table_${tableId}`)]
+    }
+    if (qrToken) {
+      sourcePendingEntries = [...sourcePendingEntries, ...readQueueStrict(tenantId, `qr_${qrToken}`)]
+    }
+  } catch {
+    throw new QueueReadError('Unable to read pending reservations.')
+  }
+
+  const browsingSuffix = tableId ? `browsing:${tableId}` : null
+  const transferDoneKey = `the-salad-transfer-done-${tenantId}-${tableId || 'none'}-${adoptedToken}`
+  let alreadyMerged = false
+  try {
+    alreadyMerged = localStorage.getItem(transferDoneKey) === '1'
   } catch {}
 
-  const { migratedEntries } = migratePendingTableQueueToSession(
-    window.localStorage,
-    tenantId,
-    tableId,
-    adoptedToken,
-    qrToken,
-    browsingItems.length > 0,
-  )
-
   let mergedResult: CartItem[] | null = null
-  if (tableId && browsingRaw !== null) {
+  if (tableId && browsingRaw !== null && !alreadyMerged) {
     if (browsingItems.length > 0) {
+      const activeBrowsingReservations = reservationsForSourceCart(
+        [...sessionEntries, ...sourcePendingEntries],
+        browsingSuffix,
+      )
       const unsubmittedBrowsing = subtractUnresolvedQueueQuantities(
         browsingItems,
-        migratedEntries,
+        activeBrowsingReservations,
       )
       if (unsubmittedBrowsing.length > 0) {
         const sessionRaw = readStored('cart', adoptedToken)
@@ -320,8 +354,24 @@ function performBrowsingTransferToSession(
         mergedResult = merged
       }
     }
+    localStorage.setItem(transferDoneKey, '1')
+  }
+
+  migratePendingTableQueueToSession(
+    window.localStorage,
+    tenantId,
+    tableId,
+    adoptedToken,
+    qrToken,
+    browsingItems.length > 0,
+  )
+
+  if (tableId && browsingRaw !== null) {
     removeStoredStrict('cart', `browsing:${tableId}`)
   }
+  try {
+    localStorage.removeItem(transferDoneKey)
+  } catch {}
   return mergedResult
 }
 
@@ -722,8 +772,8 @@ export function PublicMenu() {
       tableId: string | null | undefined,
       adoptedToken: string,
       qrToken: string | null,
-    ) {
-      if (typeof window === 'undefined' || !tenantId || !adoptedToken) return
+    ): Promise<'ok' | 'read_error' | 'quota_retry'> {
+      if (typeof window === 'undefined' || !tenantId || !adoptedToken) return 'ok'
       const runTransfer = () => {
         performBrowsingTransferToSession(tenantId, tableId, adoptedToken, qrToken)
       }
@@ -735,8 +785,12 @@ export function PublicMenu() {
         } else {
           runTransfer()
         }
-      } catch {
-        /* preserve browsing cart & queue on interrupted transfer so reload retries safely */
+        return 'ok'
+      } catch (err) {
+        if (err instanceof QueueReadError) {
+          return 'read_error'
+        }
+        return 'quota_retry'
       }
     }
 
@@ -784,12 +838,30 @@ export function PublicMenu() {
           }
 
           if (data?.session) {
-            await transferBrowsingStateToSession(
+            const transferStatus = await transferBrowsingStateToSession(
               data.tenant.id,
               data?.table?.id,
               data.session.token,
               qrToken,
             )
+            if (transferStatus === 'read_error') {
+              setSessionToken(null)
+              setSessionId(null)
+              setTenant(data.tenant)
+              setTable(data.table)
+              setSessionTenantId(data.tenant.id)
+              setSessionTableId(data.table.id)
+              setCategories(data.categories || [])
+              setMenuItems(data.menuItems || [])
+              setSocial(data.social || {})
+              setServerTheme(normaliseMenuTheme(data.theme))
+              setSessionState('active')
+              setLoading(false)
+              setTimeout(() => {
+                if (!cancelled) setRevalidateNonce((n) => n + 1)
+              }, 1000)
+              return
+            }
             adopt({ token: data.session.token, tenantId: data.tenant.id, tableId: data.table.id }, data)
             setStoredDinerSession(data.tenant.id, data.table.id, {
               sessionId: data.session.id,
@@ -849,12 +921,30 @@ export function PublicMenu() {
           return
         }
 
-        await transferBrowsingStateToSession(
+        const transferStatus = await transferBrowsingStateToSession(
           anyStored.restaurantId,
           anyStored.tableId,
           anyStored.sessionToken,
           null,
         )
+        if (transferStatus === 'read_error') {
+          setSessionToken(null)
+          setSessionId(null)
+          setTenant(data.tenant)
+          setTable(data.table)
+          setSessionTenantId(anyStored.restaurantId)
+          setSessionTableId(anyStored.tableId)
+          setCategories(data.categories || [])
+          setMenuItems(data.menuItems || [])
+          setSocial(data.social || {})
+          setServerTheme(normaliseMenuTheme(data.theme))
+          setSessionState('active')
+          setLoading(false)
+          setTimeout(() => {
+            if (!cancelled) setRevalidateNonce((n) => n + 1)
+          }, 1000)
+          return
+        }
         adopt({ token: anyStored.sessionToken, tenantId: anyStored.restaurantId, tableId: anyStored.tableId }, data)
         setSessionState('active')
         setLoading(false)
@@ -1395,7 +1485,7 @@ export function PublicMenu() {
 
             let nextCart: CartItem[]
             const tenantKey = tId || 'diner'
-            const alreadyApplied = hasAppliedCartConfirmation(tenantKey, entry.key)
+            const recordedTarget = getPendingConfirmationTarget(tenantKey, entry.key)
             const fromSeparateBrowsingCart =
               Boolean(entry.cartDeducted) ||
               Boolean(
@@ -1405,7 +1495,12 @@ export function PublicMenu() {
               )
 
             if (adoptingNewSession) {
-              if (!alreadyApplied && !entry.cartDeducted) {
+              if (recordedTarget !== null) {
+                nextCart = recordedTarget
+                if (nextCart.length > 0) {
+                  writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
+                }
+              } else if (!entry.cartDeducted) {
                 const browsingSuffix = tblId ? `browsing:${tblId}` : null
                 let latestBrowsing: CartItem[] = [...cartRef.current]
                 if (browsingSuffix) {
@@ -1431,10 +1526,10 @@ export function PublicMenu() {
                   remainingBrowsing.length > 0
                     ? mergeBrowsingRemainderIntoSession(existingSessionCart, remainingBrowsing)
                     : existingSessionCart
+                savePendingConfirmationTarget(tenantKey, entry.key, nextCart)
                 if (nextCart.length > 0) {
                   writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
                 }
-                markCartConfirmationApplied(tenantKey, entry.key)
               } else {
                 nextCart = existingSessionCart
               }
@@ -1450,27 +1545,26 @@ export function PublicMenu() {
             } else if (fromSeparateBrowsingCart) {
               // Quantities for this recovered checkout came from a separate browsing
               // cart; do not deduct them from the session cart.
-              if (alreadyApplied) {
-                nextCart = existingSessionCart
+              if (recordedTarget !== null) {
+                nextCart = recordedTarget
               } else if (lastSyncedCartRef.current.suffix === order.sessionToken) {
                 nextCart = reconcileCartOnSave(
                   cartRef.current,
                   lastSyncedCartRef.current.items,
                   existingSessionCart,
                 )
-                writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
-                markCartConfirmationApplied(tenantKey, entry.key)
+                savePendingConfirmationTarget(tenantKey, entry.key, nextCart)
               } else {
                 nextCart = existingSessionCart
-                writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
-                markCartConfirmationApplied(tenantKey, entry.key)
+                savePendingConfirmationTarget(tenantKey, entry.key, nextCart)
               }
+              writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
             } else {
               // Reconcile confirmed quantities against the previous sync baseline and
-              // latest saved cart, persisting before advancing lastSyncedCartRef or
-              // releasing the queue reservation.
-              if (alreadyApplied) {
-                nextCart = existingSessionCart
+              // latest saved cart, persisting target before writing cart so any
+              // partial failure replays idempotently without double deduction.
+              if (recordedTarget !== null) {
+                nextCart = recordedTarget
               } else {
                 const baseline =
                   lastSyncedCartRef.current.suffix === order.sessionToken
@@ -1482,9 +1576,9 @@ export function PublicMenu() {
                   existingSessionCart,
                   submittedItems,
                 )
-                writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
-                markCartConfirmationApplied(tenantKey, entry.key)
+                savePendingConfirmationTarget(tenantKey, entry.key, nextCart)
               }
+              writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
             }
 
             finalize?.()
