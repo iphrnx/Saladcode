@@ -740,6 +740,114 @@ check("PR#14 P2-2 (partial write fault): canonical write failure preserves sourc
   assert.equal(tryRecoverDraftToUnattachedCart(T, U, [], "sess-partial").ok, false, "cannot recover a second time");
 });
 
+check("PR#14 P2-1 (cleanup failure): failed recovery-entry removal after destination commit cannot recover twice across reload", () => {
+  clearPosCart(T, U);
+
+  saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-cleanup-fail",
+    cart: [{ menuItemId: "m1", name: "Burger", price: 150, quantity: 2 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-1",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  const origRemoveItem = (globalThis as any).localStorage.removeItem;
+  const origSetItem = (globalThis as any).localStorage.setItem;
+  // Simulate failure on recovery-entry removal/update
+  (globalThis as any).localStorage.removeItem = (k: string) => {
+    if (k.includes("-recoverable")) throw new DOMException("StorageError", "StorageError");
+    return origRemoveItem(k);
+  };
+  (globalThis as any).localStorage.setItem = (k: string, v: string) => {
+    if (k.includes("-recoverable")) throw new DOMException("StorageError", "StorageError");
+    return origSetItem(k, v);
+  };
+
+  const res = tryRecoverDraftToUnattachedCart(T, U, [], "sess-cleanup-fail");
+  assert.equal(res.ok, true);
+  if (res.ok) {
+    assert.equal(res.snapshot.cart[0].quantity, 2);
+  }
+
+  // Even though -recoverable key couldn't be deleted, consumed marker prevents re-recovery
+  assert.equal(getRecoverablePosDraft(T, U, "sess-cleanup-fail"), null);
+  assert.equal(getRecoverablePosDrafts(T, U).length, 0);
+
+  // Restore storage, simulate submitting/clearing restored cart and reloading -> still cannot recover twice
+  (globalThis as any).localStorage.removeItem = origRemoveItem;
+  (globalThis as any).localStorage.setItem = origSetItem;
+  const reloaded = restorePosCart(T, U);
+  assert.equal(reloaded?.cart[0].quantity, 2);
+  clearPosSessionDraft(T, U, null);
+  assert.equal(tryRecoverDraftToUnattachedCart(T, U, [], "sess-cleanup-fail").ok, false);
+});
+
+check("PR#14 P2-2 (legacy cleanup): writeStored returns true when canonical write succeeds even if legacy removal throws", () => {
+  const origRemoveItem = (globalThis as any).localStorage.removeItem;
+  (globalThis as any).localStorage.removeItem = (k: string) => {
+    if (k.startsWith("toastly-") || k.startsWith("swixo-")) {
+      throw new DOMException("SecurityError", "SecurityError");
+    }
+    return origRemoveItem(k);
+  };
+
+  const ok = writeStored("posCart", JSON.stringify({ hello: "world" }), "legacy-test");
+  assert.equal(ok, true, "canonical write succeeded so writeStored must return true");
+  assert.equal(
+    (globalThis as any).localStorage.getItem("the-salad-pos-cart-legacy-test"),
+    JSON.stringify({ hello: "world" }),
+  );
+  (globalThis as any).localStorage.removeItem = origRemoveItem;
+});
+
+check("PR#14 P2-3 (cross-tab): stale tab with empty in-memory cart cannot overwrite another tab's saved unattached cart", () => {
+  clearPosCart(T, U);
+
+  // Tab B saves an unattached cart
+  savePosSessionDraft(T, U, null, {
+    cart: [{ menuItemId: "m3", name: "Fries", price: 90, quantity: 1 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-9",
+    selectedSessionId: null,
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  // Closed sitting recoverable draft exists
+  saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-tab-race",
+    cart: [{ menuItemId: "m2", name: "Pasta", price: 250, quantity: 2 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-2",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  // Tab A has stale empty in-memory cart `[]` and attempts recovery -> must refuse!
+  const blocked = tryRecoverDraftToUnattachedCart(T, U, [], "sess-tab-race");
+  assert.equal(blocked.ok, false);
+  if (!blocked.ok) assert.equal(blocked.reason, "non_empty");
+
+  // Both Tab B's cart and the recoverable draft are preserved intact
+  const tabBCart = restorePosCart(T, U);
+  assert.equal(tabBCart?.cart[0].menuItemId, "m3");
+  assert.equal(tabBCart?.cart[0].quantity, 1);
+  assert.equal(getRecoverablePosDraft(T, U, "sess-tab-race")?.cart[0].quantity, 2);
+
+  // After Tab B clears its unattached cart, retry succeeds once
+  clearPosSessionDraft(T, U, null);
+  const retried = tryRecoverDraftToUnattachedCart(T, U, [], "sess-tab-race");
+  assert.equal(retried.ok, true);
+  if (retried.ok) {
+    assert.equal(retried.snapshot.cart[0].menuItemId, "m2");
+    assert.equal(retried.snapshot.cart[0].quantity, 2);
+  }
+});
+
 delete (globalThis as any).localStorage;
 
 // ── 2. UI & Edge Function Isolation Static Invariants ────────────────────────

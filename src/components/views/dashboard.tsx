@@ -1383,6 +1383,8 @@ export function DashboardView() {
       if (!res.ok) {
         if (res.reason === 'storage_error') {
           toast.error('Could not restore items — browser storage is full. Please free space and retry.')
+        } else if (res.reason === 'non_empty') {
+          toast.info('An unattached cart already has items. Clear or submit it before recovering.')
         }
         return
       }

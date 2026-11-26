@@ -95,11 +95,13 @@ function sessionDraftKey(sessionKey?: string | null): string {
   return sessionKey?.trim() ? `sess_${sessionKey.trim()}` : 'default'
 }
 
+const CONSUMED_RECOVERY_KEY = '__consumed_recoveries'
+
 /** Read all session drafts for this tenant+user. */
-function getPosSessionDrafts(
+function getPosSessionDraftsRaw(
   tenantId: string,
   userId: string,
-): Record<string, PosCartSnapshot> {
+): Record<string, any> {
   const raw = readStored('posCart', draftsSuffix(tenantId, userId))
   if (!raw) return {}
   try {
@@ -110,20 +112,54 @@ function getPosSessionDrafts(
   }
 }
 
+function getPosSessionDrafts(
+  tenantId: string,
+  userId: string,
+): Record<string, PosCartSnapshot> {
+  const raw = getPosSessionDraftsRaw(tenantId, userId)
+  const out: Record<string, PosCartSnapshot> = {}
+  for (const [k, v] of Object.entries(raw)) {
+    if (k === CONSUMED_RECOVERY_KEY) continue
+    if (v && Array.isArray(v.cart)) {
+      out[k] = v as PosCartSnapshot
+    }
+  }
+  return out
+}
+
+function getConsumedRecoveries(
+  tenantId: string,
+  userId: string,
+): Record<string, number> {
+  const raw = getPosSessionDraftsRaw(tenantId, userId)
+  const map = raw[CONSUMED_RECOVERY_KEY]
+  return map && typeof map === 'object' ? (map as Record<string, number>) : {}
+}
+
 /** Save a draft for a specific session (or default unattached cart). Returns true if persisted. */
 export function savePosSessionDraft(
   tenantId: string,
   userId: string,
   sessionKey: string | null | undefined,
   snapshot: Omit<PosCartSnapshot, 'savedAt'>,
+  consumedRecovery?: { sessionId: string; savedAt: number },
 ): boolean {
-  const drafts = getPosSessionDrafts(tenantId, userId)
+  const drafts = getPosSessionDraftsRaw(tenantId, userId)
   const key = sessionDraftKey(sessionKey)
   const now = Date.now()
   if (snapshot.cart.length === 0) {
     delete drafts[key]
   } else {
     drafts[key] = { ...snapshot, savedAt: now }
+  }
+  if (consumedRecovery?.sessionId) {
+    const prevConsumed = drafts[CONSUMED_RECOVERY_KEY] && typeof drafts[CONSUMED_RECOVERY_KEY] === 'object'
+      ? drafts[CONSUMED_RECOVERY_KEY]
+      : {}
+    drafts[CONSUMED_RECOVERY_KEY] = {
+      ...prevConsumed,
+      [consumedRecovery.sessionId]: consumedRecovery.savedAt,
+    }
   }
   const draftsOk = writeStored('posCart', JSON.stringify(drafts), draftsSuffix(tenantId, userId))
   if (!draftsOk) return false
@@ -157,7 +193,7 @@ export function clearPosSessionDraft(
   userId: string,
   sessionKey: string | null | undefined,
 ): void {
-  const drafts = getPosSessionDrafts(tenantId, userId)
+  const drafts = getPosSessionDraftsRaw(tenantId, userId)
   const key = sessionDraftKey(sessionKey)
   delete drafts[key]
   writeStored('posCart', JSON.stringify(drafts), draftsSuffix(tenantId, userId))
@@ -222,20 +258,23 @@ function readRecoverableDraftMap(
 ): Record<string, RecoverablePosDraft> {
   const raw = readStored('posCart', recoverableSuffix(tenantId, userId))
   if (!raw) return {}
+  const consumed = getConsumedRecoveries(tenantId, userId)
   try {
     const parsed = JSON.parse(raw)
     if (!parsed || typeof parsed !== 'object') return {}
     // Backwards compatibility: normalize legacy single-object format into a keyed map
     if (typeof (parsed as any).sessionId === 'string' && Array.isArray((parsed as any).cart)) {
       const legacy = parsed as RecoverablePosDraft
-      if (legacy.cart.length > 0 && legacy.sessionId.trim()) {
-        return { [legacy.sessionId.trim()]: legacy }
+      const sid = legacy.sessionId.trim()
+      if (legacy.cart.length > 0 && sid && (consumed[sid] ?? 0) < (legacy.savedAt ?? 0)) {
+        return { [sid]: legacy }
       }
       return {}
     }
     const out: Record<string, RecoverablePosDraft> = {}
     for (const [key, val] of Object.entries(parsed as Record<string, any>)) {
       if (val && typeof val.sessionId === 'string' && Array.isArray(val.cart) && val.cart.length > 0) {
+        if ((consumed[val.sessionId] ?? 0) >= (val.savedAt ?? 0)) continue
         out[key] = val as RecoverablePosDraft
       }
     }
@@ -351,8 +390,10 @@ export type RecoverDraftResult =
 
 /**
  * Move a recoverable draft (by sessionId, or latest if omitted) into an empty
- * unattached cart, clearing only that recoverable draft after the unattached
- * cart write succeeds. Retains the recoverable draft on storage failure.
+ * unattached cart. Checks both the in-memory cart and the latest persisted
+ * unattached draft (protecting another tab's saved cart), and records the
+ * recovery as consumed inside the same authoritative `draftsSuffix` write so
+ * even if source cleanup fails, the same draft can never be recovered twice.
  */
 export function tryRecoverDraftToUnattachedCart(
   tenantId: string,
@@ -360,7 +401,11 @@ export function tryRecoverDraftToUnattachedCart(
   currentUnattachedCart: CartItem[],
   sessionId?: string | null,
 ): RecoverDraftResult {
-  if (currentUnattachedCart.length > 0) {
+  const persistedUnattached = restorePosCart(tenantId, userId)
+  if (
+    currentUnattachedCart.length > 0 ||
+    (persistedUnattached && persistedUnattached.cart.length > 0)
+  ) {
     return { ok: false, reason: 'non_empty' }
   }
   const recoverable = getRecoverablePosDraft(tenantId, userId, sessionId)
@@ -377,7 +422,12 @@ export function tryRecoverDraftToUnattachedCart(
     customerPhone: recoverable.customerPhone ?? '',
     promoCode: recoverable.promoCode ?? '',
   }
-  if (!savePosSessionDraft(tenantId, userId, null, unattached)) {
+  if (
+    !savePosSessionDraft(tenantId, userId, null, unattached, {
+      sessionId: recoverable.sessionId,
+      savedAt: recoverable.savedAt,
+    })
+  ) {
     return { ok: false, reason: 'storage_error' }
   }
   clearRecoverablePosDraft(tenantId, userId, recoverable.sessionId)
