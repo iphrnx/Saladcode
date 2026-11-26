@@ -58,6 +58,8 @@ export interface QueueEntry {
   claimAt?: number | null
   /** Human context for the status UI: item count and total snapshot. */
   itemCount: number
+  /** True once reserved quantities were already deducted from the browsing cart on reload. */
+  cartDeducted?: boolean
 }
 
 export interface QueueHooks {

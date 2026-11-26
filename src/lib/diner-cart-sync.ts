@@ -1,5 +1,5 @@
 import { normalizePortionKey } from './portions'
-import { keyName } from './storage-keys'
+import { keyName, legacyKeyNames } from './storage-keys'
 import type { QueueEntry, StorageLike } from './order-queue'
 
 export interface SyncableCartItem {
@@ -56,15 +56,24 @@ export function reconcileCartOnSave<T extends SyncableCartItem>(
       } else {
         result.push({ ...ext })
       }
-    } else if (ext.quantity !== prev.quantity && localIdx >= 0) {
+    } else if (localIdx >= 0) {
+      const localChangedNotes = (result[localIdx].notes ?? '') !== (prev.notes ?? '')
+      const extChangedNotes = (ext.notes ?? '') !== (prev.notes ?? '')
+      const nextNotes = !localChangedNotes && extChangedNotes ? ext.notes : result[localIdx].notes
+
       // Apply external quantity delta (increment or decrement) when this tab kept the line.
-      const nextQty = result[localIdx].quantity + (ext.quantity - prev.quantity)
+      const nextQty =
+        ext.quantity !== prev.quantity
+          ? result[localIdx].quantity + (ext.quantity - prev.quantity)
+          : result[localIdx].quantity
+
       if (nextQty <= 0) {
         result.splice(localIdx, 1)
-      } else {
+      } else if (nextQty !== result[localIdx].quantity || nextNotes !== result[localIdx].notes) {
         result[localIdx] = {
           ...result[localIdx],
           quantity: nextQty,
+          notes: nextNotes,
         }
       }
     }
@@ -179,6 +188,7 @@ export function migratePendingTableQueueToSession(
   tableId: string | null | undefined,
   sessionToken: string,
   qrToken?: string | null,
+  markCartDeducted = false,
 ): QueueEntry[] {
   const sessionQueueKey = keyName('orderQueue', `${tenantId}-${sessionToken}`)
   const readEntries = (k: string): QueueEntry[] => {
@@ -200,44 +210,60 @@ export function migratePendingTableQueueToSession(
     qrToken ? `qr_${qrToken}` : null,
   ].filter(Boolean) as string[]
 
+  const sourceUpdates: Array<{ key: string; remaining: QueueEntry[] }> = []
   let changed = false
+
   for (const actor of sourceActors) {
-    const sourceKey = keyName('orderQueue', `${tenantId}-${actor}`)
-    const sourceEntries = readEntries(sourceKey)
-    if (sourceEntries.length === 0) continue
+    const suffix = `${tenantId}-${actor}`
+    const candidateKeys = [keyName('orderQueue', suffix), ...legacyKeyNames('orderQueue', suffix)]
+    for (const sourceKey of candidateKeys) {
+      const sourceEntries = readEntries(sourceKey)
+      if (sourceEntries.length === 0) continue
 
-    const remainingSource: QueueEntry[] = []
-    for (const entry of sourceEntries) {
-      const unresolved = entry.state === 'pending' || entry.state === 'submitting'
-      const matchesSession =
-        !entry.payload?.tableSessionToken || entry.payload.tableSessionToken === sessionToken
-      if (unresolved && matchesSession) {
-        if (!seenKeys.has(entry.key)) {
-          seenKeys.add(entry.key)
-          sessionEntries = [
-            ...sessionEntries,
-            {
-              ...entry,
-              state: 'pending',
-              claimId: null,
-              claimAt: null,
-            },
-          ]
-          changed = true
+      const remainingSource: QueueEntry[] = []
+      for (const entry of sourceEntries) {
+        const unresolved = entry.state === 'pending' || entry.state === 'submitting'
+        const matchesSession =
+          !entry.payload?.tableSessionToken || entry.payload.tableSessionToken === sessionToken
+        if (unresolved && matchesSession) {
+          if (!seenKeys.has(entry.key)) {
+            seenKeys.add(entry.key)
+            // An interrupted 'submitting' entry may already have reached the server;
+            // ensure attempts >= 1 so OrderQueue reconciles by key before re-POSTing.
+            const attempts =
+              entry.state === 'submitting' ? Math.max(1, entry.attempts || 0) : entry.attempts
+            sessionEntries = [
+              ...sessionEntries,
+              {
+                ...entry,
+                state: 'pending',
+                attempts,
+                claimId: null,
+                claimAt: null,
+                ...(markCartDeducted ? { cartDeducted: true } : {}),
+              },
+            ]
+            changed = true
+          }
+        } else {
+          remainingSource.push(entry)
         }
-      } else {
-        remainingSource.push(entry)
       }
-    }
 
-    if (remainingSource.length !== sourceEntries.length) {
-      if (remainingSource.length === 0) storage.removeItem(sourceKey)
-      else storage.setItem(sourceKey, JSON.stringify(remainingSource))
+      if (remainingSource.length !== sourceEntries.length) {
+        sourceUpdates.push({ key: sourceKey, remaining: remainingSource })
+      }
     }
   }
 
+  // Persist destination BEFORE removing or updating any source key so a failed
+  // write leaves the original entry intact and recoverable.
   if (changed) {
     storage.setItem(sessionQueueKey, JSON.stringify(sessionEntries))
+  }
+  for (const { key, remaining } of sourceUpdates) {
+    if (remaining.length === 0) storage.removeItem(key)
+    else storage.setItem(key, JSON.stringify(remaining))
   }
   return sessionEntries
 }

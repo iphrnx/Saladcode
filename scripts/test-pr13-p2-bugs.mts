@@ -12,6 +12,15 @@ import {
   subtractUnresolvedQueueQuantities,
 } from '../src/lib/diner-cart-sync'
 
+interface ConfirmedOrderFixture {
+  id: string
+  orderNumber?: number
+  total?: number
+  sessionId?: string
+  sessionToken?: string
+  items?: Array<{ menuItemId: string; quantity: number }>
+}
+
 const root = process.cwd()
 const publicMenuSrc = fs.readFileSync(path.join(root, 'src/components/public/public-menu.tsx'), 'utf8')
 const ordersFnSrc = fs.readFileSync(path.join(root, 'supabase/functions/orders/index.ts'), 'utf8')
@@ -242,14 +251,14 @@ await check('P2-2 behavior: failed token lookup keeps checkout queued; restored 
     return new Response(JSON.stringify({ error: 'Unexpected URL' }), { status: 500 })
   }) as any
 
-  let confirmed: any = null
+  const state: { confirmed: ConfirmedOrderFixture | null } = { confirmed: null }
   const q = new OrderQueue(
     store,
     keyName('orderQueue', `tenant-1-qr_${qrToken}`),
     fetcher,
     {
       onConfirmed: (order) => {
-        confirmed = order
+        state.confirmed = order
       },
     },
     () => nowMs,
@@ -263,7 +272,7 @@ await check('P2-2 behavior: failed token lookup keeps checkout queued; restored 
   assert.equal(q.load().length, 1)
   assert.equal(q.load()[0].state, 'pending')
   assert.equal(q.load()[0].attempts, 1)
-  assert.equal(confirmed, null)
+  assert.equal(state.confirmed === null, true)
 
   // Retry 1 while token lookup fails -> 503 -> submitEntry returns 'uncertain', stays queued.
   nowMs += 60_000
@@ -272,7 +281,7 @@ await check('P2-2 behavior: failed token lookup keeps checkout queued; restored 
   assert.equal(q.load().length, 1, 'checkout must stay queued when token lookup fails')
   assert.equal(q.load()[0].state, 'pending')
   assert.equal(q.load()[0].attempts, 2)
-  assert.equal(confirmed, null)
+  assert.equal(state.confirmed === null, true)
 
   // Restore token lookup and retry -> reconciles original order + usable token and clears queue.
   tokenLookupFails = false
@@ -280,9 +289,9 @@ await check('P2-2 behavior: failed token lookup keeps checkout queued; restored 
   await q.process()
   assert.equal(postCalls, 1, 'no duplicate order/session created on reconciliation')
   assert.equal(q.load().length, 0, 'queue entry cleared after usable token is returned')
-  assert.equal(confirmed?.id, committedOrderId)
-  assert.equal(confirmed?.sessionToken, committedToken)
-  assert.equal(confirmed?.sessionId, committedSessionId)
+  assert.equal(state.confirmed?.id, committedOrderId)
+  assert.equal(state.confirmed?.sessionToken, committedToken)
+  assert.equal(state.confirmed?.sessionId, committedSessionId)
 })
 
 // ---------------------------------------------------------------------------
@@ -692,14 +701,14 @@ await check('P2-7: failed table lookup during reconciliation keeps checkout queu
     return new Response(JSON.stringify({ error: 'Unexpected' }), { status: 500 })
   }) as any
 
-  let confirmed: any = null
+  const state: { confirmed: ConfirmedOrderFixture | null } = { confirmed: null }
   const q = new OrderQueue(
     store,
     keyName('orderQueue', `tenant-1-qr_${qrToken}`),
     fetcher,
     {
       onConfirmed: (order) => {
-        confirmed = order
+        state.confirmed = order
       },
     },
     () => nowMs,
@@ -721,7 +730,7 @@ await check('P2-7: failed table lookup during reconciliation keeps checkout queu
   assert.equal(q.load().length, 1)
   assert.equal(q.load()[0].key, entry.key)
   assert.equal(q.load()[0].state, 'pending')
-  assert.equal(confirmed, null)
+  assert.equal(state.confirmed === null, true)
 
   // Restore table lookup -> reconciles original order ID + usable token, clears queue, 1 order & 1 session.
   tableLookupFails = false
@@ -729,8 +738,8 @@ await check('P2-7: failed table lookup during reconciliation keeps checkout queu
   await q.process()
   assert.equal(postCalls, 1)
   assert.equal(q.load().length, 0)
-  assert.equal(confirmed?.id, committedOrderId)
-  assert.equal(confirmed?.sessionToken, committedToken)
+  assert.equal(state.confirmed?.id, committedOrderId)
+  assert.equal(state.confirmed?.sessionToken, committedToken)
   assert.equal(ordersCreated.length, 1)
   assert.equal(sessionsCreated.length, 1)
 })
@@ -910,12 +919,12 @@ await check('P2-10: validateDinerSession lookup error returns 503 so order stays
     return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 })
   }) as any
 
-  let confirmedOrder: any = null
+  const state: { confirmedOrder: ConfirmedOrderFixture | null } = { confirmedOrder: null }
   const q = new OrderQueue(
     store,
     keyName('orderQueue', `tenant-1-${token}`),
     fetcher,
-    { onConfirmed: (o) => { confirmedOrder = o } },
+    { onConfirmed: (o) => { state.confirmedOrder = o } },
     () => nowMs,
   )
 
@@ -929,14 +938,14 @@ await check('P2-10: validateDinerSession lookup error returns 503 so order stays
   assert.equal(q.load().length, 1)
   assert.equal(q.load()[0].key, entry.key)
   assert.equal(JSON.parse(store.getItem(sessionKey)!).sessionToken, token)
-  assert.equal(confirmedOrder, null)
+  assert.equal(state.confirmedOrder === null, true)
 
   // Restore lookup -> recovers original order, clears queue, 1 order total.
   lookupFails = false
   nowMs += 60_000
   await q.process()
   assert.equal(q.load().length, 0)
-  assert.equal(confirmedOrder?.id, 'ord-sess-1')
+  assert.equal(state.confirmedOrder?.id, 'ord-sess-1')
   assert.equal(postCalls, 1)
   assert.equal(ordersCreated.length, 1)
 })
@@ -952,7 +961,7 @@ await check('P2-11: QR reload imports browsing cart into active session once wit
   const sessionKey = keyName('cart', sessionToken)
 
   // Verify public-menu.tsx activateAndLoad performs this merge on data?.session.
-  assert.ok(publicMenuSrc.includes("const browsingRaw = readStored('cart', `browsing:${data.table.id}`)"))
+  assert.ok(publicMenuSrc.includes("readStored('cart', `browsing:${data.table.id}`)"))
   assert.ok(publicMenuSrc.includes("removeStored('cart', `browsing:${data.table.id}`)"))
 
   // Tab A has an item in session cart; Tab B has qty 2 in browsing cart.
@@ -1209,6 +1218,78 @@ await check('P2-14: ended adopted session clears both page state and storage so 
   assert.equal(sentPayloads[1].tableSessionToken, undefined)
   assert.equal(confirmedOrder?.id, 'ord-qr-retry')
   assert.equal(confirmedOrder?.sessionToken, newToken)
+})
+
+// ---------------------------------------------------------------------------
+// 15. P1: Destination write failure leaves legacy/table queue intact; retry recovers
+// ---------------------------------------------------------------------------
+await check('P1-15: queue migration persists destination first, supports legacy keys, and reconciles submitting entry', () => {
+  const inner = new MemoryStorage()
+  const tenantId = 'tenant-1'
+  const tableId = 'tbl-1'
+  const sessionToken = 'tok-dest'
+  const legacyKey = `toastly-order-queue-${tenantId}-table_${tableId}`
+  const destKey = keyName('orderQueue', `${tenantId}-${sessionToken}`)
+
+  const legacyEntry = {
+    key: 'idem-legacy-1',
+    kind: 'diner' as const,
+    payload: { orderType: 'DINE_IN', tableSessionToken: sessionToken, items: [{ menuItemId: 'd1', quantity: 1 }] },
+    state: 'submitting' as const,
+    attempts: 0,
+    nextAttemptAt: 1000,
+    createdAt: 1000,
+    itemCount: 1,
+  }
+  inner.setItem(legacyKey, JSON.stringify([legacyEntry]))
+
+  let failDestWrite = true
+  const flakyStorage: StorageLike = {
+    getItem: (k) => inner.getItem(k),
+    setItem: (k, v) => {
+      if (k === destKey && failDestWrite) throw new Error('QuotaExceededError')
+      inner.setItem(k, v)
+    },
+    removeItem: (k) => inner.removeItem(k),
+  }
+
+  assert.throws(() => migratePendingTableQueueToSession(flakyStorage, tenantId, tableId, sessionToken, null, true))
+  // Source legacy entry and key must survive when destination write fails.
+  assert.ok(inner.getItem(legacyKey), 'legacy source entry must remain intact on failed write')
+  assert.equal(inner.getItem(destKey), null)
+
+  // Restore writes and retry migration.
+  failDestWrite = false
+  const migrated = migratePendingTableQueueToSession(flakyStorage, tenantId, tableId, sessionToken, null, true)
+  assert.equal(migrated.length, 1)
+  assert.equal(migrated[0].key, 'idem-legacy-1')
+  assert.equal(migrated[0].state, 'pending')
+  assert.ok(migrated[0].attempts >= 1, 'interrupted submitting entry must have attempts >= 1 so it reconciles by key')
+  assert.equal(migrated[0].cartDeducted, true)
+  assert.equal(inner.getItem(legacyKey), null, 'source removed only after destination write succeeds')
+})
+
+// ---------------------------------------------------------------------------
+// 16. P2: Concurrent note edit + full-removal delta + ended-session browsing merge
+// ---------------------------------------------------------------------------
+await check('P2-16: reconcileCartOnSave preserves other tab note edit while applying local quantity/removal changes', () => {
+  const baseline = [
+    { menuItemId: 'dish-a', name: 'Samosa', price: 40, quantity: 2 },
+    { menuItemId: 'dish-b', name: 'Chai', price: 30, quantity: 1, notes: '' },
+  ]
+  // Tab A confirms dish-a (2 units) and updates dish-b's note.
+  const storedAfterA = [
+    { menuItemId: 'dish-b', name: 'Chai', price: 30, quantity: 1, notes: 'Less sugar' },
+  ]
+  // Stale Tab B increments dish-a to 3 and keeps dish-b untouched.
+  const staleBLocal = [
+    { menuItemId: 'dish-a', name: 'Samosa', price: 40, quantity: 3 },
+    { menuItemId: 'dish-b', name: 'Chai', price: 30, quantity: 1, notes: '' },
+  ]
+
+  const reconciled = reconcileCartOnSave(staleBLocal, baseline, storedAfterA)
+  assert.equal(reconciled.find((c) => c.menuItemId === 'dish-a')?.quantity, 1)
+  assert.equal(reconciled.find((c) => c.menuItemId === 'dish-b')?.notes, 'Less sugar')
 })
 
 console.log(`\n${pass} passed, ${fail} failed`)

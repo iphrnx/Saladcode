@@ -347,6 +347,10 @@ export function PublicMenu() {
   // session state: 'activating' | 'active' | 'ended' | 'invalid'
   const [sessionState, setSessionState] = useState<'activating' | 'active' | 'ended' | 'invalid'>('activating')
   const [sessionToken, setSessionToken] = useState<string | null>(null)
+  const sessionTokenRef = useRef<string | null>(null)
+  useEffect(() => {
+    sessionTokenRef.current = sessionToken
+  }, [sessionToken])
   /** The server's id for this diner's session — used to double-check payloads. */
   const [sessionId, setSessionId] = useState<string | null>(null)
   /**
@@ -677,6 +681,15 @@ export function PublicMenu() {
           }
 
           if (data?.session) {
+            const browsingRaw = data?.table?.id
+              ? readStored('cart', `browsing:${data.table.id}`)
+              : null
+            let browsingItems: CartItem[] = []
+            try {
+              const parsed = browsingRaw ? JSON.parse(browsingRaw) : []
+              if (Array.isArray(parsed)) browsingItems = parsed
+            } catch {}
+
             // Migrate any unresolved checkout from the table/QR queue into the
             // adopted session queue before merging the browsing cart so the
             // original checkout resumes with its idempotency key and submitted
@@ -689,6 +702,7 @@ export function PublicMenu() {
                     data?.table?.id,
                     data.session.token,
                     qrToken,
+                    browsingItems.length > 0,
                   )
                 : []
 
@@ -696,28 +710,24 @@ export function PublicMenu() {
             // before reload discovered an active session, merge them into the
             // session cart once and clear the browsing key so repeated reloads
             // never duplicate them or overwrite items already saved in the session.
-            if (data?.table?.id) {
+            if (data?.table?.id && browsingRaw !== null) {
               try {
-                const browsingRaw = readStored('cart', `browsing:${data.table.id}`)
-                if (browsingRaw) {
-                  const browsingItems = JSON.parse(browsingRaw)
-                  if (Array.isArray(browsingItems) && browsingItems.length > 0) {
-                    const unsubmittedBrowsing = subtractUnresolvedQueueQuantities(
-                      browsingItems,
-                      migratedEntries,
+                if (browsingItems.length > 0) {
+                  const unsubmittedBrowsing = subtractUnresolvedQueueQuantities(
+                    browsingItems,
+                    migratedEntries,
+                  )
+                  if (unsubmittedBrowsing.length > 0) {
+                    const sessionRaw = readStored('cart', data.session.token)
+                    const sessionItems = sessionRaw ? JSON.parse(sessionRaw) : []
+                    const merged = mergeBrowsingRemainderIntoSession(
+                      Array.isArray(sessionItems) ? sessionItems : [],
+                      unsubmittedBrowsing,
                     )
-                    if (unsubmittedBrowsing.length > 0) {
-                      const sessionRaw = readStored('cart', data.session.token)
-                      const sessionItems = sessionRaw ? JSON.parse(sessionRaw) : []
-                      const merged = mergeBrowsingRemainderIntoSession(
-                        Array.isArray(sessionItems) ? sessionItems : [],
-                        unsubmittedBrowsing,
-                      )
-                      writeStored('cart', JSON.stringify(merged), data.session.token)
-                    }
+                    writeStored('cart', JSON.stringify(merged), data.session.token)
                   }
-                  removeStored('cart', `browsing:${data.table.id}`)
                 }
+                removeStored('cart', `browsing:${data.table.id}`)
               } catch {}
             }
             adopt({ token: data.session.token, tenantId: data.tenant.id, tableId: data.table.id }, data)
@@ -1262,6 +1272,17 @@ export function PublicMenu() {
             writeStored('cart', JSON.stringify(nextCart), order.sessionToken)
           } catch {}
         }
+      } else if (entry.cartDeducted) {
+        // Quantities for this recovered checkout were already deducted from the
+        // browsing cart during reload adoption; do not deduct a second time.
+        const baseline =
+          lastSyncedCartRef.current.suffix === order.sessionToken
+            ? lastSyncedCartRef.current.items
+            : existingSessionCart
+        nextCart = reconcileCartOnSave(cartRef.current, baseline, existingSessionCart)
+        try {
+          writeStored('cart', JSON.stringify(nextCart), order.sessionToken)
+        } catch {}
       } else {
         // Reconcile confirmed quantities against the previous sync baseline and
         // latest saved cart, persisting before advancing lastSyncedCartRef so
@@ -1374,6 +1395,27 @@ export function PublicMenu() {
       },
       onFailed: (error, entry, code) => {
         placingRef.current = false
+        let workingCart = [...cartRef.current]
+        if (entry.cartDeducted && Array.isArray(entry.payload?.items)) {
+          const restored: CartItem[] = entry.payload.items.map((line: any) => {
+            const menuMatch = menuItems.find((m) => m.id === line.menuItemId)
+            return {
+              menuItemId: line.menuItemId,
+              name: menuMatch?.name || line.name || 'Item',
+              portionId: line.portionId ?? null,
+              portion: line.portion ?? null,
+              price: Number(line.price ?? menuMatch?.price ?? 0),
+              image: menuMatch?.image ?? null,
+              quantity: Math.max(1, Number(line.quantity) || 1),
+              notes: line.notes || undefined,
+              prepTime: menuMatch?.prepTime,
+            }
+          })
+          workingCart = mergeBrowsingRemainderIntoSession(workingCart, restored)
+          cartRef.current = workingCart
+          setCart(workingCart)
+        }
+
         const failedToken = entry.payload?.tableSessionToken
         const tblId = table?.id || sessionTableId
         if (failedToken && tblId && isDefinitiveSessionRejection(error, code)) {
@@ -1381,12 +1423,23 @@ export function PublicMenu() {
           if (currentStored?.sessionToken === failedToken) {
             removeStoredDinerSession(effectiveTenantId, tblId)
           }
-          if (sessionToken === failedToken) {
+          if (sessionTokenRef.current === failedToken) {
             const browsingSuffix = `browsing:${tblId}`
+            let existingBrowsing: CartItem[] = []
             try {
-              writeStored('cart', JSON.stringify(cartRef.current), browsingSuffix)
+              const raw = readStored('cart', browsingSuffix)
+              if (raw) {
+                const parsed = JSON.parse(raw)
+                if (Array.isArray(parsed)) existingBrowsing = parsed
+              }
             } catch {}
-            lastSyncedCartRef.current = { suffix: browsingSuffix, items: cartRef.current }
+            const mergedBrowsing = mergeBrowsingRemainderIntoSession(existingBrowsing, workingCart)
+            try {
+              writeStored('cart', JSON.stringify(mergedBrowsing), browsingSuffix)
+            } catch {}
+            lastSyncedCartRef.current = { suffix: browsingSuffix, items: mergedBrowsing }
+            cartRef.current = mergedBrowsing
+            setCart(mergedBrowsing)
             setSessionToken(null)
             setSessionId(null)
           }
