@@ -34,6 +34,17 @@ export interface PosCartSnapshot {
   savedAt: number
 }
 
+export interface RecoverablePosDraft extends Omit<PosCartSnapshot, 'selectedSessionId'> {
+  sessionId: string
+}
+
+export type OrderLineRef = {
+  menuItemId: string
+  portion?: string | null
+  portionId?: string | null
+  quantity: number
+}
+
 function suffix(tenantId: string, userId: string): string {
   return `${tenantId}-${userId}`
 }
@@ -44,6 +55,10 @@ function draftsSuffix(tenantId: string, userId: string): string {
 
 function activeSessionSuffix(tenantId: string, userId: string): string {
   return `${tenantId}-${userId}-active-session`
+}
+
+function recoverableSuffix(tenantId: string, userId: string): string {
+  return `${tenantId}-${userId}-recoverable`
 }
 
 /** Persist currently loaded POS active session id in localStorage. */
@@ -145,19 +160,14 @@ export function clearPosSessionDraft(
 }
 
 /**
- * Subtract submitted order lines from a stored draft, preserving any items
- * added after submission. Deletes the draft if no items remain.
+ * Subtract submitted order lines from a cart array, preserving any unsubmitted
+ * quantities or items added after submission.
  */
-export function subtractPosSessionDraft(
-  tenantId: string,
-  userId: string,
-  sessionKey: string | null | undefined,
-  lines: Array<{ menuItemId: string; portion?: string | null; portionId?: string | null; quantity: number }>,
-): PosCartSnapshot | null {
-  const existing = getPosSessionDraft(tenantId, userId, sessionKey)
-  if (!existing || !Array.isArray(existing.cart) || existing.cart.length === 0) return null
-
-  let remaining = [...existing.cart]
+export function subtractLinesFromCart(
+  cart: CartItem[],
+  lines: OrderLineRef[],
+): CartItem[] {
+  let remaining = [...cart]
   for (const line of lines) {
     const qty = Math.max(1, Number(line.quantity) || 1)
     const lineKey = normalizePortionKey(line.portion, line.portionId)
@@ -169,6 +179,23 @@ export function subtractPosSessionDraft(
       )
       .filter((c) => c.quantity > 0)
   }
+  return remaining
+}
+
+/**
+ * Subtract submitted order lines from a stored draft, preserving any items
+ * added after submission. Deletes the draft if no items remain.
+ */
+export function subtractPosSessionDraft(
+  tenantId: string,
+  userId: string,
+  sessionKey: string | null | undefined,
+  lines: OrderLineRef[],
+): PosCartSnapshot | null {
+  const existing = getPosSessionDraft(tenantId, userId, sessionKey)
+  if (!existing || !Array.isArray(existing.cart) || existing.cart.length === 0) return null
+
+  const remaining = subtractLinesFromCart(existing.cart, lines)
 
   if (remaining.length === 0) {
     clearPosSessionDraft(tenantId, userId, sessionKey)
@@ -180,6 +207,101 @@ export function subtractPosSessionDraft(
   }
   savePosSessionDraft(tenantId, userId, sessionKey, updated)
   return { ...updated, savedAt: Date.now() }
+}
+
+/** Save unsent items from a remotely closed sitting into a recoverable draft. */
+export function saveRecoverablePosDraft(
+  tenantId: string,
+  userId: string,
+  draft: Omit<RecoverablePosDraft, 'savedAt'>,
+): RecoverablePosDraft | null {
+  if (!draft.sessionId?.trim() || !Array.isArray(draft.cart) || draft.cart.length === 0) {
+    return null
+  }
+  const stored: RecoverablePosDraft = {
+    ...draft,
+    cart: [...draft.cart],
+    savedAt: Date.now(),
+  }
+  writeStored('posCart', JSON.stringify(stored), recoverableSuffix(tenantId, userId))
+  return stored
+}
+
+/** Read the recoverable draft for this tenant+user, if any. */
+export function getRecoverablePosDraft(
+  tenantId: string,
+  userId: string,
+): RecoverablePosDraft | null {
+  const raw = readStored('posCart', recoverableSuffix(tenantId, userId))
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed.sessionId === 'string' && Array.isArray(parsed.cart) && parsed.cart.length > 0) {
+      return parsed as RecoverablePosDraft
+    }
+  } catch {}
+  return null
+}
+
+/** Clear the recoverable draft for this tenant+user. */
+export function clearRecoverablePosDraft(
+  tenantId: string,
+  userId: string,
+): void {
+  removeStored('posCart', recoverableSuffix(tenantId, userId))
+}
+
+/**
+ * Subtract confirmed order lines from a recoverable draft if it belongs to
+ * the confirmed session. Clears the recoverable draft if no items remain.
+ */
+export function subtractRecoverablePosDraft(
+  tenantId: string,
+  userId: string,
+  sessionId: string | null | undefined,
+  lines: OrderLineRef[],
+): RecoverablePosDraft | null {
+  if (!sessionId?.trim()) return getRecoverablePosDraft(tenantId, userId)
+  const existing = getRecoverablePosDraft(tenantId, userId)
+  if (!existing || existing.sessionId !== sessionId.trim()) return existing
+
+  const remaining = subtractLinesFromCart(existing.cart, lines)
+  if (remaining.length === 0) {
+    clearRecoverablePosDraft(tenantId, userId)
+    return null
+  }
+  return saveRecoverablePosDraft(tenantId, userId, {
+    ...existing,
+    cart: remaining,
+  })
+}
+
+/**
+ * Move the recoverable draft into an empty unattached cart, clearing the
+ * recoverable draft so items can only be recovered once. Returns null if
+ * there is nothing to recover or if the unattached cart is non-empty.
+ */
+export function recoverDraftToUnattachedCart(
+  tenantId: string,
+  userId: string,
+  currentUnattachedCart: CartItem[],
+): PosCartSnapshot | null {
+  if (currentUnattachedCart.length > 0) return null
+  const recoverable = getRecoverablePosDraft(tenantId, userId)
+  if (!recoverable || recoverable.cart.length === 0) return null
+
+  const unattached: Omit<PosCartSnapshot, 'savedAt'> = {
+    cart: [...recoverable.cart],
+    orderType: recoverable.orderType,
+    selectedTableId: recoverable.selectedTableId,
+    selectedSessionId: null,
+    customerName: recoverable.customerName ?? '',
+    customerPhone: recoverable.customerPhone ?? '',
+    promoCode: recoverable.promoCode ?? '',
+  }
+  savePosSessionDraft(tenantId, userId, null, unattached)
+  clearRecoverablePosDraft(tenantId, userId)
+  return { ...unattached, savedAt: Date.now() }
 }
 
 export function persistPosCart(
@@ -211,4 +333,5 @@ export function restorePosCart(tenantId: string, userId: string): PosCartSnapsho
 export function clearPosCart(tenantId: string, userId: string): void {
   removeStored('posCart', suffix(tenantId, userId))
   removeStored('posCart', draftsSuffix(tenantId, userId))
+  removeStored('posCart', recoverableSuffix(tenantId, userId))
 }

@@ -24,12 +24,20 @@ import { createClient } from "@supabase/supabase-js";
 import {
   savePosSessionDraft,
   getPosSessionDraft,
+  clearPosSessionDraft,
   subtractPosSessionDraft,
+  subtractLinesFromCart,
+  saveRecoverablePosDraft,
+  getRecoverablePosDraft,
+  clearRecoverablePosDraft,
+  subtractRecoverablePosDraft,
+  recoverDraftToUnattachedCart,
   restorePosCart,
   clearPosCart,
   savePosActiveSessionId,
   getPosActiveSessionId,
 } from "../src/lib/pos-cart";
+import { OrderQueue, type StorageLike } from "../src/lib/order-queue";
 
 let passed = 0;
 let failed = 0;
@@ -148,6 +156,199 @@ check("active session id persists and clears independently", () => {
   assert.equal(getPosActiveSessionId(T, U), "sess-A");
   savePosActiveSessionId(T, U, null);
   assert.equal(getPosActiveSessionId(T, U), null);
+});
+
+await checkAsync("PR#14 P1-1: delayed confirmation after switching sittings subtracts confirmed items from snapshot & preserves sitting cart", async () => {
+  clearPosCart(T, U);
+  const queueStore = new Map<string, string>();
+  const memStorage: StorageLike = {
+    getItem: (k) => queueStore.get(k) ?? null,
+    setItem: (k, v) => queueStore.set(k, v),
+    removeItem: (k) => queueStore.delete(k),
+  };
+
+  let resolveOrder!: (res: Response) => void;
+  const deferredFetcher = (() => new Promise<Response>((r) => { resolveOrder = r; })) as any;
+
+  // 1. Cashier builds unattached cart (2x Burger Half + 1x Fries) and submits 1x Burger Half + 1x Fries
+  let preSelectSnapshot: any = {
+    cart: [
+      { menuItemId: "m1", name: "Burger", portionId: "half", portion: "Half", price: 120, quantity: 2 },
+      { menuItemId: "m3", name: "Fries", price: 90, quantity: 1 },
+    ],
+    orderType: "DINE_IN" as const,
+    selectedTableId: "tbl-1",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  };
+  savePosSessionDraft(T, U, null, { ...preSelectSnapshot, selectedSessionId: null });
+
+  let currentSessionId: string | null = "sess-A";
+  let sittingCart = [{ menuItemId: "m2", name: "Pasta", price: 250, quantity: 1 }];
+
+  const q = new OrderQueue(memStorage, `${T}-${U}-q`, deferredFetcher, {
+    onConfirmed: (_order, entry) => {
+      const originSessionId = entry.payload.tableSessionId ?? null;
+      const submittedLines = entry.payload.items ?? [];
+      if (currentSessionId !== originSessionId) {
+        subtractPosSessionDraft(T, U, originSessionId, submittedLines);
+        if (!originSessionId && preSelectSnapshot) {
+          const remainingPre = subtractLinesFromCart(preSelectSnapshot.cart, submittedLines);
+          preSelectSnapshot = remainingPre.length > 0 ? { ...preSelectSnapshot, cart: remainingPre } : null;
+        }
+      }
+    },
+  });
+
+  // Enqueue unattached order while on unattached cart, then switch to sess-A before it resolves
+  q.enqueue("pos", {
+    tableId: "tbl-1",
+    orderType: "DINE_IN",
+    items: [
+      { menuItemId: "m1", portionId: "half", portion: "Half", quantity: 1 },
+      { menuItemId: "m3", quantity: 1 },
+    ],
+  }, 2);
+
+  // Resolve delayed confirmation while sess-A is selected
+  resolveOrder(new Response(JSON.stringify({ id: "ord-1", orderNumber: 101 }), { status: 201 }));
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Sitting cart is intact
+  assert.equal(sittingCart.length, 1);
+  assert.equal(sittingCart[0].menuItemId, "m2");
+
+  // Leaving sitting restores only the unsubmitted 1x Burger (Half), Fries is absent
+  assert.ok(preSelectSnapshot, "unsubmitted quantity must remain in snapshot");
+  assert.equal(preSelectSnapshot.cart.length, 1);
+  assert.equal(preSelectSnapshot.cart[0].menuItemId, "m1");
+  assert.equal(preSelectSnapshot.cart[0].portionId, "half");
+  assert.equal(preSelectSnapshot.cart[0].quantity, 1);
+
+  const storedDefault = getPosSessionDraft(T, U, null);
+  assert.equal(storedDefault?.cart.length, 1);
+  assert.equal(storedDefault?.cart[0].quantity, 1);
+});
+
+await checkAsync("PR#14 P1-2a: remote settlement restores prior unattached cart and recovers unsent items once", async () => {
+  clearPosCart(T, U);
+  // Prior unattached cart
+  savePosSessionDraft(T, U, null, {
+    cart: [{ menuItemId: "m1", name: "Burger", price: 150, quantity: 1 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-1",
+    selectedSessionId: null,
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+  // Unsent draft on sess-A
+  savePosSessionDraft(T, U, "sess-A", {
+    cart: [{ menuItemId: "m5", name: "Pizza", price: 300, quantity: 2 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-2",
+    selectedSessionId: "sess-A",
+    customerName: "Alice",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  // Remote settlement recovery moves sess-A's unsent items to recoverable draft
+  const sessDraft = getPosSessionDraft(T, U, "sess-A")!;
+  saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-A",
+    cart: sessDraft.cart,
+    orderType: sessDraft.orderType,
+    selectedTableId: sessDraft.selectedTableId,
+    customerName: sessDraft.customerName,
+    customerPhone: sessDraft.customerPhone,
+    promoCode: sessDraft.promoCode,
+  });
+  clearPosSessionDraft(T, U, "sess-A");
+
+  // Prior unattached cart is intact
+  const prior = restorePosCart(T, U);
+  assert.equal(prior?.cart.length, 1);
+  assert.equal(prior?.cart[0].menuItemId, "m1");
+
+  // Refuses recovery while unattached cart is non-empty
+  assert.equal(recoverDraftToUnattachedCart(T, U, prior!.cart), null);
+
+  // Clear unattached cart, then recover once
+  clearPosSessionDraft(T, U, null);
+  const recovered = recoverDraftToUnattachedCart(T, U, []);
+  assert.ok(recovered);
+  assert.equal(recovered.selectedSessionId, null);
+  assert.equal(recovered.cart.length, 1);
+  assert.equal(recovered.cart[0].menuItemId, "m5");
+  assert.equal(recovered.cart[0].quantity, 2);
+
+  // Second recovery attempt returns null (once-only)
+  assert.equal(getRecoverablePosDraft(T, U), null);
+  assert.equal(recoverDraftToUnattachedCart(T, U, []), null);
+});
+
+await checkAsync("PR#14 P1-2b: in-flight checkout on closed sitting holds recovery, retains items on closed-session rejection, and subtracts on confirm", async () => {
+  clearPosCart(T, U);
+  const queueStore = new Map<string, string>();
+  const memStorage: StorageLike = {
+    getItem: (k) => queueStore.get(k) ?? null,
+    setItem: (k, v) => queueStore.set(k, v),
+    removeItem: (k) => queueStore.delete(k),
+  };
+
+  let resolveOrder!: (res: Response) => void;
+  const deferredFetcher = (() => new Promise<Response>((r) => { resolveOrder = r; })) as any;
+
+  let recoverable = saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-closed",
+    cart: [
+      { menuItemId: "m5", name: "Pizza", price: 300, quantity: 2 },
+      { menuItemId: "m6", name: "Coke", price: 60, quantity: 1 },
+    ],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-2",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  const q = new OrderQueue(memStorage, `${T}-${U}-q2`, deferredFetcher, {
+    onConfirmed: (_order, entry) => {
+      recoverable = subtractRecoverablePosDraft(T, U, entry.payload.tableSessionId, entry.payload.items ?? []);
+    },
+    onFailed: (_err, entry) => {
+      q.retire(entry.key);
+    },
+  });
+
+  q.enqueue("pos", {
+    tableId: "tbl-2",
+    tableSessionId: "sess-closed",
+    orderType: "DINE_IN",
+    items: [{ menuItemId: "m5", quantity: 1 }],
+  }, 1);
+
+  // While checkout is in-flight, recovery is held
+  const held = q.load().some((e) => (e.state === "pending" || e.state === "submitting") && e.payload?.tableSessionId === recoverable?.sessionId);
+  assert.equal(held, true, "recovery must be held while checkout is unresolved");
+
+  // Server rejects with closed-session 400
+  resolveOrder(new Response(JSON.stringify({ error: "SESSION_INVALID_OR_ENDED" }), { status: 400 }));
+  await new Promise((r) => setTimeout(r, 20));
+
+  const heldAfterReject = q.load().some((e) => (e.state === "pending" || e.state === "submitting") && e.payload?.tableSessionId === recoverable?.sessionId);
+  assert.equal(heldAfterReject, false, "recovery unblocked after rejection");
+  const retained = getRecoverablePosDraft(T, U);
+  assert.equal(retained?.cart.length, 2, "all items retained after closed-session rejection");
+  assert.equal(retained?.cart[0].quantity, 2);
+
+  // If an in-flight checkout confirms instead, only confirmed quantities are subtracted
+  const sub = subtractRecoverablePosDraft(T, U, "sess-closed", [{ menuItemId: "m5", quantity: 1 }]);
+  assert.equal(sub?.cart[0].quantity, 1, "confirmed 1x Pizza subtracted, 1x Pizza + 1x Coke remain");
+  assert.equal(sub?.cart[1].quantity, 1);
+  clearRecoverablePosDraft(T, U);
 });
 
 delete (globalThis as any).localStorage;

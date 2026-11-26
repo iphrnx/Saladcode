@@ -15,7 +15,7 @@ import { cn } from '@/lib/utils'
 import { formatCurrency } from '@/lib/constants'
 import { normalizePortions, normalizePortionKey, type MenuPortion } from '@/lib/portions'
 import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
-import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, subtractPosSessionDraft, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId } from '@/lib/pos-cart'
+import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, subtractPosSessionDraft, subtractLinesFromCart, saveRecoverablePosDraft, getRecoverablePosDraft, clearRecoverablePosDraft, subtractRecoverablePosDraft, recoverDraftToUnattachedCart, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId, type RecoverablePosDraft } from '@/lib/pos-cart'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
@@ -244,6 +244,7 @@ export function DashboardView() {
   const [tick, setTick] = useState(0)
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [refreshingCart, setRefreshingCart] = useState(false)
+  const [recoverableDraft, setRecoverableDraft] = useState<RecoverablePosDraft | null>(null)
 
   const refreshCartPricing = useCallback(async (providedData?: any) => {
     setRefreshingCart(true)
@@ -407,6 +408,15 @@ export function DashboardView() {
               clearPosActiveSessionId(tenantId, userId)
             }
           }
+          if (!originSessionId && preSelectSnapshotRef.current) {
+            const remainingPre = subtractLinesFromCart(preSelectSnapshotRef.current.cart, submittedLines)
+            preSelectSnapshotRef.current = remainingPre.length > 0
+              ? { ...preSelectSnapshotRef.current, cart: remainingPre }
+              : null
+          }
+        }
+        if (tenantId && userId && originSessionId) {
+          setRecoverableDraft(subtractRecoverablePosDraft(tenantId, userId, originSessionId, submittedLines))
         }
 
         if (order.promoApplied === false && order.promoReason) {
@@ -1292,31 +1302,51 @@ export function DashboardView() {
     preSelectSnapshotRef.current = null
   }
 
-  // Restore persisted active session on refresh, and clear stale selection if
-  // the selected session ended/settled while away or on another device.
-  const restoredSessionRef = useRef(false)
+  // Sync recoverable draft state on tenant/user mount
   useEffect(() => {
-    if (!tenantId || !userId || !sessionsLoadedOnce.current) return
-    if (!restoredSessionRef.current) {
-      restoredSessionRef.current = true
-      const savedActiveSessionId = getPosActiveSessionId(tenantId, userId)
-      if (savedActiveSessionId && !selectedSessionId) {
-        const match = activeSessionCards.find((c) => c.sessionId === savedActiveSessionId)
-        if (match) {
-          handleSessionCardClick(match)
-        } else {
-          clearPosActiveSessionId(tenantId, userId)
-          clearPosSessionDraft(tenantId, userId, savedActiveSessionId)
-        }
-        return
-      }
+    if (!tenantId || !userId) {
+      setRecoverableDraft(null)
+      return
     }
+    setRecoverableDraft(getRecoverablePosDraft(tenantId, userId))
+  }, [tenantId, userId])
 
-    if (selectedSessionId) {
-      const stillActive = activeSessionCards.some((c) => c.sessionId === selectedSessionId)
-      if (!stillActive) {
-        clearPosSessionDraft(tenantId, userId, selectedSessionId)
+  const isRecoverableHeld = Boolean(
+    recoverableDraft &&
+    queueEntries.some(
+      (e) =>
+        (e.state === 'pending' || e.state === 'submitting') &&
+        (e.payload?.tableSessionId ?? null) === recoverableDraft.sessionId,
+    ),
+  )
+
+  const recoverClosedSession = useCallback(
+    (closedSessionId: string) => {
+      if (!tenantId || !userId || !closedSessionId) return
+      const isCurrentlySelected = useStore.getState().selectedSessionId === closedSessionId
+      const storedDraft = getPosSessionDraft(tenantId, userId, closedSessionId)
+      const liveState = useStore.getState()
+
+      const unsentCart = isCurrentlySelected ? liveState.cart : (storedDraft?.cart ?? [])
+      if (unsentCart.length > 0) {
+        const saved = saveRecoverablePosDraft(tenantId, userId, {
+          sessionId: closedSessionId,
+          cart: unsentCart,
+          orderType: isCurrentlySelected ? liveState.orderType : (storedDraft?.orderType ?? 'DINE_IN'),
+          selectedTableId: isCurrentlySelected ? liveState.selectedTableId : (storedDraft?.selectedTableId ?? null),
+          customerName: isCurrentlySelected ? customerName : (storedDraft?.customerName ?? ''),
+          customerPhone: isCurrentlySelected ? customerPhone : (storedDraft?.customerPhone ?? ''),
+          promoCode: isCurrentlySelected ? liveState.promoCode : (storedDraft?.promoCode ?? ''),
+        })
+        if (saved) setRecoverableDraft(saved)
+      }
+
+      clearPosSessionDraft(tenantId, userId, closedSessionId)
+      if (getPosActiveSessionId(tenantId, userId) === closedSessionId) {
         clearPosActiveSessionId(tenantId, userId)
+      }
+
+      if (isCurrentlySelected) {
         setAppliedPromo(null)
         setPromoQuote(null)
         setPromoError('')
@@ -1337,8 +1367,58 @@ export function DashboardView() {
         }
         preSelectSnapshotRef.current = null
       }
+    },
+    [tenantId, userId, customerName, customerPhone, replaceCart, setSessionContext, setSelectedSessionId, setSelectedTableId, setPromoCode],
+  )
+
+  const handleRecoverDraft = useCallback(() => {
+    if (!tenantId || !userId || selectedSessionId || cart.length > 0 || isRecoverableHeld) return
+    const recovered = recoverDraftToUnattachedCart(tenantId, userId, cart)
+    if (!recovered) return
+    replaceCart(recovered.cart)
+    setSessionContext(recovered.selectedTableId, null, recovered.orderType)
+    setCustomerName(recovered.customerName ?? '')
+    setCustomerPhone(recovered.customerPhone ?? '')
+    setPromoCode(recovered.promoCode ?? '')
+    setAppliedPromo(null)
+    setPromoQuote(null)
+    setPromoError('')
+    setRecoverableDraft(null)
+    toast.success('Unsent items restored to cart')
+  }, [tenantId, userId, selectedSessionId, cart, isRecoverableHeld, replaceCart, setSessionContext, setPromoCode])
+
+  const handleDismissRecoverableDraft = useCallback(() => {
+    if (!tenantId || !userId) return
+    clearRecoverablePosDraft(tenantId, userId)
+    setRecoverableDraft(null)
+  }, [tenantId, userId])
+
+  // Restore persisted active session on refresh, and clear stale selection if
+  // the selected session ended/settled while away or on another device.
+  const restoredSessionRef = useRef(false)
+  useEffect(() => {
+    if (!tenantId || !userId || !sessionsLoadedOnce.current) return
+    if (!restoredSessionRef.current) {
+      restoredSessionRef.current = true
+      const savedActiveSessionId = getPosActiveSessionId(tenantId, userId)
+      if (savedActiveSessionId && !selectedSessionId) {
+        const match = activeSessionCards.find((c) => c.sessionId === savedActiveSessionId)
+        if (match) {
+          handleSessionCardClick(match)
+        } else {
+          recoverClosedSession(savedActiveSessionId)
+        }
+        return
+      }
     }
-  }, [tenantId, userId, activeSessionCards, selectedSessionId])
+
+    if (selectedSessionId) {
+      const stillActive = activeSessionCards.some((c) => c.sessionId === selectedSessionId)
+      if (!stillActive) {
+        recoverClosedSession(selectedSessionId)
+      }
+    }
+  }, [tenantId, userId, activeSessionCards, selectedSessionId, recoverClosedSession])
 
   const loadedSessionOrders = useMemo(() => {
     if (!selectedSessionId) return []
@@ -1459,31 +1539,9 @@ export function DashboardView() {
             })
           )
 
-          // If the selected session was the one that just settled, safely deselect and restore draft
-          if (endedSessionId && selectedSessionId === endedSessionId) {
-            if (tenantId && userId) {
-              clearPosSessionDraft(tenantId, userId, endedSessionId)
-              clearPosActiveSessionId(tenantId, userId)
-            }
-            setAppliedPromo(null)
-            setPromoQuote(null)
-            setPromoError('')
-            const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
-            if (pre) {
-              replaceCart(pre.cart)
-              setSessionContext(pre.selectedTableId, null, pre.orderType)
-              setCustomerName(pre.customerName ?? '')
-              setCustomerPhone(pre.customerPhone ?? '')
-              setPromoCode(pre.promoCode ?? '')
-            } else {
-              setSelectedSessionId(null)
-              setSelectedTableId(null)
-              setCustomerName('')
-              setCustomerPhone('')
-              setPromoCode('')
-              replaceCart([])
-            }
-            preSelectSnapshotRef.current = null
+          // If the selected session (or a saved draft's session) just settled, route through shared recovery
+          if (endedSessionId && (selectedSessionId === endedSessionId || (tenantId && userId && getPosSessionDraft(tenantId, userId, endedSessionId)))) {
+            recoverClosedSession(endedSessionId)
           }
 
           // Trigger a background re-sync
@@ -1497,7 +1555,7 @@ export function DashboardView() {
       bc.removeEventListener('message', handleMsg)
       bc.close()
     }
-  }, [selectedSessionId, tenantId, userId, loadSessions, replaceCart, setSessionContext, setSelectedSessionId])
+  }, [selectedSessionId, tenantId, userId, loadSessions, recoverClosedSession])
 
   const endSession = async (tableId: string, tableName?: string, force = false, sessionId?: string) => {
     setEndingTable(sessionId ? `${tableId}:${sessionId}` : tableId)
@@ -2015,6 +2073,10 @@ export function DashboardView() {
           refreshError={refreshError}
           refreshingCart={refreshingCart}
           onRetryRefresh={() => { void refreshCartPricing() }}
+          recoverableDraft={recoverableDraft}
+          isRecoverableHeld={isRecoverableHeld}
+          onRecoverDraft={handleRecoverDraft}
+          onDismissRecoverableDraft={handleDismissRecoverableDraft}
         />
       </div>
 
@@ -2083,6 +2145,10 @@ export function DashboardView() {
             refreshError={refreshError}
             refreshingCart={refreshingCart}
             onRetryRefresh={() => { void refreshCartPricing() }}
+            recoverableDraft={recoverableDraft}
+            isRecoverableHeld={isRecoverableHeld}
+            onRecoverDraft={handleRecoverDraft}
+            onDismissRecoverableDraft={handleDismissRecoverableDraft}
           />
         </SheetContent>
       </Sheet>
@@ -2365,6 +2431,10 @@ interface CartPanelProps {
   refreshError?: string | null
   refreshingCart?: boolean
   onRetryRefresh?: () => void
+  recoverableDraft?: RecoverablePosDraft | null
+  isRecoverableHeld?: boolean
+  onRecoverDraft?: () => void
+  onDismissRecoverableDraft?: () => void
 }
 
 function CartPanel(p: CartPanelProps) {
@@ -2501,6 +2571,47 @@ function CartPanel(p: CartPanelProps) {
 
       {/* Items */}
       <div className="flex-1 overflow-y-auto scrollbar-thin px-4 min-h-0">
+        {/* Recoverable unsent items from a remotely closed sitting */}
+        {p.recoverableDraft && !p.isRecoverableHeld && (
+          <div className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs space-y-2">
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <p className="font-semibold text-foreground">
+                  Unsent items from closed sitting ({p.recoverableDraft.cart.reduce((s, c) => s + c.quantity, 0)})
+                </p>
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  {!p.selectedSessionId && p.cart.length === 0
+                    ? 'Restore these items into a new unattached cart.'
+                    : 'Clear or finish the current cart to recover these items.'}
+                </p>
+              </div>
+              {p.onDismissRecoverableDraft && (
+                <button
+                  type="button"
+                  onClick={p.onDismissRecoverableDraft}
+                  className="text-muted-foreground hover:text-foreground p-0.5 rounded shrink-0"
+                  title="Dismiss recoverable items"
+                  aria-label="Dismiss recoverable items"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+            {p.onRecoverDraft && (
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                disabled={Boolean(p.selectedSessionId) || p.cart.length > 0}
+                onClick={p.onRecoverDraft}
+                className="w-full h-7 text-xs font-semibold"
+              >
+                Recover items
+              </Button>
+            )}
+          </div>
+        )}
+
         {/* Already Ordered items (read-only section) */}
         {p.selectedSessionId && committedItems.length > 0 && (
           <div className="pt-3 pb-1 space-y-2">
