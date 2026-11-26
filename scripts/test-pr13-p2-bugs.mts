@@ -3,6 +3,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { OrderQueue, type StorageLike } from '../src/lib/order-queue'
 import { keyName } from '../src/lib/storage-keys'
+import {
+  isDefinitiveSessionRejection,
+  mergeBrowsingRemainderIntoSession,
+  reconcileCartOnSave,
+} from '../src/lib/diner-cart-sync'
 
 const root = process.cwd()
 const publicMenuSrc = fs.readFileSync(path.join(root, 'src/components/public/public-menu.tsx'), 'utf8')
@@ -429,6 +434,174 @@ await check('P2-3 behavior: two-tab checkout preserves Tab A unsubmitted session
   assert.equal(reloadedTabACart[0].menuItemId, 'dish-a-unsubmitted')
   assert.equal(reloadedTabACart[0].quantity, 2)
   assert.equal(reloadedTabACart.some((c: any) => c.menuItemId === 'dish-b'), false)
+})
+
+// ---------------------------------------------------------------------------
+// 4. Preserve another tab's browsing cart on follow-up confirmation
+// ---------------------------------------------------------------------------
+await check('P2-4: follow-up order confirmation in Tab A preserves Tab B unsubmitted browsing cart', async () => {
+  const sharedStorage = new MemoryStorage()
+  const tenantId = 'tenant-1'
+  const tableId = 'tbl-1'
+  const sessionToken = 'tok-a'
+  const browsingCartKey = keyName('cart', `browsing:${tableId}`)
+  const sessionCartKey = keyName('cart', sessionToken)
+
+  // Confirm public-menu.tsx gates browsing cart removal on adoptingNewSession.
+  assert.ok(publicMenuSrc.includes('if (adoptingNewSession && tblId)'))
+
+  // Tab B saves an unsubmitted dish while browsing.
+  const tabBBrowsingCart = [{ menuItemId: 'dish-b', name: 'Lassi', price: 90, quantity: 2 }]
+  sharedStorage.setItem(browsingCartKey, JSON.stringify(tabBBrowsingCart))
+
+  // Tab A confirms a follow-up order from its active session cart (adoptingNewSession === false).
+  sharedStorage.setItem(sessionCartKey, JSON.stringify([{ menuItemId: 'dish-a2', name: 'Roti', price: 30, quantity: 1 }]))
+  const adoptingNewSession = false // order.sessionToken === sessionToken
+  if (adoptingNewSession) {
+    sharedStorage.removeItem(browsingCartKey)
+  }
+
+  // Reload Tab B: browsing cart and quantity are still intact.
+  const reloadedB = JSON.parse(sharedStorage.getItem(browsingCartKey) || '[]')
+  assert.equal(reloadedB.length, 1)
+  assert.equal(reloadedB[0].menuItemId, 'dish-b')
+  assert.equal(reloadedB[0].quantity, 2)
+})
+
+// ---------------------------------------------------------------------------
+// 5. Preserve merged dishes when a stale tab next saves
+// ---------------------------------------------------------------------------
+await check('P2-5: stale Tab A edit reconciles with Tab B merged unsubmitted dish via reconcileCartOnSave', async () => {
+  const sharedStorage = new MemoryStorage()
+  const sessionToken = 'tok-shared'
+  const sessionCartKey = keyName('cart', sessionToken)
+
+  // Tab A is open on active session with Dish A (qty 1).
+  const tabALastSynced = [{ menuItemId: 'dish-a', name: 'Dal', price: 180, quantity: 1 }]
+  sharedStorage.setItem(sessionCartKey, JSON.stringify(tabALastSynced))
+
+  // Tab B starts checkout with Dish B, holds response, and adds Dish C while in flight.
+  const tabBBrowsingCart = [
+    { menuItemId: 'dish-b', name: 'Paneer', price: 240, quantity: 1 },
+    { menuItemId: 'dish-c', name: 'Jeera Rice', price: 140, quantity: 1 },
+  ]
+  const tabBSubmitted = [{ menuItemId: 'dish-b', quantity: 1 }]
+
+  // Release successful response: Tab B removes submitted Dish B and merges Dish C into session cart.
+  const tabBRemaining = tabBBrowsingCart.filter((c) => !tabBSubmitted.some((s) => s.menuItemId === c.menuItemId))
+  const existingOnRelease = JSON.parse(sharedStorage.getItem(sessionCartKey) || '[]')
+  const afterTabBMerge = mergeBrowsingRemainderIntoSession(existingOnRelease, tabBRemaining)
+  sharedStorage.setItem(sessionCartKey, JSON.stringify(afterTabBMerge))
+
+  // Without reloading Tab A, Tab A makes an ordinary cart edit (Dish A -> qty 2) and saves.
+  const tabALocalEdited = [{ menuItemId: 'dish-a', name: 'Dal', price: 180, quantity: 2 }]
+  const latestStoredBeforeTabASave = JSON.parse(sharedStorage.getItem(sessionCartKey) || '[]')
+  const reconciled = reconcileCartOnSave(tabALocalEdited, tabALastSynced, latestStoredBeforeTabASave)
+  sharedStorage.setItem(sessionCartKey, JSON.stringify(reconciled))
+
+  // Reload both tabs: Dish C retains qty 1, Tab A edit (qty 2) persists, Dish B is absent.
+  const reloaded = JSON.parse(sharedStorage.getItem(sessionCartKey) || '[]')
+  assert.equal(reloaded.find((c: any) => c.menuItemId === 'dish-c')?.quantity, 1)
+  assert.equal(reloaded.find((c: any) => c.menuItemId === 'dish-a')?.quantity, 2)
+  assert.equal(reloaded.some((c: any) => c.menuItemId === 'dish-b'), false)
+})
+
+// ---------------------------------------------------------------------------
+// 6. Recover checkout after a cached session ends (and keep on transient error)
+// ---------------------------------------------------------------------------
+await check('P2-6: definitive rejection clears ended cached session so QR retry succeeds; transient error keeps valid credential', async () => {
+  const store = new MemoryStorage()
+  const tenantId = 'tenant-1'
+  const tableId = 'tbl-1'
+  const qrToken = 'qr-table-1'
+  const sessionKey = `restro_session:${tenantId}:${tableId}`
+  const endedToken = 'tok-ended'
+  const validToken = 'tok-valid-existing'
+  const newToken = 'tok-new-session'
+
+  // Seed ended cached session and browsing cart.
+  store.setItem(sessionKey, JSON.stringify({ sessionId: 'sess-ended', sessionToken: endedToken }))
+  let browsingCart = [{ menuItemId: 'dish-1', name: 'Dosa', price: 120, quantity: 1 }]
+  let postCount = 0
+  let confirmedCount = 0
+
+  const fetcher = (async (url: string, init?: RequestInit) => {
+    if (url === '/api/orders' && init?.method === 'POST') {
+      postCount++
+      const body = JSON.parse(String(init.body))
+      if (body.tableSessionToken === endedToken) {
+        return new Response(
+          JSON.stringify({ error: 'Session ended. Please scan the table QR code again to continue.' }),
+          { status: 403, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (body.tableSessionToken === validToken) {
+        return new Response(
+          JSON.stringify({ error: 'Upstream timeout' }),
+          { status: 503, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      assert.equal(body.qrToken, qrToken)
+      return new Response(
+        JSON.stringify({
+          id: 'ord-new-1',
+          orderNumber: 401,
+          total: 120,
+          sessionId: 'sess-new',
+          sessionToken: newToken,
+          items: body.items,
+        }),
+        { status: 201, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 })
+  }) as any
+
+  const q = new OrderQueue(
+    store,
+    keyName('orderQueue', `${tenantId}-table_${tableId}-recover`),
+    fetcher,
+    {
+      onFailed: (error, entry) => {
+        const failedToken = entry.payload?.tableSessionToken
+        if (failedToken && isDefinitiveSessionRejection(error)) {
+          const cur = JSON.parse(store.getItem(sessionKey) || 'null')
+          if (cur?.sessionToken === failedToken) store.removeItem(sessionKey)
+        }
+        q.retire(entry.key)
+      },
+      onConfirmed: () => {
+        confirmedCount++
+        browsingCart = []
+      },
+    },
+    () => 1000,
+  )
+
+  // Submit with ended token -> 403 -> clears cached credential, keeps browsing cart.
+  q.enqueue('diner', { orderType: 'DINE_IN', tableSessionToken: endedToken, items: browsingCart }, 1)
+  await new Promise((r) => setTimeout(r, 10))
+  await q.process()
+
+  assert.equal(store.getItem(sessionKey), null, 'ended credential must be cleared')
+  assert.equal(browsingCart.length, 1, 'pending items must survive rejection')
+
+  // Retry through QR -> confirms exactly one order in valid new session.
+  q.enqueue('diner', { orderType: 'DINE_IN', qrToken, tableId, items: browsingCart }, 1)
+  await new Promise((r) => setTimeout(r, 10))
+  await q.process()
+
+  assert.equal(confirmedCount, 1)
+  assert.equal(postCount, 2)
+  assert.equal(browsingCart.length, 0)
+
+  // Transient 503 failure with valid cached credential -> keeps credential intact.
+  store.setItem(sessionKey, JSON.stringify({ sessionId: 'sess-valid', sessionToken: validToken }))
+  q.enqueue('diner', { orderType: 'DINE_IN', tableSessionToken: validToken, items: [{ menuItemId: 'd2', quantity: 1 }] }, 1)
+  await new Promise((r) => setTimeout(r, 10))
+  await q.process()
+  const stillCached = JSON.parse(store.getItem(sessionKey) || 'null')
+  assert.equal(stillCached?.sessionToken, validToken, 'transient failure must leave valid cached credential intact')
 })
 
 console.log(`\n${pass} passed, ${fail} failed`)
