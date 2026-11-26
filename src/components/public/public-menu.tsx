@@ -374,6 +374,7 @@ export function PublicMenu() {
   // Latest cart, for the live-menu handler below, so that effect does not need
   // to re-subscribe on every change of the cart.
   const cartIdsRef = useRef<string[]>([])
+  const cartRef = useRef<CartItem[]>([])
   const [cartOpen, setCartOpen] = useState(false)
   const [queueEntries, setQueueEntries] = useState<QueueEntry[]>([])
   // Mirrors "a checkout is in flight" synchronously — see placeOrder.
@@ -400,6 +401,7 @@ export function PublicMenu() {
   // re-subscribing every time a line is added — updated in an effect, because a
   // ref written during render is exactly the re-render trap it exists to avoid.
   useEffect(() => {
+    cartRef.current = cart
     cartIdsRef.current = cart.map((line) => line.menuItemId)
   }, [cart])
 
@@ -1105,12 +1107,8 @@ export function PublicMenu() {
     const existingStoredSession =
       !sessionToken && table?.id ? getStoredDinerSession(effectiveTenantId, table.id) : null
     const activeToken = sessionToken || existingStoredSession?.sessionToken || null
-    if (existingStoredSession && !sessionToken) {
-      setSessionToken(existingStoredSession.sessionToken)
-      setSessionId(existingStoredSession.sessionId)
-    }
 
-    const actorKey = activeToken || (table?.id ? `table_${table.id}` : `qr_${currentQrToken}`)
+    const actorKey = sessionToken || (table?.id ? `table_${table.id}` : `qr_${currentQrToken}`)
     const payload: Record<string, any> = {
       orderType: 'DINE_IN',
       items,
@@ -1139,11 +1137,31 @@ export function PublicMenu() {
       } catch {}
     }
 
+    // Remove only the submitted items from the cart they came from before
+    // adopting the session so a rejected attempt never wipes the browsing cart
+    // and an empty session cart cannot overwrite remaining items.
+    let remainingCart = [...cartRef.current]
+    for (const line of entry.payload?.items ?? []) {
+      const qty = Math.max(1, Number(line.quantity) || 1)
+      remainingCart = remainingCart
+        .map((c) =>
+          sameCartLine(c, line.menuItemId, line.portion ?? null, line.portionId ?? null)
+            ? { ...c, quantity: c.quantity - qty }
+            : c,
+        )
+        .filter((c) => c.quantity > 0)
+    }
+    setCart(remainingCart)
+    cartRef.current = remainingCart
+
     if (order?.sessionToken && order?.sessionId) {
-      setSessionToken(order.sessionToken)
-      setSessionId(order.sessionId)
       const tId = tenant?.id || sessionTenantId
       const tblId = table?.id || sessionTableId
+      if (order.sessionToken !== sessionToken) {
+        try {
+          writeStored('cart', JSON.stringify(remainingCart), order.sessionToken)
+        } catch {}
+      }
       if (tblId) {
         try {
           removeStored('cart', `browsing:${tblId}`)
@@ -1155,6 +1173,8 @@ export function PublicMenu() {
           sessionToken: order.sessionToken,
         })
       }
+      setSessionToken(order.sessionToken)
+      setSessionId(order.sessionId)
     }
 
     // Refresh diner order tracker immediately
@@ -1182,22 +1202,6 @@ export function PublicMenu() {
       total: order.total,
       table: order.table,
       items: Array.isArray(order.items) ? order.items : [],
-    })
-    // Remove exactly what this order consumed — dishes added after the
-    // submit stay in the cart.
-    setCart((prev) => {
-      let next = [...prev]
-      for (const line of entry.payload?.items ?? []) {
-        const qty = Math.max(1, Number(line.quantity) || 1)
-        next = next
-          .map((c) =>
-            sameCartLine(c, line.menuItemId, line.portion ?? null, line.portionId ?? null)
-              ? { ...c, quantity: c.quantity - qty }
-              : c,
-          )
-          .filter((c) => c.quantity > 0)
-      }
-      return next
     })
     if (order?.pendingActivation) {
       // Not a failure and not a confirmation: the order exists, but the kitchen

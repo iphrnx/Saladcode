@@ -327,14 +327,22 @@ async function getByKey(req: Request, key: string): Promise<Response> {
   if (error) return json(req, { error: error.message }, 500);
   if (!data) return json(req, { error: "Not found" }, 404);
 
-  const { data: sessRow } = await db
+  const { data: sessRow, error: sessError } = await db
     .from("table_sessions")
     .select("token")
     .eq("id", data.table_session_id)
     .maybeSingle();
+  const resolvedToken = typeof sessRow?.token === "string" ? sessRow.token.trim() : "";
+  if (sessError || !resolvedToken) {
+    return json(
+      req,
+      { error: "Could not resolve diner credentials. Please retry." },
+      503,
+    );
+  }
   return json(req, {
     ...mapOrder(data),
-    sessionToken: sessRow?.token || "",
+    sessionToken: resolvedToken,
     sessionId: data.table_session_id,
     pendingActivation: data.status === "PENDING_ACTIVATION",
   });
@@ -1000,18 +1008,26 @@ async function create(req: Request): Promise<Response> {
           .maybeSingle();
 
         if (existingOrder) {
-          const { data: sessRow } = await db
+          const { data: sessRow, error: sessError } = await db
             .from("table_sessions")
             .select("token")
             .eq("id", existingOrder.table_session_id)
             .maybeSingle();
+          const resolvedToken = typeof sessRow?.token === "string" ? sessRow.token.trim() : "";
+          if (sessError || !resolvedToken) {
+            return json(
+              req,
+              { error: "Could not resolve diner credentials. Please retry." },
+              503,
+            );
+          }
 
           const mapped = mapOrder(existingOrder);
           return json(
             req,
             {
               ...mapped,
-              sessionToken: sessRow?.token || "",
+              sessionToken: resolvedToken,
               sessionId: existingOrder.table_session_id,
               pendingActivation: existingOrder.status === "PENDING_ACTIVATION",
               promoApplied: existingOrder.discount > 0 || !!existingOrder.promo_code_id,
