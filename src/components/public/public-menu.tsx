@@ -217,7 +217,7 @@ function tagMeta(tag: string): { label: string; icon?: React.ReactNode; cls: str
 
 
 type CachedDinerSession = { token: string; tenantId: string; tableId: string }
-type StoredDinerSession = { sessionId: string; sessionToken: string }
+type StoredDinerSession = { sessionId: string; sessionToken: string; updatedAt?: number }
 
 function getDinerStorageKey(restaurantId: string, tableId: string): string {
   return `restro_session:${restaurantId}:${tableId}`
@@ -239,7 +239,10 @@ function getStoredDinerSession(restaurantId: string, tableId: string): StoredDin
 
 function setStoredDinerSession(restaurantId: string, tableId: string, session: StoredDinerSession) {
   try {
-    localStorage.setItem(getDinerStorageKey(restaurantId, tableId), JSON.stringify(session))
+    localStorage.setItem(
+      getDinerStorageKey(restaurantId, tableId),
+      JSON.stringify({ ...session, updatedAt: session.updatedAt ?? Date.now() }),
+    )
   } catch {
     /* ignore */
   }
@@ -275,6 +278,7 @@ function setStoredQrMap(qrToken: string, restaurantId: string, tableId: string) 
 
 function findAnyStoredDinerSession(): { restaurantId: string; tableId: string; sessionId: string; sessionToken: string } | null {
   try {
+    let best: { restaurantId: string; tableId: string; sessionId: string; sessionToken: string; updatedAt: number } | null = null
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i)
       if (key && key.startsWith('restro_session:')) {
@@ -286,10 +290,21 @@ function findAnyStoredDinerSession(): { restaurantId: string; tableId: string; s
           if (raw) {
             const parsed = JSON.parse(raw)
             if (parsed?.sessionId && parsed?.sessionToken) {
-              return { restaurantId, tableId, sessionId: parsed.sessionId, sessionToken: parsed.sessionToken }
+              const updatedAt = typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0
+              if (!best || updatedAt >= best.updatedAt) {
+                best = { restaurantId, tableId, sessionId: parsed.sessionId, sessionToken: parsed.sessionToken, updatedAt }
+              }
             }
           }
         }
+      }
+    }
+    if (best) {
+      return {
+        restaurantId: best.restaurantId,
+        tableId: best.tableId,
+        sessionId: best.sessionId,
+        sessionToken: best.sessionToken,
       }
     }
   } catch {
@@ -527,8 +542,7 @@ export function PublicMenu() {
     if (tId && tblId) {
       removeStoredDinerSession(tId, tblId)
     }
-    setSessionToken(null)
-    setSessionId(null)
+    lockDinerSession(setSessionState)
     setOrdersRefreshKey((k) => k + 1)
     setCartOpen(false)
   }
@@ -695,7 +709,15 @@ export function PublicMenu() {
           setReviewsEnabled(data?.reviewsEnabled !== false)
           setAvgRating(typeof data?.averageRating === 'number' ? data.averageRating : null)
           setReviewCount(typeof data?.reviewCount === 'number' ? data.reviewCount : 0)
-          lockDinerSession(setSessionState)
+          if (data?.orderId) setBillOrderId(data.orderId)
+          lockButKeepCredential(
+            {
+              token: anyStored.sessionToken,
+              tenantId: anyStored.restaurantId,
+              tableId: anyStored.tableId,
+            },
+            data,
+          )
           setLoading(false)
           return
         }
@@ -718,18 +740,24 @@ export function PublicMenu() {
     }
   }, [revalidateNonce])
 
-  // ----- Cart persistence (keyed by SESSION, not just table) -----
+  // ----- Cart persistence (keyed by SESSION once ordered, or table while browsing) -----
   // Switching tables / re-scanning creates a new session → fresh cart.
+  const cartSuffix = useMemo(() => {
+    if (sessionToken) return sessionToken
+    if (table?.id) return `browsing:${table.id}`
+    return null
+  }, [sessionToken, table?.id])
+
   const cartKey = useMemo(() => {
-    if (!sessionToken) return null
-    return keyName('cart', sessionToken)
-  }, [sessionToken])
+    if (!cartSuffix) return null
+    return keyName('cart', cartSuffix)
+  }, [cartSuffix])
 
   // load
   useEffect(() => {
-    if (!cartKey) return
+    if (!cartSuffix) return
     try {
-      const raw = readStored('cart', sessionToken ?? '')
+      const raw = readStored('cart', cartSuffix)
       if (raw) {
         const parsed = JSON.parse(raw) as CartItem[]
         if (Array.isArray(parsed)) setCart(parsed)
@@ -737,17 +765,17 @@ export function PublicMenu() {
     } catch {
       /* ignore */
     }
-  }, [cartKey])
+  }, [cartSuffix])
 
   // save
   useEffect(() => {
-    if (!cartKey) return
+    if (!cartSuffix) return
     try {
-      writeStored('cart', JSON.stringify(cart), sessionToken ?? '')
+      writeStored('cart', JSON.stringify(cart), cartSuffix)
     } catch {
       /* ignore */
     }
-  }, [cart, cartKey])
+  }, [cart, cartSuffix])
 
   // ----- Cart actions -----
   function addToCart(item: MenuItem, portion?: { id?: string; name: string; price: number } | null) {
@@ -1074,13 +1102,21 @@ export function PublicMenu() {
       quantity: c.quantity,
       notes: c.notes || '',
     }))
-    const actorKey = sessionToken || (table?.id ? `table_${table.id}` : `qr_${currentQrToken}`)
+    const existingStoredSession =
+      !sessionToken && table?.id ? getStoredDinerSession(effectiveTenantId, table.id) : null
+    const activeToken = sessionToken || existingStoredSession?.sessionToken || null
+    if (existingStoredSession && !sessionToken) {
+      setSessionToken(existingStoredSession.sessionToken)
+      setSessionId(existingStoredSession.sessionId)
+    }
+
+    const actorKey = activeToken || (table?.id ? `table_${table.id}` : `qr_${currentQrToken}`)
     const payload: Record<string, any> = {
       orderType: 'DINE_IN',
       items,
     }
-    if (sessionToken) {
-      payload.tableSessionToken = sessionToken
+    if (activeToken) {
+      payload.tableSessionToken = activeToken
     } else if (currentQrToken) {
       payload.qrToken = currentQrToken
       if (table?.id) payload.tableId = table.id
@@ -1108,6 +1144,11 @@ export function PublicMenu() {
       setSessionId(order.sessionId)
       const tId = tenant?.id || sessionTenantId
       const tblId = table?.id || sessionTableId
+      if (tblId) {
+        try {
+          removeStored('cart', `browsing:${tblId}`)
+        } catch {}
+      }
       if (tId && tblId) {
         setStoredDinerSession(tId, tblId, {
           sessionId: order.sessionId,

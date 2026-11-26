@@ -168,7 +168,7 @@ async function validateDinerSession(
     // independently of migration 0076, and naming a column that does not exist
     // yet makes PostgREST fail the whole query — which would read as "invalid
     // session" and break every diner order in the window between the two.
-    .select("*, table:tables(id, active)")
+    .select("*, table:tables(id, active), tenant:tenants(id, active)")
     .eq("token", token)
     .maybeSingle();
   if (!row) {
@@ -180,6 +180,11 @@ async function validateDinerSession(
       error: "Session ended. Please scan the table QR code again to continue.",
       status: 403,
     };
+  }
+  const tenantRel = (row as any).tenant;
+  const tenantRow = Array.isArray(tenantRel) ? tenantRel[0] : tenantRel;
+  if (!tenantRow || tenantRow.active === false) {
+    return { ok: false, error: "This restaurant is currently unavailable.", status: 403 };
   }
   const rel = (row as any).table;
   const table = Array.isArray(rel) ? rel[0] : rel;
@@ -270,22 +275,69 @@ async function getByKey(req: Request, key: string): Promise<Response> {
     return json(req, mapOrder(data));
   }
 
+  const reqUrl = new URL(req.url);
   const token =
-    new URL(req.url).searchParams.get("tableSessionToken") ||
-    new URL(req.url).searchParams.get("sessionToken") ||
+    reqUrl.searchParams.get("tableSessionToken") ||
+    reqUrl.searchParams.get("sessionToken") ||
     req.headers.get("x-session-token") ||
     "";
-  const session = await validateDinerSession(token);
-  if (!session.ok) return json(req, { error: session.error }, session.status);
+  if (token) {
+    const session = await validateDinerSession(token);
+    if (!session.ok) return json(req, { error: session.error }, session.status);
+    const { data, error } = await db
+      .from("orders")
+      .select(ORDER_SELECT)
+      .eq("idempotency_key", key)
+      .eq("table_session_id", session.sessionId)
+      .maybeSingle();
+    if (error) return json(req, { error: error.message }, 500);
+    if (!data) return json(req, { error: "Not found" }, 404);
+    return json(req, {
+      ...mapOrder(data),
+      sessionToken: token,
+      sessionId: session.sessionId,
+      pendingActivation: data.status === "PENDING_ACTIVATION",
+    });
+  }
+
+  const qrToken = reqUrl.searchParams.get("qrToken") || reqUrl.searchParams.get("table") || "";
+  if (!qrToken) {
+    return json(req, { error: "Missing session credentials. Please scan the table QR code." }, 401);
+  }
+  const { data: tableRow } = await db
+    .from("tables")
+    .select("id, tenant_id, active, tenant:tenants(id, active)")
+    .eq("qr_token", qrToken)
+    .eq("active", true)
+    .maybeSingle();
+  if (!tableRow) return json(req, { error: "Not found" }, 404);
+  const tenantRel = (tableRow as any).tenant;
+  const tenantRow = Array.isArray(tenantRel) ? tenantRel[0] : tenantRel;
+  if (!tenantRow || tenantRow.active === false) {
+    return json(req, { error: "This restaurant is currently unavailable." }, 403);
+  }
+
   const { data, error } = await db
     .from("orders")
     .select(ORDER_SELECT)
     .eq("idempotency_key", key)
-    .eq("table_session_id", session.sessionId)
+    .eq("tenant_id", tableRow.tenant_id)
+    .eq("table_id", tableRow.id)
     .maybeSingle();
   if (error) return json(req, { error: error.message }, 500);
   if (!data) return json(req, { error: "Not found" }, 404);
-  return json(req, mapOrder(data));
+
+  const { data: sessRow } = await db
+    .from("table_sessions")
+    .select("token")
+    .eq("id", data.table_session_id)
+    .maybeSingle();
+  return json(req, {
+    ...mapOrder(data),
+    sessionToken: sessRow?.token || "",
+    sessionId: data.table_session_id,
+    pendingActivation: data.status === "PENDING_ACTIVATION",
+  });
 }
 
 async function list(req: Request): Promise<Response> {
@@ -923,13 +975,18 @@ async function create(req: Request): Promise<Response> {
       // First order on scanned QR table: mint session only now, strictly isolating this diner
       const { data: tableRow } = await db
         .from("tables")
-        .select("id, tenant_id, active")
+        .select("id, tenant_id, active, tenant:tenants(id, active)")
         .eq("qr_token", String(qrToken))
         .eq("active", true)
         .maybeSingle();
 
       if (!tableRow) {
         return json(req, { error: "Invalid QR code or table is inactive." }, 404);
+      }
+      const qrTenantRel = (tableRow as any).tenant;
+      const qrTenant = Array.isArray(qrTenantRel) ? qrTenantRel[0] : qrTenantRel;
+      if (!qrTenant || qrTenant.active === false) {
+        return json(req, { error: "This restaurant is currently unavailable." }, 403);
       }
 
       // Authorized retry check: resolve existing idempotency key before creating a new session

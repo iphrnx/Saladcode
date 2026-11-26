@@ -119,8 +119,13 @@ export async function submitEntry(
   if (isRetry) {
     // Reconcile before re-submitting — see the module comment.
     const token = entry.kind === 'diner' ? entry.payload?.tableSessionToken : null
-    const lookupUrl =
-      '/api/orders/by-key/' + entry.key + (token ? `?tableSessionToken=${encodeURIComponent(token)}` : '')
+    const qrToken = entry.kind === 'diner' && !token ? entry.payload?.qrToken : null
+    const lookupQuery = token
+      ? `?tableSessionToken=${encodeURIComponent(token)}`
+      : qrToken
+        ? `?qrToken=${encodeURIComponent(qrToken)}`
+        : ''
+    const lookupUrl = '/api/orders/by-key/' + entry.key + lookupQuery
     try {
       const headers: Record<string, string> = { ...(entry.headers ?? {}) }
       if (token) headers['x-session-token'] = token
