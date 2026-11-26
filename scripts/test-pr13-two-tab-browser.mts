@@ -539,7 +539,12 @@ try {
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
-  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  try {
+    await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  } catch (err) {
+    const bodyB = await evalIn(sidB, `document.body?.innerText`)
+    throw new Error(`Browser test 11 sidB Place Order timeout: ${String(err)}\nBODY:\n${bodyB?.slice(0, 500)}`)
+  }
 
   const ordersBeforeDup = state.orders.length
   const attemptsBeforeDup = state.postAttempts.length
@@ -548,7 +553,12 @@ try {
     evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`),
     evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`),
   ])
-  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  try {
+    await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  } catch (err) {
+    const bodyA = await evalIn(sidA, `document.body?.innerText`)
+    throw new Error(`Browser test 11 releaseHeldPost timeout: attempts=${JSON.stringify(state.postAttempts.slice(attemptsBeforeNoLocksRace))} bodyA=${bodyA?.slice(0, 300)}`)
+  }
   await sleep(300)
   state.releaseHeldPost!()
   try {
@@ -575,7 +585,12 @@ try {
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
-  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  try {
+    await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  } catch (err) {
+    const bodyB = await evalIn(sidB, `document.body?.innerText`)
+    throw new Error(`Browser test 11 sidB Place Order timeout: ${String(err)}\nBODY:\n${bodyB?.slice(0, 500)}`)
+  }
   const ordersBeforeStale = state.orders.length
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
   await waitFor(() => (state.orders.length === ordersBeforeStale + 1 ? true : false))
@@ -590,6 +605,7 @@ try {
   // hold A's follow-up order for 1 Masala Dosa, independently add 2 Masala Dosa in B,
   // reload B twice via QR, then resolve A and verify B's 2 units remain intact.
   await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await evalIn(sidB, `sessionStorage.clear()`)
   await send('Page.navigate', { url: QR_URL }, sidA)
   await send('Page.navigate', { url: QR_URL }, sidB)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
@@ -612,7 +628,12 @@ try {
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
   state.holdNextPost = true
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
-  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  try {
+    await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  } catch (err) {
+    const bodyA = await evalIn(sidA, `document.body?.innerText`)
+    throw new Error(`Browser test 11 releaseHeldPost timeout: attempts=${JSON.stringify(state.postAttempts.slice(attemptsBeforeNoLocksRace))} bodyA=${bodyA?.slice(0, 300)}`)
+  }
 
   // B (still browsing) independently adds 2 Masala Dosa, then reloads twice through QR.
   await evalIn(
@@ -657,6 +678,7 @@ try {
   // A establishes tok-browser-4, B reloads via QR (migrates queue with cartDeducted=true and clears browsing cart -> line is ABSENT from saved cart),
   // Large is removed from catalog, held retry rejects with 409 ITEM_UNAVAILABLE -> restores 2x Large at ₹380, Subtotal row ₹760.00, 0 orders created.
   await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await evalIn(sidB, `sessionStorage.clear()`)
   await send('Page.navigate', { url: QR_URL }, sidB)
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Paneer Tikka')`))
 
@@ -687,7 +709,12 @@ try {
   const ordersBeforeRemovedPortion = state.orders.length
   state.holdNextPost = true
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
-  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  try {
+    await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  } catch (err) {
+    const bodyA = await evalIn(sidA, `document.body?.innerText`)
+    throw new Error(`Browser test 11 releaseHeldPost timeout: attempts=${JSON.stringify(state.postAttempts.slice(attemptsBeforeNoLocksRace))} bodyA=${bodyA?.slice(0, 300)}`)
+  }
   state.orders.pop()
   state.releaseHeldPost = null
 
@@ -696,7 +723,12 @@ try {
   state.holdNextPost = true
   state.rejectNextPostUnavailable = true
   await send('Page.navigate', { url: QR_URL }, sidB)
-  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  try {
+    await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  } catch (err) {
+    const bodyA = await evalIn(sidA, `document.body?.innerText`)
+    throw new Error(`Browser test 11 releaseHeldPost timeout: attempts=${JSON.stringify(state.postAttempts.slice(attemptsBeforeNoLocksRace))} bodyA=${bodyA?.slice(0, 300)}`)
+  }
 
   // Assert the reserved line is absent from the saved session cart before rejection.
   const preRejectCart = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-4')`)) || '[]')
@@ -736,6 +768,7 @@ try {
   // 6. Independent reservations: A holds 1 Masala Dosa in session queue; B (browsing) independently adds 2 Masala Dosa
   // and submits using A's saved session token -> B's POST has quantity 2 and its own key; confirming both deducts only each order's own qty.
   await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await evalIn(sidB, `sessionStorage.clear()`)
   await send('Page.navigate', { url: QR_URL }, sidA)
   await send('Page.navigate', { url: QR_URL }, sidB)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
@@ -759,7 +792,12 @@ try {
   const attemptsBeforeIndep = state.postAttempts.length
   state.holdNextPost = true
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
-  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  try {
+    await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  } catch (err) {
+    const bodyA = await evalIn(sidA, `document.body?.innerText`)
+    throw new Error(`Browser test 11 releaseHeldPost timeout: attempts=${JSON.stringify(state.postAttempts.slice(attemptsBeforeNoLocksRace))} bodyA=${bodyA?.slice(0, 300)}`)
+  }
   const releaseAIndep = state.releaseHeldPost!
   state.releaseHeldPost = null
 
@@ -804,13 +842,23 @@ try {
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
-  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  try {
+    await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  } catch (err) {
+    const bodyB = await evalIn(sidB, `document.body?.innerText`)
+    throw new Error(`Browser test 11 sidB Place Order timeout: ${String(err)}\nBODY:\n${bodyB?.slice(0, 500)}`)
+  }
 
   const ordersBeforeConfirmRace = state.orders.length
   const attemptsBeforeConfirmRace = state.postAttempts.length
   state.holdNextPost = true
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
-  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  try {
+    await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  } catch (err) {
+    const bodyA = await evalIn(sidA, `document.body?.innerText`)
+    throw new Error(`Browser test 11 releaseHeldPost timeout: attempts=${JSON.stringify(state.postAttempts.slice(attemptsBeforeNoLocksRace))} bodyA=${bodyA?.slice(0, 300)}`)
+  }
   // Backend has committed (order exists), response is paused before A saves cart deduction; stale B attempts checkout now.
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
   await sleep(300)
@@ -823,7 +871,7 @@ try {
   assert.equal(state.orders.length, ordersBeforeConfirmRace + 1, 'confirmation race produces exactly 1 order')
   assert.equal(state.postAttempts.length - attemptsBeforeConfirmRace, 1, 'stale Tab B sends no duplicate POST')
 
-  // (b) No-Web-Locks path and storage error path both fail closed with no POST and cart intact.
+  // (b) Storage error path fails closed with no POST and cart intact.
   await send('Page.reload', {}, sidB)
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
   await evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
@@ -831,25 +879,10 @@ try {
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
 
-  const attemptsBeforeNoLocks = state.postAttempts.length
+  const attemptsBeforeStorageErr = state.postAttempts.length
   await evalIn(
     sidB,
     `(() => {
-      window.__origLocksDesc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'locks') || Object.getOwnPropertyDescriptor(navigator, 'locks');
-      Object.defineProperty(navigator, 'locks', { value: undefined, configurable: true });
-    })()`,
-  )
-  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
-  await sleep(200)
-  assert.equal(state.postAttempts.length, attemptsBeforeNoLocks, 'no-Web-Locks tab sends no POST')
-  const cartAfterNoLocks = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-5')`)) || '[]')
-  assert.equal(cartAfterNoLocks.length, 1, 'cart remains intact when Web Locks unavailable')
-
-  // Restore locks, then inject a storage error on lock probe.
-  await evalIn(
-    sidB,
-    `(() => {
-      delete navigator.locks;
       window.__origGetItem = Storage.prototype.getItem;
       Storage.prototype.getItem = function(k) {
         if (String(k).includes('the-salad-checkout-lock-')) throw new Error('Quota/Storage error');
@@ -859,13 +892,16 @@ try {
   )
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
   await sleep(200)
-  assert.equal(state.postAttempts.length, attemptsBeforeNoLocks, 'storage error prevents POST')
+  assert.equal(state.postAttempts.length, attemptsBeforeStorageErr, 'storage error prevents POST')
+  const cartAfterStorageErr = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-5')`)) || '[]')
+  assert.equal(cartAfterStorageErr.length, 1, 'cart remains intact on lock storage error')
   await evalIn(sidB, `if (window.__origGetItem) Storage.prototype.getItem = window.__origGetItem`)
-  console.log('  ok    Browser test 7: Confirmation race + no-Web-Locks + storage error prevent duplicate or unlocked POSTs')
+  console.log('  ok    Browser test 7: Confirmation race + storage error prevent duplicate or unlocked POSTs')
 
   // 8. Cached-session cart ownership: A has 1 unsubmitted Masala Dosa in session; B has pending browsing order for 1 Masala Dosa,
   // reopens through MENU_URL (no QR token) adopting cached session, confirms -> A's unit survives.
   await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await evalIn(sidB, `sessionStorage.clear()`)
   await send('Page.navigate', { url: QR_URL }, sidB)
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
   await send('Page.navigate', { url: QR_URL }, sidA)
@@ -909,8 +945,9 @@ try {
 
   // 9. Concurrent QR adoption: both tabs begin adopting the same browsing cart concurrently before either completes.
   await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await evalIn(sidB, `sessionStorage.clear()`)
   await send('Page.navigate', { url: QR_URL }, sidB)
-  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Mango Lassi')`))
+  await waitFor(() => evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')].length >= 3`))
   await send('Page.navigate', { url: QR_URL }, sidA)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Paneer Tikka')`))
   await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
@@ -948,6 +985,211 @@ try {
   const concCart2 = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-7')`)) || '[]')
   assert.equal(concCart2.find((c: any) => c.menuItemId === MENU_ITEMS[2].id)?.quantity, 1, 'repeated reloads keep Mango Lassi at 1')
   console.log('  ok    Browser test 9: Concurrent QR adoption imports browsing cart once and stays idempotent across reloads')
+
+  // 10. Duplicate first order across two tabs:
+  // Shared browsing cart in both tabs -> A's first order commits, paused before retiring queue entry ->
+  // stale Tab B attempts checkout -> sends NO POST; resume A -> 1 order, 1 session, credential saved & usable, cart stays clear across reloads.
+  await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await evalIn(sidB, `sessionStorage.clear()`)
+  await send('Page.navigate', { url: QR_URL }, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Paneer Tikka')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
+  await waitFor(async () => {
+    return await evalIn(sidA, `Object.entries(localStorage).some(([k, v]) => k.includes('browsing') && JSON.parse(v || '[]').some((c) => c.menuItemId === '${MENU_ITEMS[0].id}' && c.quantity === 1))`)
+  })
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  try {
+    await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  } catch (err) {
+    const bodyB = await evalIn(sidB, `document.body?.innerText`)
+    throw new Error(`Browser test 11 sidB Place Order timeout: ${String(err)}\nBODY:\n${bodyB?.slice(0, 500)}`)
+  }
+
+  const ordersBeforeFirstDup = state.orders.length
+  const attemptsBeforeFirstDup = state.postAttempts.length
+  const sessionsBeforeFirstDup = state.sessions.size
+  state.holdNextPost = true
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  try {
+    await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  } catch (err) {
+    const bodyA = await evalIn(sidA, `document.body?.innerText`)
+    throw new Error(`Browser test 11 releaseHeldPost timeout: attempts=${JSON.stringify(state.postAttempts.slice(attemptsBeforeNoLocksRace))} bodyA=${bodyA?.slice(0, 300)}`)
+  }
+  // A's first order has committed on the server (1 order, 1 new session), response paused before retiring queue entry.
+  assert.equal(state.orders.length, ordersBeforeFirstDup + 1)
+  assert.equal(state.sessions.size, sessionsBeforeFirstDup + 1)
+
+  // Stale Tab B attempts checkout while A's reservation is still active -> must send NO POST.
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await sleep(300)
+  assert.equal(state.postAttempts.length, attemptsBeforeFirstDup + 1, 'stale Tab B sends no duplicate first-order POST')
+
+  // Resume A -> saves credential, clears browsing cart, retires queue entry.
+  state.releaseHeldPost!()
+  state.releaseHeldPost = null
+  await waitFor(() => (state.sessions.has('tok-browser-8') ? true : false))
+  await waitFor(async () => {
+    const raw = await evalIn(sidA, `localStorage.getItem('restro_session:${TENANT.id}:${TABLE.id}')`)
+    return JSON.parse(raw || '{}').sessionToken === 'tok-browser-8'
+  })
+  await send('Page.reload', {}, sidA)
+  await send('Page.reload', {}, sidB)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Paneer Tikka')`))
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Paneer Tikka')`))
+  assert.equal(state.orders.length, ordersBeforeFirstDup + 1, 'exactly one order recorded')
+  assert.equal(state.sessions.size, sessionsBeforeFirstDup + 1, 'exactly one session recorded')
+  const browsingAfterFirst = await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-browsing:${TABLE.id}')`)
+  const sessionCartAfterFirst = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-8')`)) || '[]')
+  assert.equal(browsingAfterFirst, null, 'browsing cart removed')
+  assert.equal(sessionCartAfterFirst.length, 0, 'confirmed quantities stay removed after reload')
+  console.log('  ok    Browser test 10: Duplicate first order across two tabs produces 1 order, 1 session, and clears cart')
+
+  // 11. Checkout without Web Locks:
+  // Disable navigator.locks before app loads -> single tab places order normally -> two tabs race same cart -> 1 key, 1 order.
+  await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await evalIn(sidB, `sessionStorage.clear()`)
+  const noLocksScriptA = await send(
+    'Page.addScriptToEvaluateOnNewDocument',
+    { source: `Object.defineProperty(navigator, 'locks', { value: undefined, configurable: true });` },
+    sidA,
+  )
+  const noLocksScriptB = await send(
+    'Page.addScriptToEvaluateOnNewDocument',
+    { source: `Object.defineProperty(navigator, 'locks', { value: undefined, configurable: true });` },
+    sidB,
+  )
+  await send('Page.navigate', { url: QR_URL }, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Paneer Tikka')`))
+  assert.equal(await evalIn(sidA, `typeof navigator.locks`), 'undefined', 'navigator.locks disabled before load')
+
+  // Single tab places first order normally without Web Locks -> establishes tok-browser-9.
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.sessions.has('tok-browser-9') ? true : false))
+  await waitFor(async () => {
+    const raw = await evalIn(sidA, `localStorage.getItem('restro_session:${TENANT.id}:${TABLE.id}')`)
+    return JSON.parse(raw || '{}').sessionToken === 'tok-browser-9'
+  })
+
+  // Put 1 Mango Lassi in shared session cart of both tabs, then race Place Order simultaneously without Web Locks.
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')].length >= 3`))
+  await evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')][2]?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await waitFor(async () => {
+    const raw = await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-9')`)
+    return JSON.parse(raw || '[]').some((c: any) => c.menuItemId === MENU_ITEMS[2].id && c.quantity === 1)
+  })
+  await send('Page.reload', {}, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  try {
+    await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  } catch (err) {
+    const bodyB = await evalIn(sidB, `document.body?.innerText`)
+    throw new Error(`Browser test 11 sidB Place Order timeout: ${String(err)}\nBODY:\n${bodyB?.slice(0, 500)}`)
+  }
+
+  const ordersBeforeNoLocksRace = state.orders.length
+  const attemptsBeforeNoLocksRace = state.postAttempts.length
+  state.holdNextPost = true
+  await Promise.all([
+    evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`),
+    evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`),
+  ])
+  try {
+    await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  } catch (err) {
+    const bodyA = await evalIn(sidA, `document.body?.innerText`)
+    throw new Error(`Browser test 11 releaseHeldPost timeout: attempts=${JSON.stringify(state.postAttempts.slice(attemptsBeforeNoLocksRace))} bodyA=${bodyA?.slice(0, 300)}`)
+  }
+  await sleep(300)
+  state.releaseHeldPost!()
+  state.releaseHeldPost = null
+  await waitFor(async () => {
+    const raw = await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-9')`)
+    return JSON.parse(raw || '[]').length === 0
+  })
+  assert.equal(state.orders.length, ordersBeforeNoLocksRace + 1, 'no-Web-Locks race produces exactly 1 order')
+  assert.equal(state.postAttempts.length - attemptsBeforeNoLocksRace, 1, 'no-Web-Locks race sends exactly 1 POST/key')
+
+  await send('Page.removeScriptToEvaluateOnNewDocument', { identifier: noLocksScriptA.identifier }, sidA)
+  await send('Page.removeScriptToEvaluateOnNewDocument', { identifier: noLocksScriptB.identifier }, sidB)
+  console.log('  ok    Browser test 11: Checkout without Web Locks works for single tab and serializes two-tab race to 1 order')
+
+  // 12. Full-storage migration:
+  // Seed unresolved browsing checkout (already committed on server with dropped response), inject QuotaExceededError on destination queue write ->
+  // menu stays usable, source entry & key remain intact -> restore writes -> automatic retry migrates, reconciles by original key, clears queue once, 0 duplicate orders.
+  await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await evalIn(sidB, `sessionStorage.clear()`)
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
+  await send('Page.navigate', { url: QR_URL }, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Paneer Tikka')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.sessions.has('tok-browser-10') ? true : false))
+
+  // B (browsing) submits 1 Masala Dosa with dropped response (committed on server, unresolved in table queue).
+  await evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  const ordersBeforeQuota = state.orders.length
+  state.dropNextPostResponse = true
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.orders.length === ordersBeforeQuota + 1 ? true : false))
+  const quotaOrderKey = state.orders[state.orders.length - 1].idempotencyKey
+
+  // Arm QuotaExceededError on destination session queue write before reloading B via QR.
+  const quotaScriptB = await send(
+    'Page.addScriptToEvaluateOnNewDocument',
+    {
+      source: `(() => {
+        const origSet = Storage.prototype.setItem;
+        Storage.prototype.setItem = function(k, v) {
+          if (this.getItem('__quota_armed') === '1' && String(k).includes('the-salad-order-queue-${TENANT.id}-tok-browser-10')) {
+            throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+          }
+          return origSet.call(this, k, v);
+        };
+      })();`,
+    },
+    sidB,
+  )
+  await evalIn(sidB, `localStorage.setItem('__quota_armed', '1')`)
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
+
+  // Menu is usable and source entry + original idempotency key remain intact in table queue.
+  const sourceQueueUnderQuota = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-order-queue-${TENANT.id}-table_${TABLE.id}')`)) || '[]')
+  assert.equal(sourceQueueUnderQuota.length, 1, 'source queue entry survives QuotaExceededError')
+  assert.equal(sourceQueueUnderQuota[0].key, quotaOrderKey, 'original idempotency key preserved under quota error')
+
+  // Restore writes -> automatic retry migrates, reconciles by original key, clears queue, and creates no duplicate order.
+  await evalIn(sidB, `localStorage.removeItem('__quota_armed')`)
+  await waitFor(() => (state.byKeyCalls.some((c) => c.key === quotaOrderKey) ? true : false))
+  await waitFor(async () => {
+    const src = await evalIn(sidB, `localStorage.getItem('the-salad-order-queue-${TENANT.id}-table_${TABLE.id}')`)
+    const dst = await evalIn(sidB, `localStorage.getItem('the-salad-order-queue-${TENANT.id}-tok-browser-10')`)
+    return (!src || JSON.parse(src).length === 0) && (!dst || JSON.parse(dst).length === 0)
+  })
+  assert.equal(state.orders.length, ordersBeforeQuota + 1, 'no duplicate order recorded after quota recovery')
+  await send('Page.removeScriptToEvaluateOnNewDocument', { identifier: quotaScriptB.identifier }, sidB)
+  console.log('  ok    Browser test 12: Full-storage migration keeps menu usable, preserves key, and recovers once quota clears')
 } finally {
   try { ws?.close() } catch { }
   try { chrome?.kill('SIGKILL') } catch { }

@@ -70,7 +70,7 @@ await check('public-menu.tsx keeps browsing cart selected in placeOrder and adop
   const confirmStart = placeEnd
   const confirmEnd = publicMenuSrc.indexOf('useEffect(() => {\n    const effectiveTenantId =', confirmStart)
   const confirmBlock = publicMenuSrc.slice(confirmStart, confirmEnd)
-  const removeIdx = confirmBlock.indexOf('let remainingCart = [...cartRef.current]')
+  const removeIdx = confirmBlock.indexOf('reconcileCartOnConfirm(')
   const adoptIdx = confirmBlock.indexOf('setSessionToken(order.sessionToken)')
   assert.ok(removeIdx !== -1 && adoptIdx !== -1 && removeIdx < adoptIdx, 'submitted items must be removed before adopting session')
 })
@@ -303,7 +303,7 @@ await check('public-menu.tsx merges remaining browsing cart into existing sessio
   const confirmEnd = publicMenuSrc.indexOf('useEffect(() => {\n    const effectiveTenantId =', confirmStart)
   const confirmBlock = publicMenuSrc.slice(confirmStart, confirmEnd)
   assert.ok(confirmBlock.includes("readStored('cart', order.sessionToken)"))
-  assert.ok(confirmBlock.includes('remainingCart.length > 0'))
+  assert.ok(confirmBlock.includes('remainingBrowsing.length > 0'))
   assert.ok(confirmBlock.includes(': existingSessionCart'))
 })
 
