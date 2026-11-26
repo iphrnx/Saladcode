@@ -60,6 +60,20 @@ export interface QueueEntry {
   itemCount: number
   /** True once reserved quantities were already deducted from the browsing cart on reload. */
   cartDeducted?: boolean
+  /** Cart suffix that supplied this checkout's items (scopes reservations per source cart). */
+  sourceCartSuffix?: string
+  /** Local UI snapshot of submitted lines (portionId, portion, unit price) for failure recovery. */
+  cartSnapshot?: Array<{
+    menuItemId: string
+    name: string
+    portionId?: string | null
+    portion?: string | null
+    price: number
+    image?: string | null
+    quantity: number
+    notes?: string
+    prepTime?: number
+  }>
 }
 
 export interface QueueHooks {
@@ -319,6 +333,7 @@ export class OrderQueue {
     payload: Record<string, any>,
     itemCount: number,
     headers?: Record<string, string>,
+    meta?: Pick<QueueEntry, 'sourceCartSuffix' | 'cartSnapshot' | 'cartDeducted'>,
   ): QueueEntry {
     const entry: QueueEntry = {
       key: newKey(),
@@ -330,6 +345,9 @@ export class OrderQueue {
       nextAttemptAt: this.now(),
       createdAt: this.now(),
       itemCount,
+      ...(meta?.sourceCartSuffix ? { sourceCartSuffix: meta.sourceCartSuffix } : {}),
+      ...(meta?.cartSnapshot ? { cartSnapshot: meta.cartSnapshot } : {}),
+      ...(meta?.cartDeducted ? { cartDeducted: meta.cartDeducted } : {}),
     }
     const entries = [...this.load(), entry]
     this.save(entries)

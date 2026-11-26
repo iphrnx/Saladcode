@@ -286,6 +286,9 @@ export function resolveRestoredLinePrice(
   portionId?: string | null,
   explicitPrice?: number | null,
 ): number {
+  if (typeof explicitPrice === 'number' && Number.isFinite(explicitPrice)) {
+    return explicitPrice
+  }
   const targetKey = normalizePortionKey(portion, portionId)
   if (targetKey && Array.isArray(menuItem?.portions)) {
     const matched = menuItem.portions.find((p) => {
@@ -297,10 +300,73 @@ export function resolveRestoredLinePrice(
       return matched.price
     }
   }
-  if (typeof explicitPrice === 'number' && Number.isFinite(explicitPrice)) {
-    return explicitPrice
-  }
   return Number(menuItem?.price ?? 0)
+}
+
+/**
+ * Filter unresolved queue entries to those that reserved items from `sourceCartSuffix`.
+ * Legacy entries without `sourceCartSuffix` still match the same queue scope.
+ */
+export function reservationsForSourceCart(
+  entries: QueueEntry[],
+  sourceCartSuffix: string | null,
+): QueueEntry[] {
+  return entries.filter((e) => {
+    if (e.state !== 'pending' && e.state !== 'submitting') return false
+    if (!e.sourceCartSuffix || !sourceCartSuffix) return true
+    return e.sourceCartSuffix === sourceCartSuffix
+  })
+}
+
+const CHECKOUT_LOCK_TTL_MS = 2_000
+
+/**
+ * Acquire a short cross-tab storage lease for a given cart suffix so two tabs
+ * cannot read the same cart snapshot and enqueue duplicate idempotency keys.
+ */
+export async function withCrossTabCheckoutLock<T>(
+  storage: StorageLike,
+  tenantId: string,
+  lockScope: string,
+  fn: () => T | Promise<T>,
+  now: () => number = Date.now,
+): Promise<T> {
+  const lockKey = `the-salad-checkout-lock-${tenantId}-${lockScope}`
+  if (typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function') {
+    return navigator.locks.request(lockKey, () => fn())
+  }
+  const nonce = `${now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+
+  for (let attempt = 0; attempt < 25; attempt++) {
+    try {
+      const raw = storage.getItem(lockKey)
+      const parsed = raw ? JSON.parse(raw) : null
+      const expired = !parsed || typeof parsed.ts !== 'number' || now() - parsed.ts > CHECKOUT_LOCK_TTL_MS
+      if (expired || parsed.nonce === nonce) {
+        storage.setItem(lockKey, JSON.stringify({ nonce, ts: now() }))
+        const verify = storage.getItem(lockKey)
+        if (verify && JSON.parse(verify)?.nonce === nonce) {
+          break
+        }
+      }
+    } catch {
+      break
+    }
+    await new Promise((r) => setTimeout(r, 15))
+  }
+
+  try {
+    return await fn()
+  } finally {
+    try {
+      const cur = storage.getItem(lockKey)
+      if (cur && JSON.parse(cur)?.nonce === nonce) {
+        storage.removeItem(lockKey)
+      }
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /**

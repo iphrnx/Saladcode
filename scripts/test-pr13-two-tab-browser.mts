@@ -75,7 +75,18 @@ const state = {
   holdNextPost: false,
   releaseHeldPost: null as (() => void) | null,
   rejectNextPostUnavailable: false,
+  removeLargePortionFromCatalog: false,
+  postAttempts: [] as Array<{ key: string; token: string | null; items: any[] }>,
   byKeyCalls: [] as Array<{ key: string; qrToken: string | null; token: string | null }>,
+}
+
+function currentMenuItems() {
+  if (!state.removeLargePortionFromCatalog) return MENU_ITEMS
+  return MENU_ITEMS.map((m) =>
+    m.id === MENU_ITEMS[0].id
+      ? { ...m, portions: (m.portions || []).filter((p) => p.id !== 'large') }
+      : m,
+  )
 }
 
 function corsHeaders(req: http.IncomingMessage): Record<string, string> {
@@ -137,7 +148,7 @@ const backend = http.createServer(async (req, res) => {
           social: {},
           theme: 'light',
           categories: CATEGORIES,
-          menuItems: MENU_ITEMS,
+          menuItems: currentMenuItems(),
         }),
       )
       return
@@ -156,7 +167,7 @@ const backend = http.createServer(async (req, res) => {
         social: {},
         theme: 'light',
         categories: CATEGORIES,
-        menuItems: MENU_ITEMS,
+        menuItems: currentMenuItems(),
       }),
     )
     return
@@ -200,6 +211,11 @@ const backend = http.createServer(async (req, res) => {
 
   if (path === '/functions/v1/orders' && req.method === 'POST') {
     const body = await readJson(req)
+    state.postAttempts.push({
+      key: body.idempotencyKey,
+      token: (req.headers['x-session-token'] as string) || body.tableSessionToken || null,
+      items: body.items || [],
+    })
     if (state.rejectNextPostUnavailable) {
       state.rejectNextPostUnavailable = false
       res.writeHead(409, headers)
@@ -415,7 +431,14 @@ try {
       btns[2]?.click();
     })()`,
   )
-  await sleep(300)
+  await waitFor(async () => {
+    const raw = await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-1')`)
+    const items = JSON.parse(raw || '[]')
+    return items.some((c: any) => c.menuItemId === MENU_ITEMS[1].id) &&
+      items.some((c: any) => c.menuItemId === MENU_ITEMS[2].id)
+      ? true
+      : false
+  })
 
   // Tab B (still browsing) adds 1 unit of Masala Dosa, drops response on submit, then reloads via QR URL.
   await evalIn(
@@ -512,16 +535,48 @@ try {
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
 
   const ordersBeforeDup = state.orders.length
+  const attemptsBeforeDup = state.postAttempts.length
   state.holdNextPost = true
-  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await Promise.all([
+    evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`),
+    evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`),
+  ])
   await waitFor(() => (state.releaseHeldPost !== null ? true : false))
-  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
   await sleep(300)
   state.releaseHeldPost!()
-  await waitFor(() => (state.orders.length === ordersBeforeDup + 1 ? true : false))
+  try {
+    await waitFor(() => (state.orders.length === ordersBeforeDup + 1 ? true : false))
+  } catch (err) {
+    throw new Error(`waitFor orders failed: orders=${state.orders.length} before=${ordersBeforeDup} attempts=${JSON.stringify(state.postAttempts.slice(attemptsBeforeDup))} (${String(err)})`)
+  }
   await sleep(400)
+  const dupAttempts = state.postAttempts.slice(attemptsBeforeDup)
+  const uniqueDupKeys = new Set(dupAttempts.map((a) => a.key))
+  assert.equal(uniqueDupKeys.size, 1, 'simultaneous checkout must use only one idempotency key')
   assert.equal(state.orders.length, ordersBeforeDup + 1, 'must create exactly 1 order for duplicate shared-cart checkout')
-  console.log('  ok    Browser test 3: Duplicate shared-cart checkout across two tabs produces exactly 1 order')
+
+  // Also cover stale-tab B attempting checkout after A confirms before B receives storage update:
+  // Put 1 Mango Lassi in A & B, confirm from A while suppressing storage event in B, then click Place Order in B.
+  await evalIn(sidB, `window.addEventListener('storage', (e) => e.stopImmediatePropagation(), true)`)
+  await send('Page.reload', {}, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Mango Lassi')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][2]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await send('Page.reload', {}, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidB, `window.addEventListener('storage', (e) => e.stopImmediatePropagation(), true)`)
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  const ordersBeforeStale = state.orders.length
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.orders.length === ordersBeforeStale + 1 ? true : false))
+  // Now B still shows stale Place Order button; clicking it must not create a second order.
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await sleep(350)
+  assert.equal(state.orders.length, ordersBeforeStale + 1, 'stale tab must not re-submit item already confirmed by A')
+  console.log('  ok    Browser test 3: Simultaneous + stale-tab checkout across two tabs produces exactly 1 order')
 
   // 4. Reload with an unrelated reservation:
   // Reset browser storage, open both tabs in browsing mode, establish session in A,
@@ -562,11 +617,19 @@ try {
     })()`,
   )
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
-  await sleep(100)
+  await waitFor(async () => {
+    const ok = await evalIn(sidB, `Object.entries(localStorage).some(([k, v]) => k.includes('browsing') && JSON.parse(v || '[]').some((c) => c.menuItemId === '${MENU_ITEMS[1].id}' && c.quantity === 2))`)
+    return ok ? true : false
+  })
   await send('Page.navigate', { url: QR_URL }, sidB)
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
   await send('Page.navigate', { url: QR_URL }, sidB)
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
+  await waitFor(async () => {
+    const raw = await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)
+    const items = JSON.parse(raw || '[]')
+    return items.some((c: any) => c.menuItemId === MENU_ITEMS[1].id)
+  })
 
   const cartB1 = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)) || '[]')
   assert.equal(cartB1.find((c: any) => c.menuItemId === MENU_ITEMS[1].id)?.quantity, 3, 'A pending 1 + B independent 2 = 3 across both reloads')
@@ -582,47 +645,124 @@ try {
   assert.equal(cartB2.find((c: any) => c.menuItemId === MENU_ITEMS[1].id)?.quantity, 2, 'B retains 2 units after A confirms')
   console.log('  ok    Browser test 4: Reload with unrelated A reservation preserves B 2 independent units')
 
-  // 5. Failed checkout with portion-price override:
-  // Seed a queued cartDeducted checkout for 2 units of Paneer Tikka (Large = ₹380, base = ₹250)
-  // that fails definitively with ITEM_UNAVAILABLE, and assert cart restores 2 units of Large at ₹380 (subtotal ₹760).
+  // 5. Removed portion: select Large (₹380, base ₹250) through UI, submit 2 units (dropped),
+  // remove Large from test catalog, reload, and return 409 ITEM_UNAVAILABLE -> restores 2x Large at ₹380 (subtotal ₹760) with no order created.
+  await evalIn(sidB, `localStorage.setItem('the-salad-cart-session-tok-browser-3', '[]')`)
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Paneer Tikka')`))
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Large'))?.click()`)
   await evalIn(
     sidB,
     `(() => {
-      localStorage.setItem('the-salad-cart-session-tok-browser-3', '[]');
-      localStorage.setItem(
-        'the-salad-order-queue-00000000-0000-4000-8000-000000000001-table_00000000-0000-4000-8000-000000000010',
-        JSON.stringify([{
-          key: '11111111-1111-4111-8111-111111111111',
-          kind: 'diner',
-          payload: {
-            orderType: 'DINE_IN',
-            tableSessionToken: 'tok-browser-3',
-            items: [{ menuItemId: '${MENU_ITEMS[0].id}', portionId: 'large', portion: 'Large', quantity: 2, notes: '' }]
-          },
-          state: 'pending',
-          attempts: 0,
-          nextAttemptAt: Date.now() - 1000,
-          createdAt: Date.now() - 2000,
-          itemCount: 1,
-          cartDeducted: true
-        }])
-      );
+      const btn = [...document.querySelectorAll('button[aria-label^="Add "]')][0];
+      btn?.click();
+      btn?.click();
     })()`,
   )
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+
+  const ordersBeforeRemovedPortion = state.orders.length
+  // Reject with 503-equivalent dropped response? Instead use holdNextPost + reload, or seed queue after clicking Place Order:
+  // Actually, dropNextPostResponse commits on server, whereas we want NO order created when rejected:
+  // Hold the POST, reload B so it stays unresolved in queue, then reject the retry after catalog removes Large!
+  state.holdNextPost = true
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  // Roll back the simulated server order (representing network drop before commit) while keeping client queue entry.
+  state.orders.pop()
+  state.removeLargePortionFromCatalog = true
   state.rejectNextPostUnavailable = true
+  state.releaseHeldPost = null
   await send('Page.navigate', { url: QR_URL }, sidB)
+  // Wait for the recovered queue entry to hit POST /orders and receive 409 ITEM_UNAVAILABLE.
+  await waitFor(() => (!state.rejectNextPostUnavailable ? true : false))
   await waitFor(async () => {
     const raw = await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)
     const items = JSON.parse(raw || '[]')
     return items.length === 1 && items[0].quantity === 2 ? items : false
   })
   const restoredCart = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)) || '[]')
+  assert.equal(restoredCart[0].portionId, 'large')
   assert.equal(restoredCart[0].portion, 'Large')
   assert.equal(restoredCart[0].price, 380)
   assert.equal(restoredCart[0].quantity, 2)
+  assert.equal(state.orders.length, ordersBeforeRemovedPortion, 'failed checkout must create no order')
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
-  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('760')`))
-  console.log('  ok    Browser test 5: Failed portioned checkout restores 2x Large at ₹380 with subtotal ₹760')
+  try {
+    await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('760')`))
+  } catch (err) {
+    const bodyText = await evalIn(sidB, `document.body?.innerText`)
+    throw new Error(`waitFor 760 failed: ${String(err)}\nBODY:\n${bodyText}`)
+  }
+  state.removeLargePortionFromCatalog = false
+  console.log('  ok    Browser test 5: Removed portion restores 2x Large at ₹380 with subtotal ₹760 and no order')
+
+  // 6. Independent reservations: A holds 1 Masala Dosa in session queue; B (browsing) independently adds 2 Masala Dosa
+  // and submits using A's saved session token -> B's POST has quantity 2 and its own key; confirming both deducts only each order's own qty.
+  await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await send('Page.navigate', { url: QR_URL }, sidA)
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
+
+  // Establish session tok-browser-4 in A.
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  try {
+    await waitFor(() => (state.sessions.has('tok-browser-4') ? true : false))
+  } catch (err) {
+    const bodyText = await evalIn(sidA, `document.body?.innerText`)
+    throw new Error(`waitFor tok-browser-4 failed: sessions=${JSON.stringify([...state.sessions.keys()])} attempts=${JSON.stringify(state.postAttempts.slice(-3))} body=${bodyText?.slice(0, 400)}`)
+  }
+
+  // A adds 1 Masala Dosa and holds its session order unresolved.
+  await send('Page.reload', {}, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  const attemptsBeforeIndep = state.postAttempts.length
+  state.holdNextPost = true
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  const releaseAIndep = state.releaseHeldPost!
+  state.releaseHeldPost = null
+
+  // B (still browsing) independently adds 2 Masala Dosa and submits using saved tok-browser-4.
+  await evalIn(
+    sidB,
+    `(() => {
+      const btn = [...document.querySelectorAll('button[aria-label^="Add "]')][1];
+      btn?.click();
+      btn?.click();
+    })()`,
+  )
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.postAttempts.length >= attemptsBeforeIndep + 2 ? true : false))
+
+  const indepAttempts = state.postAttempts.slice(attemptsBeforeIndep)
+  assert.equal(indepAttempts[0].items[0].quantity, 1, 'A submitted 1 unit')
+  assert.equal(indepAttempts[1].items[0].quantity, 2, 'B submitted 2 independent units')
+  assert.notEqual(indepAttempts[0].key, indepAttempts[1].key, 'A and B have distinct idempotency keys')
+
+  releaseAIndep()
+  await sleep(300)
+  await send('Page.reload', {}, sidA)
+  await send('Page.reload', {}, sidB)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
+  const finalIndepCart = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-4')`)) || '[]')
+  assert.equal(finalIndepCart.length, 0, 'each confirmation deducted only its own quantities')
+  console.log('  ok    Browser test 6: Independent reservations submit separate keys/quantities and deduct once')
 } finally {
   try { ws?.close() } catch { }
   try { chrome?.kill('SIGKILL') } catch { }

@@ -34,8 +34,11 @@ import {
   migratePendingTableQueueToSession,
   reconcileCartOnConfirm,
   reconcileCartOnSave,
+  reservationsForSourceCart,
   resolveRestoredLinePrice,
+  sameSyncCartLine,
   subtractUnresolvedQueueQuantities,
+  withCrossTabCheckoutLock,
 } from '@/lib/diner-cart-sync'
 import { keyName, readStored, removeStored, writeStored } from '@/lib/storage-keys'
 import { DinerOrderTracker } from '@/components/public/diner-order-tracker'
@@ -1171,7 +1174,7 @@ export function PublicMenu() {
   // The checkout is snapshotted into the persistent queue with an
   // idempotency key: a network drop can no longer lose or duplicate the
   // order. The cart is cleared only by the confirmation itself.
-  function placeOrder() {
+  async function placeOrder() {
     if (!cart.length) return
     // Synchronous double-click guard: `busy` is React state and two clicks
     // can land before it flushes. The ref closes the window.
@@ -1196,60 +1199,90 @@ export function PublicMenu() {
       }
     }
 
-    const items = cart.map((c) => ({
-      menuItemId: c.menuItemId,
-      portionId: c.portionId || undefined,
-      portion: c.portion || undefined,
-      quantity: c.quantity,
-      notes: c.notes || '',
-    }))
-    const existingStoredSession =
-      !sessionToken && table?.id ? getStoredDinerSession(effectiveTenantId, table.id) : null
-    const activeToken = sessionToken || existingStoredSession?.sessionToken || null
-
-    const actorKey = sessionToken || (table?.id ? `table_${table.id}` : `qr_${currentQrToken}`)
-    const q = orderQueue(effectiveTenantId, actorKey, {})
-
-    // Check unresolved reservations synchronously in shared localStorage across
-    // both the current queue and (when browsing with a saved session) the
-    // session queue so two tabs cannot submit the same cart contents under two
-    // separate idempotency keys.
-    const activeUnresolved = [
-      ...q.load(),
-      ...(activeToken && activeToken !== actorKey
-        ? orderQueue(effectiveTenantId, activeToken, {}).load()
-        : []),
-    ].filter((e) => e.state === 'pending' || e.state === 'submitting')
-
-    const submittableCart = subtractUnresolvedQueueQuantities(cart, activeUnresolved)
-    if (submittableCart.length === 0) {
-      toast.info('Your order is already being submitted.')
-      return
-    }
-
-    const submittableItems = submittableCart.map((c) => ({
-      menuItemId: c.menuItemId,
-      portionId: c.portionId || undefined,
-      portion: c.portion || undefined,
-      quantity: c.quantity,
-      notes: c.notes || '',
-    }))
-    const payload: Record<string, any> = {
-      orderType: 'DINE_IN',
-      items: submittableItems,
-    }
-    if (activeToken) {
-      payload.tableSessionToken = activeToken
-    } else if (currentQrToken) {
-      payload.qrToken = currentQrToken
-      if (table?.id) payload.tableId = table.id
-    }
     placingRef.current = true
-    q.enqueue(
-      'diner',
-      payload,
-      submittableItems.length,
-    )
+    const tblId = table?.id || sessionTableId
+    const sourceCartSuffix = sessionToken || (tblId ? `browsing:${tblId}` : null)
+    const lockScope = sourceCartSuffix || (currentQrToken ? `qr_${currentQrToken}` : 'diner')
+
+    const runLocked = () => {
+      const existingStoredSession =
+        !sessionToken && tblId ? getStoredDinerSession(effectiveTenantId, tblId) : null
+      const activeToken = sessionToken || existingStoredSession?.sessionToken || null
+      const actorKey = sessionToken || (tblId ? `table_${tblId}` : `qr_${currentQrToken}`)
+      const q = orderQueue(effectiveTenantId, actorKey, {})
+
+      // Reconcile this tab's cart against the latest saved cart in storage so a
+      // stale tab cannot re-submit items another tab already confirmed.
+      let workingCart = [...cartRef.current]
+      if (sourceCartSuffix) {
+        try {
+          const rawStored = readStored('cart', sourceCartSuffix)
+          const parsedStored = rawStored ? JSON.parse(rawStored) : []
+          const latestStored = Array.isArray(parsedStored) ? parsedStored : []
+          if (lastSyncedCartRef.current.suffix === sourceCartSuffix) {
+            workingCart = reconcileCartOnSave(
+              workingCart,
+              lastSyncedCartRef.current.items,
+              latestStored,
+            )
+            lastSyncedCartRef.current = { suffix: sourceCartSuffix, items: workingCart }
+            cartRef.current = workingCart
+            setCart(workingCart)
+          }
+        } catch {}
+      }
+
+      // Scope unresolved reservations to the source cart that supplied them so
+      // a pending session order never blocks independent browsing quantities.
+      const activeUnresolved = reservationsForSourceCart(
+        [
+          ...q.load(),
+          ...(activeToken && activeToken !== actorKey
+            ? orderQueue(effectiveTenantId, activeToken, {}).load()
+            : []),
+        ],
+        sourceCartSuffix,
+      )
+
+      const submittableCart = subtractUnresolvedQueueQuantities(workingCart, activeUnresolved)
+      if (submittableCart.length === 0) {
+        placingRef.current = false
+        toast.info('Your order is already being submitted.')
+        return
+      }
+
+      const submittableItems = submittableCart.map((c) => ({
+        menuItemId: c.menuItemId,
+        portionId: c.portionId || undefined,
+        portion: c.portion || undefined,
+        quantity: c.quantity,
+        notes: c.notes || '',
+      }))
+      const payload: Record<string, any> = {
+        orderType: 'DINE_IN',
+        items: submittableItems,
+      }
+      if (activeToken) {
+        payload.tableSessionToken = activeToken
+      } else if (currentQrToken) {
+        payload.qrToken = currentQrToken
+        if (tblId) payload.tableId = tblId
+      }
+      q.enqueue('diner', payload, submittableItems.length, undefined, {
+        sourceCartSuffix: sourceCartSuffix ?? undefined,
+        cartSnapshot: submittableCart.map((c) => ({ ...c })),
+      })
+    }
+
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        await withCrossTabCheckoutLock(window.localStorage, effectiveTenantId, lockScope, runLocked)
+      } else {
+        runLocked()
+      }
+    } catch {
+      placingRef.current = false
+    }
   }
 
   // Everything that happens once the server has the order — fresh commit or
@@ -1427,21 +1460,24 @@ export function PublicMenu() {
         if (entry.cartDeducted && Array.isArray(entry.payload?.items)) {
           const restored: CartItem[] = entry.payload.items.map((line: any) => {
             const menuMatch = menuItems.find((m) => m.id === line.menuItemId)
+            const snap = entry.cartSnapshot?.find((s) =>
+              sameSyncCartLine(s, line.menuItemId, line.portion ?? null, line.portionId ?? null),
+            )
             return {
               menuItemId: line.menuItemId,
-              name: menuMatch?.name || line.name || 'Item',
-              portionId: line.portionId ?? null,
-              portion: line.portion ?? null,
+              name: snap?.name || menuMatch?.name || line.name || 'Item',
+              portionId: snap?.portionId ?? line.portionId ?? null,
+              portion: snap?.portion ?? line.portion ?? null,
               price: resolveRestoredLinePrice(
                 menuMatch,
-                line.portion,
-                line.portionId,
-                line.price,
+                snap?.portion ?? line.portion,
+                snap?.portionId ?? line.portionId,
+                snap?.price ?? line.price,
               ),
-              image: menuMatch?.image ?? null,
+              image: snap?.image ?? menuMatch?.image ?? null,
               quantity: Math.max(1, Number(line.quantity) || 1),
-              notes: line.notes || undefined,
-              prepTime: menuMatch?.prepTime,
+              notes: snap?.notes || line.notes || undefined,
+              prepTime: snap?.prepTime ?? menuMatch?.prepTime,
             }
           })
           workingCart = mergeBrowsingRemainderIntoSession(workingCart, restored)
