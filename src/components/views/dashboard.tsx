@@ -15,7 +15,7 @@ import { cn } from '@/lib/utils'
 import { formatCurrency } from '@/lib/constants'
 import { normalizePortions, normalizePortionKey, type MenuPortion } from '@/lib/portions'
 import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
-import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, subtractPosSessionDraft, subtractLinesFromCart, saveRecoverablePosDraft, getRecoverablePosDrafts, clearRecoverablePosDraft, subtractRecoverablePosDraft, tryRecoverDraftToUnattachedCart, resolveSessionLifecycle, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId, type RecoverablePosDraft } from '@/lib/pos-cart'
+import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, subtractPosSessionDraft, subtractLinesFromCart, saveRecoverablePosDraft, getRecoverablePosDrafts, clearRecoverablePosDraft, subtractRecoverablePosDraft, tryRecoverDraftToUnattachedCart, isRecoveryConsumed, resolveSessionLifecycle, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId, type RecoverablePosDraft } from '@/lib/pos-cart'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
@@ -1340,7 +1340,8 @@ export function DashboardView() {
       const liveState = useStore.getState()
 
       const unsentCart = isCurrentlySelected ? liveState.cart : (storedDraft?.cart ?? [])
-      if (unsentCart.length > 0) {
+      const sourceVersion = storedDraft?.draftVersion
+      if (unsentCart.length > 0 && !(sourceVersion && isRecoveryConsumed(tenantId, userId, closedSessionId, sourceVersion))) {
         const saved = saveRecoverablePosDraft(tenantId, userId, {
           sessionId: closedSessionId,
           cart: unsentCart,
@@ -1349,6 +1350,7 @@ export function DashboardView() {
           customerName: isCurrentlySelected ? customerName : (storedDraft?.customerName ?? ''),
           customerPhone: isCurrentlySelected ? customerPhone : (storedDraft?.customerPhone ?? ''),
           promoCode: isCurrentlySelected ? liveState.promoCode : (storedDraft?.promoCode ?? ''),
+          sourceVersion,
         })
         if (!saved) {
           // Destination write failed (e.g. storage quota): preserve source draft so items are never lost.

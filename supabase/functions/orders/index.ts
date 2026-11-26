@@ -157,34 +157,68 @@ async function validateDinerSession(
   token: string,
 ): Promise<
   | { ok: true; tenantId: string; tableId: string | null; sessionId: string; activation: string }
-  | { ok: false; error: string; status: number }
+  | { ok: false; error: string; status: number; code: string }
 > {
   if (!token) {
-    return { ok: false, error: "Missing session credentials. Please scan the table QR code.", status: 401 };
+    return {
+      ok: false,
+      error: "Missing session credentials. Please scan the table QR code.",
+      status: 401,
+      code: "SESSION_INVALID",
+    };
   }
-  const { data: row } = await admin()
+  const { data: row, error } = await admin()
     .from("table_sessions")
     // `*` rather than a column list on purpose: this function is deployed
     // independently of migration 0076, and naming a column that does not exist
     // yet makes PostgREST fail the whole query — which would read as "invalid
     // session" and break every diner order in the window between the two.
-    .select("*, table:tables(id, active)")
+    .select("*, table:tables(id, active), tenant:tenants(id, active)")
     .eq("token", token)
     .maybeSingle();
+  if (error) {
+    return {
+      ok: false,
+      error: "Could not verify table availability. Please retry.",
+      status: 503,
+      code: "LOOKUP_FAILED",
+    };
+  }
   if (!row) {
-    return { ok: false, error: "Invalid session. Please scan the table QR code.", status: 401 };
+    return {
+      ok: false,
+      error: "Invalid session. Please scan the table QR code.",
+      status: 401,
+      code: "SESSION_INVALID",
+    };
   }
   if (row.status !== "ACTIVE") {
     return {
       ok: false,
       error: "Session ended. Please scan the table QR code again to continue.",
       status: 403,
+      code: "SESSION_ENDED",
+    };
+  }
+  const tenantRel = (row as any).tenant;
+  const tenantRow = Array.isArray(tenantRel) ? tenantRel[0] : tenantRel;
+  if (!tenantRow || tenantRow.active === false) {
+    return {
+      ok: false,
+      error: "This restaurant is currently unavailable.",
+      status: 403,
+      code: "RESTAURANT_UNAVAILABLE",
     };
   }
   const rel = (row as any).table;
   const table = Array.isArray(rel) ? rel[0] : rel;
   if (!table || table.active === false) {
-    return { ok: false, error: "This table is no longer available.", status: 403 };
+    return {
+      ok: false,
+      error: "This table is no longer available.",
+      status: 403,
+      code: "TABLE_UNAVAILABLE",
+    };
   }
   // The table and the session travel with the tenant: an order written without
   // them is an order that cannot be traced back to where it was placed — the
@@ -270,22 +304,78 @@ async function getByKey(req: Request, key: string): Promise<Response> {
     return json(req, mapOrder(data));
   }
 
+  const reqUrl = new URL(req.url);
   const token =
-    new URL(req.url).searchParams.get("tableSessionToken") ||
-    new URL(req.url).searchParams.get("sessionToken") ||
+    reqUrl.searchParams.get("tableSessionToken") ||
+    reqUrl.searchParams.get("sessionToken") ||
     req.headers.get("x-session-token") ||
     "";
-  const session = await validateDinerSession(token);
-  if (!session.ok) return json(req, { error: session.error }, session.status);
+  if (token) {
+    const session = await validateDinerSession(token);
+    if (!session.ok) return json(req, { error: session.error, code: session.code }, session.status);
+    const { data, error } = await db
+      .from("orders")
+      .select(ORDER_SELECT)
+      .eq("idempotency_key", key)
+      .eq("table_session_id", session.sessionId)
+      .maybeSingle();
+    if (error) return json(req, { error: error.message }, 500);
+    if (!data) return json(req, { error: "Not found" }, 404);
+    return json(req, {
+      ...mapOrder(data),
+      sessionToken: token,
+      sessionId: session.sessionId,
+      pendingActivation: data.status === "PENDING_ACTIVATION",
+    });
+  }
+
+  const qrToken = reqUrl.searchParams.get("qrToken") || reqUrl.searchParams.get("table") || "";
+  if (!qrToken) {
+    return json(req, { error: "Missing session credentials. Please scan the table QR code." }, 401);
+  }
+  const { data: tableRow, error: tableError } = await db
+    .from("tables")
+    .select("id, tenant_id, active, tenant:tenants(id, active)")
+    .eq("qr_token", qrToken)
+    .eq("active", true)
+    .maybeSingle();
+  if (tableError) return json(req, { error: "Could not verify table availability. Please retry." }, 503);
+  if (!tableRow) return json(req, { error: "Not found" }, 404);
+  const tenantRel = (tableRow as any).tenant;
+  const tenantRow = Array.isArray(tenantRel) ? tenantRel[0] : tenantRel;
+  if (!tenantRow || tenantRow.active === false) {
+    return json(req, { error: "This restaurant is currently unavailable." }, 403);
+  }
+
   const { data, error } = await db
     .from("orders")
     .select(ORDER_SELECT)
     .eq("idempotency_key", key)
-    .eq("table_session_id", session.sessionId)
+    .eq("tenant_id", tableRow.tenant_id)
+    .eq("table_id", tableRow.id)
     .maybeSingle();
   if (error) return json(req, { error: error.message }, 500);
   if (!data) return json(req, { error: "Not found" }, 404);
-  return json(req, mapOrder(data));
+
+  const { data: sessRow, error: sessError } = await db
+    .from("table_sessions")
+    .select("token")
+    .eq("id", data.table_session_id)
+    .maybeSingle();
+  const resolvedToken = typeof sessRow?.token === "string" ? sessRow.token.trim() : "";
+  if (sessError || !resolvedToken) {
+    return json(
+      req,
+      { error: "Could not resolve diner credentials. Please retry." },
+      503,
+    );
+  }
+  return json(req, {
+    ...mapOrder(data),
+    sessionToken: resolvedToken,
+    sessionId: data.table_session_id,
+    pendingActivation: data.status === "PENDING_ACTIVATION",
+  });
 }
 
 async function list(req: Request): Promise<Response> {
@@ -790,7 +880,7 @@ async function create(req: Request): Promise<Response> {
     // contract, and each refusal is reported in the words that page expects.
     if (tableSessionToken) {
       const session = await validateDinerSession(tableSessionToken);
-      if (!session.ok) return json(req, { error: session.error }, session.status);
+      if (!session.ok) return json(req, { error: session.error, code: session.code }, session.status);
 
       // Authorized retry check: resolve existing idempotency key before promo validation or session writes
       if (idempotencyKey) {
@@ -884,7 +974,7 @@ async function create(req: Request): Promise<Response> {
               created.reason === "unavailable"
                 ? "One or more items are no longer available"
                 : created.error,
-            ...(created.code ? { code: created.code } : {}),
+            code: created.reason === "unavailable" ? "ITEM_UNAVAILABLE" : created.code,
           },
           created.status,
         );
@@ -921,40 +1011,59 @@ async function create(req: Request): Promise<Response> {
       }, 201);
     } else if (qrToken) {
       // First order on scanned QR table: mint session only now, strictly isolating this diner
-      const { data: tableRow } = await db
+      const { data: tableRow, error: tableError } = await db
         .from("tables")
-        .select("id, tenant_id, active")
+        .select("id, tenant_id, active, tenant:tenants(id, active)")
         .eq("qr_token", String(qrToken))
         .eq("active", true)
         .maybeSingle();
 
+      if (tableError) {
+        return json(req, { error: "Could not verify table availability. Please retry." }, 503);
+      }
       if (!tableRow) {
         return json(req, { error: "Invalid QR code or table is inactive." }, 404);
+      }
+      const qrTenantRel = (tableRow as any).tenant;
+      const qrTenant = Array.isArray(qrTenantRel) ? qrTenantRel[0] : qrTenantRel;
+      if (!qrTenant || qrTenant.active === false) {
+        return json(req, { error: "This restaurant is currently unavailable." }, 403);
       }
 
       // Authorized retry check: resolve existing idempotency key before creating a new session
       if (idempotencyKey) {
-        const { data: existingOrder } = await db
+        const { data: existingOrder, error: existingError } = await db
           .from("orders")
           .select(ORDER_SELECT)
           .eq("idempotency_key", idempotencyKey)
           .eq("tenant_id", tableRow.tenant_id)
           .eq("table_id", tableRow.id)
           .maybeSingle();
+        if (existingError) {
+          return json(req, { error: "Could not verify existing order. Please retry." }, 503);
+        }
 
         if (existingOrder) {
-          const { data: sessRow } = await db
+          const { data: sessRow, error: sessError } = await db
             .from("table_sessions")
             .select("token")
             .eq("id", existingOrder.table_session_id)
             .maybeSingle();
+          const resolvedToken = typeof sessRow?.token === "string" ? sessRow.token.trim() : "";
+          if (sessError || !resolvedToken) {
+            return json(
+              req,
+              { error: "Could not resolve diner credentials. Please retry." },
+              503,
+            );
+          }
 
           const mapped = mapOrder(existingOrder);
           return json(
             req,
             {
               ...mapped,
-              sessionToken: sessRow?.token || "",
+              sessionToken: resolvedToken,
               sessionId: existingOrder.table_session_id,
               pendingActivation: existingOrder.status === "PENDING_ACTIVATION",
               promoApplied: existingOrder.discount > 0 || !!existingOrder.promo_code_id,
@@ -1014,7 +1123,7 @@ async function create(req: Request): Promise<Response> {
               created.reason === "unavailable"
                 ? "One or more items are no longer available"
                 : created.error,
-            ...(created.code ? { code: created.code } : {}),
+            code: created.reason === "unavailable" ? "ITEM_UNAVAILABLE" : created.code,
           },
           created.status,
         );

@@ -34,6 +34,7 @@ import {
   subtractRecoverablePosDraft,
   recoverDraftToUnattachedCart,
   tryRecoverDraftToUnattachedCart,
+  isRecoveryConsumed,
   findEditableSession,
   isSessionEditable,
   resolveSessionLifecycle,
@@ -846,6 +847,138 @@ check("PR#14 P2-3 (cross-tab): stale tab with empty in-memory cart cannot overwr
     assert.equal(retried.snapshot.cart[0].menuItemId, "m2");
     assert.equal(retried.snapshot.cart[0].quantity, 2);
   }
+});
+
+check("PR#14 (interleaved tab save): save from another tab between read and commit aborts recovery and preserves both carts", () => {
+  clearPosCart(T, U);
+
+  saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-interleave",
+    cart: [{ menuItemId: "m2", name: "Pasta", price: 250, quantity: 2 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-2",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  const res = tryRecoverDraftToUnattachedCart(T, U, [], "sess-interleave", () => {
+    // Another tab saves an unattached cart right before commit
+    savePosSessionDraft(T, U, null, {
+      cart: [{ menuItemId: "m3", name: "Fries", price: 90, quantity: 1 }],
+      orderType: "DINE_IN",
+      selectedTableId: "tbl-8",
+      selectedSessionId: null,
+      customerName: "",
+      customerPhone: "",
+      promoCode: "",
+    });
+  });
+
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.equal(res.reason, "non_empty");
+  assert.equal(restorePosCart(T, U)?.cart[0].menuItemId, "m3", "other tab's cart preserved");
+  assert.equal(getRecoverablePosDraft(T, U, "sess-interleave")?.cart[0].quantity, 2, "recoverable draft preserved");
+});
+
+check("PR#14 (legacy-only draft): failed migration cleanup preserves legacy draft and blocks recovery from replacing it", () => {
+  clearPosCart(T, U);
+
+  // Legacy-only draft under old key name
+  (globalThis as any).localStorage.setItem(
+    `toastly-pos-cart-${T}-${U}`,
+    JSON.stringify({
+      cart: [{ menuItemId: "m0", name: "Soup", price: 100, quantity: 1 }],
+      orderType: "DINE_IN",
+      selectedTableId: "tbl-0",
+      promoCode: "",
+      savedAt: 1000,
+    }),
+  );
+
+  saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-leg-block",
+    cart: [{ menuItemId: "m1", name: "Burger", price: 150, quantity: 2 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-1",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  const origSetItem = (globalThis as any).localStorage.setItem;
+  const origRemoveItem = (globalThis as any).localStorage.removeItem;
+  (globalThis as any).localStorage.setItem = (k: string, v: string) => {
+    if (k === `the-salad-pos-cart-${T}-${U}`) throw new DOMException("QuotaExceededError", "QuotaExceededError");
+    return origSetItem(k, v);
+  };
+  (globalThis as any).localStorage.removeItem = (k: string) => {
+    if (k.startsWith("toastly-")) throw new DOMException("SecurityError", "SecurityError");
+    return origRemoveItem(k);
+  };
+
+  const res = tryRecoverDraftToUnattachedCart(T, U, [], "sess-leg-block");
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.equal(res.reason, "non_empty");
+
+  (globalThis as any).localStorage.setItem = origSetItem;
+  (globalThis as any).localStorage.removeItem = origRemoveItem;
+
+  // Legacy draft and recoverable draft are both preserved
+  assert.equal(restorePosCart(T, U)?.cart[0].menuItemId, "m0");
+  assert.equal(getRecoverablePosDraft(T, U, "sess-leg-block")?.cart[0].quantity, 2);
+});
+
+check("PR#14 (repeated closure): failed attached-draft cleanup + consumed recovery never recreates recovery entry on repeated closure", () => {
+  clearPosCart(T, U);
+
+  // 1. Save attached draft on sess-rep
+  savePosSessionDraft(T, U, "sess-rep", {
+    cart: [{ menuItemId: "m1", name: "Burger", price: 150, quantity: 2 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-1",
+    selectedSessionId: "sess-rep",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+  const storedDraft = getPosSessionDraft(T, U, "sess-rep")!;
+  assert.ok(storedDraft.draftVersion, "draftVersion assigned");
+
+  // 2. First closure moves it to recoverable, then attached-draft cleanup fails
+  const saved = saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-rep",
+    cart: storedDraft.cart,
+    orderType: storedDraft.orderType,
+    selectedTableId: storedDraft.selectedTableId,
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+    sourceVersion: storedDraft.draftVersion,
+  });
+  assert.ok(saved);
+  // (Simulate clearPosSessionDraft failing — storedDraft remains in posSessionDrafts)
+
+  // 3. Cashier recovers and submits/clears the restored unattached cart
+  const rec = tryRecoverDraftToUnattachedCart(T, U, [], "sess-rep");
+  assert.equal(rec.ok, true);
+  clearPosSessionDraft(T, U, null);
+
+  // 4. Repeated closure notification arrives for sess-rep while stale attached draft still exists
+  const stillStored = getPosSessionDraft(T, U, "sess-rep")!;
+  assert.equal(isRecoveryConsumed(T, U, "sess-rep", stillStored.draftVersion), true);
+  const recreated = saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-rep",
+    cart: stillStored.cart,
+    orderType: stillStored.orderType,
+    selectedTableId: stillStored.selectedTableId,
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+    sourceVersion: stillStored.draftVersion,
+  });
+  assert.equal(recreated, null, "must not recreate recovery entry for already-consumed draft version");
+  assert.equal(getRecoverablePosDrafts(T, U).length, 0);
 });
 
 delete (globalThis as any).localStorage;

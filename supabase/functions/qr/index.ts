@@ -41,17 +41,35 @@ Deno.serve(async (req: Request) => {
 
   // Where the QR should point. NEXT_PUBLIC_APP_URL / SITE_URL is the canonical
   // deployment origin; fall back to the caller's own origin so local dev works.
-  const origin = (
-    Deno.env.get("NEXT_PUBLIC_APP_URL") ??
-    Deno.env.get("SITE_URL") ??
-    req.headers.get("origin") ??
-    url.origin
-  ).replace(/\/+$/, "");
+  const nonEmpty = (v: string | null | undefined) => {
+    const trimmed = (v ?? "").trim().replace(/\/+$/, "");
+    return trimmed.length > 0 ? trimmed : null;
+  };
+  const origin =
+    nonEmpty(Deno.env.get("NEXT_PUBLIC_APP_URL")) ??
+    nonEmpty(Deno.env.get("SITE_URL")) ??
+    nonEmpty(req.headers.get("origin")) ??
+    url.origin.replace(/\/+$/, "");
+
+  // Never silently encode the Supabase API host into a diner QR code:
+  // `https://<ref>.supabase.co/?view=public-menu&table=...` hits Supabase's
+  // gateway root and returns HTTP 404 `{"error":"requested path is invalid"}`.
+  try {
+    if (new URL(origin).hostname.endsWith(".supabase.co")) {
+      return json(
+        req,
+        { error: "QR origin is not configured. Set NEXT_PUBLIC_APP_URL." },
+        500,
+      );
+    }
+  } catch {
+    return json(req, { error: "Invalid QR origin configuration." }, 500);
+  }
 
   const db = admin();
 
   const render = async (table: any) => {
-    const targetUrl = `${origin}/?view=public-menu&table=${table.qr_token}`;
+    const targetUrl = `${origin}/?view=public-menu&table=${encodeURIComponent(String(table.qr_token ?? ""))}`;
     const qrData = await QRCode.toDataURL(targetUrl, {
       margin: 1,
       width: width ?? 400,

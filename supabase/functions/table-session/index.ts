@@ -147,6 +147,10 @@ async function validateTableSession(params: {
     }
 
     const data = shape(row);
+    const tenantRow = Array.isArray(row.tenant) ? row.tenant[0] : row.tenant;
+    if (!tenantRow || tenantRow.active === false) {
+      return { ok: false, error: "This restaurant is currently unavailable.", status: 403 };
+    }
     if (!data.table || !data.table.active) {
       return { ok: false, error: "This table is no longer available.", status: 403 };
     }

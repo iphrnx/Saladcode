@@ -32,10 +32,13 @@ export interface PosCartSnapshot {
   customerPhone?: string
   promoCode: string
   savedAt: number
+  /** Unique version token for the draft content, used to deduplicate recovery across repeated closures. */
+  draftVersion?: string
 }
 
 export interface RecoverablePosDraft extends Omit<PosCartSnapshot, 'selectedSessionId'> {
   sessionId: string
+  sourceVersion?: string
 }
 
 export type OrderLineRef = {
@@ -59,6 +62,54 @@ function activeSessionSuffix(tenantId: string, userId: string): string {
 
 function recoverableSuffix(tenantId: string, userId: string): string {
   return `${tenantId}-${userId}-recoverable`
+}
+
+function lockSuffix(tenantId: string, userId: string): string {
+  return `${tenantId}-${userId}-lock`
+}
+
+let draftSeq = 0
+function nextDraftVersion(): string {
+  draftSeq += 1
+  return `${Date.now()}-${draftSeq}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+const LOCK_STALE_MS = 2000
+
+function acquireRecoveryLock(tenantId: string, userId: string): string | null {
+  const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  const existingRaw = readStored('posCart', lockSuffix(tenantId, userId))
+  if (existingRaw) {
+    try {
+      const parsed = JSON.parse(existingRaw)
+      if (parsed && typeof parsed.ts === 'number' && Date.now() - parsed.ts < LOCK_STALE_MS) {
+        return null
+      }
+    } catch {}
+  }
+  const wrote = writeStored('posCart', JSON.stringify({ nonce, ts: Date.now() }), lockSuffix(tenantId, userId))
+  if (!wrote) return nonce // If storage lock itself can't be written, proceed with in-storage check
+  const verifyRaw = readStored('posCart', lockSuffix(tenantId, userId))
+  if (verifyRaw) {
+    try {
+      const parsed = JSON.parse(verifyRaw)
+      if (parsed?.nonce && parsed.nonce !== nonce) return null
+    } catch {}
+  }
+  return nonce
+}
+
+function releaseRecoveryLock(tenantId: string, userId: string, nonce: string): void {
+  const currentRaw = readStored('posCart', lockSuffix(tenantId, userId))
+  if (!currentRaw) return
+  try {
+    const parsed = JSON.parse(currentRaw)
+    if (parsed?.nonce === nonce) {
+      removeStored('posCart', lockSuffix(tenantId, userId))
+    }
+  } catch {
+    removeStored('posCart', lockSuffix(tenantId, userId))
+  }
 }
 
 /** Persist currently loaded POS active session id in localStorage. */
@@ -127,13 +178,41 @@ function getPosSessionDrafts(
   return out
 }
 
+interface ConsumedRecoveryEntry {
+  savedAt: number
+  version?: string
+}
+
 function getConsumedRecoveries(
   tenantId: string,
   userId: string,
-): Record<string, number> {
+): Record<string, ConsumedRecoveryEntry | number> {
   const raw = getPosSessionDraftsRaw(tenantId, userId)
   const map = raw[CONSUMED_RECOVERY_KEY]
-  return map && typeof map === 'object' ? (map as Record<string, number>) : {}
+  return map && typeof map === 'object' ? (map as Record<string, ConsumedRecoveryEntry | number>) : {}
+}
+
+export function isRecoveryConsumed(
+  tenantId: string,
+  userId: string,
+  sessionId: string | null | undefined,
+  sourceVersion?: string | null,
+  savedAt?: number,
+): boolean {
+  const sid = sessionId?.trim()
+  if (!sid) return false
+  const entry = getConsumedRecoveries(tenantId, userId)[sid]
+  if (!entry) return false
+  if (typeof entry === 'number') {
+    return savedAt !== undefined ? entry >= savedAt : false
+  }
+  if (sourceVersion && entry.version && entry.version === sourceVersion) {
+    return true
+  }
+  if (savedAt !== undefined && entry.savedAt >= savedAt && (!sourceVersion || !entry.version)) {
+    return true
+  }
+  return false
 }
 
 /** Save a draft for a specific session (or default unattached cart). Returns true if persisted. */
@@ -142,7 +221,7 @@ export function savePosSessionDraft(
   userId: string,
   sessionKey: string | null | undefined,
   snapshot: Omit<PosCartSnapshot, 'savedAt'>,
-  consumedRecovery?: { sessionId: string; savedAt: number },
+  consumedRecovery?: { sessionId: string; savedAt: number; version?: string },
 ): boolean {
   const drafts = getPosSessionDraftsRaw(tenantId, userId)
   const key = sessionDraftKey(sessionKey)
@@ -150,7 +229,11 @@ export function savePosSessionDraft(
   if (snapshot.cart.length === 0) {
     delete drafts[key]
   } else {
-    drafts[key] = { ...snapshot, savedAt: now }
+    drafts[key] = {
+      ...snapshot,
+      draftVersion: snapshot.draftVersion ?? nextDraftVersion(),
+      savedAt: now,
+    }
   }
   if (consumedRecovery?.sessionId) {
     const prevConsumed = drafts[CONSUMED_RECOVERY_KEY] && typeof drafts[CONSUMED_RECOVERY_KEY] === 'object'
@@ -158,7 +241,10 @@ export function savePosSessionDraft(
       : {}
     drafts[CONSUMED_RECOVERY_KEY] = {
       ...prevConsumed,
-      [consumedRecovery.sessionId]: consumedRecovery.savedAt,
+      [consumedRecovery.sessionId]: {
+        savedAt: consumedRecovery.savedAt,
+        version: consumedRecovery.version,
+      },
     }
   }
   const draftsOk = writeStored('posCart', JSON.stringify(drafts), draftsSuffix(tenantId, userId))
@@ -258,7 +344,6 @@ function readRecoverableDraftMap(
 ): Record<string, RecoverablePosDraft> {
   const raw = readStored('posCart', recoverableSuffix(tenantId, userId))
   if (!raw) return {}
-  const consumed = getConsumedRecoveries(tenantId, userId)
   try {
     const parsed = JSON.parse(raw)
     if (!parsed || typeof parsed !== 'object') return {}
@@ -266,7 +351,11 @@ function readRecoverableDraftMap(
     if (typeof (parsed as any).sessionId === 'string' && Array.isArray((parsed as any).cart)) {
       const legacy = parsed as RecoverablePosDraft
       const sid = legacy.sessionId.trim()
-      if (legacy.cart.length > 0 && sid && (consumed[sid] ?? 0) < (legacy.savedAt ?? 0)) {
+      if (
+        legacy.cart.length > 0 &&
+        sid &&
+        !isRecoveryConsumed(tenantId, userId, sid, legacy.sourceVersion, legacy.savedAt ?? 0)
+      ) {
         return { [sid]: legacy }
       }
       return {}
@@ -274,7 +363,9 @@ function readRecoverableDraftMap(
     const out: Record<string, RecoverablePosDraft> = {}
     for (const [key, val] of Object.entries(parsed as Record<string, any>)) {
       if (val && typeof val.sessionId === 'string' && Array.isArray(val.cart) && val.cart.length > 0) {
-        if ((consumed[val.sessionId] ?? 0) >= (val.savedAt ?? 0)) continue
+        if (isRecoveryConsumed(tenantId, userId, val.sessionId, val.sourceVersion, val.savedAt ?? 0)) {
+          continue
+        }
         out[key] = val as RecoverablePosDraft
       }
     }
@@ -304,6 +395,9 @@ export function saveRecoverablePosDraft(
 ): RecoverablePosDraft | null {
   const sid = draft.sessionId?.trim()
   if (!sid || !Array.isArray(draft.cart) || draft.cart.length === 0) {
+    return null
+  }
+  if (draft.sourceVersion && isRecoveryConsumed(tenantId, userId, sid, draft.sourceVersion)) {
     return null
   }
   const stored: RecoverablePosDraft = {
@@ -390,48 +484,65 @@ export type RecoverDraftResult =
 
 /**
  * Move a recoverable draft (by sessionId, or latest if omitted) into an empty
- * unattached cart. Checks both the in-memory cart and the latest persisted
- * unattached draft (protecting another tab's saved cart), and records the
- * recovery as consumed inside the same authoritative `draftsSuffix` write so
- * even if source cleanup fails, the same draft can never be recovered twice.
+ * unattached cart. Acquires cross-tab lock, re-checks both canonical and
+ * legacy persisted unattached drafts inside the critical section, and records
+ * the recovery as consumed inside the same authoritative `draftsSuffix` write
+ * so even if source cleanup fails, the same draft can never be recovered twice.
  */
 export function tryRecoverDraftToUnattachedCart(
   tenantId: string,
   userId: string,
   currentUnattachedCart: CartItem[],
   sessionId?: string | null,
+  beforeCommitHook?: () => void,
 ): RecoverDraftResult {
-  const persistedUnattached = restorePosCart(tenantId, userId)
-  if (
-    currentUnattachedCart.length > 0 ||
-    (persistedUnattached && persistedUnattached.cart.length > 0)
-  ) {
+  if (currentUnattachedCart.length > 0) {
     return { ok: false, reason: 'non_empty' }
   }
-  const recoverable = getRecoverablePosDraft(tenantId, userId, sessionId)
-  if (!recoverable || recoverable.cart.length === 0) {
-    return { ok: false, reason: 'empty_recoverable' }
+  const lockNonce = acquireRecoveryLock(tenantId, userId)
+  if (!lockNonce) {
+    return { ok: false, reason: 'non_empty' }
   }
+  try {
+    const recoverable = getRecoverablePosDraft(tenantId, userId, sessionId)
+    if (!recoverable || recoverable.cart.length === 0) {
+      return { ok: false, reason: 'empty_recoverable' }
+    }
 
-  const unattached: Omit<PosCartSnapshot, 'savedAt'> = {
-    cart: [...recoverable.cart],
-    orderType: recoverable.orderType,
-    selectedTableId: recoverable.selectedTableId,
-    selectedSessionId: null,
-    customerName: recoverable.customerName ?? '',
-    customerPhone: recoverable.customerPhone ?? '',
-    promoCode: recoverable.promoCode ?? '',
+    if (beforeCommitHook) {
+      beforeCommitHook()
+    }
+
+    // Re-read persisted unattached cart (including legacy-only drafts) inside the lock
+    // immediately before committing so an interleaved save from another tab is never overwritten.
+    const persistedUnattached = restorePosCart(tenantId, userId)
+    if (persistedUnattached && persistedUnattached.cart.length > 0) {
+      return { ok: false, reason: 'non_empty' }
+    }
+
+    const unattached: Omit<PosCartSnapshot, 'savedAt'> = {
+      cart: [...recoverable.cart],
+      orderType: recoverable.orderType,
+      selectedTableId: recoverable.selectedTableId,
+      selectedSessionId: null,
+      customerName: recoverable.customerName ?? '',
+      customerPhone: recoverable.customerPhone ?? '',
+      promoCode: recoverable.promoCode ?? '',
+    }
+    if (
+      !savePosSessionDraft(tenantId, userId, null, unattached, {
+        sessionId: recoverable.sessionId,
+        savedAt: recoverable.savedAt,
+        version: recoverable.sourceVersion,
+      })
+    ) {
+      return { ok: false, reason: 'storage_error' }
+    }
+    clearRecoverablePosDraft(tenantId, userId, recoverable.sessionId)
+    return { ok: true, snapshot: { ...unattached, savedAt: Date.now() } }
+  } finally {
+    releaseRecoveryLock(tenantId, userId, lockNonce)
   }
-  if (
-    !savePosSessionDraft(tenantId, userId, null, unattached, {
-      sessionId: recoverable.sessionId,
-      savedAt: recoverable.savedAt,
-    })
-  ) {
-    return { ok: false, reason: 'storage_error' }
-  }
-  clearRecoverablePosDraft(tenantId, userId, recoverable.sessionId)
-  return { ok: true, snapshot: { ...unattached, savedAt: Date.now() } }
 }
 
 /**
