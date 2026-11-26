@@ -318,55 +318,45 @@ export function reservationsForSourceCart(
   })
 }
 
-const CHECKOUT_LOCK_TTL_MS = 2_000
+export class CheckoutLockError extends Error {
+  readonly retryable = true
+  constructor(message = 'Unable to acquire exclusive checkout lock. Please try again.') {
+    super(message)
+    this.name = 'CheckoutLockError'
+  }
+}
 
 /**
- * Acquire a short cross-tab storage lease for a given cart suffix so two tabs
+ * Acquire an exclusive cross-tab Web Lock for a given cart scope so two tabs
  * cannot read the same cart snapshot and enqueue duplicate idempotency keys.
+ * Fails closed with a retryable CheckoutLockError if exclusive ownership
+ * cannot be guaranteed.
  */
 export async function withCrossTabCheckoutLock<T>(
-  storage: StorageLike,
+  storage: StorageLike | null | undefined,
   tenantId: string,
   lockScope: string,
   fn: () => T | Promise<T>,
-  now: () => number = Date.now,
 ): Promise<T> {
+  if (!storage) {
+    throw new CheckoutLockError('Local storage is unavailable. Please try again.')
+  }
+  // Verify storage is accessible before attempting lock acquisition.
+  try {
+    const probeKey = `the-salad-checkout-lock-${tenantId}-${lockScope}`
+    storage.getItem(probeKey)
+  } catch {
+    throw new CheckoutLockError('Unable to access cart storage. Please try again.')
+  }
+
   const lockKey = `the-salad-checkout-lock-${tenantId}-${lockScope}`
   if (typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function') {
-    return navigator.locks.request(lockKey, () => fn())
-  }
-  const nonce = `${now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-
-  for (let attempt = 0; attempt < 25; attempt++) {
-    try {
-      const raw = storage.getItem(lockKey)
-      const parsed = raw ? JSON.parse(raw) : null
-      const expired = !parsed || typeof parsed.ts !== 'number' || now() - parsed.ts > CHECKOUT_LOCK_TTL_MS
-      if (expired || parsed.nonce === nonce) {
-        storage.setItem(lockKey, JSON.stringify({ nonce, ts: now() }))
-        const verify = storage.getItem(lockKey)
-        if (verify && JSON.parse(verify)?.nonce === nonce) {
-          break
-        }
-      }
-    } catch {
-      break
-    }
-    await new Promise((r) => setTimeout(r, 15))
+    return navigator.locks.request(lockKey, async () => fn())
   }
 
-  try {
-    return await fn()
-  } finally {
-    try {
-      const cur = storage.getItem(lockKey)
-      if (cur && JSON.parse(cur)?.nonce === nonce) {
-        storage.removeItem(lockKey)
-      }
-    } catch {
-      /* ignore */
-    }
-  }
+  throw new CheckoutLockError(
+    'Unable to acquire exclusive cross-tab checkout lock. Please try again.',
+  )
 }
 
 /**

@@ -962,8 +962,8 @@ await check('P2-11: QR reload imports browsing cart into active session once wit
   const sessionKey = keyName('cart', sessionToken)
 
   // Verify public-menu.tsx activateAndLoad performs this merge on data?.session.
-  assert.ok(publicMenuSrc.includes("readStored('cart', `browsing:${data.table.id}`)"))
-  assert.ok(publicMenuSrc.includes("removeStored('cart', `browsing:${data.table.id}`)"))
+  assert.ok(publicMenuSrc.includes("readStored('cart', `browsing:${tableId}`)"))
+  assert.ok(publicMenuSrc.includes("removeStored('cart', `browsing:${tableId}`)"))
 
   // Tab A has an item in session cart; Tab B has qty 2 in browsing cart.
   store.setItem(sessionKey, JSON.stringify([{ menuItemId: 'dish-a', name: 'Idli', price: 50, quantity: 1 }]))

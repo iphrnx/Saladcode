@@ -40,7 +40,7 @@ import {
   subtractUnresolvedQueueQuantities,
   withCrossTabCheckoutLock,
 } from '@/lib/diner-cart-sync'
-import { keyName, readStored, removeStored, writeStored } from '@/lib/storage-keys'
+import { keyName, readStored, removeStored, writeStored, writeStoredStrict } from '@/lib/storage-keys'
 import { DinerOrderTracker } from '@/components/public/diner-order-tracker'
 import {
   canonicalPortionName,
@@ -641,6 +641,62 @@ export function PublicMenu() {
       setServerTheme(normaliseMenuTheme(data.theme))
     }
 
+    async function transferBrowsingStateToSession(
+      tenantId: string,
+      tableId: string | null | undefined,
+      adoptedToken: string,
+      qrToken: string | null,
+    ) {
+      if (typeof window === 'undefined' || !tenantId || !adoptedToken) return
+      const runTransfer = () => {
+        const browsingRaw = tableId ? readStored('cart', `browsing:${tableId}`) : null
+        let browsingItems: CartItem[] = []
+        try {
+          const parsed = browsingRaw ? JSON.parse(browsingRaw) : []
+          if (Array.isArray(parsed)) browsingItems = parsed
+        } catch {}
+
+        const { migratedEntries } = migratePendingTableQueueToSession(
+          window.localStorage,
+          tenantId,
+          tableId,
+          adoptedToken,
+          qrToken,
+          browsingItems.length > 0,
+        )
+
+        if (tableId && browsingRaw !== null) {
+          if (browsingItems.length > 0) {
+            const unsubmittedBrowsing = subtractUnresolvedQueueQuantities(
+              browsingItems,
+              migratedEntries,
+            )
+            if (unsubmittedBrowsing.length > 0) {
+              const sessionRaw = readStored('cart', adoptedToken)
+              const sessionItems = sessionRaw ? JSON.parse(sessionRaw) : []
+              const merged = mergeBrowsingRemainderIntoSession(
+                Array.isArray(sessionItems) ? sessionItems : [],
+                unsubmittedBrowsing,
+              )
+              writeStoredStrict('cart', JSON.stringify(merged), adoptedToken)
+            }
+          }
+          removeStored('cart', `browsing:${tableId}`)
+        }
+      }
+
+      const lockKey = `the-salad-checkout-lock-${tenantId}-adopt:${tableId || 'none'}:${adoptedToken}`
+      try {
+        if (typeof navigator !== 'undefined' && navigator.locks?.request) {
+          await navigator.locks.request(lockKey, () => runTransfer())
+        } else {
+          runTransfer()
+        }
+      } catch {
+        /* preserve browsing cart & queue on interrupted transfer so reload retries safely */
+      }
+    }
+
     async function activateAndLoad() {
       try {
         setLoading(true)
@@ -685,56 +741,12 @@ export function PublicMenu() {
           }
 
           if (data?.session) {
-            const browsingRaw = data?.table?.id
-              ? readStored('cart', `browsing:${data.table.id}`)
-              : null
-            let browsingItems: CartItem[] = []
-            try {
-              const parsed = browsingRaw ? JSON.parse(browsingRaw) : []
-              if (Array.isArray(parsed)) browsingItems = parsed
-            } catch {}
-
-            // Migrate any unresolved checkout from the table/QR queue into the
-            // adopted session queue before merging the browsing cart so the
-            // original checkout resumes with its idempotency key and submitted
-            // quantities stay out of the cart while unresolved. Only entries
-            // migrated from this browsing queue are deducted from browsingItems.
-            const { migratedEntries } =
-              typeof window !== 'undefined' && data?.tenant?.id
-                ? migratePendingTableQueueToSession(
-                    window.localStorage,
-                    data.tenant.id,
-                    data?.table?.id,
-                    data.session.token,
-                    qrToken,
-                    browsingItems.length > 0,
-                  )
-                : { migratedEntries: [] }
-
-            // If this tab had unsubmitted items in the pre-order browsing cart
-            // before reload discovered an active session, merge them into the
-            // session cart once and clear the browsing key so repeated reloads
-            // never duplicate them or overwrite items already saved in the session.
-            if (data?.table?.id && browsingRaw !== null) {
-              try {
-                if (browsingItems.length > 0) {
-                  const unsubmittedBrowsing = subtractUnresolvedQueueQuantities(
-                    browsingItems,
-                    migratedEntries,
-                  )
-                  if (unsubmittedBrowsing.length > 0) {
-                    const sessionRaw = readStored('cart', data.session.token)
-                    const sessionItems = sessionRaw ? JSON.parse(sessionRaw) : []
-                    const merged = mergeBrowsingRemainderIntoSession(
-                      Array.isArray(sessionItems) ? sessionItems : [],
-                      unsubmittedBrowsing,
-                    )
-                    writeStored('cart', JSON.stringify(merged), data.session.token)
-                  }
-                }
-                removeStored('cart', `browsing:${data.table.id}`)
-              } catch {}
-            }
+            await transferBrowsingStateToSession(
+              data.tenant.id,
+              data?.table?.id,
+              data.session.token,
+              qrToken,
+            )
             adopt({ token: data.session.token, tenantId: data.tenant.id, tableId: data.table.id }, data)
             setStoredDinerSession(data.tenant.id, data.table.id, {
               sessionId: data.session.id,
@@ -794,6 +806,12 @@ export function PublicMenu() {
           return
         }
 
+        await transferBrowsingStateToSession(
+          anyStored.restaurantId,
+          anyStored.tableId,
+          anyStored.sessionToken,
+          null,
+        )
         adopt({ token: anyStored.sessionToken, tenantId: anyStored.restaurantId, tableId: anyStored.tableId }, data)
         setSessionState('active')
         setLoading(false)
@@ -1275,97 +1293,120 @@ export function PublicMenu() {
     }
 
     try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        await withCrossTabCheckoutLock(window.localStorage, effectiveTenantId, lockScope, runLocked)
-      } else {
-        runLocked()
-      }
-    } catch {
+      await withCrossTabCheckoutLock(
+        typeof window !== 'undefined' ? window.localStorage : null,
+        effectiveTenantId,
+        lockScope,
+        runLocked,
+      )
+    } catch (err: any) {
       placingRef.current = false
+      toast.error(
+        err?.message || 'Unable to lock checkout right now. Please try again.',
+      )
     }
   }
 
   // Everything that happens once the server has the order — fresh commit or
   // reconciled replay. One function, because the two paths must not diverge.
-  function handleOrderConfirmed(order: any, entry: QueueEntry) {
-    if (order?.id) {
-      setPlacedOrderId(order.id)
-      try {
-        writeStored('lastOrderId', order.id)
-      } catch {}
-    }
-
+  async function handleOrderConfirmed(
+    order: any,
+    entry: QueueEntry,
+    finalize?: () => void,
+  ): Promise<boolean> {
     const submittedItems = entry.payload?.items ?? []
 
     if (order?.sessionToken && order?.sessionId) {
       const tId = tenant?.id || sessionTenantId
       const tblId = table?.id || sessionTableId
       const adoptingNewSession = order.sessionToken !== sessionToken
+      const lockScope = entry.sourceCartSuffix || order.sessionToken
 
-      let existingSessionCart: CartItem[] = []
       try {
-        const raw = readStored('cart', order.sessionToken)
-        if (raw) {
-          const parsed = JSON.parse(raw)
-          if (Array.isArray(parsed)) existingSessionCart = parsed
-        }
-      } catch {}
+        await withCrossTabCheckoutLock(
+          typeof window !== 'undefined' ? window.localStorage : null,
+          tId || 'diner',
+          lockScope,
+          () => {
+            let existingSessionCart: CartItem[] = []
+            try {
+              const raw = readStored('cart', order.sessionToken)
+              if (raw) {
+                const parsed = JSON.parse(raw)
+                if (Array.isArray(parsed)) existingSessionCart = parsed
+              }
+            } catch {}
 
-      let nextCart: CartItem[]
-      if (adoptingNewSession) {
-        let remainingCart = [...cartRef.current]
-        for (const line of submittedItems) {
-          const qty = Math.max(1, Number(line.quantity) || 1)
-          remainingCart = remainingCart
-            .map((c) =>
-              sameCartLine(c, line.menuItemId, line.portion ?? null, line.portionId ?? null)
-                ? { ...c, quantity: c.quantity - qty }
-                : c,
-            )
-            .filter((c) => c.quantity > 0)
-        }
-        nextCart =
-          remainingCart.length > 0
-            ? mergeBrowsingRemainderIntoSession(existingSessionCart, remainingCart)
-            : existingSessionCart
-        if (remainingCart.length > 0) {
-          try {
-            writeStored('cart', JSON.stringify(nextCart), order.sessionToken)
-          } catch {}
-        }
-      } else if (entry.cartDeducted) {
-        // Quantities for this recovered checkout were already deducted from the
-        // browsing cart during reload adoption; do not deduct a second time.
-        const baseline =
-          lastSyncedCartRef.current.suffix === order.sessionToken
-            ? lastSyncedCartRef.current.items
-            : existingSessionCart
-        nextCart = reconcileCartOnSave(cartRef.current, baseline, existingSessionCart)
-        try {
-          writeStored('cart', JSON.stringify(nextCart), order.sessionToken)
-        } catch {}
-      } else {
-        // Reconcile confirmed quantities against the previous sync baseline and
-        // latest saved cart, persisting before advancing lastSyncedCartRef so
-        // the confirmed dish is never re-added by the save effect.
-        const baseline =
-          lastSyncedCartRef.current.suffix === order.sessionToken
-            ? lastSyncedCartRef.current.items
-            : existingSessionCart
-        nextCart = reconcileCartOnConfirm(
-          cartRef.current,
-          baseline,
-          existingSessionCart,
-          submittedItems,
+            let nextCart: CartItem[]
+            const fromSeparateBrowsingCart =
+              Boolean(entry.cartDeducted) ||
+              Boolean(
+                entry.sourceCartSuffix &&
+                  entry.sourceCartSuffix !== order.sessionToken &&
+                  !adoptingNewSession,
+              )
+
+            if (adoptingNewSession) {
+              let remainingCart = [...cartRef.current]
+              for (const line of submittedItems) {
+                const qty = Math.max(1, Number(line.quantity) || 1)
+                remainingCart = remainingCart
+                  .map((c) =>
+                    sameCartLine(c, line.menuItemId, line.portion ?? null, line.portionId ?? null)
+                      ? { ...c, quantity: c.quantity - qty }
+                      : c,
+                  )
+                  .filter((c) => c.quantity > 0)
+              }
+              nextCart =
+                remainingCart.length > 0
+                  ? mergeBrowsingRemainderIntoSession(existingSessionCart, remainingCart)
+                  : existingSessionCart
+              if (remainingCart.length > 0) {
+                writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
+              }
+            } else if (fromSeparateBrowsingCart) {
+              // Quantities for this recovered checkout came from a separate browsing
+              // cart; do not deduct them from the session cart.
+              const baseline =
+                lastSyncedCartRef.current.suffix === order.sessionToken
+                  ? lastSyncedCartRef.current.items
+                  : existingSessionCart
+              nextCart = reconcileCartOnSave(cartRef.current, baseline, existingSessionCart)
+              writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
+            } else {
+              // Reconcile confirmed quantities against the previous sync baseline and
+              // latest saved cart, persisting before advancing lastSyncedCartRef or
+              // releasing the queue reservation.
+              const baseline =
+                lastSyncedCartRef.current.suffix === order.sessionToken
+                  ? lastSyncedCartRef.current.items
+                  : existingSessionCart
+              nextCart = reconcileCartOnConfirm(
+                cartRef.current,
+                baseline,
+                existingSessionCart,
+                submittedItems,
+              )
+              writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
+            }
+
+            finalize?.()
+            lastSyncedCartRef.current = { suffix: order.sessionToken, items: nextCart }
+            setCart(nextCart)
+            cartRef.current = nextCart
+          },
         )
-        try {
-          writeStored('cart', JSON.stringify(nextCart), order.sessionToken)
-        } catch {}
+      } catch {
+        return false
       }
 
-      lastSyncedCartRef.current = { suffix: order.sessionToken, items: nextCart }
-      setCart(nextCart)
-      cartRef.current = nextCart
+      if (order?.id) {
+        setPlacedOrderId(order.id)
+        try {
+          writeStored('lastOrderId', order.id)
+        } catch {}
+      }
 
       if (adoptingNewSession && tblId) {
         try {
@@ -1391,6 +1432,13 @@ export function PublicMenu() {
               : c,
           )
           .filter((c) => c.quantity > 0)
+      }
+      finalize?.()
+      if (order?.id) {
+        setPlacedOrderId(order.id)
+        try {
+          writeStored('lastOrderId', order.id)
+        } catch {}
       }
       setCart(remainingCart)
       cartRef.current = remainingCart
@@ -1431,6 +1479,7 @@ export function PublicMenu() {
       setAwaitingActivation(false)
       toast.success('Order placed!', { duration: 2500 })
     }
+    return true
   }
 
   // The queue lifecycle follows the session or table: same scope (tenant + actorKey)
@@ -1441,18 +1490,21 @@ export function PublicMenu() {
     const actorKey = sessionToken || (table?.id ? `table_${table.id}` : (currentQrToken ? `qr_${currentQrToken}` : null))
     if (!effectiveTenantId || !actorKey) return
     if (sessionToken && typeof window !== 'undefined') {
+      const tblId = table?.id || sessionTableId
+      const hasBrowsingCart = Boolean(tblId && readStored('cart', `browsing:${tblId}`))
       migratePendingTableQueueToSession(
         window.localStorage,
         effectiveTenantId,
-        table?.id || sessionTableId,
+        tblId,
         sessionToken,
         currentQrToken,
+        hasBrowsingCart,
       )
     }
     const q = orderQueue(effectiveTenantId, actorKey, {
-      onConfirmed: (order, entry) => {
+      onConfirmed: (order, entry, finalize) => {
         placingRef.current = false
-        handleOrderConfirmed(order, entry)
+        return handleOrderConfirmed(order, entry, finalize)
       },
       onFailed: (error, entry, code) => {
         placingRef.current = false

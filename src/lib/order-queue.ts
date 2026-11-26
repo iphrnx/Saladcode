@@ -77,8 +77,15 @@ export interface QueueEntry {
 }
 
 export interface QueueHooks {
-  /** The order is on the server (fresh commit or reconciled). */
-  onConfirmed?: (order: any, entry: QueueEntry) => void
+  /**
+   * The order is on the server (fresh commit or reconciled).
+   * Return `false` or throw to keep the entry in the queue for durable retry.
+   */
+  onConfirmed?: (
+    order: any,
+    entry: QueueEntry,
+    finalize?: () => void,
+  ) => void | boolean | Promise<void | boolean>
   /** The order permanently failed / was rejected. */
   onFailed?: (error: string, entry: QueueEntry, code?: string) => void
   /** An entry changed state (pending/submitting/failed). */
@@ -403,7 +410,7 @@ export class OrderQueue {
       })
       if (lookup.ok) {
         const order = await lookup.json().catch(() => null)
-        this.confirm(key, order)
+        await this.confirm(key, order)
         return 'confirmed'
       }
       if (lookup.status === 404 || lookup.status === 401 || lookup.status === 403) {
@@ -449,11 +456,56 @@ export class OrderQueue {
     }
   }
 
-  private confirm(key: string, order: any) {
+  private async confirm(key: string, order: any) {
     const entries = this.load()
     const entry = entries.find((e) => e.key === key)
-    this.save(entries.filter((e) => e.key !== key))
-    if (entry) this.hooks.onConfirmed?.(order, entry)
+    if (!entry) return
+    let finalized = false
+    const finalize = () => {
+      if (finalized) return
+      finalized = true
+      this.save(this.load().filter((e) => e.key !== key))
+    }
+    try {
+      const res = await this.hooks.onConfirmed?.(order, entry, finalize)
+      if (res === false) {
+        if (!finalized) {
+          this.save(
+            this.load().map((e) =>
+              e.key === key
+                ? {
+                    ...e,
+                    state: 'pending' as const,
+                    attempts: Math.max(1, e.attempts || 1),
+                    nextAttemptAt: this.now() + 1000,
+                    claimId: null,
+                    claimAt: null,
+                  }
+                : e,
+            ),
+          )
+        }
+        return
+      }
+      finalize()
+    } catch {
+      if (!finalized) {
+        this.save(
+          this.load().map((e) =>
+            e.key === key
+              ? {
+                  ...e,
+                  state: 'pending' as const,
+                  attempts: Math.max(1, e.attempts || 1),
+                  nextAttemptAt: this.now() + 1000,
+                  claimId: null,
+                  claimAt: null,
+                }
+              : e,
+          ),
+        )
+      }
+    }
   }
 
   /**
@@ -499,7 +551,7 @@ export class OrderQueue {
         if (stolen) continue
 
         if (result.outcome === 'confirmed') {
-          this.confirm(due.key, result.order)
+          await this.confirm(due.key, result.order)
         } else if (result.outcome === 'rejected') {
           const failedEntry = { ...held, state: 'failed' as const, lastError: result.error, errorCode: result.code, claimId: null, claimAt: null }
           this.save(

@@ -90,6 +90,17 @@ export function readStored(name: KeyName, suffix = ''): string | null {
   }
 }
 
+export function writeStoredStrict(name: KeyName, value: string, suffix = ''): void {
+  const store = area(name)
+  if (!store) throw new Error('Storage unavailable')
+  store.setItem(keyName(name, suffix), value)
+  for (const legacy of legacyKeyNames(name, suffix)) {
+    try {
+      store.removeItem(legacy)
+    } catch {}
+  }
+}
+
 export function writeStored(name: KeyName, value: string, suffix = ''): void {
   const store = area(name)
   if (!store) return

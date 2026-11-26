@@ -16,6 +16,7 @@ const APP_PORT = 3002
 const CDP_PORT = 9229
 const APP_ORIGIN = `http://localhost:${APP_PORT}`
 const QR_URL = `${APP_ORIGIN}/?view=public-menu&table=qr-table-1`
+const MENU_URL = `${APP_ORIGIN}/?view=public-menu`
 const CHROME_BIN = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 const PROFILE_DIR = '/tmp/chrome-pr13-two-tab-profile'
 
@@ -216,6 +217,12 @@ const backend = http.createServer(async (req, res) => {
       token: (req.headers['x-session-token'] as string) || body.tableSessionToken || null,
       items: body.items || [],
     })
+    if (state.holdNextPost && state.rejectNextPostUnavailable) {
+      state.holdNextPost = false
+      await new Promise<void>((resolve) => {
+        state.releaseHeldPost = resolve
+      })
+    }
     if (state.rejectNextPostUnavailable) {
       state.rejectNextPostUnavailable = false
       res.writeHead(409, headers)
@@ -645,11 +652,25 @@ try {
   assert.equal(cartB2.find((c: any) => c.menuItemId === MENU_ITEMS[1].id)?.quantity, 2, 'B retains 2 units after A confirms')
   console.log('  ok    Browser test 4: Reload with unrelated A reservation preserves B 2 independent units')
 
-  // 5. Removed portion: select Large (₹380, base ₹250) through UI, submit 2 units (dropped),
-  // remove Large from test catalog, reload, and return 409 ITEM_UNAVAILABLE -> restores 2x Large at ₹380 (subtotal ₹760) with no order created.
-  await evalIn(sidB, `localStorage.setItem('the-salad-cart-session-tok-browser-3', '[]')`)
+  // 5. Removed portion via production browsing-cart adoption path:
+  // Browsing Tab B selects Large (₹380, base ₹250), submits 2 units (held),
+  // A establishes tok-browser-4, B reloads via QR (migrates queue with cartDeducted=true and clears browsing cart -> line is ABSENT from saved cart),
+  // Large is removed from catalog, held retry rejects with 409 ITEM_UNAVAILABLE -> restores 2x Large at ₹380, Subtotal row ₹760.00, 0 orders created.
+  await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
   await send('Page.navigate', { url: QR_URL }, sidB)
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Paneer Tikka')`))
+
+  // A establishes session tok-browser-4 on the server while B remains in browsing state.
+  await send('Page.navigate', { url: QR_URL }, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Paneer Tikka')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.sessions.has('tok-browser-4') ? true : false))
+
+  // B (browsing) selects Large (₹380), adds 2 units, and submits (held before server commit).
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Large'))?.click()`)
   await evalIn(
     sidB,
@@ -664,26 +685,33 @@ try {
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
 
   const ordersBeforeRemovedPortion = state.orders.length
-  // Reject with 503-equivalent dropped response? Instead use holdNextPost + reload, or seed queue after clicking Place Order:
-  // Actually, dropNextPostResponse commits on server, whereas we want NO order created when rejected:
-  // Hold the POST, reload B so it stays unresolved in queue, then reject the retry after catalog removes Large!
   state.holdNextPost = true
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
   await waitFor(() => (state.releaseHeldPost !== null ? true : false))
-  // Roll back the simulated server order (representing network drop before commit) while keeping client queue entry.
   state.orders.pop()
-  state.removeLargePortionFromCatalog = true
-  state.rejectNextPostUnavailable = true
   state.releaseHeldPost = null
+
+  // Remove Large from catalog and hold the post-reload retry BEFORE returning 409.
+  state.removeLargePortionFromCatalog = true
+  state.holdNextPost = true
+  state.rejectNextPostUnavailable = true
   await send('Page.navigate', { url: QR_URL }, sidB)
-  // Wait for the recovered queue entry to hit POST /orders and receive 409 ITEM_UNAVAILABLE.
+  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+
+  // Assert the reserved line is absent from the saved session cart before rejection.
+  const preRejectCart = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-4')`)) || '[]')
+  assert.equal(preRejectCart.length, 0, 'reserved line must be absent from saved cart before rejection')
+
+  // Release 409 ITEM_UNAVAILABLE and verify restoration.
+  state.releaseHeldPost!()
+  state.releaseHeldPost = null
   await waitFor(() => (!state.rejectNextPostUnavailable ? true : false))
   await waitFor(async () => {
-    const raw = await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)
+    const raw = await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-4')`)
     const items = JSON.parse(raw || '[]')
     return items.length === 1 && items[0].quantity === 2 ? items : false
   })
-  const restoredCart = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)) || '[]')
+  const restoredCart = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-4')`)) || '[]')
   assert.equal(restoredCart[0].portionId, 'large')
   assert.equal(restoredCart[0].portion, 'Large')
   assert.equal(restoredCart[0].price, 380)
@@ -691,14 +719,19 @@ try {
   assert.equal(state.orders.length, ordersBeforeRemovedPortion, 'failed checkout must create no order')
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
-  try {
-    await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('760')`))
-  } catch (err) {
-    const bodyText = await evalIn(sidB, `document.body?.innerText`)
-    throw new Error(`waitFor 760 failed: ${String(err)}\nBODY:\n${bodyText}`)
-  }
+  await waitFor(async () => {
+    const subtotalText = await evalIn(
+      sidB,
+      `(() => {
+        const els = [...document.querySelectorAll('div, p, span')];
+        const row = els.find(el => el.textContent?.includes('Subtotal') && el.textContent?.includes('760'));
+        return row ? row.textContent : null;
+      })()`,
+    )
+    return subtotalText ? true : false
+  })
   state.removeLargePortionFromCatalog = false
-  console.log('  ok    Browser test 5: Removed portion restores 2x Large at ₹380 with subtotal ₹760 and no order')
+  console.log('  ok    Browser test 5: Removed portion restores 2x Large at ₹380 with Subtotal row ₹760 and no order')
 
   // 6. Independent reservations: A holds 1 Masala Dosa in session queue; B (browsing) independently adds 2 Masala Dosa
   // and submits using A's saved session token -> B's POST has quantity 2 and its own key; confirming both deducts only each order's own qty.
@@ -708,18 +741,13 @@ try {
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
 
-  // Establish session tok-browser-4 in A.
+  // Establish session tok-browser-5 in A.
   await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
   await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
-  try {
-    await waitFor(() => (state.sessions.has('tok-browser-4') ? true : false))
-  } catch (err) {
-    const bodyText = await evalIn(sidA, `document.body?.innerText`)
-    throw new Error(`waitFor tok-browser-4 failed: sessions=${JSON.stringify([...state.sessions.keys()])} attempts=${JSON.stringify(state.postAttempts.slice(-3))} body=${bodyText?.slice(0, 400)}`)
-  }
+  await waitFor(() => (state.sessions.has('tok-browser-5') ? true : false))
 
   // A adds 1 Masala Dosa and holds its session order unresolved.
   await send('Page.reload', {}, sidA)
@@ -735,7 +763,7 @@ try {
   const releaseAIndep = state.releaseHeldPost!
   state.releaseHeldPost = null
 
-  // B (still browsing) independently adds 2 Masala Dosa and submits using saved tok-browser-4.
+  // B (still browsing) independently adds 2 Masala Dosa and submits using saved tok-browser-5.
   await evalIn(
     sidB,
     `(() => {
@@ -760,9 +788,166 @@ try {
   await send('Page.reload', {}, sidA)
   await send('Page.reload', {}, sidB)
   await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
-  const finalIndepCart = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-4')`)) || '[]')
+  const finalIndepCart = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-5')`)) || '[]')
   assert.equal(finalIndepCart.length, 0, 'each confirmation deducted only its own quantities')
   console.log('  ok    Browser test 6: Independent reservations submit separate keys/quantities and deduct once')
+
+  // 7. Reservation & confirmation races + no-Web-Locks contention/storage error:
+  // (a) Pause A after backend commits and before cart deduction is saved, then attempt checkout from stale Tab B -> 1 key, 1 order.
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await waitFor(async () => {
+    const raw = await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-5')`)
+    return JSON.parse(raw || '[]').some((c: any) => c.menuItemId === MENU_ITEMS[1].id)
+  })
+  await send('Page.reload', {}, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+
+  const ordersBeforeConfirmRace = state.orders.length
+  const attemptsBeforeConfirmRace = state.postAttempts.length
+  state.holdNextPost = true
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  // Backend has committed (order exists), response is paused before A saves cart deduction; stale B attempts checkout now.
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await sleep(300)
+  state.releaseHeldPost!()
+  state.releaseHeldPost = null
+  await waitFor(async () => {
+    const raw = await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-5')`)
+    return JSON.parse(raw || '[]').length === 0
+  })
+  assert.equal(state.orders.length, ordersBeforeConfirmRace + 1, 'confirmation race produces exactly 1 order')
+  assert.equal(state.postAttempts.length - attemptsBeforeConfirmRace, 1, 'stale Tab B sends no duplicate POST')
+
+  // (b) No-Web-Locks path and storage error path both fail closed with no POST and cart intact.
+  await send('Page.reload', {}, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
+  await evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+
+  const attemptsBeforeNoLocks = state.postAttempts.length
+  await evalIn(
+    sidB,
+    `(() => {
+      window.__origLocksDesc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'locks') || Object.getOwnPropertyDescriptor(navigator, 'locks');
+      Object.defineProperty(navigator, 'locks', { value: undefined, configurable: true });
+    })()`,
+  )
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await sleep(200)
+  assert.equal(state.postAttempts.length, attemptsBeforeNoLocks, 'no-Web-Locks tab sends no POST')
+  const cartAfterNoLocks = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-5')`)) || '[]')
+  assert.equal(cartAfterNoLocks.length, 1, 'cart remains intact when Web Locks unavailable')
+
+  // Restore locks, then inject a storage error on lock probe.
+  await evalIn(
+    sidB,
+    `(() => {
+      delete navigator.locks;
+      window.__origGetItem = Storage.prototype.getItem;
+      Storage.prototype.getItem = function(k) {
+        if (String(k).includes('the-salad-checkout-lock-')) throw new Error('Quota/Storage error');
+        return window.__origGetItem.call(this, k);
+      };
+    })()`,
+  )
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await sleep(200)
+  assert.equal(state.postAttempts.length, attemptsBeforeNoLocks, 'storage error prevents POST')
+  await evalIn(sidB, `if (window.__origGetItem) Storage.prototype.getItem = window.__origGetItem`)
+  console.log('  ok    Browser test 7: Confirmation race + no-Web-Locks + storage error prevent duplicate or unlocked POSTs')
+
+  // 8. Cached-session cart ownership: A has 1 unsubmitted Masala Dosa in session; B has pending browsing order for 1 Masala Dosa,
+  // reopens through MENU_URL (no QR token) adopting cached session, confirms -> A's unit survives.
+  await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
+  await send('Page.navigate', { url: QR_URL }, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.sessions.has('tok-browser-6') ? true : false))
+
+  // Give A 1 unsubmitted Masala Dosa in tok-browser-6.
+  await send('Page.reload', {}, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await waitFor(async () => {
+    const raw = await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-6')`)
+    return JSON.parse(raw || '[]').some((c: any) => c.menuItemId === MENU_ITEMS[1].id && c.quantity === 1)
+  })
+
+  // B (browsing) submits 1 Masala Dosa with dropped response, then reopens via MENU_URL (cached session, no QR token).
+  await evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+  const ordersBeforeCached = state.orders.length
+  state.dropNextPostResponse = true
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.orders.length === ordersBeforeCached + 1 ? true : false))
+  const cachedOrderKey = state.orders[state.orders.length - 1].idempotencyKey
+
+  await send('Page.navigate', { url: MENU_URL }, sidB)
+  await waitFor(() => (state.byKeyCalls.some((c) => c.key === cachedOrderKey) ? true : false))
+  await sleep(300)
+  await send('Page.reload', {}, sidA)
+  await send('Page.reload', {}, sidB)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
+  const cartAfterCachedA = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-6')`)) || '[]')
+  assert.equal(cartAfterCachedA.find((c: any) => c.menuItemId === MENU_ITEMS[1].id)?.quantity, 1, 'A unsubmitted Dosa survives cached-session adoption')
+  console.log('  ok    Browser test 8: Cached-session adoption preserves A unsubmitted unit and deducts B order from its source cart')
+
+  // 9. Concurrent QR adoption: both tabs begin adopting the same browsing cart concurrently before either completes.
+  await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Mango Lassi')`))
+  await send('Page.navigate', { url: QR_URL }, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Paneer Tikka')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.sessions.has('tok-browser-7') ? true : false))
+
+  // B (browsing) adds 1 Mango Lassi and clears its sessionStorage; A also clears sessionStorage so both adopt tok-browser-7 concurrently via QR.
+  await evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')][2]?.click()`)
+  await waitFor(async () => {
+    return await evalIn(sidB, `Object.entries(localStorage).some(([k, v]) => k.includes('browsing') && JSON.parse(v || '[]').some((c) => c.menuItemId === '${MENU_ITEMS[2].id}' && c.quantity === 1))`)
+  })
+  await evalIn(sidA, `sessionStorage.clear()`)
+  await evalIn(sidB, `sessionStorage.clear()`)
+
+  await Promise.all([
+    send('Page.navigate', { url: QR_URL }, sidA),
+    send('Page.navigate', { url: QR_URL }, sidB),
+  ])
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Mango Lassi')`))
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Mango Lassi')`))
+  await waitFor(async () => {
+    const raw = await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-7')`)
+    return JSON.parse(raw || '[]').some((c: any) => c.menuItemId === MENU_ITEMS[2].id)
+  })
+  const concCart1 = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-7')`)) || '[]')
+  assert.equal(concCart1.find((c: any) => c.menuItemId === MENU_ITEMS[2].id)?.quantity, 1, 'concurrent QR adoption imports Mango Lassi once')
+
+  // Repeated reloads leave quantities unchanged.
+  await send('Page.reload', {}, sidA)
+  await send('Page.reload', {}, sidB)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Mango Lassi')`))
+  const concCart2 = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-7')`)) || '[]')
+  assert.equal(concCart2.find((c: any) => c.menuItemId === MENU_ITEMS[2].id)?.quantity, 1, 'repeated reloads keep Mango Lassi at 1')
+  console.log('  ok    Browser test 9: Concurrent QR adoption imports browsing cart once and stays idempotent across reloads')
 } finally {
   try { ws?.close() } catch { }
   try { chrome?.kill('SIGKILL') } catch { }
