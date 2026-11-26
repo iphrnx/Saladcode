@@ -326,15 +326,15 @@ export class CheckoutLockError extends Error {
   }
 }
 
-const CHECKOUT_LOCK_TTL_MS = 2_000
+const CHECKOUT_LOCK_TTL_MS = 30_000
 const CHECKOUT_LOCK_SETTLE_MS = 45
 
 /**
  * Acquire an exclusive cross-tab lock for a given cart scope so two tabs
  * cannot read the same cart snapshot and enqueue duplicate idempotency keys.
- * Uses navigator.locks when available and a settle-and-verify localStorage
- * lease fallback when Web Locks are unavailable; fails closed with a retryable
- * CheckoutLockError if exclusive ownership cannot be guaranteed.
+ * Uses navigator.locks when available and a non-stealing settle-and-verify
+ * localStorage lock fallback when Web Locks are unavailable; fails closed
+ * with a retryable CheckoutLockError if exclusive ownership cannot be established.
  */
 export async function withCrossTabCheckoutLock<T>(
   storage: StorageLike | null | undefined,
@@ -367,6 +367,7 @@ export async function withCrossTabCheckoutLock<T>(
       const parsed = raw ? JSON.parse(raw) : null
       const expired =
         !parsed || typeof parsed.ts !== 'number' || now() - parsed.ts > CHECKOUT_LOCK_TTL_MS
+      // Never overwrite an active owner's lock; only claim when empty/expired or already ours.
       if (expired || parsed.nonce === nonce) {
         storage.setItem(lockKey, JSON.stringify({ nonce, ts: now() }))
         shouldSettle = true
@@ -375,7 +376,7 @@ export async function withCrossTabCheckoutLock<T>(
       throw new CheckoutLockError('Unable to access cart storage. Please try again.')
     }
     if (shouldSettle) {
-      // Wait for cross-tab storage IPC to settle before verifying ownership.
+      // Wait for cross-tab storage IPC to settle before verifying exclusive ownership.
       await new Promise((r) => setTimeout(r, CHECKOUT_LOCK_SETTLE_MS))
       try {
         const verify = storage.getItem(lockKey)
@@ -392,7 +393,7 @@ export async function withCrossTabCheckoutLock<T>(
 
   if (!acquired) {
     throw new CheckoutLockError(
-      'Unable to acquire exclusive cross-tab checkout lock. Please try again.',
+      'Another tab is currently submitting this order. Please try again.',
     )
   }
 

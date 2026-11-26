@@ -11,6 +11,7 @@ import {
   reconcileCartOnSave,
   resolveRestoredLinePrice,
   subtractUnresolvedQueueQuantities,
+  withCrossTabCheckoutLock,
 } from '../src/lib/diner-cart-sync'
 
 interface ConfirmedOrderFixture {
@@ -963,7 +964,7 @@ await check('P2-11: QR reload imports browsing cart into active session once wit
 
   // Verify public-menu.tsx activateAndLoad performs this merge on data?.session.
   assert.ok(publicMenuSrc.includes("readStored('cart', `browsing:${tableId}`)"))
-  assert.ok(publicMenuSrc.includes("removeStored('cart', `browsing:${tableId}`)"))
+  assert.ok(publicMenuSrc.includes("removeStoredStrict('cart', `browsing:${tableId}`)"))
 
   // Tab A has an item in session cart; Tab B has qty 2 in browsing cart.
   store.setItem(sessionKey, JSON.stringify([{ menuItemId: 'dish-a', name: 'Idli', price: 50, quantity: 1 }]))
@@ -1391,6 +1392,63 @@ await check('P2-19: resolveRestoredLinePrice restores selected portion price ins
   const restoredPrice = resolveRestoredLinePrice(dish, 'Large', 'large', undefined)
   assert.equal(restoredPrice, 380)
   assert.equal(restoredPrice * 2, 760)
+})
+
+// ---------------------------------------------------------------------------
+// 20. P2: Non-Web-Locks checkout lock blocks delayed contender beyond 2s pause
+// ---------------------------------------------------------------------------
+await check('P2-20: withCrossTabCheckoutLock without Web Locks rejects contender while owner is paused > 2s', async () => {
+  const store = new MemoryStorage()
+  let nowMs = 1_000_000
+  let releaseOwner!: () => void
+  const ownerHolding = new Promise<void>((resolve) => {
+    releaseOwner = resolve
+  })
+
+  const ownerPromise = withCrossTabCheckoutLock(
+    store,
+    'tenant-1',
+    'tok-1',
+    async () => {
+      await ownerHolding
+      return 'owner-done'
+    },
+    () => nowMs,
+  )
+
+  // Advance clock by 2.5s (beyond the old 2_000ms lease expiry) while owner is still active.
+  await new Promise((r) => setTimeout(r, 80))
+  nowMs += 2_500
+
+  let contenderRan = false
+  await assert.rejects(
+    () =>
+      withCrossTabCheckoutLock(
+        store,
+        'tenant-1',
+        'tok-1',
+        () => {
+          contenderRan = true
+          return 'contender-done'
+        },
+        () => nowMs,
+      ),
+    /Another tab is currently submitting/i,
+  )
+  assert.equal(contenderRan, false, 'delayed contender must not run while owner holds lock')
+
+  releaseOwner()
+  assert.equal(await ownerPromise, 'owner-done')
+
+  // Single-tab checkout succeeds normally once owner releases.
+  const singleRes = await withCrossTabCheckoutLock(
+    store,
+    'tenant-1',
+    'tok-1',
+    () => 'single-ok',
+    () => nowMs,
+  )
+  assert.equal(singleRes, 'single-ok')
 })
 
 console.log(`\n${pass} passed, ${fail} failed`)

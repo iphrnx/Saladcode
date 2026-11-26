@@ -69,6 +69,21 @@ function area(name: KeyName): Storage | null {
 }
 
 /** Read a value, carrying it across from any old name the first time. */
+export function readStoredStrict(name: KeyName, suffix = ''): string | null {
+  const store = area(name)
+  if (!store) throw new Error('Storage unavailable')
+  const current = store.getItem(keyName(name, suffix))
+  if (current !== null) return current
+  for (const legacy of legacyKeyNames(name, suffix)) {
+    const previous = store.getItem(legacy)
+    if (previous === null) continue
+    store.setItem(keyName(name, suffix), previous)
+    for (const k of legacyKeyNames(name, suffix)) store.removeItem(k)
+    return previous
+  }
+  return null
+}
+
 export function readStored(name: KeyName, suffix = ''): string | null {
   const store = area(name)
   if (!store) return null
@@ -112,6 +127,15 @@ export function writeStored(name: KeyName, value: string, suffix = ''): void {
     }
   } catch {
     /* storage blocked — the value simply does not persist */
+  }
+}
+
+export function removeStoredStrict(name: KeyName, suffix = ''): void {
+  const store = area(name)
+  if (!store) throw new Error('Storage unavailable')
+  store.removeItem(keyName(name, suffix))
+  for (const legacy of legacyKeyNames(name, suffix)) {
+    store.removeItem(legacy)
   }
 }
 

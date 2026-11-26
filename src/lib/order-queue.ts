@@ -34,7 +34,7 @@
  */
 
 import { edgeFetch } from './edge'
-import { readStored, removeStored, writeStored } from './storage-keys'
+import { readStored, readStoredStrict, removeStored, writeStored, writeStoredStrict } from './storage-keys'
 
 export type QueueEntryState = 'pending' | 'submitting' | 'failed'
 
@@ -334,6 +334,12 @@ export class OrderQueue {
     this.hooks.onChange?.(entries)
   }
 
+  private saveStrict(entries: QueueEntry[]) {
+    const writer = (this.storage as { setItemStrict?: (k: string, v: string) => void }).setItemStrict ?? this.storage.setItem
+    writer.call(this.storage, this.storageKey, JSON.stringify(entries))
+    this.hooks.onChange?.(entries)
+  }
+
   /** Snapshot a checkout into the queue and start processing immediately. */
   enqueue(
     kind: 'pos' | 'diner',
@@ -463,8 +469,8 @@ export class OrderQueue {
     let finalized = false
     const finalize = () => {
       if (finalized) return
+      this.saveStrict(this.load().filter((e) => e.key !== key))
       finalized = true
-      this.save(this.load().filter((e) => e.key !== key))
     }
     try {
       const res = await this.hooks.onConfirmed?.(order, entry, finalize)
@@ -605,6 +611,20 @@ export class OrderQueue {
 const instances = new Map<string, OrderQueue>()
 const wakeTimers = new Map<string, number>()
 
+/**
+ * Strictly read and migrate (if needed) the queue entries for a scope.
+ * Throws if storage access, legacy-key migration, or JSON parsing fails.
+ */
+export function readQueueStrict(tenantId: string, actorId: string): QueueEntry[] {
+  const raw = readStoredStrict('orderQueue', `${tenantId}-${actorId}`)
+  if (!raw) return []
+  const parsed = JSON.parse(raw)
+  if (!Array.isArray(parsed)) {
+    throw new Error('Corrupt order queue state')
+  }
+  return parsed
+}
+
 /** The (singleton per scope) queue for this restaurant + actor. */
 export function orderQueue(tenantId: string, actorId: string, hooks: QueueHooks = {}): OrderQueue {
   const id = `${tenantId}:${actorId}`
@@ -612,9 +632,10 @@ export function orderQueue(tenantId: string, actorId: string, hooks: QueueHooks 
   if (!q) {
     // Scoped by restaurant AND actor: a queue never crosses either boundary.
     const suffix = `${tenantId}-${actorId}`
-    const storage: StorageLike = {
+    const storage: StorageLike & { setItemStrict?: (k: string, v: string) => void } = {
       getItem: () => readStored('orderQueue', suffix),
       setItem: (_k, v) => writeStored('orderQueue', v, suffix),
+      setItemStrict: (_k, v) => writeStoredStrict('orderQueue', v, suffix),
       removeItem: () => removeStored('orderQueue', suffix),
     }
     q = new OrderQueue(storage, id, edgeFetch, hooks)

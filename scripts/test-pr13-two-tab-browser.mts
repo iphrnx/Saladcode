@@ -961,6 +961,8 @@ try {
   await evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')][2]?.click()`)
   await waitFor(async () => {
     return await evalIn(sidB, `Object.entries(localStorage).some(([k, v]) => k.includes('browsing') && JSON.parse(v || '[]').some((c) => c.menuItemId === '${MENU_ITEMS[2].id}' && c.quantity === 1))`)
+    const raw = await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-browsing:${TABLE.id}')`)
+    return JSON.parse(raw || '[]').some((c: any) => c.menuItemId === MENU_ITEMS[2].id && c.quantity === 1)
   })
   await evalIn(sidA, `sessionStorage.clear()`)
   await evalIn(sidB, `sessionStorage.clear()`)
@@ -1144,6 +1146,8 @@ try {
   await waitFor(() => (state.sessions.has('tok-browser-10') ? true : false))
 
   // B (browsing) submits 1 Masala Dosa with dropped response (committed on server, unresolved in table queue).
+  // B (browsing) submits 1 Masala Dosa with dropped response (committed on server, unresolved in table queue),
+  // then adds an unrelated 1 Mango Lassi to browsing cart before reloading under QuotaExceededError.
   await evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
   await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
@@ -1153,6 +1157,15 @@ try {
   await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
   await waitFor(() => (state.orders.length === ordersBeforeQuota + 1 ? true : false))
   const quotaOrderKey = state.orders[state.orders.length - 1].idempotencyKey
+  await evalIn(
+    sidB,
+    `(() => {
+      const k = 'the-salad-cart-session-browsing:${TABLE.id}';
+      const cur = JSON.parse(localStorage.getItem(k) || '[]');
+      cur.push({ menuItemId: '${MENU_ITEMS[2].id}', name: 'Mango Lassi', price: 90, quantity: 1 });
+      localStorage.setItem(k, JSON.stringify(cur));
+    })()`,
+  )
 
   // Arm QuotaExceededError on destination session queue write before reloading B via QR.
   const quotaScriptB = await send(
@@ -1180,6 +1193,7 @@ try {
   assert.equal(sourceQueueUnderQuota[0].key, quotaOrderKey, 'original idempotency key preserved under quota error')
 
   // Restore writes -> automatic retry migrates, reconciles by original key, clears queue, and creates no duplicate order.
+  // Restore writes -> automatic retry completes cart transfer (1 Mango Lassi merged, 1 Masala Dosa deducted), reconciles by original key, clears queue.
   await evalIn(sidB, `localStorage.removeItem('__quota_armed')`)
   await waitFor(() => (state.byKeyCalls.some((c) => c.key === quotaOrderKey) ? true : false))
   await waitFor(async () => {
@@ -1187,9 +1201,194 @@ try {
     const dst = await evalIn(sidB, `localStorage.getItem('the-salad-order-queue-${TENANT.id}-tok-browser-10')`)
     return (!src || JSON.parse(src).length === 0) && (!dst || JSON.parse(dst).length === 0)
   })
+  await send('Page.reload', {}, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Mango Lassi')`))
+  const quotaFinalCart = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-10')`)) || '[]')
+  assert.equal(quotaFinalCart.find((c: any) => c.menuItemId === MENU_ITEMS[1].id), undefined, 'confirmed Masala Dosa stays out after reload')
+  assert.equal(quotaFinalCart.find((c: any) => c.menuItemId === MENU_ITEMS[2].id)?.quantity, 1, 'unrelated Mango Lassi survives quota recovery')
   assert.equal(state.orders.length, ordersBeforeQuota + 1, 'no duplicate order recorded after quota recovery')
   await send('Page.removeScriptToEvaluateOnNewDocument', { identifier: quotaScriptB.identifier }, sidB)
   console.log('  ok    Browser test 12: Full-storage migration keeps menu usable, preserves key, and recovers once quota clears')
+  console.log('  ok    Browser test 12: Full-storage migration keeps menu usable, completes cart transfer, and recovers once quota clears')
+
+  // 13. Interrupted confirmation (first order & follow-up order):
+  // First order: browsing cart has 1 Paneer Tikka + 1 Mango Lassi; submit Paneer Tikka (dropped response),
+  // fail credential write once, then fail source-cart deletion once -> reload & resume with original key ->
+  // Mango Lassi merged once, Paneer Tikka deducted once, stale Tab B sends no POST.
+  await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await evalIn(sidB, `sessionStorage.clear()`)
+  await send('Page.navigate', { url: QR_URL }, sidA)
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')].length >= 3`))
+  await waitFor(() => evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')].length >= 3`))
+
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  // Sync stale Tab B with [1 Paneer Tikka] BEFORE A submits, and open Place Order in B.
+  await send('Page.reload', {}, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  const ordersBeforeInterrupt = state.orders.length
+  const attemptsBeforeInterrupt = state.postAttempts.length
+  state.dropNextPostResponse = true
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.orders.length === ordersBeforeInterrupt + 1 ? true : false))
+  const firstInterruptKey = state.orders[state.orders.length - 1].idempotencyKey
+  // Add unrelated 1 Mango Lassi to browsing cart before sidA reloads for confirmation recovery.
+  await evalIn(
+    sidA,
+    `(() => {
+      const k = 'the-salad-cart-session-browsing:${TABLE.id}';
+      const cur = JSON.parse(localStorage.getItem(k) || '[]');
+      cur.push({ menuItemId: '${MENU_ITEMS[2].id}', name: 'Mango Lassi', price: 90, quantity: 1 });
+      localStorage.setItem(k, JSON.stringify(cur));
+    })()`,
+  )
+
+  // Inject one-shot credential write failure + one-shot source-cart deletion failure on sidA.
+  const interruptScriptA = await send(
+    'Page.addScriptToEvaluateOnNewDocument',
+    {
+      source: `(() => {
+        const origSet = Storage.prototype.setItem;
+        const origRemove = Storage.prototype.removeItem;
+        Storage.prototype.setItem = function(k, v) {
+          if (this.getItem('__fail_cred_once') === '1' && String(k).startsWith('restro_session:')) {
+            this.removeItem('__fail_cred_once');
+            throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+          }
+          if (this.getItem('__fail_retire_once') === '1' && String(k).includes('the-salad-order-queue-') && v === '[]') {
+            this.removeItem('__fail_retire_once');
+            throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+          }
+          return origSet.call(this, k, v);
+        };
+        Storage.prototype.removeItem = function(k) {
+          if (this.getItem('__fail_rm_once') === '1' && String(k).includes('browsing:')) {
+            this.removeItem('__fail_rm_once');
+            throw new Error('Delete failed');
+          }
+          return origRemove.call(this, k);
+        };
+      })();`,
+    },
+    sidA,
+  )
+  await evalIn(sidA, `localStorage.setItem('__fail_cred_once', '1'); localStorage.setItem('__fail_rm_once', '1')`)
+  await send('Page.reload', {}, sidA)
+  await waitFor(() => (state.byKeyCalls.some((c) => c.key === firstInterruptKey) ? true : false))
+  await sleep(200)
+  // Stale Tab B attempts checkout while A is recovering -> must not submit Paneer Tikka under a fresh key.
+  state.holdNextPost = true
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await sleep(200)
+  state.holdNextPost = false
+  if (state.releaseHeldPost) {
+    state.orders.pop()
+    state.releaseHeldPost = null
+  }
+
+  // Reload sidA to resume confirmation cleanly without failures.
+  await send('Page.reload', {}, sidA)
+  await waitFor(async () => {
+    const qRaw = await evalIn(sidA, `localStorage.getItem('the-salad-order-queue-${TENANT.id}-tok-browser-11')`)
+    const qTable = await evalIn(sidA, `localStorage.getItem('the-salad-order-queue-${TENANT.id}-table_${TABLE.id}')`)
+    return (!qRaw || JSON.parse(qRaw).length === 0) && (!qTable || JSON.parse(qTable).length === 0)
+  })
+  const interruptCart1 = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-11')`)) || '[]')
+  assert.equal(interruptCart1.find((c: any) => c.menuItemId === MENU_ITEMS[0].id), undefined, 'first-order Paneer Tikka deducted once')
+  assert.equal(interruptCart1.find((c: any) => c.menuItemId === MENU_ITEMS[2].id)?.quantity, 1, 'unrelated Mango Lassi merged once')
+  const paneerAttempts = state.postAttempts.slice(attemptsBeforeInterrupt).filter((a) => a.items.some((i: any) => i.menuItemId === MENU_ITEMS[0].id))
+  assert.equal(paneerAttempts.length, 1, 'stale Tab B sent no duplicate POST for reserved Paneer Tikka')
+
+  // Follow-up order: interrupt queue retirement once, reload & resume with original key -> deducted once.
+  await send('Page.reload', {}, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await evalIn(sidA, `localStorage.setItem('__fail_retire_once', '1')`)
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.orders.length === ordersBeforeInterrupt + 2 ? true : false))
+  const followUpKey = state.orders[state.orders.length - 1].idempotencyKey
+  await sleep(200)
+  await send('Page.reload', {}, sidA)
+  await waitFor(() => (state.byKeyCalls.some((c) => c.key === followUpKey) ? true : false))
+  await waitFor(async () => {
+    const qRaw = await evalIn(sidA, `localStorage.getItem('the-salad-order-queue-${TENANT.id}-tok-browser-11')`)
+    return !qRaw || JSON.parse(qRaw).length === 0
+  })
+  const interruptCart2 = JSON.parse((await evalIn(sidA, `localStorage.getItem('the-salad-cart-session-tok-browser-11')`)) || '[]')
+  assert.equal(interruptCart2.find((c: any) => c.menuItemId === MENU_ITEMS[1].id), undefined, 'follow-up Masala Dosa deducted once')
+  assert.equal(interruptCart2.find((c: any) => c.menuItemId === MENU_ITEMS[2].id)?.quantity, 1, 'unrelated Mango Lassi preserved across follow-up replay')
+  await send('Page.removeScriptToEvaluateOnNewDocument', { identifier: interruptScriptA.identifier }, sidA)
+  console.log('  ok    Browser test 13: Interrupted first & follow-up confirmations replay idempotently without double deduction')
+
+  // 14. Failed queue reads & legacy-key migration failure:
+  // Seed an existing reservation; fail getItem on queue key -> no POST, cart & key intact;
+  // fail legacy-key migration -> no POST, cart & key intact; restore access -> resumes without duplication.
+  await evalIn(sidB, `localStorage.clear(); sessionStorage.clear()`)
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')].length >= 3`))
+  await evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+
+  const attemptsBeforeReadErr = state.postAttempts.length
+  const ordersBeforeReadErr = state.orders.length
+  // Inject queue read failure on Place Order.
+  await evalIn(
+    sidB,
+    `(() => {
+      window.__origGetQueue = Storage.prototype.getItem;
+      Storage.prototype.getItem = function(k) {
+        if (String(k).includes('the-salad-order-queue-')) throw new Error('Read error');
+        return window.__origGetQueue.call(this, k);
+      };
+    })()`,
+  )
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await sleep(200)
+  assert.equal(state.postAttempts.length, attemptsBeforeReadErr, 'failed queue read sends no POST')
+
+  // Restore getItem, remove primary queue key, seed a legacy queue entry (toastly-order-queue-), and fail removeItem during legacy migration.
+  const attemptsBeforeLegacyErr = state.postAttempts.length
+  await evalIn(
+    sidB,
+    `(() => {
+      Storage.prototype.getItem = window.__origGetQueue;
+      localStorage.removeItem('the-salad-order-queue-${TENANT.id}-table_${TABLE.id}');
+      localStorage.setItem('toastly-order-queue-${TENANT.id}-table_${TABLE.id}', JSON.stringify([{ key: 'legacy-key-1', kind: 'diner', payload: { orderType: 'DINE_IN', items: [{ menuItemId: '${MENU_ITEMS[1].id}', quantity: 1 }] }, state: 'pending', attempts: 0, nextAttemptAt: 0, createdAt: 0, itemCount: 1 }]));
+      window.__origRmLegacy = Storage.prototype.removeItem;
+      Storage.prototype.removeItem = function(k) {
+        if (String(k).startsWith('toastly-order-queue-')) throw new Error('Legacy migration failed');
+        return window.__origRmLegacy.call(this, k);
+      };
+    })()`,
+  )
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await sleep(200)
+  assert.equal(state.postAttempts.length, attemptsBeforeLegacyErr, 'failed legacy-key migration sends no POST')
+
+  // Restore storage access and place order cleanly (single order).
+  await evalIn(
+    sidB,
+    `(() => {
+      Storage.prototype.removeItem = window.__origRmLegacy;
+      localStorage.removeItem('toastly-order-queue-${TENANT.id}-table_${TABLE.id}');
+      localStorage.removeItem('the-salad-order-queue-${TENANT.id}-table_${TABLE.id}');
+    })()`,
+  )
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.orders.length === ordersBeforeReadErr + 1 ? true : false))
+  assert.equal(state.orders.length, ordersBeforeReadErr + 1, 'checkout resumes cleanly once queue storage is readable')
+  console.log('  ok    Browser test 14: Failed queue read and legacy migration failure block POSTs and resume cleanly')
 } finally {
   try { ws?.close() } catch { }
   try { chrome?.kill('SIGKILL') } catch { }
