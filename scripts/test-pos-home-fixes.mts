@@ -33,8 +33,10 @@ import {
   clearRecoverablePosDraft,
   subtractRecoverablePosDraft,
   recoverDraftToUnattachedCart,
+  tryRecoverDraftToUnattachedCart,
   findEditableSession,
   isSessionEditable,
+  resolveSessionLifecycle,
   restorePosCart,
   clearPosCart,
   savePosActiveSessionId,
@@ -533,6 +535,115 @@ check("PR#14 review P2-2: multiple closed sittings keep separate recovery drafts
   assert.equal(getRecoverablePosDrafts(T, U).length, 0);
 });
 
+check("PR#14 P2-1 (lifecycle): open sitting omitted from /active after last order cancelled stays selected; confirmed closure triggers recovery", () => {
+  const sid = "sess-old-cancelled";
+  // Omitted from `/table-session/active` (`sessionGroups = []`), but authoritative `tableSessions` is ACTIVE
+  const openRes = resolveSessionLifecycle(
+    sid,
+    [],
+    { [sid]: { id: sid, tableId: "tbl-3", status: "ACTIVE", endedAt: null } },
+    {},
+    [{ tableSessionId: sid, checkId: "chk-3", orderType: "DINE_IN", customerName: "Sam" }],
+  );
+  assert.equal(openRes.state, "open");
+  assert.equal(openRes.editable?.sessionId, sid);
+  assert.equal(openRes.editable?.tableId, "tbl-3");
+
+  // Omitted from both `/table-session/active` and `tableSessions` -> unknown (must NOT treat as closed)
+  const unknownRes = resolveSessionLifecycle(sid, [], {}, {}, []);
+  assert.equal(unknownRes.state, "unknown");
+
+  // Confirmed ENDED in `tableSessions` -> closed (safe to move draft to recovery)
+  const closedRes = resolveSessionLifecycle(
+    sid,
+    [],
+    { [sid]: { id: sid, tableId: "tbl-3", status: "ENDED", endedAt: new Date().toISOString() } },
+    {},
+    [],
+  );
+  assert.equal(closedRes.state, "closed");
+  assert.equal(closedRes.editable, null);
+});
+
+check("PR#14 P2-2 (quota): storage write failure preserves source draft in both move directions and retry succeeds once", () => {
+  clearPosCart(T, U);
+
+  // Direction A: session draft -> recoverable draft
+  savePosSessionDraft(T, U, "sess-q1", {
+    cart: [{ menuItemId: "m1", name: "Burger", price: 150, quantity: 2 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-1",
+    selectedSessionId: "sess-q1",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  const origSetItem = (globalThis as any).localStorage.setItem;
+  // Simulate QuotaExceededError when writing recoverable storage
+  (globalThis as any).localStorage.setItem = (k: string, v: string) => {
+    if (k.includes("-recoverable")) {
+      throw new DOMException("QuotaExceededError", "QuotaExceededError");
+    }
+    return origSetItem(k, v);
+  };
+
+  const failedMoveA = saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-q1",
+    cart: getPosSessionDraft(T, U, "sess-q1")!.cart,
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-1",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+  assert.equal(failedMoveA, null, "must report failure when recoverable write throws");
+  // Source session draft must survive untouched
+  assert.equal(getPosSessionDraft(T, U, "sess-q1")?.cart[0].quantity, 2);
+
+  // Clear quota error and retry -> succeeds and source can be cleared
+  (globalThis as any).localStorage.setItem = origSetItem;
+  const retryMoveA = saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-q1",
+    cart: getPosSessionDraft(T, U, "sess-q1")!.cart,
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-1",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+  assert.ok(retryMoveA, "retry succeeds once storage is writable");
+  clearPosSessionDraft(T, U, "sess-q1");
+  assert.equal(getPosSessionDraft(T, U, "sess-q1"), null);
+  assert.equal(getRecoverablePosDraft(T, U, "sess-q1")?.cart[0].quantity, 2);
+
+  // Direction B: recoverable draft -> unattached cart
+  (globalThis as any).localStorage.setItem = (k: string, v: string) => {
+    if (k.includes("-drafts") || k.endsWith(`${T}-${U}`)) {
+      throw new DOMException("QuotaExceededError", "QuotaExceededError");
+    }
+    return origSetItem(k, v);
+  };
+
+  const failedMoveB = tryRecoverDraftToUnattachedCart(T, U, [], "sess-q1");
+  assert.equal(failedMoveB.ok, false);
+  if (!failedMoveB.ok) assert.equal(failedMoveB.reason, "storage_error");
+  // Source recoverable draft must survive untouched
+  assert.equal(getRecoverablePosDraft(T, U, "sess-q1")?.cart[0].quantity, 2);
+
+  // Clear quota error and retry -> moves exactly once
+  (globalThis as any).localStorage.setItem = origSetItem;
+  const retryMoveB = tryRecoverDraftToUnattachedCart(T, U, [], "sess-q1");
+  assert.equal(retryMoveB.ok, true);
+  if (retryMoveB.ok) {
+    assert.equal(retryMoveB.snapshot.cart[0].menuItemId, "m1");
+    assert.equal(retryMoveB.snapshot.cart[0].quantity, 2);
+  }
+  assert.equal(getRecoverablePosDraft(T, U, "sess-q1"), null);
+  const secondMoveB = tryRecoverDraftToUnattachedCart(T, U, [], "sess-q1");
+  assert.equal(secondMoveB.ok, false);
+});
+
 delete (globalThis as any).localStorage;
 
 // ── 2. UI & Edge Function Isolation Static Invariants ────────────────────────
@@ -574,8 +685,8 @@ check("POS Home cleans up session labels (no S1, chronological Diner N)", () => 
 
 check("POS Home handles delayed confirmation, refresh, and remote settlement cleanup", () => {
   assert.match(dashboardCode, /subtractPosSessionDraft\(tenantId, userId, originSessionId, submittedLines\)/);
-  assert.match(dashboardCode, /isSessionEditable\(selectedSessionId, sessions\)/);
-  assert.match(dashboardCode, /findEditableSession\(savedActiveSessionId, sessions\)/);
+  assert.match(dashboardCode, /resolveSessionLifecycle\(selectedSessionId, sessions, tableSessions, checks, data\?\.orders\)/);
+  assert.match(dashboardCode, /resolveSessionLifecycle\(savedActiveSessionId, sessions, tableSessions, checks, data\?\.orders\)/);
   assert.match(ordersFnCode, /createNewSession = true/);
 });
 

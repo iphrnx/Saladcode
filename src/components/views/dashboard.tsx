@@ -15,7 +15,7 @@ import { cn } from '@/lib/utils'
 import { formatCurrency } from '@/lib/constants'
 import { normalizePortions, normalizePortionKey, type MenuPortion } from '@/lib/portions'
 import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
-import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, subtractPosSessionDraft, subtractLinesFromCart, saveRecoverablePosDraft, getRecoverablePosDrafts, clearRecoverablePosDraft, subtractRecoverablePosDraft, recoverDraftToUnattachedCart, findEditableSession, isSessionEditable, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId, type RecoverablePosDraft } from '@/lib/pos-cart'
+import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, subtractPosSessionDraft, subtractLinesFromCart, saveRecoverablePosDraft, getRecoverablePosDrafts, clearRecoverablePosDraft, subtractRecoverablePosDraft, tryRecoverDraftToUnattachedCart, resolveSessionLifecycle, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId, type RecoverablePosDraft } from '@/lib/pos-cart'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
@@ -220,7 +220,7 @@ function ActiveSessionCard({
 
 export function DashboardView() {
   const tr = useT()
-  const { data, refresh, sessionRevision } = useApp()
+  const { data, refresh, sessionRevision, tableSessions, checks } = useApp()
   const { denied, handleLoad, handleAction } = useAccessDenied()
   const { cart, addToCart, updateCartQty, removeFromCart, setCartNotes, clearCart, replaceCart, hydrateCart, subtractCartLines, orderType, setOrderType, selectedTableId, setSelectedTableId, selectedSessionId, setSelectedSessionId, setSessionContext, promoCode, setPromoCode } = useStore()
   const [activeCat, setActiveCat] = useState<string>('all')
@@ -1350,7 +1350,12 @@ export function DashboardView() {
           customerPhone: isCurrentlySelected ? customerPhone : (storedDraft?.customerPhone ?? ''),
           promoCode: isCurrentlySelected ? liveState.promoCode : (storedDraft?.promoCode ?? ''),
         })
-        if (saved) setRecoverableDrafts(getRecoverablePosDrafts(tenantId, userId))
+        if (!saved) {
+          // Destination write failed (e.g. storage quota): preserve source draft so items are never lost.
+          toast.error('Could not save unsent items for recovery (storage full). Keeping draft in place.')
+          return
+        }
+        setRecoverableDrafts(getRecoverablePosDrafts(tenantId, userId))
       }
 
       clearPosSessionDraft(tenantId, userId, closedSessionId)
@@ -1374,8 +1379,14 @@ export function DashboardView() {
           (e.payload?.tableSessionId ?? null) === sessionId,
       )
       if (isHeld) return
-      const recovered = recoverDraftToUnattachedCart(tenantId, userId, cart, sessionId)
-      if (!recovered) return
+      const res = tryRecoverDraftToUnattachedCart(tenantId, userId, cart, sessionId)
+      if (!res.ok) {
+        if (res.reason === 'storage_error') {
+          toast.error('Could not restore items — browser storage is full. Please free space and retry.')
+        }
+        return
+      }
+      const recovered = res.snapshot
       replaceCart(recovered.cart)
       setSessionContext(recovered.selectedTableId, null, recovered.orderType)
       setCustomerName(recovered.customerName ?? '')
@@ -1399,11 +1410,10 @@ export function DashboardView() {
     [tenantId, userId],
   )
 
-  // Restore persisted active session on refresh, and clear stale selection if
-  // the selected session ended/settled while away or on another device.
-  // Uses underlying session & settlement state (not activeSessionCards) so
-  // ended unpaid sittings cannot be reclaimed and open sittings with cancelled
-  // orders stay selected.
+  // Restore persisted active session on refresh, and clear stale selection only when
+  // authoritative lifecycle confirms closure. If a session is omitted from `/table-session/active`
+  // (e.g. >3m old after its last order was cancelled) or its status is still unknown,
+  // preserve the sitting selection and unsent items.
   const restoredSessionRef = useRef(false)
   useEffect(() => {
     if (!tenantId || !userId || !sessionsLoadedOnce.current) return
@@ -1411,20 +1421,32 @@ export function DashboardView() {
       restoredSessionRef.current = true
       const savedActiveSessionId = getPosActiveSessionId(tenantId, userId)
       if (savedActiveSessionId && !selectedSessionId) {
-        const editable = findEditableSession(savedActiveSessionId, sessions)
-        if (editable) {
-          handleSessionCardClick(editable)
-        } else {
+        const lifecycle = resolveSessionLifecycle(savedActiveSessionId, sessions, tableSessions, checks, data?.orders)
+        if (lifecycle.state === 'open' && lifecycle.editable) {
+          handleSessionCardClick(lifecycle.editable)
+        } else if (lifecycle.state === 'closed') {
           recoverClosedSession(savedActiveSessionId)
+        } else {
+          // Lifecycle unknown: preserve selection & any saved draft without deleting it
+          const savedDraft = getPosSessionDraft(tenantId, userId, savedActiveSessionId)
+          handleSessionCardClick({
+            sessionId: savedActiveSessionId,
+            tableId: savedDraft?.selectedTableId ?? null,
+            orderType: savedDraft?.orderType,
+            customerName: savedDraft?.customerName,
+          })
         }
         return
       }
     }
 
-    if (selectedSessionId && !isSessionEditable(selectedSessionId, sessions)) {
-      recoverClosedSession(selectedSessionId)
+    if (selectedSessionId) {
+      const lifecycle = resolveSessionLifecycle(selectedSessionId, sessions, tableSessions, checks, data?.orders)
+      if (lifecycle.state === 'closed') {
+        recoverClosedSession(selectedSessionId)
+      }
     }
-  }, [tenantId, userId, sessions, selectedSessionId, recoverClosedSession])
+  }, [tenantId, userId, sessions, tableSessions, checks, data?.orders, selectedSessionId, recoverClosedSession])
 
   const loadedSessionOrders = useMemo(() => {
     if (!selectedSessionId) return []

@@ -90,29 +90,33 @@ export function readStored(name: KeyName, suffix = ''): string | null {
   }
 }
 
-export function writeStored(name: KeyName, value: string, suffix = ''): void {
+export function writeStored(name: KeyName, value: string, suffix = ''): boolean {
   const store = area(name)
-  if (!store) return
+  if (!store) return false
   try {
     store.setItem(keyName(name, suffix), value)
     // The new name is the truth from here on.
     for (const legacy of legacyKeyNames(name, suffix)) {
       store.removeItem(legacy)
     }
+    return true
   } catch {
-    /* storage blocked — the value simply does not persist */
+    /* storage blocked or quota exceeded — caller decides how to handle */
+    return false
   }
 }
 
-export function removeStored(name: KeyName, suffix = ''): void {
+export function removeStored(name: KeyName, suffix = ''): boolean {
   const store = area(name)
-  if (!store) return
+  if (!store) return false
   try {
     store.removeItem(keyName(name, suffix))
     for (const legacy of legacyKeyNames(name, suffix)) {
       store.removeItem(legacy)
     }
+    return true
   } catch {
     /* nothing to clear */
+    return false
   }
 }

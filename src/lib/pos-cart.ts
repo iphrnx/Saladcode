@@ -110,13 +110,13 @@ function getPosSessionDrafts(
   }
 }
 
-/** Save a draft for a specific session (or default unattached cart). */
+/** Save a draft for a specific session (or default unattached cart). Returns true if persisted. */
 export function savePosSessionDraft(
   tenantId: string,
   userId: string,
   sessionKey: string | null | undefined,
   snapshot: Omit<PosCartSnapshot, 'savedAt'>,
-): void {
+): boolean {
   const drafts = getPosSessionDrafts(tenantId, userId)
   const key = sessionDraftKey(sessionKey)
   const now = Date.now()
@@ -125,12 +125,14 @@ export function savePosSessionDraft(
   } else {
     drafts[key] = { ...snapshot, savedAt: now }
   }
-  writeStored('posCart', JSON.stringify(drafts), draftsSuffix(tenantId, userId))
+  const draftsOk = writeStored('posCart', JSON.stringify(drafts), draftsSuffix(tenantId, userId))
+  if (!draftsOk) return false
   // Only the unattached ('default') cart is mirrored to the legacy single-cart key;
   // session drafts must never overwrite the unattached cart snapshot.
   if (key === 'default') {
-    writeStored('posCart', JSON.stringify({ ...snapshot, selectedSessionId: null, savedAt: now }), suffix(tenantId, userId))
+    return writeStored('posCart', JSON.stringify({ ...snapshot, selectedSessionId: null, savedAt: now }), suffix(tenantId, userId))
   }
+  return true
 }
 
 /** Retrieve a draft for a specific session key. */
@@ -242,13 +244,12 @@ function writeRecoverableDraftMap(
   tenantId: string,
   userId: string,
   map: Record<string, RecoverablePosDraft>,
-): void {
+): boolean {
   const keys = Object.keys(map)
   if (keys.length === 0) {
-    removeStored('posCart', recoverableSuffix(tenantId, userId))
-  } else {
-    writeStored('posCart', JSON.stringify(map), recoverableSuffix(tenantId, userId))
+    return removeStored('posCart', recoverableSuffix(tenantId, userId))
   }
+  return writeStored('posCart', JSON.stringify(map), recoverableSuffix(tenantId, userId))
 }
 
 /** Save unsent items from a remotely closed sitting into a per-session recoverable draft. */
@@ -269,7 +270,9 @@ export function saveRecoverablePosDraft(
   }
   const map = readRecoverableDraftMap(tenantId, userId)
   map[sid] = stored
-  writeRecoverableDraftMap(tenantId, userId, map)
+  if (!writeRecoverableDraftMap(tenantId, userId, map)) {
+    return null
+  }
   return stored
 }
 
@@ -337,20 +340,28 @@ export function subtractRecoverablePosDraft(
   })
 }
 
+export type RecoverDraftResult =
+  | { ok: true; snapshot: PosCartSnapshot }
+  | { ok: false; reason: 'non_empty' | 'empty_recoverable' | 'storage_error' }
+
 /**
  * Move a recoverable draft (by sessionId, or latest if omitted) into an empty
- * unattached cart, clearing only that recoverable draft so items can only be
- * recovered once. Returns null if nothing matches or unattached cart is non-empty.
+ * unattached cart, clearing only that recoverable draft after the unattached
+ * cart write succeeds. Retains the recoverable draft on storage failure.
  */
-export function recoverDraftToUnattachedCart(
+export function tryRecoverDraftToUnattachedCart(
   tenantId: string,
   userId: string,
   currentUnattachedCart: CartItem[],
   sessionId?: string | null,
-): PosCartSnapshot | null {
-  if (currentUnattachedCart.length > 0) return null
+): RecoverDraftResult {
+  if (currentUnattachedCart.length > 0) {
+    return { ok: false, reason: 'non_empty' }
+  }
   const recoverable = getRecoverablePosDraft(tenantId, userId, sessionId)
-  if (!recoverable || recoverable.cart.length === 0) return null
+  if (!recoverable || recoverable.cart.length === 0) {
+    return { ok: false, reason: 'empty_recoverable' }
+  }
 
   const unattached: Omit<PosCartSnapshot, 'savedAt'> = {
     cart: [...recoverable.cart],
@@ -361,9 +372,27 @@ export function recoverDraftToUnattachedCart(
     customerPhone: recoverable.customerPhone ?? '',
     promoCode: recoverable.promoCode ?? '',
   }
-  savePosSessionDraft(tenantId, userId, null, unattached)
+  if (!savePosSessionDraft(tenantId, userId, null, unattached)) {
+    return { ok: false, reason: 'storage_error' }
+  }
   clearRecoverablePosDraft(tenantId, userId, recoverable.sessionId)
-  return { ...unattached, savedAt: Date.now() }
+  return { ok: true, snapshot: { ...unattached, savedAt: Date.now() } }
+}
+
+/**
+ * Move a recoverable draft (by sessionId, or latest if omitted) into an empty
+ * unattached cart, clearing only that recoverable draft so items can only be
+ * recovered once. Returns null if nothing matches, unattached cart is non-empty,
+ * or storage write fails.
+ */
+export function recoverDraftToUnattachedCart(
+  tenantId: string,
+  userId: string,
+  currentUnattachedCart: CartItem[],
+  sessionId?: string | null,
+): PosCartSnapshot | null {
+  const res = tryRecoverDraftToUnattachedCart(tenantId, userId, currentUnattachedCart, sessionId)
+  return res.ok ? res.snapshot : null
 }
 
 export interface SessionGroupLike {
@@ -423,6 +452,102 @@ export function isSessionEditable(
   sessionGroups: SessionGroupLike[],
 ): boolean {
   return findEditableSession(sessionId, sessionGroups) !== null
+}
+
+export type SessionLifecycleState = 'open' | 'closed' | 'unknown'
+
+export interface SessionLifecycleResolution {
+  state: SessionLifecycleState
+  editable: {
+    sessionId: string
+    tableId: string | null
+    orderType?: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
+    customerName?: string
+    isVerifyingPayment: boolean
+  } | null
+}
+
+/**
+ * Resolve authoritative session lifecycle from `/table-session/active` groups,
+ * `/orders/sync` `tableSessions`, and `checks`.
+ *
+ * `/table-session/active` omits `ACTIVE` sessions older than 3 minutes that have
+ * zero live orders and zero balance (e.g. after their last order is cancelled).
+ * Absence from `/table-session/active` alone is therefore treated as `'unknown'`
+ * unless authoritative `tableSessions` confirms closure (`'ENDED'` / `endedAt`),
+ * or confirms it is still `'ACTIVE'` (`'open'`).
+ */
+export function resolveSessionLifecycle(
+  sessionId: string | null | undefined,
+  sessionGroups: SessionGroupLike[],
+  tableSessions?: Record<string, { id: string; tableId: string | null; status: string; endedAt?: string | null }>,
+  checks?: Record<string, { status?: string | null }>,
+  orders?: Array<{ tableSessionId?: string | null; checkId?: string | null; orderType?: string | null; customerName?: string | null }>,
+): SessionLifecycleResolution {
+  const sid = sessionId?.trim()
+  if (!sid) return { state: 'closed', editable: null }
+
+  const authSess = tableSessions?.[sid]
+
+  for (const group of sessionGroups) {
+    for (const s of group.sessions ?? []) {
+      if (s.id !== sid) continue
+      const checkStatus = String(s.check?.status ?? '').toUpperCase()
+      if (
+        s.status === 'ENDED' ||
+        authSess?.status === 'ENDED' ||
+        Boolean(authSess?.endedAt) ||
+        checkStatus === 'PAID' ||
+        checkStatus === 'VOID'
+      ) {
+        return { state: 'closed', editable: null }
+      }
+      if (s.status === 'ACTIVE') {
+        return {
+          state: 'open',
+          editable: {
+            sessionId: s.id,
+            tableId: group.tableId ?? null,
+            orderType: (s.orderType ?? (group.tableId ? 'DINE_IN' : 'TAKEAWAY')) as 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY',
+            customerName: s.customerName ?? undefined,
+            isVerifyingPayment: Boolean(s.paymentVerificationPending || checkStatus === 'VERIFYING'),
+          },
+        }
+      }
+    }
+  }
+
+  // Session omitted from `/table-session/active`: consult authoritative `tableSessions`
+  if (authSess) {
+    if (authSess.status === 'ENDED' || Boolean(authSess.endedAt)) {
+      return { state: 'closed', editable: null }
+    }
+    if (authSess.status === 'ACTIVE') {
+      const sessOrders = (orders ?? []).filter((o) => o.tableSessionId === sid)
+      for (const o of sessOrders) {
+        if (o.checkId && checks?.[o.checkId]) {
+          const cs = String(checks[o.checkId].status ?? '').toUpperCase()
+          if (cs === 'PAID' || cs === 'VOID') {
+            return { state: 'closed', editable: null }
+          }
+        }
+      }
+      const lastOrder = sessOrders[sessOrders.length - 1]
+      return {
+        state: 'open',
+        editable: {
+          sessionId: sid,
+          tableId: authSess.tableId ?? null,
+          orderType: ((lastOrder?.orderType as any) ?? (authSess.tableId ? 'DINE_IN' : 'TAKEAWAY')) as 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY',
+          customerName: lastOrder?.customerName ?? undefined,
+          isVerifyingPayment: false,
+        },
+      }
+    }
+  }
+
+  // Neither active list nor delta sync has a definitive record yet: preserve draft/selection
+  return { state: 'unknown', editable: null }
 }
 
 export function persistPosCart(
