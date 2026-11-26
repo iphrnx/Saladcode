@@ -277,5 +277,159 @@ await check('P2-2 behavior: failed token lookup keeps checkout queued; restored 
   assert.equal(confirmed?.sessionId, committedSessionId)
 })
 
+// ---------------------------------------------------------------------------
+// 3. Two-tab cart merge: browsing tab B does not overwrite session A's cart
+// ---------------------------------------------------------------------------
+await check('public-menu.tsx merges remaining browsing cart into existing session cart without overwriting', () => {
+  const confirmStart = publicMenuSrc.indexOf('function handleOrderConfirmed(')
+  const confirmEnd = publicMenuSrc.indexOf('useEffect(() => {\n    const effectiveTenantId =', confirmStart)
+  const confirmBlock = publicMenuSrc.slice(confirmStart, confirmEnd)
+  assert.ok(confirmBlock.includes("readStored('cart', order.sessionToken)"))
+  assert.ok(confirmBlock.includes('if (remainingCart.length > 0)'))
+  assert.ok(confirmBlock.includes('nextCart = existingSessionCart'))
+})
+
+await check('P2-3 behavior: two-tab checkout preserves Tab A unsubmitted session cart when Tab B submits browsing cart', async () => {
+  const sharedStorage = new MemoryStorage()
+  const tenantId = 'tenant-1'
+  const tableId = 'tbl-1'
+  const qrToken = 'qr-table-1'
+  const sessionStorageKey = `restro_session:${tenantId}:${tableId}`
+  const browsingCartKey = keyName('cart', `browsing:${tableId}`)
+
+  const sameLine = (a: any, b: any) =>
+    a.menuItemId === b.menuItemId &&
+    (a.portionId || a.portion || '') === (b.portionId || b.portion || '')
+
+  // Track server-side orders per session.
+  const serverOrders: any[] = []
+  const sessionId = 'sess-tab-a'
+  const sessionToken = 'tok-tab-a'
+
+  const fetcher = (async (url: string, init?: RequestInit) => {
+    if (url === '/api/orders' && init?.method === 'POST') {
+      const body = JSON.parse(String(init.body))
+      if (body.tableSessionToken) {
+        assert.equal(body.tableSessionToken, sessionToken)
+        const order = {
+          id: `ord-${serverOrders.length + 1}`,
+          orderNumber: 300 + serverOrders.length + 1,
+          total: 200,
+          sessionId,
+          sessionToken,
+          items: body.items,
+        }
+        serverOrders.push(order)
+        return new Response(JSON.stringify(order), {
+          status: 201,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      // First order from Tab A via qrToken establishes the session.
+      const order = {
+        id: 'ord-1',
+        orderNumber: 301,
+        total: 150,
+        sessionId,
+        sessionToken,
+        items: body.items,
+      }
+      serverOrders.push(order)
+      return new Response(JSON.stringify(order), {
+        status: 201,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 })
+  }) as any
+
+  // 1. Open Tab A and Tab B before either has a session; add Dish B to Tab B's browsing cart.
+  let tabASessionToken: string | null = null
+  let tabBSessionToken: string | null = null
+  let tabBCart: any[] = [{ menuItemId: 'dish-b', name: 'Masala Chai', price: 60, quantity: 1 }]
+  sharedStorage.setItem(browsingCartKey, JSON.stringify(tabBCart))
+
+  // 2. Tab A places first order to establish the session, then adds Dish A-unsubmitted (qty 2).
+  const queueA = new OrderQueue(
+    sharedStorage,
+    keyName('orderQueue', `${tenantId}-table_${tableId}-A`),
+    fetcher,
+    {
+      onConfirmed: (order) => {
+        tabASessionToken = order.sessionToken
+        sharedStorage.setItem(
+          sessionStorageKey,
+          JSON.stringify({ sessionId: order.sessionId, sessionToken: order.sessionToken }),
+        )
+        sharedStorage.removeItem(browsingCartKey)
+      },
+    },
+    () => 1000,
+  )
+  queueA.enqueue('diner', { orderType: 'DINE_IN', qrToken, tableId, items: [{ menuItemId: 'dish-a-1', quantity: 1 }] }, 1)
+  await new Promise((r) => setTimeout(r, 10))
+  await queueA.process()
+  assert.equal(tabASessionToken, sessionToken)
+
+  const sessionCartKey = keyName('cart', sessionToken)
+  const tabAUnsubmitted = [{ menuItemId: 'dish-a-unsubmitted', name: 'Garlic Naan', price: 80, quantity: 2 }]
+  sharedStorage.setItem(sessionCartKey, JSON.stringify(tabAUnsubmitted))
+
+  // 3. Tab B submits its browsing cart (discovers saved session token, keeps browsing cart until confirm).
+  const discovered = JSON.parse(sharedStorage.getItem(sessionStorageKey)!)
+  let tabBConfirmedOrder: any = null
+  const queueB = new OrderQueue(
+    sharedStorage,
+    keyName('orderQueue', `${tenantId}-table_${tableId}-B`),
+    fetcher,
+    {
+      onConfirmed: (order, entry) => {
+        tabBConfirmedOrder = order
+        // Mirror handleOrderConfirmed: subtract submitted items from Tab B's browsing cart,
+        // then merge any remainder into existing session cart (or leave intact if empty).
+        let remaining = [...tabBCart]
+        for (const line of entry.payload.items) {
+          remaining = remaining
+            .map((c) => (sameLine(c, line) ? { ...c, quantity: c.quantity - line.quantity } : c))
+            .filter((c) => c.quantity > 0)
+        }
+        const existingSessionCart = JSON.parse(sharedStorage.getItem(keyName('cart', order.sessionToken)) || '[]')
+        if (remaining.length > 0) {
+          const merged = [...existingSessionCart, ...remaining]
+          sharedStorage.setItem(keyName('cart', order.sessionToken), JSON.stringify(merged))
+        }
+        tabBCart = existingSessionCart
+        sharedStorage.removeItem(browsingCartKey)
+        tabBSessionToken = order.sessionToken
+      },
+    },
+    () => 2000,
+  )
+  queueB.enqueue(
+    'diner',
+    {
+      orderType: 'DINE_IN',
+      tableSessionToken: discovered.sessionToken,
+      items: tabBCart.map((c) => ({ menuItemId: c.menuItemId, quantity: c.quantity })),
+    },
+    1,
+  )
+  await new Promise((r) => setTimeout(r, 10))
+  await queueB.process()
+
+  assert.equal(tabBConfirmedOrder?.sessionId, sessionId)
+  assert.equal(tabBSessionToken, sessionToken)
+  assert.equal(tabBConfirmedOrder?.items.length, 1)
+  assert.equal(tabBConfirmedOrder?.items[0].menuItemId, 'dish-b')
+
+  // 4. Reload Tab A and assert its unsubmitted dish is still in the session cart with qty 2,
+  // and Tab B's submitted dish is absent from the saved cart.
+  const reloadedTabACart = JSON.parse(sharedStorage.getItem(sessionCartKey) || '[]')
+  assert.equal(reloadedTabACart.length, 1)
+  assert.equal(reloadedTabACart[0].menuItemId, 'dish-a-unsubmitted')
+  assert.equal(reloadedTabACart[0].quantity, 2)
+  assert.equal(reloadedTabACart.some((c: any) => c.menuItemId === 'dish-b'), false)
+})
+
 console.log(`\n${pass} passed, ${fail} failed`)
 if (fail > 0) process.exit(1)

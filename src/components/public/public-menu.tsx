@@ -1151,17 +1151,51 @@ export function PublicMenu() {
         )
         .filter((c) => c.quantity > 0)
     }
-    setCart(remainingCart)
-    cartRef.current = remainingCart
 
     if (order?.sessionToken && order?.sessionId) {
       const tId = tenant?.id || sessionTenantId
       const tblId = table?.id || sessionTableId
+      let nextCart = remainingCart
+
       if (order.sessionToken !== sessionToken) {
+        let existingSessionCart: CartItem[] = []
         try {
-          writeStored('cart', JSON.stringify(remainingCart), order.sessionToken)
+          const raw = readStored('cart', order.sessionToken)
+          if (raw) {
+            const parsed = JSON.parse(raw)
+            if (Array.isArray(parsed)) existingSessionCart = parsed
+          }
         } catch {}
+
+        if (remainingCart.length > 0) {
+          const merged = existingSessionCart.map((c) => ({ ...c }))
+          for (const item of remainingCart) {
+            const idx = merged.findIndex((c) =>
+              sameCartLine(c, item.menuItemId, item.portion ?? null, item.portionId ?? null),
+            )
+            if (idx >= 0) {
+              merged[idx] = {
+                ...merged[idx],
+                quantity: merged[idx].quantity + item.quantity,
+                notes: merged[idx].notes || item.notes,
+              }
+            } else {
+              merged.push({ ...item })
+            }
+          }
+          nextCart = merged
+          try {
+            writeStored('cart', JSON.stringify(merged), order.sessionToken)
+          } catch {}
+        } else {
+          // No unsubmitted browsing remainder: leave the saved session cart intact.
+          nextCart = existingSessionCart
+        }
       }
+
+      setCart(nextCart)
+      cartRef.current = nextCart
+
       if (tblId) {
         try {
           removeStored('cart', `browsing:${tblId}`)
@@ -1175,6 +1209,9 @@ export function PublicMenu() {
       }
       setSessionToken(order.sessionToken)
       setSessionId(order.sessionId)
+    } else {
+      setCart(remainingCart)
+      cartRef.current = remainingCart
     }
 
     // Refresh diner order tracker immediately
