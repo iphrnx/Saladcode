@@ -209,51 +209,111 @@ export function subtractPosSessionDraft(
   return { ...updated, savedAt: Date.now() }
 }
 
-/** Save unsent items from a remotely closed sitting into a recoverable draft. */
+function readRecoverableDraftMap(
+  tenantId: string,
+  userId: string,
+): Record<string, RecoverablePosDraft> {
+  const raw = readStored('posCart', recoverableSuffix(tenantId, userId))
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return {}
+    // Backwards compatibility: normalize legacy single-object format into a keyed map
+    if (typeof (parsed as any).sessionId === 'string' && Array.isArray((parsed as any).cart)) {
+      const legacy = parsed as RecoverablePosDraft
+      if (legacy.cart.length > 0 && legacy.sessionId.trim()) {
+        return { [legacy.sessionId.trim()]: legacy }
+      }
+      return {}
+    }
+    const out: Record<string, RecoverablePosDraft> = {}
+    for (const [key, val] of Object.entries(parsed as Record<string, any>)) {
+      if (val && typeof val.sessionId === 'string' && Array.isArray(val.cart) && val.cart.length > 0) {
+        out[key] = val as RecoverablePosDraft
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function writeRecoverableDraftMap(
+  tenantId: string,
+  userId: string,
+  map: Record<string, RecoverablePosDraft>,
+): void {
+  const keys = Object.keys(map)
+  if (keys.length === 0) {
+    removeStored('posCart', recoverableSuffix(tenantId, userId))
+  } else {
+    writeStored('posCart', JSON.stringify(map), recoverableSuffix(tenantId, userId))
+  }
+}
+
+/** Save unsent items from a remotely closed sitting into a per-session recoverable draft. */
 export function saveRecoverablePosDraft(
   tenantId: string,
   userId: string,
   draft: Omit<RecoverablePosDraft, 'savedAt'>,
 ): RecoverablePosDraft | null {
-  if (!draft.sessionId?.trim() || !Array.isArray(draft.cart) || draft.cart.length === 0) {
+  const sid = draft.sessionId?.trim()
+  if (!sid || !Array.isArray(draft.cart) || draft.cart.length === 0) {
     return null
   }
   const stored: RecoverablePosDraft = {
     ...draft,
+    sessionId: sid,
     cart: [...draft.cart],
     savedAt: Date.now(),
   }
-  writeStored('posCart', JSON.stringify(stored), recoverableSuffix(tenantId, userId))
+  const map = readRecoverableDraftMap(tenantId, userId)
+  map[sid] = stored
+  writeRecoverableDraftMap(tenantId, userId, map)
   return stored
 }
 
-/** Read the recoverable draft for this tenant+user, if any. */
+/** List all recoverable drafts for this tenant+user (newest first). */
+export function getRecoverablePosDrafts(
+  tenantId: string,
+  userId: string,
+): RecoverablePosDraft[] {
+  const map = readRecoverableDraftMap(tenantId, userId)
+  return Object.values(map).sort((a, b) => (b.savedAt ?? 0) - (a.savedAt ?? 0))
+}
+
+/** Read a specific recoverable draft (or the latest one if sessionId is omitted). */
 export function getRecoverablePosDraft(
   tenantId: string,
   userId: string,
+  sessionId?: string | null,
 ): RecoverablePosDraft | null {
-  const raw = readStored('posCart', recoverableSuffix(tenantId, userId))
-  if (!raw) return null
-  try {
-    const parsed = JSON.parse(raw)
-    if (parsed && typeof parsed.sessionId === 'string' && Array.isArray(parsed.cart) && parsed.cart.length > 0) {
-      return parsed as RecoverablePosDraft
-    }
-  } catch {}
-  return null
+  const map = readRecoverableDraftMap(tenantId, userId)
+  if (sessionId?.trim()) {
+    return map[sessionId.trim()] ?? null
+  }
+  const all = Object.values(map).sort((a, b) => (b.savedAt ?? 0) - (a.savedAt ?? 0))
+  return all[0] ?? null
 }
 
-/** Clear the recoverable draft for this tenant+user. */
+/** Clear one recoverable draft by sessionId, or all recoverable drafts if omitted. */
 export function clearRecoverablePosDraft(
   tenantId: string,
   userId: string,
+  sessionId?: string | null,
 ): void {
-  removeStored('posCart', recoverableSuffix(tenantId, userId))
+  if (!sessionId?.trim()) {
+    removeStored('posCart', recoverableSuffix(tenantId, userId))
+    return
+  }
+  const map = readRecoverableDraftMap(tenantId, userId)
+  delete map[sessionId.trim()]
+  writeRecoverableDraftMap(tenantId, userId, map)
 }
 
 /**
  * Subtract confirmed order lines from a recoverable draft if it belongs to
- * the confirmed session. Clears the recoverable draft if no items remain.
+ * the confirmed session. Clears only that session's draft if no items remain.
  */
 export function subtractRecoverablePosDraft(
   tenantId: string,
@@ -261,13 +321,14 @@ export function subtractRecoverablePosDraft(
   sessionId: string | null | undefined,
   lines: OrderLineRef[],
 ): RecoverablePosDraft | null {
-  if (!sessionId?.trim()) return getRecoverablePosDraft(tenantId, userId)
-  const existing = getRecoverablePosDraft(tenantId, userId)
-  if (!existing || existing.sessionId !== sessionId.trim()) return existing
+  const sid = sessionId?.trim()
+  if (!sid) return null
+  const existing = getRecoverablePosDraft(tenantId, userId, sid)
+  if (!existing) return null
 
   const remaining = subtractLinesFromCart(existing.cart, lines)
   if (remaining.length === 0) {
-    clearRecoverablePosDraft(tenantId, userId)
+    clearRecoverablePosDraft(tenantId, userId, sid)
     return null
   }
   return saveRecoverablePosDraft(tenantId, userId, {
@@ -277,17 +338,18 @@ export function subtractRecoverablePosDraft(
 }
 
 /**
- * Move the recoverable draft into an empty unattached cart, clearing the
- * recoverable draft so items can only be recovered once. Returns null if
- * there is nothing to recover or if the unattached cart is non-empty.
+ * Move a recoverable draft (by sessionId, or latest if omitted) into an empty
+ * unattached cart, clearing only that recoverable draft so items can only be
+ * recovered once. Returns null if nothing matches or unattached cart is non-empty.
  */
 export function recoverDraftToUnattachedCart(
   tenantId: string,
   userId: string,
   currentUnattachedCart: CartItem[],
+  sessionId?: string | null,
 ): PosCartSnapshot | null {
   if (currentUnattachedCart.length > 0) return null
-  const recoverable = getRecoverablePosDraft(tenantId, userId)
+  const recoverable = getRecoverablePosDraft(tenantId, userId, sessionId)
   if (!recoverable || recoverable.cart.length === 0) return null
 
   const unattached: Omit<PosCartSnapshot, 'savedAt'> = {
@@ -300,8 +362,67 @@ export function recoverDraftToUnattachedCart(
     promoCode: recoverable.promoCode ?? '',
   }
   savePosSessionDraft(tenantId, userId, null, unattached)
-  clearRecoverablePosDraft(tenantId, userId)
+  clearRecoverablePosDraft(tenantId, userId, recoverable.sessionId)
   return { ...unattached, savedAt: Date.now() }
+}
+
+export interface SessionGroupLike {
+  tableId?: string | null
+  table?: { name?: string | null; area?: string | null } | null
+  sessions?: Array<{
+    id: string
+    status?: string | null
+    orderType?: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY' | null
+    customerName?: string | null
+    paymentVerificationPending?: boolean | null
+    check?: { status?: string | null } | null
+  }>
+}
+
+/**
+ * Find the underlying session & its parent group from `/table-session/active`
+ * and determine whether it is still open and editable.
+ *
+ * Unlike `activeSessionCards` (which includes ENDED unpaid bills and hides
+ * ACTIVE sessions whose orders were all cancelled), this checks the real
+ * session lifecycle and settlement status.
+ */
+export function findEditableSession(
+  sessionId: string | null | undefined,
+  sessionGroups: SessionGroupLike[],
+): {
+  sessionId: string
+  tableId: string | null
+  orderType?: 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
+  customerName?: string
+  isVerifyingPayment: boolean
+} | null {
+  const sid = sessionId?.trim()
+  if (!sid) return null
+  for (const group of sessionGroups) {
+    for (const s of group.sessions ?? []) {
+      if (s.id !== sid) continue
+      const checkStatus = String(s.check?.status ?? '').toUpperCase()
+      if (s.status !== 'ACTIVE' || checkStatus === 'PAID' || checkStatus === 'VOID') {
+        return null
+      }
+      return {
+        sessionId: s.id,
+        tableId: group.tableId ?? null,
+        orderType: (s.orderType ?? (group.tableId ? 'DINE_IN' : 'TAKEAWAY')) as 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY',
+        customerName: s.customerName ?? undefined,
+        isVerifyingPayment: Boolean(s.paymentVerificationPending || checkStatus === 'VERIFYING'),
+      }
+    }
+  }
+  return null
+}
+
+export function isSessionEditable(
+  sessionId: string | null | undefined,
+  sessionGroups: SessionGroupLike[],
+): boolean {
+  return findEditableSession(sessionId, sessionGroups) !== null
 }
 
 export function persistPosCart(

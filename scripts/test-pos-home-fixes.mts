@@ -29,15 +29,20 @@ import {
   subtractLinesFromCart,
   saveRecoverablePosDraft,
   getRecoverablePosDraft,
+  getRecoverablePosDrafts,
   clearRecoverablePosDraft,
   subtractRecoverablePosDraft,
   recoverDraftToUnattachedCart,
+  findEditableSession,
+  isSessionEditable,
   restorePosCart,
   clearPosCart,
   savePosActiveSessionId,
   getPosActiveSessionId,
+  clearPosActiveSessionId,
 } from "../src/lib/pos-cart";
 import { OrderQueue, type StorageLike } from "../src/lib/order-queue";
+import { writeStored } from "../src/lib/storage-keys";
 
 let passed = 0;
 let failed = 0;
@@ -351,6 +356,183 @@ await checkAsync("PR#14 P1-2b: in-flight checkout on closed sitting holds recove
   clearRecoverablePosDraft(T, U);
 });
 
+await checkAsync("PR#14 review P1: confirming last item of a sitting restores original unattached cart and survives reload", async () => {
+  clearPosCart(T, U);
+  const queueStore = new Map<string, string>();
+  const memStorage: StorageLike = {
+    getItem: (k) => queueStore.get(k) ?? null,
+    setItem: (k, v) => queueStore.set(k, v),
+    removeItem: (k) => queueStore.delete(k),
+  };
+
+  // 1. Cashier builds unattached cart (2x Burger on tbl-1)
+  let preSelectSnapshot: any = {
+    cart: [{ menuItemId: "m1", name: "Burger", price: 150, quantity: 2 }],
+    orderType: "DINE_IN" as const,
+    selectedTableId: "tbl-1",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  };
+  savePosSessionDraft(T, U, null, { ...preSelectSnapshot, selectedSessionId: null });
+
+  // 2. Cashier opens sitting sess-A and adds 1x Pasta
+  let selectedSessionId: string | null = "sess-A";
+  let selectedTableId: string | null = "tbl-2";
+  let cart = [{ menuItemId: "m2", name: "Pasta", price: 250, quantity: 1 }];
+  savePosSessionDraft(T, U, "sess-A", {
+    cart,
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-2",
+    selectedSessionId: "sess-A",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  const mockFetcher = (async () =>
+    new Response(JSON.stringify({ id: "ord-200", orderNumber: 200 }), { status: 201 })) as any;
+
+  const q = new OrderQueue(memStorage, `${T}-${U}-q3`, mockFetcher, {
+    onConfirmed: (_order, entry) => {
+      const originSessionId = entry.payload.tableSessionId ?? null;
+      const submittedLines = entry.payload.items ?? [];
+      if (selectedSessionId === originSessionId) {
+        cart = subtractLinesFromCart(cart, submittedLines);
+        if (cart.length === 0) {
+          clearPosSessionDraft(T, U, originSessionId);
+          if (originSessionId) {
+            clearPosActiveSessionId(T, U);
+            const pre = preSelectSnapshot ?? getPosSessionDraft(T, U, null);
+            if (pre) {
+              cart = [...pre.cart];
+              selectedTableId = pre.selectedTableId;
+              selectedSessionId = null;
+              // Simulate persistence effect running on restored unattached cart
+              savePosSessionDraft(T, U, null, { ...pre, selectedSessionId: null });
+            }
+            preSelectSnapshot = null;
+          }
+        }
+      }
+    },
+  });
+
+  q.enqueue("pos", {
+    tableId: "tbl-2",
+    tableSessionId: "sess-A",
+    orderType: "DINE_IN",
+    items: [{ menuItemId: "m2", quantity: 1 }],
+  }, 1);
+  await new Promise((r) => setTimeout(r, 20));
+
+  assert.equal(selectedSessionId, null);
+  assert.equal(selectedTableId, "tbl-1");
+  assert.equal(cart.length, 1);
+  assert.equal(cart[0].menuItemId, "m1");
+  assert.equal(cart[0].quantity, 2);
+
+  // Survives reload
+  const reloaded = restorePosCart(T, U);
+  assert.ok(reloaded, "unattached cart must survive reload after sitting confirmation");
+  assert.equal(reloaded.selectedTableId, "tbl-1");
+  assert.equal(reloaded.cart.length, 1);
+  assert.equal(reloaded.cart[0].menuItemId, "m1");
+  assert.equal(reloaded.cart[0].quantity, 2);
+});
+
+check("PR#14 review P2-1: ended sitting with unpaid bill is NOT editable, while open sitting with cancelled last order stays editable", () => {
+  const sessionGroups = [
+    {
+      tableId: "tbl-1",
+      sessions: [
+        {
+          id: "sess-ended-unpaid",
+          status: "ENDED",
+          orderType: "DINE_IN" as const,
+          check: { status: "UNSETTLED" },
+        },
+        {
+          id: "sess-open-cancelled",
+          status: "ACTIVE",
+          orderType: "DINE_IN" as const,
+          check: { status: "OPEN" },
+        },
+      ],
+    },
+  ];
+
+  assert.equal(isSessionEditable("sess-ended-unpaid", sessionGroups), false, "ended sitting with unpaid bill cannot be edited");
+  assert.equal(findEditableSession("sess-ended-unpaid", sessionGroups), null);
+
+  assert.equal(isSessionEditable("sess-open-cancelled", sessionGroups), true, "open sitting remains editable after last order cancelled");
+  const found = findEditableSession("sess-open-cancelled", sessionGroups);
+  assert.equal(found?.sessionId, "sess-open-cancelled");
+  assert.equal(found?.tableId, "tbl-1");
+});
+
+check("PR#14 review P2-2: multiple closed sittings keep separate recovery drafts and recover/dismiss independently (with legacy compatibility)", () => {
+  clearPosCart(T, U);
+
+  // Verify legacy single-object format is preserved and normalized
+  writeStored(
+    "posCart",
+    JSON.stringify({
+      sessionId: "sess-legacy",
+      cart: [{ menuItemId: "m0", name: "Soup", price: 100, quantity: 1 }],
+      orderType: "DINE_IN",
+      selectedTableId: "tbl-0",
+      promoCode: "",
+      savedAt: 1000,
+    }),
+    `${T}-${U}-recoverable`,
+  );
+  assert.equal(getRecoverablePosDrafts(T, U).length, 1);
+  assert.equal(getRecoverablePosDraft(T, U, "sess-legacy")?.cart[0].menuItemId, "m0");
+
+  // Close two more sittings with unsent items before recovering any
+  saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-1",
+    cart: [{ menuItemId: "m1", name: "Burger", price: 150, quantity: 2 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-1",
+    customerName: "Alice",
+    customerPhone: "",
+    promoCode: "",
+  });
+  saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-2",
+    cart: [{ menuItemId: "m2", name: "Pasta", price: 250, quantity: 1 }],
+    orderType: "TAKEAWAY",
+    selectedTableId: null,
+    customerName: "Bob",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  const all = getRecoverablePosDrafts(T, U);
+  assert.equal(all.length, 3, "all three drafts (legacy + sess-1 + sess-2) survive independently");
+
+  // Dismiss legacy draft -> only sess-legacy removed
+  clearRecoverablePosDraft(T, U, "sess-legacy");
+  assert.equal(getRecoverablePosDraft(T, U, "sess-legacy"), null);
+  assert.equal(getRecoverablePosDrafts(T, U).length, 2);
+
+  // Recover sess-1 -> sess-2 remains intact
+  const rec1 = recoverDraftToUnattachedCart(T, U, [], "sess-1");
+  assert.equal(rec1?.cart[0].menuItemId, "m1");
+  assert.equal(rec1?.cart[0].quantity, 2);
+  assert.equal(getRecoverablePosDraft(T, U, "sess-1"), null);
+  assert.equal(getRecoverablePosDraft(T, U, "sess-2")?.cart[0].menuItemId, "m2");
+
+  // Clear unattached cart, then recover sess-2 independently
+  clearPosSessionDraft(T, U, null);
+  const rec2 = recoverDraftToUnattachedCart(T, U, [], "sess-2");
+  assert.equal(rec2?.cart[0].menuItemId, "m2");
+  assert.equal(rec2?.orderType, "TAKEAWAY");
+  assert.equal(getRecoverablePosDrafts(T, U).length, 0);
+});
+
 delete (globalThis as any).localStorage;
 
 // ── 2. UI & Edge Function Isolation Static Invariants ────────────────────────
@@ -392,7 +574,8 @@ check("POS Home cleans up session labels (no S1, chronological Diner N)", () => 
 
 check("POS Home handles delayed confirmation, refresh, and remote settlement cleanup", () => {
   assert.match(dashboardCode, /subtractPosSessionDraft\(tenantId, userId, originSessionId, submittedLines\)/);
-  assert.match(dashboardCode, /const stillActive = activeSessionCards\.some\(\(c\) => c\.sessionId === selectedSessionId\)/);
+  assert.match(dashboardCode, /isSessionEditable\(selectedSessionId, sessions\)/);
+  assert.match(dashboardCode, /findEditableSession\(savedActiveSessionId, sessions\)/);
   assert.match(ordersFnCode, /createNewSession = true/);
 });
 
