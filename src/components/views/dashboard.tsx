@@ -1653,6 +1653,7 @@ export function DashboardView() {
       return
     }
     const floorTable = selectedTableId ? floor.find((f: any) => f.tableId === selectedTableId) : null
+    void floorTable
     let activeSessionId: string | null = null
 
     if (orderType === 'DINE_IN') {
@@ -1660,21 +1661,7 @@ export function DashboardView() {
         toast.error('Please select a table')
         return
       }
-      if (selectedSessionId) {
-        activeSessionId = selectedSessionId
-      } else {
-        activeSessionId = null
-      }
-
-      if (activeSessionId && floorTable) {
-        const isLive =
-          (floorTable.liveSessions || []).some((s: any) => s.id === activeSessionId) ||
-          floorTable.check?.sessionId === activeSessionId
-        if (!isLive) {
-          toast.error('The selected table session has ended or is closed. Please start or select an active session.')
-          return
-        }
-      }
+      activeSessionId = selectedSessionId || null
     } else {
       // Takeaway or Delivery
       if (selectedSessionId) {
@@ -1684,13 +1671,17 @@ export function DashboardView() {
         toast.error('Please enter customer name')
         return
       }
-      if (activeSessionId && sessions.length > 0) {
-        const allActive = sessions.flatMap((g: any) => g.sessions || []).filter((s: any) => s.status === 'ACTIVE')
-        const isLive = allActive.some((s: any) => s.id === activeSessionId)
-        if (!isLive) {
-          toast.error('The selected session has ended or is closed. Please start or select an active session.')
-          return
-        }
+    }
+
+    if (activeSessionId) {
+      const lifecycle = resolveSessionLifecycle(activeSessionId, sessions, tableSessions, checks, data?.orders)
+      if (lifecycle.state === 'closed') {
+        toast.error(
+          orderType === 'DINE_IN'
+            ? 'The selected table session has ended or is closed. Please start or select an active session.'
+            : 'The selected session has ended or is closed. Please start or select an active session.',
+        )
+        return
       }
     }
 

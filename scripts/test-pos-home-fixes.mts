@@ -644,6 +644,102 @@ check("PR#14 P2-2 (quota): storage write failure preserves source draft in both 
   assert.equal(secondMoveB.ok, false);
 });
 
+await checkAsync("PR#14 P2-1 (checkout): active sitting omitted from floor list after last order cancelled still submits to original sitting", async () => {
+  const sid = "sess-omitted-active";
+  const sessions: any[] = []; // Omitted from /table-session/active (and therefore floor list)
+  const tableSessions = {
+    [sid]: { id: sid, tableId: "tbl-4", status: "ACTIVE", endedAt: null },
+  };
+  const lifecycle = resolveSessionLifecycle(sid, sessions, tableSessions, {}, []);
+  assert.notEqual(lifecycle.state, "closed", "active sitting omitted from floor list must not be treated as closed at checkout");
+  assert.equal(lifecycle.state, "open");
+
+  const queueStore = new Map<string, string>();
+  const memStorage: StorageLike = {
+    getItem: (k) => queueStore.get(k) ?? null,
+    setItem: (k, v) => queueStore.set(k, v),
+    removeItem: (k) => queueStore.delete(k),
+  };
+
+  let capturedPayload: any = null;
+  const mockFetcher = (async (_url: string, init?: RequestInit) => {
+    capturedPayload = JSON.parse(String(init?.body ?? "{}"));
+    return new Response(JSON.stringify({ id: "ord-301", orderNumber: 301, tableSessionId: sid }), { status: 201 });
+  }) as any;
+
+  const q = new OrderQueue(memStorage, `${T}-${U}-q4`, mockFetcher);
+  q.enqueue("pos", {
+    tableId: "tbl-4",
+    tableSessionId: sid,
+    createNewSitting: false,
+    orderType: "DINE_IN",
+    items: [{ menuItemId: "m1", quantity: 1 }],
+  }, 1);
+  await new Promise((r) => setTimeout(r, 20));
+
+  assert.equal(capturedPayload?.tableSessionId, sid, "checkout must submit to the original sitting ID");
+  assert.equal(capturedPayload?.createNewSitting, false);
+
+  // When confirmed ENDED, lifecycle is 'closed' and checkout would block
+  const closedLifecycle = resolveSessionLifecycle(
+    sid,
+    sessions,
+    { [sid]: { id: sid, tableId: "tbl-4", status: "ENDED", endedAt: new Date().toISOString() } },
+    {},
+    [],
+  );
+  assert.equal(closedLifecycle.state, "closed");
+});
+
+check("PR#14 P2-2 (partial write fault): canonical write failure preserves source; canonical success + legacy mirror failure leaves single copy", () => {
+  clearPosCart(T, U);
+
+  saveRecoverablePosDraft(T, U, {
+    sessionId: "sess-partial",
+    cart: [{ menuItemId: "m1", name: "Burger", price: 150, quantity: 3 }],
+    orderType: "DINE_IN",
+    selectedTableId: "tbl-1",
+    customerName: "",
+    customerPhone: "",
+    promoCode: "",
+  });
+
+  const origSetItem = (globalThis as any).localStorage.setItem;
+
+  // Case A: failure on first (canonical -drafts) write
+  (globalThis as any).localStorage.setItem = (k: string, v: string) => {
+    if (k.includes("-drafts")) {
+      throw new DOMException("QuotaExceededError", "QuotaExceededError");
+    }
+    return origSetItem(k, v);
+  };
+  const resA = tryRecoverDraftToUnattachedCart(T, U, [], "sess-partial");
+  assert.equal(resA.ok, false);
+  if (!resA.ok) assert.equal(resA.reason, "storage_error");
+  assert.equal(restorePosCart(T, U), null, "canonical write failed so nothing committed");
+  assert.equal(getRecoverablePosDraft(T, U, "sess-partial")?.cart[0].quantity, 3, "source recoverable draft preserved");
+
+  // Case B: canonical -drafts succeeds, legacy mirror suffix fails
+  (globalThis as any).localStorage.setItem = (k: string, v: string) => {
+    if (k.endsWith(`${T}-${U}`)) {
+      throw new DOMException("QuotaExceededError", "QuotaExceededError");
+    }
+    return origSetItem(k, v);
+  };
+  const resB = tryRecoverDraftToUnattachedCart(T, U, [], "sess-partial");
+  assert.equal(resB.ok, true, "canonical commit succeeds even if legacy mirror write fails");
+  assert.equal(getRecoverablePosDraft(T, U, "sess-partial"), null, "recoverable source cleared so no duplicate copy exists");
+
+  // Simulate reload: only one usable copy exists with exact items and quantities
+  (globalThis as any).localStorage.setItem = origSetItem;
+  const reloaded = restorePosCart(T, U);
+  assert.ok(reloaded, "recovered cart survives reload");
+  assert.equal(reloaded.cart.length, 1);
+  assert.equal(reloaded.cart[0].menuItemId, "m1");
+  assert.equal(reloaded.cart[0].quantity, 3);
+  assert.equal(tryRecoverDraftToUnattachedCart(T, U, [], "sess-partial").ok, false, "cannot recover a second time");
+});
+
 delete (globalThis as any).localStorage;
 
 // ── 2. UI & Edge Function Isolation Static Invariants ────────────────────────

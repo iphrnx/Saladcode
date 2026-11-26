@@ -127,10 +127,15 @@ export function savePosSessionDraft(
   }
   const draftsOk = writeStored('posCart', JSON.stringify(drafts), draftsSuffix(tenantId, userId))
   if (!draftsOk) return false
-  // Only the unattached ('default') cart is mirrored to the legacy single-cart key;
-  // session drafts must never overwrite the unattached cart snapshot.
+  // `draftsSuffix` is the single authoritative commit. Mirroring to the legacy
+  // single-cart key is best-effort; if it fails, clear any stale legacy value
+  // and still treat the authoritative write as committed so moves never leave
+  // duplicate copies across reload.
   if (key === 'default') {
-    return writeStored('posCart', JSON.stringify({ ...snapshot, selectedSessionId: null, savedAt: now }), suffix(tenantId, userId))
+    const mirrorOk = writeStored('posCart', JSON.stringify({ ...snapshot, selectedSessionId: null, savedAt: now }), suffix(tenantId, userId))
+    if (!mirrorOk) {
+      removeStored('posCart', suffix(tenantId, userId))
+    }
   }
   return true
 }
