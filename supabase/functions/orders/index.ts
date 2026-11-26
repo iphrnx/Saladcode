@@ -1189,6 +1189,7 @@ async function create(req: Request): Promise<Response> {
 
     let tableId: string | null = null;
     let tableSessionId: string | null = null;
+    let createNewSession = false;
 
     if (orderType === "DINE_IN" || b.tableId) {
       if (b.tableId) {
@@ -1210,8 +1211,9 @@ async function create(req: Request): Promise<Response> {
             }, 400);
           }
         } else if (b.createNewSitting) {
-          // Explicitly creating a new sitting: do not attach to any existing session
+          // Explicitly creating a new sitting: create session + check + order atomically inside create_order_tx
           tableSessionId = null;
+          createNewSession = true;
         } else {
           // Safe resolution when no session was explicitly specified:
           // If multiple active diner sittings exist on this table, reject ambiguous placement
@@ -1235,26 +1237,8 @@ async function create(req: Request): Promise<Response> {
               tableSessionId = activeSessions[0].id;
             }
           }
-        }
-
-        // When placing a clean new order on a table with no session attached, create a new table session cleanly
-        if (!tableSessionId) {
-          const { data: newSession } = await db
-            .from("table_sessions")
-            .insert({
-              tenant_id: tenantId,
-              table_id: tableId,
-              order_type: "DINE_IN",
-              status: "ACTIVE",
-              activation_status: "ACTIVE",
-              token: crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, ""),
-              activated_at: new Date().toISOString(),
-            })
-            .select("id")
-            .maybeSingle();
-          if (newSession) {
-            tableSessionId = newSession.id;
-            newlyCreatedSessionId = newSession.id;
+          if (!tableSessionId) {
+            createNewSession = true;
           }
         }
       }
@@ -1318,6 +1302,7 @@ async function create(req: Request): Promise<Response> {
       tenantId,
       tableId,
       tableSessionId,
+      createNewSession,
       items,
       orderType,
       customerName,

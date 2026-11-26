@@ -95,8 +95,20 @@ export function readStored(name: KeyName, suffix = ''): string | null {
       const previous = store.getItem(legacy)
       if (previous === null) continue
       // Move it, so this only ever happens once for a given browser.
-      store.setItem(keyName(name, suffix), previous)
-      for (const k of legacyKeyNames(name, suffix)) store.removeItem(k)
+      // Migration write/cleanup is best-effort: if either throws (e.g. quota),
+      // still return `previous` so the legacy value is preserved and visible.
+      try {
+        store.setItem(keyName(name, suffix), previous)
+        for (const k of legacyKeyNames(name, suffix)) {
+          try {
+            store.removeItem(k)
+          } catch {
+            /* ignore legacy cleanup error */
+          }
+        }
+      } catch {
+        /* ignore migration write error; legacy value remains intact */
+      }
       return previous
     }
     return null
@@ -116,18 +128,25 @@ export function writeStoredStrict(name: KeyName, value: string, suffix = ''): vo
   }
 }
 
-export function writeStored(name: KeyName, value: string, suffix = ''): void {
+export function writeStored(name: KeyName, value: string, suffix = ''): boolean {
   const store = area(name)
-  if (!store) return
+  if (!store) return false
   try {
     store.setItem(keyName(name, suffix), value)
-    // The new name is the truth from here on.
-    for (const legacy of legacyKeyNames(name, suffix)) {
-      store.removeItem(legacy)
-    }
   } catch {
-    /* storage blocked — the value simply does not persist */
+    /* storage blocked or quota exceeded — caller decides how to handle */
+    return false
   }
+  // Canonical write succeeded; legacy cleanup is best-effort and must not
+  // report the canonical write as failed.
+  for (const legacy of legacyKeyNames(name, suffix)) {
+    try {
+      store.removeItem(legacy)
+    } catch {
+      /* ignore legacy cleanup failure */
+    }
+  }
+  return true
 }
 
 export function removeStoredStrict(name: KeyName, suffix = ''): void {
@@ -139,15 +158,21 @@ export function removeStoredStrict(name: KeyName, suffix = ''): void {
   }
 }
 
-export function removeStored(name: KeyName, suffix = ''): void {
+export function removeStored(name: KeyName, suffix = ''): boolean {
   const store = area(name)
-  if (!store) return
+  if (!store) return false
   try {
     store.removeItem(keyName(name, suffix))
-    for (const legacy of legacyKeyNames(name, suffix)) {
-      store.removeItem(legacy)
-    }
   } catch {
     /* nothing to clear */
+    return false
   }
+  for (const legacy of legacyKeyNames(name, suffix)) {
+    try {
+      store.removeItem(legacy)
+    } catch {
+      /* ignore legacy cleanup failure */
+    }
+  }
+  return true
 }

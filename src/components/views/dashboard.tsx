@@ -15,7 +15,7 @@ import { cn } from '@/lib/utils'
 import { formatCurrency } from '@/lib/constants'
 import { normalizePortions, normalizePortionKey, type MenuPortion } from '@/lib/portions'
 import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
-import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId } from '@/lib/pos-cart'
+import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, subtractPosSessionDraft, subtractLinesFromCart, saveRecoverablePosDraft, getRecoverablePosDrafts, clearRecoverablePosDraft, subtractRecoverablePosDraft, tryRecoverDraftToUnattachedCart, isRecoveryConsumed, resolveSessionLifecycle, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId, type RecoverablePosDraft } from '@/lib/pos-cart'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
@@ -60,18 +60,20 @@ function getSessionIdentifier(
   const hasGuestName = custName && custName.toLowerCase() !== 'guest'
 
   if (orderType === 'TAKEAWAY') {
-    return hasGuestName ? `Takeaway · ${custName}` : `Takeaway · S${sessionNumber || 1}`
+    if (hasGuestName) return `Takeaway · ${custName}`
+    return sessionNumber ? `Takeaway · Diner ${sessionNumber}` : 'Takeaway'
   }
   if (orderType === 'DELIVERY') {
-    return hasGuestName ? `Delivery · ${custName}` : `Delivery · S${sessionNumber || 1}`
+    if (hasGuestName) return `Delivery · ${custName}`
+    return sessionNumber ? `Delivery · Diner ${sessionNumber}` : 'Delivery'
   }
   if (hasGuestName) {
     return `${tableName} · ${custName}`
   }
   if (sessionNumber) {
-    return `${tableName} · S${sessionNumber}`
+    return `${tableName} · Diner ${sessionNumber}`
   }
-  return `${tableName} · S1`
+  return tableName
 }
 
 function ActiveSessionCard({
@@ -218,7 +220,7 @@ function ActiveSessionCard({
 
 export function DashboardView() {
   const tr = useT()
-  const { data, refresh, sessionRevision } = useApp()
+  const { data, refresh, sessionRevision, tableSessions, checks } = useApp()
   const { denied, handleLoad, handleAction } = useAccessDenied()
   const { cart, addToCart, updateCartQty, removeFromCart, setCartNotes, clearCart, replaceCart, hydrateCart, subtractCartLines, orderType, setOrderType, selectedTableId, setSelectedTableId, selectedSessionId, setSelectedSessionId, setSessionContext, promoCode, setPromoCode } = useStore()
   const [activeCat, setActiveCat] = useState<string>('all')
@@ -242,6 +244,7 @@ export function DashboardView() {
   const [tick, setTick] = useState(0)
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [refreshingCart, setRefreshingCart] = useState(false)
+  const [recoverableDrafts, setRecoverableDrafts] = useState<RecoverablePosDraft[]>([])
 
   const refreshCartPricing = useCallback(async (providedData?: any) => {
     setRefreshingCart(true)
@@ -372,20 +375,72 @@ export function DashboardView() {
       onConfirmed: (order, entry) => {
         submittingRef.current = false
         setLastOrder(order)
-        subtractCartLines(entry.payload.items ?? [])
-        setPromoCode('')
-        setAppliedPromo(null)
-        setPromoQuote(null)
-        setPromoError('')
-        if (tenantId && userId) {
-          clearPosSessionDraft(tenantId, userId, entry.payload.tableSessionId)
-          clearPosActiveSessionId(tenantId, userId)
+        const originSessionId = entry.payload.tableSessionId ?? null
+        const currentSessionId = useStore.getState().selectedSessionId ?? null
+        const submittedLines = entry.payload.items ?? []
+
+        if (currentSessionId === originSessionId) {
+          subtractCartLines(submittedLines)
+          setPromoCode('')
+          setAppliedPromo(null)
+          setPromoQuote(null)
+          setPromoError('')
+          const remainingCart = useStore.getState().cart
+          if (remainingCart.length === 0) {
+            if (tenantId && userId) {
+              clearPosSessionDraft(tenantId, userId, originSessionId)
+              if (originSessionId) {
+                clearPosActiveSessionId(tenantId, userId)
+              }
+            }
+            if (originSessionId) {
+              // Confirming the last item of a sitting restores the cashier's unattached cart
+              // before the persistence effect runs, preventing it from being overwritten with [].
+              const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
+              if (pre) {
+                replaceCart(pre.cart)
+                setSessionContext(pre.selectedTableId, null, pre.orderType)
+                setCustomerName(pre.customerName ?? '')
+                setCustomerPhone(pre.customerPhone ?? '')
+                setPromoCode(pre.promoCode ?? '')
+              } else {
+                setSelectedSessionId(null)
+                setSelectedTableId(null)
+                setCustomerName('')
+                setCustomerPhone('')
+                setPromoCode('')
+                replaceCart([])
+              }
+              preSelectSnapshotRef.current = null
+            } else {
+              setSelectedSessionId(null)
+              setSelectedTableId(null)
+              setCustomerName('')
+              setCustomerPhone('')
+            }
+          }
+          setCartOpen(false)
+        } else {
+          // Cashier switched to another cart/session while this order was in flight:
+          // clear only the submitted lines from the originating draft without disturbing active work.
+          if (tenantId && userId) {
+            subtractPosSessionDraft(tenantId, userId, originSessionId, submittedLines)
+            if (originSessionId && getPosActiveSessionId(tenantId, userId) === originSessionId) {
+              clearPosActiveSessionId(tenantId, userId)
+            }
+          }
+          if (!originSessionId && preSelectSnapshotRef.current) {
+            const remainingPre = subtractLinesFromCart(preSelectSnapshotRef.current.cart, submittedLines)
+            preSelectSnapshotRef.current = remainingPre.length > 0
+              ? { ...preSelectSnapshotRef.current, cart: remainingPre }
+              : null
+          }
         }
-        setSelectedSessionId(null)
-        setSelectedTableId(null)
-        setCustomerName('')
-        setCustomerPhone('')
-        replaceCart([])
+        if (tenantId && userId && originSessionId) {
+          subtractRecoverablePosDraft(tenantId, userId, originSessionId, submittedLines)
+          setRecoverableDrafts(getRecoverablePosDrafts(tenantId, userId))
+        }
+
         if (order.promoApplied === false && order.promoReason) {
           // The server is the authority on promos, and it can still decline a
           // code the cashier had already applied. Say so, or the customer is
@@ -400,7 +455,6 @@ export function DashboardView() {
           toast.success(`Order #${order.orderNumber} placed!`)
         }
         refresh()
-        setCartOpen(false)
       },
       onFailed: async (error, entry, code) => {
         submittingRef.current = false
@@ -878,16 +932,16 @@ export function DashboardView() {
 
     // 1. Live sessions from the active floor groups
     for (const group of sessions) {
-      const live = (group.sessions || []).filter((s: any) => s.status === 'ACTIVE')
+      const live = (group.sessions || [])
+        .filter((s: any) => s.status === 'ACTIVE')
+        .sort((a: any, b: any) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime())
       const totalLiveAtTable = live.length
-      const groupCheck = group.check
 
       live.forEach((s: any, idx: number) => {
         seenSessionIds.add(s.id)
         if (s.check?.id) seenCheckIds.add(s.check.id)
-        if (groupCheck?.id) seenCheckIds.add(groupCheck.id)
 
-        // Totals for this specific session or the table check
+        // Totals strictly for this specific session or its own orders
         let total = 0
         let paid = 0
         let outstanding = 0
@@ -900,26 +954,21 @@ export function DashboardView() {
           total = Number(s.check.total || 0)
           paid = Number(s.check.paid_total || s.check.paid || 0)
           outstanding = Math.max(0, total - paid)
-        } else if (groupCheck && totalLiveAtTable === 1) {
-          total = Number(groupCheck.total || 0)
-          paid = Number(groupCheck.paid || 0)
-          outstanding = Number(groupCheck.outstanding || 0)
         } else {
           total = ordersTotal
           paid = 0
           outstanding = ordersTotal
         }
 
-        // Exclude fully paid, completed, ended, or abandoned empty sessions
+        // Exclude fully paid, completed, ended, or abandoned/scan-only empty sessions
         if (s.status === 'ENDED') return
         if (s.check?.status === 'PAID') return
-        if (groupCheck?.status === 'PAID' && totalLiveAtTable === 1) return
         if (total > 0 && outstanding <= 0.01 && (s.check?.status === 'PAID' || (activeOrders.length > 0 && activeOrders.every((o: any) => o.status === 'COMPLETED')))) return
         if (total === 0 && activeOrders.length === 0) return
 
-        // Correlate with app orders in data.orders
+        // Correlate strictly with app orders belonging to this exact session
         const matchingAppOrders = (data?.orders || []).filter(
-          (o: any) => (o.tableSessionId === s.id || (group.tableId && o.tableId === group.tableId && totalLiveAtTable === 1)) && o.status !== 'CANCELLED' && o.status !== 'PENDING_ACTIVATION'
+          (o: any) => o.tableSessionId === s.id && o.status !== 'CANCELLED' && o.status !== 'PENDING_ACTIVATION'
         )
 
         // Gather all dish items across orders
@@ -951,8 +1000,7 @@ export function DashboardView() {
         )
         const isBillRequested = Boolean(
           s.billRequested ||
-          s.check?.status === 'UNSETTLED' ||
-          groupCheck?.status === 'UNSETTLED'
+          s.check?.status === 'UNSETTLED'
         )
 
         // Dynamic status pill
@@ -1046,8 +1094,7 @@ export function DashboardView() {
       const alreadyRepresented = cards.some(
         (c) =>
           (b.checkId && c.id === `bill-${b.checkId}`) ||
-          (b.sessionId && c.sessionId === b.sessionId) ||
-          (b.tableId && c.tableId === b.tableId && Math.abs(c.outstanding - Number(b.outstanding)) < 0.01)
+          (b.sessionId && c.sessionId === b.sessionId)
       )
       if (alreadyRepresented) continue
 
@@ -1061,7 +1108,10 @@ export function DashboardView() {
         : (b.tableName || 'Table')
 
       const matchingAppOrders = (data?.orders || []).filter(
-        (o: any) => (b.sessionId && o.tableSessionId === b.sessionId) || (b.tableId && o.tableId === b.tableId)
+        (o: any) =>
+          (b.checkId ? o.checkId === b.checkId : (b.sessionId ? o.tableSessionId === b.sessionId : false)) &&
+          o.status !== 'CANCELLED' &&
+          o.status !== 'PENDING_ACTIVATION'
       )
       const allItems: Array<{ name: string; quantity: number; portion?: string | null; status?: string }> = []
       for (const ord of matchingAppOrders) {
@@ -1188,6 +1238,9 @@ export function DashboardView() {
     // Restore or initialize draft for this clicked session
     const existingDraft = tenantId && userId ? getPosSessionDraft(tenantId, userId, card.sessionId) : null
     const targetOrderType = card.orderType || (card.tableId ? 'DINE_IN' : 'TAKEAWAY')
+    setAppliedPromo(null)
+    setPromoQuote(null)
+    setPromoError('')
 
     if (existingDraft) {
       replaceCart(existingDraft.cart)
@@ -1203,6 +1256,28 @@ export function DashboardView() {
       setPromoCode('')
     }
   }
+
+  const restorePreSelectOrNeutral = useCallback(() => {
+    setAppliedPromo(null)
+    setPromoQuote(null)
+    setPromoError('')
+    const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
+    if (pre) {
+      replaceCart(pre.cart)
+      setSessionContext(pre.selectedTableId, null, pre.orderType)
+      setCustomerName(pre.customerName ?? '')
+      setCustomerPhone(pre.customerPhone ?? '')
+      setPromoCode(pre.promoCode ?? '')
+    } else {
+      setSelectedSessionId(null)
+      setSelectedTableId(null)
+      setCustomerName('')
+      setCustomerPhone('')
+      setPromoCode('')
+      replaceCart([])
+    }
+    preSelectSnapshotRef.current = null
+  }, [tenantId, userId, replaceCart, setSessionContext, setSelectedSessionId, setSelectedTableId, setPromoCode])
 
   const handleDeselectSession = () => {
     setForceNewSitting(false)
@@ -1221,21 +1296,7 @@ export function DashboardView() {
         })
       }
     }
-    const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
-    if (pre) {
-      replaceCart(pre.cart)
-      setSessionContext(pre.selectedTableId, null, pre.orderType)
-      setCustomerName(pre.customerName ?? '')
-      setCustomerPhone(pre.customerPhone ?? '')
-      setPromoCode(pre.promoCode ?? '')
-    } else {
-      setSelectedSessionId(null)
-      setSelectedTableId(null)
-      setCustomerName('')
-      setCustomerPhone('')
-      replaceCart([])
-    }
-    preSelectSnapshotRef.current = null
+    restorePreSelectOrNeutral()
   }
 
   const handleUnloadSession = () => {
@@ -1246,32 +1307,150 @@ export function DashboardView() {
       }
       clearPosActiveSessionId(tenantId, userId)
     }
-    setSelectedSessionId(null)
-    setSelectedTableId(null)
-    setCustomerName('')
-    setCustomerPhone('')
-    setPromoCode('')
-    setAppliedPromo(null)
-    setPromoError('')
-    replaceCart([])
-    preSelectSnapshotRef.current = null
+    restorePreSelectOrNeutral()
   }
 
-  // Restore persisted active session from localStorage on initial page load / refresh
-  const restoredSessionRef = useRef(false)
+  // Sync recoverable drafts state on tenant/user mount
   useEffect(() => {
-    if (!tenantId || !userId || !sessionsLoadedOnce.current || restoredSessionRef.current) return
-    restoredSessionRef.current = true
-    const savedActiveSessionId = getPosActiveSessionId(tenantId, userId)
-    if (savedActiveSessionId && !selectedSessionId) {
-      const match = activeSessionCards.find((c) => c.sessionId === savedActiveSessionId)
-      if (match) {
-        handleSessionCardClick(match)
-      } else {
+    if (!tenantId || !userId) {
+      setRecoverableDrafts([])
+      return
+    }
+    setRecoverableDrafts(getRecoverablePosDrafts(tenantId, userId))
+  }, [tenantId, userId])
+
+  const visibleRecoverableDrafts = useMemo(
+    () =>
+      recoverableDrafts.filter(
+        (d) =>
+          !queueEntries.some(
+            (e) =>
+              (e.state === 'pending' || e.state === 'submitting') &&
+              (e.payload?.tableSessionId ?? null) === d.sessionId,
+          ),
+      ),
+    [recoverableDrafts, queueEntries],
+  )
+
+  const recoverClosedSession = useCallback(
+    (closedSessionId: string) => {
+      if (!tenantId || !userId || !closedSessionId) return
+      const isCurrentlySelected = useStore.getState().selectedSessionId === closedSessionId
+      const storedDraft = getPosSessionDraft(tenantId, userId, closedSessionId)
+      const liveState = useStore.getState()
+
+      const unsentCart = isCurrentlySelected ? liveState.cart : (storedDraft?.cart ?? [])
+      const sourceVersion = storedDraft?.draftVersion
+      if (unsentCart.length > 0 && !(sourceVersion && isRecoveryConsumed(tenantId, userId, closedSessionId, sourceVersion))) {
+        const saved = saveRecoverablePosDraft(tenantId, userId, {
+          sessionId: closedSessionId,
+          cart: unsentCart,
+          orderType: isCurrentlySelected ? liveState.orderType : (storedDraft?.orderType ?? 'DINE_IN'),
+          selectedTableId: isCurrentlySelected ? liveState.selectedTableId : (storedDraft?.selectedTableId ?? null),
+          customerName: isCurrentlySelected ? customerName : (storedDraft?.customerName ?? ''),
+          customerPhone: isCurrentlySelected ? customerPhone : (storedDraft?.customerPhone ?? ''),
+          promoCode: isCurrentlySelected ? liveState.promoCode : (storedDraft?.promoCode ?? ''),
+          sourceVersion,
+        })
+        if (!saved) {
+          // Destination write failed (e.g. storage quota): preserve source draft so items are never lost.
+          toast.error('Could not save unsent items for recovery (storage full). Keeping draft in place.')
+          return
+        }
+        setRecoverableDrafts(getRecoverablePosDrafts(tenantId, userId))
+      }
+
+      clearPosSessionDraft(tenantId, userId, closedSessionId)
+      if (getPosActiveSessionId(tenantId, userId) === closedSessionId) {
         clearPosActiveSessionId(tenantId, userId)
       }
+
+      if (isCurrentlySelected) {
+        restorePreSelectOrNeutral()
+      }
+    },
+    [tenantId, userId, customerName, customerPhone, restorePreSelectOrNeutral],
+  )
+
+  const handleRecoverDraft = useCallback(
+    (sessionId: string) => {
+      if (!tenantId || !userId || selectedSessionId || cart.length > 0) return
+      const isHeld = queueEntries.some(
+        (e) =>
+          (e.state === 'pending' || e.state === 'submitting') &&
+          (e.payload?.tableSessionId ?? null) === sessionId,
+      )
+      if (isHeld) return
+      const res = tryRecoverDraftToUnattachedCart(tenantId, userId, cart, sessionId)
+      if (!res.ok) {
+        if (res.reason === 'storage_error') {
+          toast.error('Could not restore items — browser storage is full. Please free space and retry.')
+        } else if (res.reason === 'non_empty') {
+          toast.info('An unattached cart already has items. Clear or submit it before recovering.')
+        }
+        return
+      }
+      const recovered = res.snapshot
+      replaceCart(recovered.cart)
+      setSessionContext(recovered.selectedTableId, null, recovered.orderType)
+      setCustomerName(recovered.customerName ?? '')
+      setCustomerPhone(recovered.customerPhone ?? '')
+      setPromoCode(recovered.promoCode ?? '')
+      setAppliedPromo(null)
+      setPromoQuote(null)
+      setPromoError('')
+      setRecoverableDrafts(getRecoverablePosDrafts(tenantId, userId))
+      toast.success('Unsent items restored to cart')
+    },
+    [tenantId, userId, selectedSessionId, cart, queueEntries, replaceCart, setSessionContext, setPromoCode],
+  )
+
+  const handleDismissRecoverableDraft = useCallback(
+    (sessionId: string) => {
+      if (!tenantId || !userId) return
+      clearRecoverablePosDraft(tenantId, userId, sessionId)
+      setRecoverableDrafts(getRecoverablePosDrafts(tenantId, userId))
+    },
+    [tenantId, userId],
+  )
+
+  // Restore persisted active session on refresh, and clear stale selection only when
+  // authoritative lifecycle confirms closure. If a session is omitted from `/table-session/active`
+  // (e.g. >3m old after its last order was cancelled) or its status is still unknown,
+  // preserve the sitting selection and unsent items.
+  const restoredSessionRef = useRef(false)
+  useEffect(() => {
+    if (!tenantId || !userId || !sessionsLoadedOnce.current) return
+    if (!restoredSessionRef.current) {
+      restoredSessionRef.current = true
+      const savedActiveSessionId = getPosActiveSessionId(tenantId, userId)
+      if (savedActiveSessionId && !selectedSessionId) {
+        const lifecycle = resolveSessionLifecycle(savedActiveSessionId, sessions, tableSessions, checks, data?.orders)
+        if (lifecycle.state === 'open' && lifecycle.editable) {
+          handleSessionCardClick(lifecycle.editable)
+        } else if (lifecycle.state === 'closed') {
+          recoverClosedSession(savedActiveSessionId)
+        } else {
+          // Lifecycle unknown: preserve selection & any saved draft without deleting it
+          const savedDraft = getPosSessionDraft(tenantId, userId, savedActiveSessionId)
+          handleSessionCardClick({
+            sessionId: savedActiveSessionId,
+            tableId: savedDraft?.selectedTableId ?? null,
+            orderType: savedDraft?.orderType,
+            customerName: savedDraft?.customerName,
+          })
+        }
+        return
+      }
     }
-  }, [tenantId, userId, activeSessionCards, selectedSessionId])
+
+    if (selectedSessionId) {
+      const lifecycle = resolveSessionLifecycle(selectedSessionId, sessions, tableSessions, checks, data?.orders)
+      if (lifecycle.state === 'closed') {
+        recoverClosedSession(selectedSessionId)
+      }
+    }
+  }, [tenantId, userId, sessions, tableSessions, checks, data?.orders, selectedSessionId, recoverClosedSession])
 
   const loadedSessionOrders = useMemo(() => {
     if (!selectedSessionId) return []
@@ -1392,22 +1571,9 @@ export function DashboardView() {
             })
           )
 
-          // If the selected session was the one that just settled, safely deselect and restore draft
-          if (endedSessionId && selectedSessionId === endedSessionId) {
-            if (tenantId && userId) {
-              clearPosSessionDraft(tenantId, userId, endedSessionId)
-            }
-            const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
-            if (pre) {
-              replaceCart(pre.cart)
-              setSessionContext(pre.selectedTableId, null, pre.orderType)
-              setCustomerName(pre.customerName ?? '')
-              setCustomerPhone(pre.customerPhone ?? '')
-              setPromoCode(pre.promoCode ?? '')
-            } else {
-              setSelectedSessionId(null)
-            }
-            preSelectSnapshotRef.current = null
+          // If the selected session (or a saved draft's session) just settled, route through shared recovery
+          if (endedSessionId && (selectedSessionId === endedSessionId || (tenantId && userId && getPosSessionDraft(tenantId, userId, endedSessionId)))) {
+            recoverClosedSession(endedSessionId)
           }
 
           // Trigger a background re-sync
@@ -1421,7 +1587,7 @@ export function DashboardView() {
       bc.removeEventListener('message', handleMsg)
       bc.close()
     }
-  }, [selectedSessionId, tenantId, userId, loadSessions, replaceCart, setSessionContext, setSelectedSessionId])
+  }, [selectedSessionId, tenantId, userId, loadSessions, recoverClosedSession])
 
   const endSession = async (tableId: string, tableName?: string, force = false, sessionId?: string) => {
     setEndingTable(sessionId ? `${tableId}:${sessionId}` : tableId)
@@ -1491,6 +1657,7 @@ export function DashboardView() {
       return
     }
     const floorTable = selectedTableId ? floor.find((f: any) => f.tableId === selectedTableId) : null
+    void floorTable
     let activeSessionId: string | null = null
 
     if (orderType === 'DINE_IN') {
@@ -1498,26 +1665,7 @@ export function DashboardView() {
         toast.error('Please select a table')
         return
       }
-      const liveSessions = floorTable?.liveSessions || []
-      if (selectedSessionId) {
-        activeSessionId = selectedSessionId
-      } else {
-        if (liveSessions.length > 1 && !forceNewSitting) {
-          toast.error('This table has multiple active diner sessions. Please select which diner/bill to add this order to.')
-          return
-        }
-        activeSessionId = null
-      }
-
-      if (activeSessionId && floorTable) {
-        const isLive =
-          (floorTable.liveSessions || []).some((s: any) => s.id === activeSessionId) ||
-          floorTable.check?.sessionId === activeSessionId
-        if (!isLive) {
-          toast.error('The selected table session has ended or is closed. Please start or select an active session.')
-          return
-        }
-      }
+      activeSessionId = selectedSessionId || null
     } else {
       // Takeaway or Delivery
       if (selectedSessionId) {
@@ -1527,13 +1675,17 @@ export function DashboardView() {
         toast.error('Please enter customer name')
         return
       }
-      if (activeSessionId && sessions.length > 0) {
-        const allActive = sessions.flatMap((g: any) => g.sessions || []).filter((s: any) => s.status === 'ACTIVE')
-        const isLive = allActive.some((s: any) => s.id === activeSessionId)
-        if (!isLive) {
-          toast.error('The selected session has ended or is closed. Please start or select an active session.')
-          return
-        }
+    }
+
+    if (activeSessionId) {
+      const lifecycle = resolveSessionLifecycle(activeSessionId, sessions, tableSessions, checks, data?.orders)
+      if (lifecycle.state === 'closed') {
+        toast.error(
+          orderType === 'DINE_IN'
+            ? 'The selected table session has ended or is closed. Please start or select an active session.'
+            : 'The selected session has ended or is closed. Please start or select an active session.',
+        )
+        return
       }
     }
 
@@ -1944,6 +2096,9 @@ export function DashboardView() {
           refreshError={refreshError}
           refreshingCart={refreshingCart}
           onRetryRefresh={() => { void refreshCartPricing() }}
+          recoverableDrafts={visibleRecoverableDrafts}
+          onRecoverDraft={handleRecoverDraft}
+          onDismissRecoverableDraft={handleDismissRecoverableDraft}
         />
       </div>
 
@@ -2012,6 +2167,9 @@ export function DashboardView() {
             refreshError={refreshError}
             refreshingCart={refreshingCart}
             onRetryRefresh={() => { void refreshCartPricing() }}
+            recoverableDrafts={visibleRecoverableDrafts}
+            onRecoverDraft={handleRecoverDraft}
+            onDismissRecoverableDraft={handleDismissRecoverableDraft}
           />
         </SheetContent>
       </Sheet>
@@ -2294,13 +2452,16 @@ interface CartPanelProps {
   refreshError?: string | null
   refreshingCart?: boolean
   onRetryRefresh?: () => void
+  recoverableDrafts?: RecoverablePosDraft[]
+  onRecoverDraft?: (sessionId: string) => void
+  onDismissRecoverableDraft?: (sessionId: string) => void
 }
 
 function CartPanel(p: CartPanelProps) {
   const tr = useT()
   const { embedded } = p
   const tableName = p.tables.find((t) => t.id === p.selectedTableId)?.name || 'Table'
-  const isAmbiguousSitting = p.orderType === 'DINE_IN' && Boolean(p.selectedTableId) && p.liveSessions.length > 1 && !p.selectedSessionId && !p.forceNewSitting
+  const isAmbiguousSitting = false
   const cardMatch = (p.activeSessionCards || []).find((c: any) => c.sessionId === p.selectedSessionId)
   const hasUnavailableLines = p.cart.some((c) => c.unavailable)
   const hasRefreshError = Boolean(p.refreshError)
@@ -2362,7 +2523,7 @@ function CartPanel(p: CartPanelProps) {
               <div className="flex items-center gap-1.5">
                 <span className="inline-block w-2 h-2 rounded-full bg-primary animate-pulse shrink-0" />
                 <h4 className="font-semibold text-sm truncate text-foreground">
-                  {cardMatch?.compactIdentifier || (cardMatch?.sessionNumber ? `Adding to ${tableName} · S${cardMatch.sessionNumber}` : `Adding to ${tableName}`)}
+                  {cardMatch?.compactIdentifier || (cardMatch?.sessionNumber ? `Adding to ${tableName} · Diner ${cardMatch.sessionNumber}` : `Adding to ${tableName}`)}
                 </h4>
               </div>
               <p className="text-xs text-muted-foreground mt-0.5">
@@ -2407,64 +2568,6 @@ function CartPanel(p: CartPanelProps) {
                 ))}
               </SelectContent>
             </Select>
-
-            {p.selectedTableId && p.liveSessions.length > 1 && !p.forceNewSitting ? (
-              /* Minimal sitting selector when multiple sittings exist and none loaded */
-              <div className="space-y-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2">
-                <div className="flex items-center justify-between text-[11px] font-medium text-amber-600 dark:text-amber-400">
-                  <span>Select Diner ({p.liveSessions.length} active)</span>
-                  <button
-                    type="button"
-                    onClick={p.onNewSitting}
-                    className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold underline"
-                  >
-                    New Diner
-                  </button>
-                </div>
-                <Select
-                  value={p.selectedSessionId || ''}
-                  onValueChange={(v) => {
-                    if (v === '__new__') {
-                      if (p.onNewSitting) p.onNewSitting()
-                    } else if (v) {
-                      p.setSelectedSessionId(v)
-                      if (p.onCancelNewSitting) p.onCancelNewSitting()
-                    }
-                  }}
-                >
-                  <SelectTrigger className="bg-background border border-border h-8 text-xs">
-                    <SelectValue placeholder="Choose diner..." />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {p.liveSessions.map((s: any, idx: number) => {
-                      const timeStr = s.createdAt ? new Date(s.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
-                      const orderCount = s._count?.orders ?? 0
-                      return (
-                        <SelectItem key={s.id} value={s.id}>
-                          Diner {idx + 1}{timeStr ? ` · ${timeStr}` : ''}{orderCount > 0 ? ` · ${orderCount} order${orderCount === 1 ? '' : 's'}` : ''}
-                        </SelectItem>
-                      )
-                    })}
-                    <SelectItem value="__new__">
-                      + Start New Diner
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            ) : p.selectedTableId && p.forceNewSitting ? (
-              <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/30 px-2.5 py-1.5 text-[11px]">
-                <span className="font-medium text-muted-foreground truncate">
-                  Starting new diner session at {tableName}
-                </span>
-                <button
-                  type="button"
-                  onClick={p.onCancelNewSitting}
-                  className="text-[10.5px] text-primary hover:text-primary-hover font-semibold shrink-0 ml-2 underline"
-                >
-                  Cancel
-                </button>
-              </div>
-            ) : null}
           </div>
         ) : (
           <div className="space-y-2">
@@ -2488,6 +2591,61 @@ function CartPanel(p: CartPanelProps) {
 
       {/* Items */}
       <div className="flex-1 overflow-y-auto scrollbar-thin px-4 min-h-0">
+        {/* Recoverable unsent items from remotely closed sittings */}
+        {p.recoverableDrafts && p.recoverableDrafts.length > 0 && (
+          <div className="mt-3 space-y-2">
+            {p.recoverableDrafts.map((draft) => {
+              const itemCount = draft.cart.reduce((s, c) => s + c.quantity, 0)
+              const label = draft.customerName?.trim()
+                ? draft.customerName.trim()
+                : draft.orderType === 'TAKEAWAY'
+                  ? 'Takeaway'
+                  : draft.orderType === 'DELIVERY'
+                    ? 'Delivery'
+                    : (p.tables.find((t) => t.id === draft.selectedTableId)?.name || 'Closed sitting')
+              return (
+                <div key={draft.sessionId} className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs space-y-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="font-semibold text-foreground truncate">
+                        Unsent items from {label} ({itemCount})
+                      </p>
+                      <p className="text-[11px] text-muted-foreground mt-0.5">
+                        {!p.selectedSessionId && p.cart.length === 0
+                          ? 'Restore these items into a new unattached cart.'
+                          : 'Clear or finish the current cart to recover these items.'}
+                      </p>
+                    </div>
+                    {p.onDismissRecoverableDraft && (
+                      <button
+                        type="button"
+                        onClick={() => p.onDismissRecoverableDraft?.(draft.sessionId)}
+                        className="text-muted-foreground hover:text-foreground p-0.5 rounded shrink-0"
+                        title="Dismiss recoverable items"
+                        aria-label="Dismiss recoverable items"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  {p.onRecoverDraft && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      disabled={Boolean(p.selectedSessionId) || p.cart.length > 0}
+                      onClick={() => p.onRecoverDraft?.(draft.sessionId)}
+                      className="w-full h-7 text-xs font-semibold"
+                    >
+                      Recover items
+                    </Button>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+
         {/* Already Ordered items (read-only section) */}
         {p.selectedSessionId && committedItems.length > 0 && (
           <div className="pt-3 pb-1 space-y-2">
