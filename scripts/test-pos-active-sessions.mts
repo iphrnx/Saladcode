@@ -107,7 +107,8 @@ test("POS dashboard computes activeSessionCards with deduplication and multi-sit
 // ── 3. Edge Function Active Sessions & Inactivity Expiry ──
 test("table-session Edge Function attaches session-level checks for independent diner sessions", () => {
   assert.match(tableSessionCode, /checkBySession\[c\.session_id\]/);
-  assert.match(tableSessionCode, /\(s as any\)\.check = \(s\.id && checkBySession\[s\.id\]\) \|\| \(s\.tableId && checkByTable\[s\.tableId\]\) \|\| null/);
+  assert.match(tableSessionCode, /\(s as any\)\.check = \(s\.id && checkBySession\[s\.id\]\) \|\| null/);
+  assert.doesNotMatch(tableSessionCode, /\(s as any\)\.check = .*checkByTable\[s\.tableId\]/);
   assert.match(tableSessionCode, /sessionId: c\.session_id/);
 });
 

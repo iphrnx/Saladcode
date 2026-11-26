@@ -15,7 +15,7 @@ import { cn } from '@/lib/utils'
 import { formatCurrency } from '@/lib/constants'
 import { normalizePortions, normalizePortionKey, type MenuPortion } from '@/lib/portions'
 import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
-import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId } from '@/lib/pos-cart'
+import { persistPosCart, restorePosCart, clearPosCart, getPosSessionDraft, savePosSessionDraft, clearPosSessionDraft, subtractPosSessionDraft, savePosActiveSessionId, getPosActiveSessionId, clearPosActiveSessionId } from '@/lib/pos-cart'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
@@ -60,18 +60,20 @@ function getSessionIdentifier(
   const hasGuestName = custName && custName.toLowerCase() !== 'guest'
 
   if (orderType === 'TAKEAWAY') {
-    return hasGuestName ? `Takeaway · ${custName}` : `Takeaway · S${sessionNumber || 1}`
+    if (hasGuestName) return `Takeaway · ${custName}`
+    return sessionNumber ? `Takeaway · Diner ${sessionNumber}` : 'Takeaway'
   }
   if (orderType === 'DELIVERY') {
-    return hasGuestName ? `Delivery · ${custName}` : `Delivery · S${sessionNumber || 1}`
+    if (hasGuestName) return `Delivery · ${custName}`
+    return sessionNumber ? `Delivery · Diner ${sessionNumber}` : 'Delivery'
   }
   if (hasGuestName) {
     return `${tableName} · ${custName}`
   }
   if (sessionNumber) {
-    return `${tableName} · S${sessionNumber}`
+    return `${tableName} · Diner ${sessionNumber}`
   }
-  return `${tableName} · S1`
+  return tableName
 }
 
 function ActiveSessionCard({
@@ -372,20 +374,41 @@ export function DashboardView() {
       onConfirmed: (order, entry) => {
         submittingRef.current = false
         setLastOrder(order)
-        subtractCartLines(entry.payload.items ?? [])
-        setPromoCode('')
-        setAppliedPromo(null)
-        setPromoQuote(null)
-        setPromoError('')
-        if (tenantId && userId) {
-          clearPosSessionDraft(tenantId, userId, entry.payload.tableSessionId)
-          clearPosActiveSessionId(tenantId, userId)
+        const originSessionId = entry.payload.tableSessionId ?? null
+        const currentSessionId = useStore.getState().selectedSessionId ?? null
+        const submittedLines = entry.payload.items ?? []
+
+        if (currentSessionId === originSessionId) {
+          subtractCartLines(submittedLines)
+          setPromoCode('')
+          setAppliedPromo(null)
+          setPromoQuote(null)
+          setPromoError('')
+          const remainingCart = useStore.getState().cart
+          if (remainingCart.length === 0) {
+            if (tenantId && userId) {
+              clearPosSessionDraft(tenantId, userId, originSessionId)
+              if (originSessionId) {
+                clearPosActiveSessionId(tenantId, userId)
+              }
+            }
+            setSelectedSessionId(null)
+            setSelectedTableId(null)
+            setCustomerName('')
+            setCustomerPhone('')
+          }
+          setCartOpen(false)
+        } else {
+          // Cashier switched to another cart/session while this order was in flight:
+          // clear only the submitted lines from the originating draft without disturbing active work.
+          if (tenantId && userId) {
+            subtractPosSessionDraft(tenantId, userId, originSessionId, submittedLines)
+            if (originSessionId && getPosActiveSessionId(tenantId, userId) === originSessionId) {
+              clearPosActiveSessionId(tenantId, userId)
+            }
+          }
         }
-        setSelectedSessionId(null)
-        setSelectedTableId(null)
-        setCustomerName('')
-        setCustomerPhone('')
-        replaceCart([])
+
         if (order.promoApplied === false && order.promoReason) {
           // The server is the authority on promos, and it can still decline a
           // code the cashier had already applied. Say so, or the customer is
@@ -400,7 +423,6 @@ export function DashboardView() {
           toast.success(`Order #${order.orderNumber} placed!`)
         }
         refresh()
-        setCartOpen(false)
       },
       onFailed: async (error, entry, code) => {
         submittingRef.current = false
@@ -878,16 +900,16 @@ export function DashboardView() {
 
     // 1. Live sessions from the active floor groups
     for (const group of sessions) {
-      const live = (group.sessions || []).filter((s: any) => s.status === 'ACTIVE')
+      const live = (group.sessions || [])
+        .filter((s: any) => s.status === 'ACTIVE')
+        .sort((a: any, b: any) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime())
       const totalLiveAtTable = live.length
-      const groupCheck = group.check
 
       live.forEach((s: any, idx: number) => {
         seenSessionIds.add(s.id)
         if (s.check?.id) seenCheckIds.add(s.check.id)
-        if (groupCheck?.id) seenCheckIds.add(groupCheck.id)
 
-        // Totals for this specific session or the table check
+        // Totals strictly for this specific session or its own orders
         let total = 0
         let paid = 0
         let outstanding = 0
@@ -900,26 +922,21 @@ export function DashboardView() {
           total = Number(s.check.total || 0)
           paid = Number(s.check.paid_total || s.check.paid || 0)
           outstanding = Math.max(0, total - paid)
-        } else if (groupCheck && totalLiveAtTable === 1) {
-          total = Number(groupCheck.total || 0)
-          paid = Number(groupCheck.paid || 0)
-          outstanding = Number(groupCheck.outstanding || 0)
         } else {
           total = ordersTotal
           paid = 0
           outstanding = ordersTotal
         }
 
-        // Exclude fully paid, completed, ended, or abandoned empty sessions
+        // Exclude fully paid, completed, ended, or abandoned/scan-only empty sessions
         if (s.status === 'ENDED') return
         if (s.check?.status === 'PAID') return
-        if (groupCheck?.status === 'PAID' && totalLiveAtTable === 1) return
         if (total > 0 && outstanding <= 0.01 && (s.check?.status === 'PAID' || (activeOrders.length > 0 && activeOrders.every((o: any) => o.status === 'COMPLETED')))) return
         if (total === 0 && activeOrders.length === 0) return
 
-        // Correlate with app orders in data.orders
+        // Correlate strictly with app orders belonging to this exact session
         const matchingAppOrders = (data?.orders || []).filter(
-          (o: any) => (o.tableSessionId === s.id || (group.tableId && o.tableId === group.tableId && totalLiveAtTable === 1)) && o.status !== 'CANCELLED' && o.status !== 'PENDING_ACTIVATION'
+          (o: any) => o.tableSessionId === s.id && o.status !== 'CANCELLED' && o.status !== 'PENDING_ACTIVATION'
         )
 
         // Gather all dish items across orders
@@ -951,8 +968,7 @@ export function DashboardView() {
         )
         const isBillRequested = Boolean(
           s.billRequested ||
-          s.check?.status === 'UNSETTLED' ||
-          groupCheck?.status === 'UNSETTLED'
+          s.check?.status === 'UNSETTLED'
         )
 
         // Dynamic status pill
@@ -1046,8 +1062,7 @@ export function DashboardView() {
       const alreadyRepresented = cards.some(
         (c) =>
           (b.checkId && c.id === `bill-${b.checkId}`) ||
-          (b.sessionId && c.sessionId === b.sessionId) ||
-          (b.tableId && c.tableId === b.tableId && Math.abs(c.outstanding - Number(b.outstanding)) < 0.01)
+          (b.sessionId && c.sessionId === b.sessionId)
       )
       if (alreadyRepresented) continue
 
@@ -1061,7 +1076,10 @@ export function DashboardView() {
         : (b.tableName || 'Table')
 
       const matchingAppOrders = (data?.orders || []).filter(
-        (o: any) => (b.sessionId && o.tableSessionId === b.sessionId) || (b.tableId && o.tableId === b.tableId)
+        (o: any) =>
+          (b.checkId ? o.checkId === b.checkId : (b.sessionId ? o.tableSessionId === b.sessionId : false)) &&
+          o.status !== 'CANCELLED' &&
+          o.status !== 'PENDING_ACTIVATION'
       )
       const allItems: Array<{ name: string; quantity: number; portion?: string | null; status?: string }> = []
       for (const ord of matchingAppOrders) {
@@ -1188,6 +1206,9 @@ export function DashboardView() {
     // Restore or initialize draft for this clicked session
     const existingDraft = tenantId && userId ? getPosSessionDraft(tenantId, userId, card.sessionId) : null
     const targetOrderType = card.orderType || (card.tableId ? 'DINE_IN' : 'TAKEAWAY')
+    setAppliedPromo(null)
+    setPromoQuote(null)
+    setPromoError('')
 
     if (existingDraft) {
       replaceCart(existingDraft.cart)
@@ -1221,6 +1242,9 @@ export function DashboardView() {
         })
       }
     }
+    setAppliedPromo(null)
+    setPromoQuote(null)
+    setPromoError('')
     const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
     if (pre) {
       replaceCart(pre.cart)
@@ -1233,6 +1257,7 @@ export function DashboardView() {
       setSelectedTableId(null)
       setCustomerName('')
       setCustomerPhone('')
+      setPromoCode('')
       replaceCart([])
     }
     preSelectSnapshotRef.current = null
@@ -1246,29 +1271,71 @@ export function DashboardView() {
       }
       clearPosActiveSessionId(tenantId, userId)
     }
-    setSelectedSessionId(null)
-    setSelectedTableId(null)
-    setCustomerName('')
-    setCustomerPhone('')
-    setPromoCode('')
     setAppliedPromo(null)
+    setPromoQuote(null)
     setPromoError('')
-    replaceCart([])
+    const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
+    if (pre) {
+      replaceCart(pre.cart)
+      setSessionContext(pre.selectedTableId, null, pre.orderType)
+      setCustomerName(pre.customerName ?? '')
+      setCustomerPhone(pre.customerPhone ?? '')
+      setPromoCode(pre.promoCode ?? '')
+    } else {
+      setSelectedSessionId(null)
+      setSelectedTableId(null)
+      setCustomerName('')
+      setCustomerPhone('')
+      setPromoCode('')
+      replaceCart([])
+    }
     preSelectSnapshotRef.current = null
   }
 
-  // Restore persisted active session from localStorage on initial page load / refresh
+  // Restore persisted active session on refresh, and clear stale selection if
+  // the selected session ended/settled while away or on another device.
   const restoredSessionRef = useRef(false)
   useEffect(() => {
-    if (!tenantId || !userId || !sessionsLoadedOnce.current || restoredSessionRef.current) return
-    restoredSessionRef.current = true
-    const savedActiveSessionId = getPosActiveSessionId(tenantId, userId)
-    if (savedActiveSessionId && !selectedSessionId) {
-      const match = activeSessionCards.find((c) => c.sessionId === savedActiveSessionId)
-      if (match) {
-        handleSessionCardClick(match)
-      } else {
+    if (!tenantId || !userId || !sessionsLoadedOnce.current) return
+    if (!restoredSessionRef.current) {
+      restoredSessionRef.current = true
+      const savedActiveSessionId = getPosActiveSessionId(tenantId, userId)
+      if (savedActiveSessionId && !selectedSessionId) {
+        const match = activeSessionCards.find((c) => c.sessionId === savedActiveSessionId)
+        if (match) {
+          handleSessionCardClick(match)
+        } else {
+          clearPosActiveSessionId(tenantId, userId)
+          clearPosSessionDraft(tenantId, userId, savedActiveSessionId)
+        }
+        return
+      }
+    }
+
+    if (selectedSessionId) {
+      const stillActive = activeSessionCards.some((c) => c.sessionId === selectedSessionId)
+      if (!stillActive) {
+        clearPosSessionDraft(tenantId, userId, selectedSessionId)
         clearPosActiveSessionId(tenantId, userId)
+        setAppliedPromo(null)
+        setPromoQuote(null)
+        setPromoError('')
+        const pre = preSelectSnapshotRef.current ?? getPosSessionDraft(tenantId, userId, null)
+        if (pre) {
+          replaceCart(pre.cart)
+          setSessionContext(pre.selectedTableId, null, pre.orderType)
+          setCustomerName(pre.customerName ?? '')
+          setCustomerPhone(pre.customerPhone ?? '')
+          setPromoCode(pre.promoCode ?? '')
+        } else {
+          setSelectedSessionId(null)
+          setSelectedTableId(null)
+          setCustomerName('')
+          setCustomerPhone('')
+          setPromoCode('')
+          replaceCart([])
+        }
+        preSelectSnapshotRef.current = null
       }
     }
   }, [tenantId, userId, activeSessionCards, selectedSessionId])
@@ -1396,7 +1463,11 @@ export function DashboardView() {
           if (endedSessionId && selectedSessionId === endedSessionId) {
             if (tenantId && userId) {
               clearPosSessionDraft(tenantId, userId, endedSessionId)
+              clearPosActiveSessionId(tenantId, userId)
             }
+            setAppliedPromo(null)
+            setPromoQuote(null)
+            setPromoError('')
             const pre = preSelectSnapshotRef.current ?? (tenantId && userId ? getPosSessionDraft(tenantId, userId, null) : null)
             if (pre) {
               replaceCart(pre.cart)
@@ -1406,6 +1477,11 @@ export function DashboardView() {
               setPromoCode(pre.promoCode ?? '')
             } else {
               setSelectedSessionId(null)
+              setSelectedTableId(null)
+              setCustomerName('')
+              setCustomerPhone('')
+              setPromoCode('')
+              replaceCart([])
             }
             preSelectSnapshotRef.current = null
           }
@@ -1498,14 +1574,9 @@ export function DashboardView() {
         toast.error('Please select a table')
         return
       }
-      const liveSessions = floorTable?.liveSessions || []
       if (selectedSessionId) {
         activeSessionId = selectedSessionId
       } else {
-        if (liveSessions.length > 1 && !forceNewSitting) {
-          toast.error('This table has multiple active diner sessions. Please select which diner/bill to add this order to.')
-          return
-        }
         activeSessionId = null
       }
 
@@ -2300,7 +2371,7 @@ function CartPanel(p: CartPanelProps) {
   const tr = useT()
   const { embedded } = p
   const tableName = p.tables.find((t) => t.id === p.selectedTableId)?.name || 'Table'
-  const isAmbiguousSitting = p.orderType === 'DINE_IN' && Boolean(p.selectedTableId) && p.liveSessions.length > 1 && !p.selectedSessionId && !p.forceNewSitting
+  const isAmbiguousSitting = false
   const cardMatch = (p.activeSessionCards || []).find((c: any) => c.sessionId === p.selectedSessionId)
   const hasUnavailableLines = p.cart.some((c) => c.unavailable)
   const hasRefreshError = Boolean(p.refreshError)
@@ -2362,7 +2433,7 @@ function CartPanel(p: CartPanelProps) {
               <div className="flex items-center gap-1.5">
                 <span className="inline-block w-2 h-2 rounded-full bg-primary animate-pulse shrink-0" />
                 <h4 className="font-semibold text-sm truncate text-foreground">
-                  {cardMatch?.compactIdentifier || (cardMatch?.sessionNumber ? `Adding to ${tableName} · S${cardMatch.sessionNumber}` : `Adding to ${tableName}`)}
+                  {cardMatch?.compactIdentifier || (cardMatch?.sessionNumber ? `Adding to ${tableName} · Diner ${cardMatch.sessionNumber}` : `Adding to ${tableName}`)}
                 </h4>
               </div>
               <p className="text-xs text-muted-foreground mt-0.5">
@@ -2407,64 +2478,6 @@ function CartPanel(p: CartPanelProps) {
                 ))}
               </SelectContent>
             </Select>
-
-            {p.selectedTableId && p.liveSessions.length > 1 && !p.forceNewSitting ? (
-              /* Minimal sitting selector when multiple sittings exist and none loaded */
-              <div className="space-y-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2">
-                <div className="flex items-center justify-between text-[11px] font-medium text-amber-600 dark:text-amber-400">
-                  <span>Select Diner ({p.liveSessions.length} active)</span>
-                  <button
-                    type="button"
-                    onClick={p.onNewSitting}
-                    className="text-[10.5px] text-muted-foreground hover:text-foreground font-semibold underline"
-                  >
-                    New Diner
-                  </button>
-                </div>
-                <Select
-                  value={p.selectedSessionId || ''}
-                  onValueChange={(v) => {
-                    if (v === '__new__') {
-                      if (p.onNewSitting) p.onNewSitting()
-                    } else if (v) {
-                      p.setSelectedSessionId(v)
-                      if (p.onCancelNewSitting) p.onCancelNewSitting()
-                    }
-                  }}
-                >
-                  <SelectTrigger className="bg-background border border-border h-8 text-xs">
-                    <SelectValue placeholder="Choose diner..." />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {p.liveSessions.map((s: any, idx: number) => {
-                      const timeStr = s.createdAt ? new Date(s.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
-                      const orderCount = s._count?.orders ?? 0
-                      return (
-                        <SelectItem key={s.id} value={s.id}>
-                          Diner {idx + 1}{timeStr ? ` · ${timeStr}` : ''}{orderCount > 0 ? ` · ${orderCount} order${orderCount === 1 ? '' : 's'}` : ''}
-                        </SelectItem>
-                      )
-                    })}
-                    <SelectItem value="__new__">
-                      + Start New Diner
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            ) : p.selectedTableId && p.forceNewSitting ? (
-              <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/30 px-2.5 py-1.5 text-[11px]">
-                <span className="font-medium text-muted-foreground truncate">
-                  Starting new diner session at {tableName}
-                </span>
-                <button
-                  type="button"
-                  onClick={p.onCancelNewSitting}
-                  className="text-[10.5px] text-primary hover:text-primary-hover font-semibold shrink-0 ml-2 underline"
-                >
-                  Cancel
-                </button>
-              </div>
-            ) : null}
           </div>
         ) : (
           <div className="space-y-2">

@@ -706,15 +706,16 @@ async function active(req: Request): Promise<Response> {
     }
   }
 
-  // Attach session-level checks to each session row
+  // Attach session-level checks strictly by session ID (never fall back to table-level checks,
+  // which would bleed another sitting's balance or PAID status onto an independent session).
   for (const s of sessions) {
-    (s as any).check = (s.id && checkBySession[s.id]) || (s.tableId && checkByTable[s.tableId]) || null;
+    (s as any).check = (s.id && checkBySession[s.id]) || null;
   }
 
   // Exclude sessions that have ended and are fully paid / have no outstanding balance,
   // as well as abandoned empty sessions with 0 orders and 0 check total.
   const activeSessions = sessions.filter((s) => {
-    const chk = (s.id && checkBySession[s.id]) || (s.tableId && checkByTable[s.tableId]);
+    const chk = (s.id && checkBySession[s.id]) || null;
     const orders = s.order_rows || [];
     const liveOrders = orders.filter((o: any) => o.status !== "CANCELLED" && o.status !== "PENDING_ACTIVATION");
 

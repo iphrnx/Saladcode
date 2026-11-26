@@ -20,6 +20,7 @@
  */
 
 import { readStored, removeStored, writeStored } from './storage-keys'
+import { normalizePortionKey } from './portions'
 import type { CartItem } from './store'
 
 export interface PosCartSnapshot {
@@ -103,13 +104,18 @@ export function savePosSessionDraft(
 ): void {
   const drafts = getPosSessionDrafts(tenantId, userId)
   const key = sessionDraftKey(sessionKey)
+  const now = Date.now()
   if (snapshot.cart.length === 0) {
     delete drafts[key]
   } else {
-    drafts[key] = { ...snapshot, savedAt: Date.now() }
+    drafts[key] = { ...snapshot, savedAt: now }
   }
   writeStored('posCart', JSON.stringify(drafts), draftsSuffix(tenantId, userId))
-  writeStored('posCart', JSON.stringify({ ...snapshot, savedAt: Date.now() }), suffix(tenantId, userId))
+  // Only the unattached ('default') cart is mirrored to the legacy single-cart key;
+  // session drafts must never overwrite the unattached cart snapshot.
+  if (key === 'default') {
+    writeStored('posCart', JSON.stringify({ ...snapshot, selectedSessionId: null, savedAt: now }), suffix(tenantId, userId))
+  }
 }
 
 /** Retrieve a draft for a specific session key. */
@@ -133,6 +139,47 @@ export function clearPosSessionDraft(
   const key = sessionDraftKey(sessionKey)
   delete drafts[key]
   writeStored('posCart', JSON.stringify(drafts), draftsSuffix(tenantId, userId))
+  if (key === 'default') {
+    removeStored('posCart', suffix(tenantId, userId))
+  }
+}
+
+/**
+ * Subtract submitted order lines from a stored draft, preserving any items
+ * added after submission. Deletes the draft if no items remain.
+ */
+export function subtractPosSessionDraft(
+  tenantId: string,
+  userId: string,
+  sessionKey: string | null | undefined,
+  lines: Array<{ menuItemId: string; portion?: string | null; portionId?: string | null; quantity: number }>,
+): PosCartSnapshot | null {
+  const existing = getPosSessionDraft(tenantId, userId, sessionKey)
+  if (!existing || !Array.isArray(existing.cart) || existing.cart.length === 0) return null
+
+  let remaining = [...existing.cart]
+  for (const line of lines) {
+    const qty = Math.max(1, Number(line.quantity) || 1)
+    const lineKey = normalizePortionKey(line.portion, line.portionId)
+    remaining = remaining
+      .map((c) =>
+        c.menuItemId === line.menuItemId && normalizePortionKey(c.portion, c.portionId) === lineKey
+          ? { ...c, quantity: c.quantity - qty }
+          : c,
+      )
+      .filter((c) => c.quantity > 0)
+  }
+
+  if (remaining.length === 0) {
+    clearPosSessionDraft(tenantId, userId, sessionKey)
+    return null
+  }
+  const updated: Omit<PosCartSnapshot, 'savedAt'> = {
+    ...existing,
+    cart: remaining,
+  }
+  savePosSessionDraft(tenantId, userId, sessionKey, updated)
+  return { ...updated, savedAt: Date.now() }
 }
 
 export function persistPosCart(
@@ -144,18 +191,21 @@ export function persistPosCart(
 }
 
 export function restorePosCart(tenantId: string, userId: string): PosCartSnapshot | null {
+  const drafts = getPosSessionDrafts(tenantId, userId)
+  const defaultDraft = drafts['default']
+  if (defaultDraft && Array.isArray(defaultDraft.cart) && defaultDraft.cart.length > 0) {
+    return defaultDraft
+  }
   const raw = readStored('posCart', suffix(tenantId, userId))
   if (raw) {
     try {
       const parsed = JSON.parse(raw)
-      if (parsed && Array.isArray(parsed.cart)) return parsed as PosCartSnapshot
+      if (parsed && Array.isArray(parsed.cart) && !parsed.selectedSessionId) {
+        return parsed as PosCartSnapshot
+      }
     } catch {}
   }
-  const drafts = getPosSessionDrafts(tenantId, userId)
-  const defaultDraft = drafts['default']
-  if (defaultDraft && Array.isArray(defaultDraft.cart)) return defaultDraft
-  const firstDraft = Object.values(drafts)[0]
-  return firstDraft && Array.isArray(firstDraft.cart) ? firstDraft : null
+  return null
 }
 
 export function clearPosCart(tenantId: string, userId: string): void {
