@@ -1,4 +1,6 @@
 import { normalizePortionKey } from './portions'
+import { keyName } from './storage-keys'
+import type { QueueEntry, StorageLike } from './order-queue'
 
 export interface SyncableCartItem {
   menuItemId: string
@@ -68,7 +70,8 @@ export function reconcileCartOnSave<T extends SyncableCartItem>(
     }
   }
 
-  // Respect intentional removals by another tab for lines this tab did not modify.
+  // Apply confirmed/external removals by subtracting the baseline quantity from
+  // the local line (so stale increments like 2 -> 3 become 3 - 2 = 1).
   for (const prev of lastSyncedCart) {
     const stillInStored = latestStoredCart.some((ext) =>
       sameSyncCartLine(ext, prev.menuItemId, prev.portion ?? null, prev.portionId ?? null),
@@ -77,12 +80,16 @@ export function reconcileCartOnSave<T extends SyncableCartItem>(
     const localIdx = result.findIndex((l) =>
       sameSyncCartLine(l, prev.menuItemId, prev.portion ?? null, prev.portionId ?? null),
     )
-    if (
-      localIdx >= 0 &&
-      result[localIdx].quantity === prev.quantity &&
-      (result[localIdx].notes || '') === (prev.notes || '')
-    ) {
-      result.splice(localIdx, 1)
+    if (localIdx >= 0) {
+      const nextQty = result[localIdx].quantity - prev.quantity
+      if (nextQty <= 0) {
+        result.splice(localIdx, 1)
+      } else {
+        result[localIdx] = {
+          ...result[localIdx],
+          quantity: nextQty,
+        }
+      }
     }
   }
 
@@ -161,6 +168,106 @@ const NON_SESSION_CODES = new Set([
  * session credential is ended, expired, or invalid (and should be cleared so
  * a retry can re-authenticate via the scanned QR).
  */
+/**
+ * Move any unresolved (`pending` / `submitting`) checkouts from the table- or
+ * QR-scoped queue into the adopted session-scoped queue, preserving each
+ * entry's idempotency key and preventing duplicate submissions.
+ */
+export function migratePendingTableQueueToSession(
+  storage: StorageLike,
+  tenantId: string,
+  tableId: string | null | undefined,
+  sessionToken: string,
+  qrToken?: string | null,
+): QueueEntry[] {
+  const sessionQueueKey = keyName('orderQueue', `${tenantId}-${sessionToken}`)
+  const readEntries = (k: string): QueueEntry[] => {
+    try {
+      const raw = storage.getItem(k)
+      if (!raw) return []
+      const parsed = JSON.parse(raw)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+
+  let sessionEntries = readEntries(sessionQueueKey)
+  const seenKeys = new Set(sessionEntries.map((e) => e.key))
+
+  const sourceActors = [
+    tableId ? `table_${tableId}` : null,
+    qrToken ? `qr_${qrToken}` : null,
+  ].filter(Boolean) as string[]
+
+  let changed = false
+  for (const actor of sourceActors) {
+    const sourceKey = keyName('orderQueue', `${tenantId}-${actor}`)
+    const sourceEntries = readEntries(sourceKey)
+    if (sourceEntries.length === 0) continue
+
+    const remainingSource: QueueEntry[] = []
+    for (const entry of sourceEntries) {
+      const unresolved = entry.state === 'pending' || entry.state === 'submitting'
+      const matchesSession =
+        !entry.payload?.tableSessionToken || entry.payload.tableSessionToken === sessionToken
+      if (unresolved && matchesSession) {
+        if (!seenKeys.has(entry.key)) {
+          seenKeys.add(entry.key)
+          sessionEntries = [
+            ...sessionEntries,
+            {
+              ...entry,
+              state: 'pending',
+              claimId: null,
+              claimAt: null,
+            },
+          ]
+          changed = true
+        }
+      } else {
+        remainingSource.push(entry)
+      }
+    }
+
+    if (remainingSource.length !== sourceEntries.length) {
+      if (remainingSource.length === 0) storage.removeItem(sourceKey)
+      else storage.setItem(sourceKey, JSON.stringify(remainingSource))
+    }
+  }
+
+  if (changed) {
+    storage.setItem(sessionQueueKey, JSON.stringify(sessionEntries))
+  }
+  return sessionEntries
+}
+
+/**
+ * Subtract quantities already committed to unresolved queue entries so a
+ * reload before confirmation cannot re-expose submitted dishes for a second
+ * checkout.
+ */
+export function subtractUnresolvedQueueQuantities<T extends SyncableCartItem>(
+  items: T[],
+  queueEntries: QueueEntry[],
+): T[] {
+  let next = items.map((c) => ({ ...c }))
+  for (const entry of queueEntries) {
+    if (entry.state !== 'pending' && entry.state !== 'submitting') continue
+    for (const line of entry.payload?.items ?? []) {
+      const qty = Math.max(1, Number(line.quantity) || 1)
+      next = next
+        .map((c) =>
+          sameSyncCartLine(c, line.menuItemId, line.portion ?? null, line.portionId ?? null)
+            ? { ...c, quantity: c.quantity - qty }
+            : c,
+        )
+        .filter((c) => c.quantity > 0)
+    }
+  }
+  return next
+}
+
 export function isDefinitiveSessionRejection(errorMessage: string, errorCode?: string): boolean {
   if (errorCode) {
     if (NON_SESSION_CODES.has(errorCode)) return false

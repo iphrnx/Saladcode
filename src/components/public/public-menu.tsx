@@ -31,8 +31,10 @@ import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } 
 import {
   isDefinitiveSessionRejection,
   mergeBrowsingRemainderIntoSession,
+  migratePendingTableQueueToSession,
   reconcileCartOnConfirm,
   reconcileCartOnSave,
+  subtractUnresolvedQueueQuantities,
 } from '@/lib/diner-cart-sync'
 import { keyName, readStored, removeStored, writeStored } from '@/lib/storage-keys'
 import { DinerOrderTracker } from '@/components/public/diner-order-tracker'
@@ -675,6 +677,21 @@ export function PublicMenu() {
           }
 
           if (data?.session) {
+            // Migrate any unresolved checkout from the table/QR queue into the
+            // adopted session queue before merging the browsing cart so the
+            // original checkout resumes with its idempotency key and submitted
+            // quantities stay out of the cart while unresolved.
+            const migratedEntries =
+              typeof window !== 'undefined' && data?.tenant?.id
+                ? migratePendingTableQueueToSession(
+                    window.localStorage,
+                    data.tenant.id,
+                    data?.table?.id,
+                    data.session.token,
+                    qrToken,
+                  )
+                : []
+
             // If this tab had unsubmitted items in the pre-order browsing cart
             // before reload discovered an active session, merge them into the
             // session cart once and clear the browsing key so repeated reloads
@@ -685,13 +702,19 @@ export function PublicMenu() {
                 if (browsingRaw) {
                   const browsingItems = JSON.parse(browsingRaw)
                   if (Array.isArray(browsingItems) && browsingItems.length > 0) {
-                    const sessionRaw = readStored('cart', data.session.token)
-                    const sessionItems = sessionRaw ? JSON.parse(sessionRaw) : []
-                    const merged = mergeBrowsingRemainderIntoSession(
-                      Array.isArray(sessionItems) ? sessionItems : [],
+                    const unsubmittedBrowsing = subtractUnresolvedQueueQuantities(
                       browsingItems,
+                      migratedEntries,
                     )
-                    writeStored('cart', JSON.stringify(merged), data.session.token)
+                    if (unsubmittedBrowsing.length > 0) {
+                      const sessionRaw = readStored('cart', data.session.token)
+                      const sessionItems = sessionRaw ? JSON.parse(sessionRaw) : []
+                      const merged = mergeBrowsingRemainderIntoSession(
+                        Array.isArray(sessionItems) ? sessionItems : [],
+                        unsubmittedBrowsing,
+                      )
+                      writeStored('cart', JSON.stringify(merged), data.session.token)
+                    }
                   }
                   removeStored('cart', `browsing:${data.table.id}`)
                 }
@@ -1335,6 +1358,15 @@ export function PublicMenu() {
     const currentQrToken = pendingScanToken || (typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('table') : null)
     const actorKey = sessionToken || (table?.id ? `table_${table.id}` : (currentQrToken ? `qr_${currentQrToken}` : null))
     if (!effectiveTenantId || !actorKey) return
+    if (sessionToken && typeof window !== 'undefined') {
+      migratePendingTableQueueToSession(
+        window.localStorage,
+        effectiveTenantId,
+        table?.id || sessionTableId,
+        sessionToken,
+        currentQrToken,
+      )
+    }
     const q = orderQueue(effectiveTenantId, actorKey, {
       onConfirmed: (order, entry) => {
         placingRef.current = false
@@ -1348,6 +1380,15 @@ export function PublicMenu() {
           const currentStored = getStoredDinerSession(effectiveTenantId, tblId)
           if (currentStored?.sessionToken === failedToken) {
             removeStoredDinerSession(effectiveTenantId, tblId)
+          }
+          if (sessionToken === failedToken) {
+            const browsingSuffix = `browsing:${tblId}`
+            try {
+              writeStored('cart', JSON.stringify(cartRef.current), browsingSuffix)
+            } catch {}
+            lastSyncedCartRef.current = { suffix: browsingSuffix, items: cartRef.current }
+            setSessionToken(null)
+            setSessionId(null)
           }
         }
         const msg = cleanOrderErrorMessage(error)

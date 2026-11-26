@@ -6,8 +6,10 @@ import { keyName } from '../src/lib/storage-keys'
 import {
   isDefinitiveSessionRejection,
   mergeBrowsingRemainderIntoSession,
+  migratePendingTableQueueToSession,
   reconcileCartOnConfirm,
   reconcileCartOnSave,
+  subtractUnresolvedQueueQuantities,
 } from '../src/lib/diner-cart-sync'
 
 const root = process.cwd()
@@ -981,6 +983,232 @@ await check('P2-11: QR reload imports browsing cart into active session once wit
   // Reload 2: dish-b stays qty 2 (never imported twice).
   const reload2 = simulateQrReload()
   assert.equal(reload2.find((c: any) => c.menuItemId === 'dish-b')?.quantity, 2)
+})
+
+// ---------------------------------------------------------------------------
+// 12. P1: Pending checkout resumes across session adoption on reload
+// ---------------------------------------------------------------------------
+await check('P1-12: lost response + QR reload migrates table queue to session queue, keeps idempotency key & blocks duplicate checkout', async () => {
+  const store = new MemoryStorage()
+  let nowMs = 4_000_000
+  const tenantId = 'tenant-1'
+  const tableId = 'tbl-1'
+  const qrToken = 'qr-table-1'
+  const sessionToken = 'tok-tab-a'
+  const sessionId = 'sess-tab-a'
+  const browsingKey = keyName('cart', `browsing:${tableId}`)
+  const sessionCartKey = keyName('cart', sessionToken)
+
+  // Tab A established session; Tab B has Dish B (submitted, response dropped) + Dish C (unsubmitted).
+  store.setItem(`restro_session:${tenantId}:${tableId}`, JSON.stringify({ sessionId, sessionToken }))
+  store.setItem(
+    browsingKey,
+    JSON.stringify([
+      { menuItemId: 'dish-b', name: 'Biryani', price: 220, quantity: 1 },
+      { menuItemId: 'dish-c', name: 'Raita', price: 50, quantity: 1 },
+    ]),
+  )
+
+  let postCalls = 0
+  let reconciledCalls = 0
+  const committedOrder = {
+    id: 'ord-migrated-1',
+    orderNumber: 801,
+    total: 220,
+    sessionId,
+    sessionToken,
+    items: [{ menuItemId: 'dish-b', quantity: 1 }],
+  }
+  let storedIdempotencyKey: string | null = null
+
+  const dropFetcher = (async (url: string, init?: RequestInit) => {
+    if (url === '/api/orders' && init?.method === 'POST') {
+      postCalls++
+      const body = JSON.parse(String(init.body))
+      storedIdempotencyKey = body.idempotencyKey
+      throw new Error('Response dropped')
+    }
+    return new Response(JSON.stringify({ error: 'Offline' }), { status: 503 })
+  }) as any
+
+  // Step 1: Browsing Tab B submits into table-scoped queue with A's saved token, response drops.
+  const tableQueue = new OrderQueue(
+    store,
+    keyName('orderQueue', `${tenantId}-table_${tableId}`),
+    dropFetcher,
+    {},
+    () => nowMs,
+  )
+  const entry = tableQueue.enqueue(
+    'diner',
+    { orderType: 'DINE_IN', tableSessionToken: sessionToken, items: [{ menuItemId: 'dish-b', quantity: 1 }] },
+    1,
+  )
+  await new Promise((r) => setTimeout(r, 10))
+  await tableQueue.process()
+  assert.equal(postCalls, 1)
+  assert.equal(tableQueue.load().length, 1)
+
+  // Step 2: Tab B reloads via QR URL, adopts sessionToken, migrates queue & subtracts unresolved items from cart.
+  const migrated = migratePendingTableQueueToSession(store, tenantId, tableId, sessionToken, qrToken)
+  assert.equal(migrated.length, 1)
+  assert.equal(migrated[0].key, entry.key)
+  assert.equal(tableQueue.load().length, 0, 'table queue must be drained after migration')
+
+  const browsingItems = JSON.parse(store.getItem(browsingKey) || '[]')
+  const unsubmittedOnly = subtractUnresolvedQueueQuantities(browsingItems, migrated)
+  assert.equal(unsubmittedOnly.some((c: any) => c.menuItemId === 'dish-b'), false, 'unresolved dish must not re-enter cart')
+  assert.equal(unsubmittedOnly.find((c: any) => c.menuItemId === 'dish-c')?.quantity, 1)
+  store.setItem(sessionCartKey, JSON.stringify(unsubmittedOnly))
+  store.removeItem(browsingKey)
+
+  // Step 3: Session-scoped queue resumes with original idempotency key and reconciles original order.
+  const recoverFetcher = (async (url: string) => {
+    if (url.startsWith(`/api/orders/by-key/${entry.key}`)) {
+      reconciledCalls++
+      return new Response(JSON.stringify(committedOrder), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(JSON.stringify({ error: 'Should not re-POST' }), { status: 500 })
+  }) as any
+
+  let recovered: any = null
+  const sessionQueue = new OrderQueue(
+    store,
+    keyName('orderQueue', `${tenantId}-${sessionToken}`),
+    recoverFetcher,
+    { onConfirmed: (o) => { recovered = o } },
+    () => nowMs + 60_000,
+  )
+  await sessionQueue.process()
+
+  assert.equal(reconciledCalls, 1)
+  assert.equal(postCalls, 1, 'only one order created')
+  assert.equal(recovered?.id, 'ord-migrated-1')
+  assert.equal(storedIdempotencyKey, entry.key)
+  assert.equal(sessionQueue.load().length, 0, 'queue cleared only after confirmation')
+
+  // After reload, confirmed dish-b stays out and dish-c survives.
+  const finalCart = JSON.parse(store.getItem(sessionCartKey) || '[]')
+  assert.equal(finalCart.some((c: any) => c.menuItemId === 'dish-b'), false)
+  assert.equal(finalCart.find((c: any) => c.menuItemId === 'dish-c')?.quantity, 1)
+})
+
+// ---------------------------------------------------------------------------
+// 13. P2: Confirmed removal delta applied to stale incremented cart (3 - 2 = 1)
+// ---------------------------------------------------------------------------
+await check('P2-13: confirmed removal of 2 units reduces stale tab edit from 3 to 1 while preserving unrelated dishes', () => {
+  const baseline = [
+    { menuItemId: 'dish-a', name: 'Samosa', price: 40, quantity: 2 },
+    { menuItemId: 'dish-other', name: 'Chai', price: 30, quantity: 1 },
+  ]
+  // Tab A confirms both units of dish-a, leaving only dish-other in stored cart.
+  const storedAfterTabAConfirm = [
+    { menuItemId: 'dish-other', name: 'Chai', price: 30, quantity: 1 },
+  ]
+  // Stale Tab B increments dish-a from 2 to 3 before processing storage update.
+  const staleTabBLocal = [
+    { menuItemId: 'dish-a', name: 'Samosa', price: 40, quantity: 3 },
+    { menuItemId: 'dish-other', name: 'Chai', price: 30, quantity: 1 },
+  ]
+
+  const reconciled = reconcileCartOnSave(staleTabBLocal, baseline, storedAfterTabAConfirm)
+  assert.equal(reconciled.find((c) => c.menuItemId === 'dish-a')?.quantity, 1)
+  assert.equal(reconciled.find((c) => c.menuItemId === 'dish-other')?.quantity, 1)
+})
+
+// ---------------------------------------------------------------------------
+// 14. P2: Clear rejected active token from BOTH page state and storage
+// ---------------------------------------------------------------------------
+await check('P2-14: ended adopted session clears both page state and storage so QR retry succeeds without reload', async () => {
+  const store = new MemoryStorage()
+  const tenantId = 'tenant-1'
+  const tableId = 'tbl-1'
+  const qrToken = 'qr-table-1'
+  const sessionKey = `restro_session:${tenantId}:${tableId}`
+  const endedToken = 'tok-ended-adopted'
+  const newToken = 'tok-fresh-qr'
+
+  // Simulate Tab B having adopted A's session in BOTH page state and storage.
+  let pageSessionToken: string | null = endedToken
+  let pageSessionId: string | null = 'sess-ended'
+  store.setItem(sessionKey, JSON.stringify({ sessionId: pageSessionId, sessionToken: endedToken }))
+  let cart = [{ menuItemId: 'dish-1', name: 'Dosa', price: 120, quantity: 1 }]
+
+  let postCount = 0
+  const sentPayloads: any[] = []
+
+  const fetcher = (async (url: string, init?: RequestInit) => {
+    if (url === '/api/orders' && init?.method === 'POST') {
+      postCount++
+      const body = JSON.parse(String(init.body))
+      sentPayloads.push(body)
+      if (body.tableSessionToken === endedToken) {
+        return new Response(
+          JSON.stringify({ error: 'Session ended. Please scan the table QR code again to continue.', code: 'SESSION_ENDED' }),
+          { status: 403, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      return new Response(
+        JSON.stringify({ id: 'ord-qr-retry', orderNumber: 901, total: 120, sessionId: 'sess-new', sessionToken: newToken }),
+        { status: 201, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 })
+  }) as any
+
+  let confirmedOrder: any = null
+  const q = new OrderQueue(
+    store,
+    keyName('orderQueue', `${tenantId}-${endedToken}`),
+    fetcher,
+    {
+      onFailed: (error, entry, code) => {
+        const failedToken = entry.payload?.tableSessionToken
+        if (failedToken && isDefinitiveSessionRejection(error, code)) {
+          const cur = JSON.parse(store.getItem(sessionKey) || 'null')
+          if (cur?.sessionToken === failedToken) store.removeItem(sessionKey)
+          if (pageSessionToken === failedToken) {
+            pageSessionToken = null
+            pageSessionId = null
+          }
+        }
+        q.retire(entry.key)
+      },
+      onConfirmed: (o) => { confirmedOrder = o },
+    },
+    () => 1000,
+  )
+
+  q.enqueue('diner', { orderType: 'DINE_IN', tableSessionToken: pageSessionToken, items: cart }, 1)
+  await new Promise((r) => setTimeout(r, 10))
+  await q.process()
+
+  // Both page state and storage cleared; cart preserved.
+  assert.equal(pageSessionToken, null)
+  assert.equal(pageSessionId, null)
+  assert.equal(store.getItem(sessionKey), null)
+  assert.equal(cart.length, 1)
+
+  // Retry without reload goes through QR token and creates 1 order in valid session.
+  const qrRetryQ = new OrderQueue(
+    store,
+    keyName('orderQueue', `${tenantId}-table_${tableId}`),
+    fetcher,
+    { onConfirmed: (o) => { confirmedOrder = o } },
+    () => 2000,
+  )
+  qrRetryQ.enqueue('diner', { orderType: 'DINE_IN', qrToken, tableId, items: cart }, 1)
+  await new Promise((r) => setTimeout(r, 10))
+  await qrRetryQ.process()
+
+  assert.equal(postCount, 2)
+  assert.equal(sentPayloads[1].qrToken, qrToken)
+  assert.equal(sentPayloads[1].tableSessionToken, undefined)
+  assert.equal(confirmedOrder?.id, 'ord-qr-retry')
+  assert.equal(confirmedOrder?.sessionToken, newToken)
 })
 
 console.log(`\n${pass} passed, ${fail} failed`)
