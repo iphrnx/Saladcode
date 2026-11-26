@@ -76,9 +76,18 @@ function resolveQrUrl(qrUrl: string, qrToken: string): string {
   if (configured && qrToken) {
     return `${configured}/?view=public-menu&table=${encodeURIComponent(qrToken)}`
   }
-  if (qrUrl.startsWith('http')) return qrUrl
+  if (qrUrl.startsWith('http')) {
+    try {
+      if (!new URL(qrUrl).hostname.endsWith('.supabase.co')) return qrUrl
+    } catch {
+      return qrUrl
+    }
+  }
   const origin = typeof window !== 'undefined' ? window.location.origin : ''
-  return `${origin}${qrUrl}`
+  if (origin && qrToken) {
+    return `${origin}/?view=public-menu&table=${encodeURIComponent(qrToken)}`
+  }
+  return qrUrl.startsWith('http') ? qrUrl : `${origin}${qrUrl}`
 }
 
 export function QrView() {

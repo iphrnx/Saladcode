@@ -27,8 +27,20 @@ import {
 import { cn } from '@/lib/utils'
 import { createClient } from '@/lib/supabase/client'
 import { edgeFetch, edgeUrl } from '@/lib/edge'
-import { orderQueue, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
-import { keyName, readStored, removeStored, writeStored } from '@/lib/storage-keys'
+import { orderQueue, readQueueStrict, startOrderQueue, cleanOrderErrorMessage, type QueueEntry } from '@/lib/order-queue'
+import {
+  isDefinitiveSessionRejection,
+  mergeBrowsingRemainderIntoSession,
+  migratePendingTableQueueToSession,
+  reconcileCartOnConfirm,
+  reconcileCartOnSave,
+  reservationsForSourceCart,
+  resolveRestoredLinePrice,
+  sameSyncCartLine,
+  subtractUnresolvedQueueQuantities,
+  withCrossTabCheckoutLock,
+} from '@/lib/diner-cart-sync'
+import { keyName, readStored, readStoredStrict, removeStored, removeStoredStrict, writeStored, writeStoredStrict } from '@/lib/storage-keys'
 import { DinerOrderTracker } from '@/components/public/diner-order-tracker'
 import {
   canonicalPortionName,
@@ -217,7 +229,7 @@ function tagMeta(tag: string): { label: string; icon?: React.ReactNode; cls: str
 
 
 type CachedDinerSession = { token: string; tenantId: string; tableId: string }
-type StoredDinerSession = { sessionId: string; sessionToken: string }
+type StoredDinerSession = { sessionId: string; sessionToken: string; updatedAt?: number }
 
 function getDinerStorageKey(restaurantId: string, tableId: string): string {
   return `restro_session:${restaurantId}:${tableId}`
@@ -237,9 +249,138 @@ function getStoredDinerSession(restaurantId: string, tableId: string): StoredDin
   }
 }
 
+function setStoredDinerSessionStrict(restaurantId: string, tableId: string, session: StoredDinerSession) {
+  localStorage.setItem(
+    getDinerStorageKey(restaurantId, tableId),
+    JSON.stringify({ ...session, updatedAt: session.updatedAt ?? Date.now() }),
+  )
+}
+
+class QueueReadError extends Error {
+  constructor(message = 'Unable to read reservation state.') {
+    super(message)
+    this.name = 'QueueReadError'
+  }
+}
+
+function getPendingConfirmationTarget(tenantId: string, entryKey: string): CartItem[] | null {
+  try {
+    const raw = localStorage.getItem(`the-salad-confirmed-targets-${tenantId}`)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return null
+    const found = parsed.find((x: any) => x && x.key === entryKey)
+    return found && Array.isArray(found.targetCart) ? found.targetCart : null
+  } catch {
+    return null
+  }
+}
+
+function savePendingConfirmationTarget(tenantId: string, entryKey: string, targetCart: CartItem[]): void {
+  const key = `the-salad-confirmed-targets-${tenantId}`
+  let existing: Array<{ key: string; targetCart: CartItem[] }> = []
+  try {
+    const raw = localStorage.getItem(key)
+    const parsed = raw ? JSON.parse(raw) : []
+    if (Array.isArray(parsed)) existing = parsed.filter((x: any) => x && x.key !== entryKey)
+  } catch {}
+  const next = [{ key: entryKey, targetCart }, ...existing].slice(0, 20)
+  localStorage.setItem(key, JSON.stringify(next))
+}
+
+function performBrowsingTransferToSession(
+  tenantId: string,
+  tableId: string | null | undefined,
+  adoptedToken: string,
+  qrToken: string | null,
+): CartItem[] | null {
+  let browsingRaw: string | null = null
+  try {
+    browsingRaw = tableId ? readStoredStrict('cart', `browsing:${tableId}`) : null
+  } catch {
+    throw new QueueReadError('Unable to read browsing cart.')
+  }
+  let browsingItems: CartItem[] = []
+  if (browsingRaw !== null && browsingRaw !== '') {
+    try {
+      const parsed = JSON.parse(browsingRaw)
+      if (!Array.isArray(parsed)) throw new Error('Corrupt browsing cart')
+      browsingItems = parsed
+    } catch {
+      throw new QueueReadError('Corrupt browsing cart.')
+    }
+  }
+
+  let sessionEntries: QueueEntry[] = []
+  let sourcePendingEntries: QueueEntry[] = []
+  try {
+    sessionEntries = readQueueStrict(tenantId, adoptedToken)
+    if (tableId) {
+      sourcePendingEntries = [...sourcePendingEntries, ...readQueueStrict(tenantId, `table_${tableId}`)]
+    }
+    if (qrToken) {
+      sourcePendingEntries = [...sourcePendingEntries, ...readQueueStrict(tenantId, `qr_${qrToken}`)]
+    }
+  } catch {
+    throw new QueueReadError('Unable to read pending reservations.')
+  }
+
+  const browsingSuffix = tableId ? `browsing:${tableId}` : null
+  const transferDoneKey = `the-salad-transfer-done-${tenantId}-${tableId || 'none'}-${adoptedToken}`
+  let alreadyMerged = false
+  try {
+    alreadyMerged = localStorage.getItem(transferDoneKey) === '1'
+  } catch {}
+
+  let mergedResult: CartItem[] | null = null
+  if (tableId && browsingRaw !== null && !alreadyMerged) {
+    if (browsingItems.length > 0) {
+      const activeBrowsingReservations = reservationsForSourceCart(
+        [...sessionEntries, ...sourcePendingEntries],
+        browsingSuffix,
+      )
+      const unsubmittedBrowsing = subtractUnresolvedQueueQuantities(
+        browsingItems,
+        activeBrowsingReservations,
+      )
+      if (unsubmittedBrowsing.length > 0) {
+        const sessionRaw = readStored('cart', adoptedToken)
+        const sessionItems = sessionRaw ? JSON.parse(sessionRaw) : []
+        const merged = mergeBrowsingRemainderIntoSession(
+          Array.isArray(sessionItems) ? sessionItems : [],
+          unsubmittedBrowsing,
+        )
+        writeStoredStrict('cart', JSON.stringify(merged), adoptedToken)
+        mergedResult = merged
+      }
+    }
+    localStorage.setItem(transferDoneKey, '1')
+  }
+
+  migratePendingTableQueueToSession(
+    window.localStorage,
+    tenantId,
+    tableId,
+    adoptedToken,
+    qrToken,
+    browsingItems.length > 0,
+  )
+
+  if (tableId && browsingRaw !== null) {
+    removeStoredStrict('cart', `browsing:${tableId}`)
+  }
+  try {
+    localStorage.removeItem(transferDoneKey)
+  } catch {}
+  return mergedResult
+}
+
 function setStoredDinerSession(restaurantId: string, tableId: string, session: StoredDinerSession) {
   try {
-    localStorage.setItem(getDinerStorageKey(restaurantId, tableId), JSON.stringify(session))
+    localStorage.setItem(
+      getDinerStorageKey(restaurantId, tableId),
+      JSON.stringify({ ...session, updatedAt: session.updatedAt ?? Date.now() }),
+    )
   } catch {
     /* ignore */
   }
@@ -275,6 +416,7 @@ function setStoredQrMap(qrToken: string, restaurantId: string, tableId: string) 
 
 function findAnyStoredDinerSession(): { restaurantId: string; tableId: string; sessionId: string; sessionToken: string } | null {
   try {
+    let best: { restaurantId: string; tableId: string; sessionId: string; sessionToken: string; updatedAt: number } | null = null
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i)
       if (key && key.startsWith('restro_session:')) {
@@ -286,10 +428,21 @@ function findAnyStoredDinerSession(): { restaurantId: string; tableId: string; s
           if (raw) {
             const parsed = JSON.parse(raw)
             if (parsed?.sessionId && parsed?.sessionToken) {
-              return { restaurantId, tableId, sessionId: parsed.sessionId, sessionToken: parsed.sessionToken }
+              const updatedAt = typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0
+              if (!best || updatedAt >= best.updatedAt) {
+                best = { restaurantId, tableId, sessionId: parsed.sessionId, sessionToken: parsed.sessionToken, updatedAt }
+              }
             }
           }
         }
+      }
+    }
+    if (best) {
+      return {
+        restaurantId: best.restaurantId,
+        tableId: best.tableId,
+        sessionId: best.sessionId,
+        sessionToken: best.sessionToken,
       }
     }
   } catch {
@@ -324,6 +477,10 @@ export function PublicMenu() {
   // session state: 'activating' | 'active' | 'ended' | 'invalid'
   const [sessionState, setSessionState] = useState<'activating' | 'active' | 'ended' | 'invalid'>('activating')
   const [sessionToken, setSessionToken] = useState<string | null>(null)
+  const sessionTokenRef = useRef<string | null>(null)
+  useEffect(() => {
+    sessionTokenRef.current = sessionToken
+  }, [sessionToken])
   /** The server's id for this diner's session — used to double-check payloads. */
   const [sessionId, setSessionId] = useState<string | null>(null)
   /**
@@ -359,6 +516,11 @@ export function PublicMenu() {
   // Latest cart, for the live-menu handler below, so that effect does not need
   // to re-subscribe on every change of the cart.
   const cartIdsRef = useRef<string[]>([])
+  const cartRef = useRef<CartItem[]>([])
+  const lastSyncedCartRef = useRef<{ suffix: string | null; items: CartItem[] }>({
+    suffix: null,
+    items: [],
+  })
   const [cartOpen, setCartOpen] = useState(false)
   const [queueEntries, setQueueEntries] = useState<QueueEntry[]>([])
   // Mirrors "a checkout is in flight" synchronously — see placeOrder.
@@ -385,6 +547,7 @@ export function PublicMenu() {
   // re-subscribing every time a line is added — updated in an effect, because a
   // ref written during render is exactly the re-render trap it exists to avoid.
   useEffect(() => {
+    cartRef.current = cart
     cartIdsRef.current = cart.map((line) => line.menuItemId)
   }, [cart])
 
@@ -527,8 +690,7 @@ export function PublicMenu() {
     if (tId && tblId) {
       removeStoredDinerSession(tId, tblId)
     }
-    setSessionToken(null)
-    setSessionId(null)
+    lockDinerSession(setSessionState)
     setOrdersRefreshKey((k) => k + 1)
     setCartOpen(false)
   }
@@ -605,6 +767,33 @@ export function PublicMenu() {
       setServerTheme(normaliseMenuTheme(data.theme))
     }
 
+    async function transferBrowsingStateToSession(
+      tenantId: string,
+      tableId: string | null | undefined,
+      adoptedToken: string,
+      qrToken: string | null,
+    ): Promise<'ok' | 'read_error' | 'quota_retry'> {
+      if (typeof window === 'undefined' || !tenantId || !adoptedToken) return 'ok'
+      const runTransfer = () => {
+        performBrowsingTransferToSession(tenantId, tableId, adoptedToken, qrToken)
+      }
+
+      const lockKey = `the-salad-checkout-lock-${tenantId}-adopt:${tableId || 'none'}:${adoptedToken}`
+      try {
+        if (typeof navigator !== 'undefined' && navigator.locks?.request) {
+          await navigator.locks.request(lockKey, () => runTransfer())
+        } else {
+          runTransfer()
+        }
+        return 'ok'
+      } catch (err) {
+        if (err instanceof QueueReadError) {
+          return 'read_error'
+        }
+        return 'quota_retry'
+      }
+    }
+
     async function activateAndLoad() {
       try {
         setLoading(true)
@@ -649,6 +838,30 @@ export function PublicMenu() {
           }
 
           if (data?.session) {
+            const transferStatus = await transferBrowsingStateToSession(
+              data.tenant.id,
+              data?.table?.id,
+              data.session.token,
+              qrToken,
+            )
+            if (transferStatus === 'read_error') {
+              setSessionToken(null)
+              setSessionId(null)
+              setTenant(data.tenant)
+              setTable(data.table)
+              setSessionTenantId(data.tenant.id)
+              setSessionTableId(data.table.id)
+              setCategories(data.categories || [])
+              setMenuItems(data.menuItems || [])
+              setSocial(data.social || {})
+              setServerTheme(normaliseMenuTheme(data.theme))
+              setSessionState('active')
+              setLoading(false)
+              setTimeout(() => {
+                if (!cancelled) setRevalidateNonce((n) => n + 1)
+              }, 1000)
+              return
+            }
             adopt({ token: data.session.token, tenantId: data.tenant.id, tableId: data.table.id }, data)
             setStoredDinerSession(data.tenant.id, data.table.id, {
               sessionId: data.session.id,
@@ -695,11 +908,43 @@ export function PublicMenu() {
           setReviewsEnabled(data?.reviewsEnabled !== false)
           setAvgRating(typeof data?.averageRating === 'number' ? data.averageRating : null)
           setReviewCount(typeof data?.reviewCount === 'number' ? data.reviewCount : 0)
-          lockDinerSession(setSessionState)
+          if (data?.orderId) setBillOrderId(data.orderId)
+          lockButKeepCredential(
+            {
+              token: anyStored.sessionToken,
+              tenantId: anyStored.restaurantId,
+              tableId: anyStored.tableId,
+            },
+            data,
+          )
           setLoading(false)
           return
         }
 
+        const transferStatus = await transferBrowsingStateToSession(
+          anyStored.restaurantId,
+          anyStored.tableId,
+          anyStored.sessionToken,
+          null,
+        )
+        if (transferStatus === 'read_error') {
+          setSessionToken(null)
+          setSessionId(null)
+          setTenant(data.tenant)
+          setTable(data.table)
+          setSessionTenantId(anyStored.restaurantId)
+          setSessionTableId(anyStored.tableId)
+          setCategories(data.categories || [])
+          setMenuItems(data.menuItems || [])
+          setSocial(data.social || {})
+          setServerTheme(normaliseMenuTheme(data.theme))
+          setSessionState('active')
+          setLoading(false)
+          setTimeout(() => {
+            if (!cancelled) setRevalidateNonce((n) => n + 1)
+          }, 1000)
+          return
+        }
         adopt({ token: anyStored.sessionToken, tenantId: anyStored.restaurantId, tableId: anyStored.tableId }, data)
         setSessionState('active')
         setLoading(false)
@@ -718,36 +963,81 @@ export function PublicMenu() {
     }
   }, [revalidateNonce])
 
-  // ----- Cart persistence (keyed by SESSION, not just table) -----
+  // ----- Cart persistence (keyed by SESSION once ordered, or table while browsing) -----
   // Switching tables / re-scanning creates a new session → fresh cart.
+  const cartSuffix = useMemo(() => {
+    if (sessionToken) return sessionToken
+    if (table?.id) return `browsing:${table.id}`
+    return null
+  }, [sessionToken, table?.id])
+
   const cartKey = useMemo(() => {
-    if (!sessionToken) return null
-    return keyName('cart', sessionToken)
-  }, [sessionToken])
+    if (!cartSuffix) return null
+    return keyName('cart', cartSuffix)
+  }, [cartSuffix])
 
   // load
   useEffect(() => {
-    if (!cartKey) return
+    if (!cartSuffix) return
     try {
-      const raw = readStored('cart', sessionToken ?? '')
+      const raw = readStored('cart', cartSuffix)
+      const parsed = raw ? (JSON.parse(raw) as CartItem[]) : []
+      const items = Array.isArray(parsed) ? parsed : []
+      lastSyncedCartRef.current = { suffix: cartSuffix, items }
+      cartRef.current = items
+      if (raw && Array.isArray(parsed)) setCart(parsed)
+    } catch {
+      lastSyncedCartRef.current = { suffix: cartSuffix, items: [] }
+      cartRef.current = []
+    }
+  }, [cartSuffix])
+
+  // cross-tab storage sync for the active cart key
+  useEffect(() => {
+    if (!cartKey || !cartSuffix || typeof window === 'undefined') return
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== cartKey) return
+      try {
+        const parsed = e.newValue ? (JSON.parse(e.newValue) as CartItem[]) : []
+        if (!Array.isArray(parsed)) return
+        lastSyncedCartRef.current = { suffix: cartSuffix, items: parsed }
+        cartRef.current = parsed
+        setCart(parsed)
+      } catch {
+        /* ignore */
+      }
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [cartKey, cartSuffix])
+
+  // save (reconciling any concurrent session-cart merges from another tab)
+  const prevCartSuffixRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!cartSuffix) return
+    if (prevCartSuffixRef.current !== cartSuffix) {
+      prevCartSuffixRef.current = cartSuffix
+      return
+    }
+    if (lastSyncedCartRef.current.suffix !== cartSuffix) return
+    try {
+      let latestStored: CartItem[] = []
+      const raw = readStored('cart', cartSuffix)
       if (raw) {
-        const parsed = JSON.parse(raw) as CartItem[]
-        if (Array.isArray(parsed)) setCart(parsed)
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed)) latestStored = parsed
+      }
+      const reconciled = reconcileCartOnSave(cart, lastSyncedCartRef.current.items, latestStored)
+      lastSyncedCartRef.current = { suffix: cartSuffix, items: reconciled }
+      writeStored('cart', JSON.stringify(reconciled), cartSuffix)
+      if (JSON.stringify(reconciled) !== JSON.stringify(cart)) {
+        cartRef.current = reconciled
+        setCart(reconciled)
       }
     } catch {
       /* ignore */
     }
-  }, [cartKey])
-
-  // save
-  useEffect(() => {
-    if (!cartKey) return
-    try {
-      writeStored('cart', JSON.stringify(cart), sessionToken ?? '')
-    } catch {
-      /* ignore */
-    }
-  }, [cart, cartKey])
+  }, [cart, cartSuffix])
 
   // ----- Cart actions -----
   function addToCart(item: MenuItem, portion?: { id?: string; name: string; price: number } | null) {
@@ -1042,7 +1332,7 @@ export function PublicMenu() {
   // The checkout is snapshotted into the persistent queue with an
   // idempotency key: a network drop can no longer lose or duplicate the
   // order. The cart is cleared only by the confirmation itself.
-  function placeOrder() {
+  async function placeOrder() {
     if (!cart.length) return
     // Synchronous double-click guard: `busy` is React state and two clicks
     // can land before it flushes. The ref closes the window.
@@ -1067,53 +1357,281 @@ export function PublicMenu() {
       }
     }
 
-    const items = cart.map((c) => ({
-      menuItemId: c.menuItemId,
-      portionId: c.portionId || undefined,
-      portion: c.portion || undefined,
-      quantity: c.quantity,
-      notes: c.notes || '',
-    }))
-    const actorKey = sessionToken || (table?.id ? `table_${table.id}` : `qr_${currentQrToken}`)
-    const payload: Record<string, any> = {
-      orderType: 'DINE_IN',
-      items,
-    }
-    if (sessionToken) {
-      payload.tableSessionToken = sessionToken
-    } else if (currentQrToken) {
-      payload.qrToken = currentQrToken
-      if (table?.id) payload.tableId = table.id
-    }
     placingRef.current = true
-    orderQueue(effectiveTenantId, actorKey, {}).enqueue(
-      'diner',
-      payload,
-      items.length,
-    )
+    const tblId = table?.id || sessionTableId
+    const sourceCartSuffix = sessionToken || (tblId ? `browsing:${tblId}` : null)
+    const lockScope = sourceCartSuffix || (currentQrToken ? `qr_${currentQrToken}` : 'diner')
+
+    const runLocked = () => {
+      const existingStoredSession =
+        !sessionToken && tblId ? getStoredDinerSession(effectiveTenantId, tblId) : null
+      const activeToken = sessionToken || existingStoredSession?.sessionToken || null
+      const actorKey = sessionToken || (tblId ? `table_${tblId}` : `qr_${currentQrToken}`)
+      const q = orderQueue(effectiveTenantId, actorKey, {})
+
+      // Reconcile this tab's cart against the latest saved cart in storage so a
+      // stale tab cannot re-submit items another tab already confirmed.
+      let workingCart = [...cartRef.current]
+      if (sourceCartSuffix) {
+        try {
+          const rawStored = readStored('cart', sourceCartSuffix)
+          const parsedStored = rawStored ? JSON.parse(rawStored) : []
+          const latestStored = Array.isArray(parsedStored) ? parsedStored : []
+          if (lastSyncedCartRef.current.suffix === sourceCartSuffix) {
+            workingCart = reconcileCartOnSave(
+              workingCart,
+              lastSyncedCartRef.current.items,
+              latestStored,
+            )
+            lastSyncedCartRef.current = { suffix: sourceCartSuffix, items: workingCart }
+            cartRef.current = workingCart
+            setCart(workingCart)
+          }
+        } catch {}
+      }
+
+      // Scope unresolved reservations to the source cart that supplied them so
+      // a pending session order never blocks independent browsing quantities.
+      // Fail closed if reservation state or legacy queue migration cannot be read.
+      let rawEntries: QueueEntry[]
+      try {
+        rawEntries = [
+          ...readQueueStrict(effectiveTenantId, actorKey),
+          ...(activeToken && activeToken !== actorKey
+            ? readQueueStrict(effectiveTenantId, activeToken)
+            : []),
+        ]
+      } catch {
+        placingRef.current = false
+        toast.error('Unable to verify existing orders right now. Please try again.')
+        return
+      }
+      const activeUnresolved = reservationsForSourceCart(rawEntries, sourceCartSuffix)
+
+      const submittableCart = subtractUnresolvedQueueQuantities(workingCart, activeUnresolved)
+      if (submittableCart.length === 0) {
+        placingRef.current = false
+        toast.info('Your order is already being submitted.')
+        return
+      }
+
+      const submittableItems = submittableCart.map((c) => ({
+        menuItemId: c.menuItemId,
+        portionId: c.portionId || undefined,
+        portion: c.portion || undefined,
+        quantity: c.quantity,
+        notes: c.notes || '',
+      }))
+      const payload: Record<string, any> = {
+        orderType: 'DINE_IN',
+        items: submittableItems,
+      }
+      if (activeToken) {
+        payload.tableSessionToken = activeToken
+      } else if (currentQrToken) {
+        payload.qrToken = currentQrToken
+        if (tblId) payload.tableId = tblId
+      }
+      q.enqueue('diner', payload, submittableItems.length, undefined, {
+        sourceCartSuffix: sourceCartSuffix ?? undefined,
+        cartSnapshot: submittableCart.map((c) => ({ ...c })),
+      })
+    }
+
+    try {
+      await withCrossTabCheckoutLock(
+        typeof window !== 'undefined' ? window.localStorage : null,
+        effectiveTenantId,
+        lockScope,
+        runLocked,
+      )
+    } catch (err: any) {
+      placingRef.current = false
+      toast.error(
+        err?.message || 'Unable to lock checkout right now. Please try again.',
+      )
+    }
   }
 
   // Everything that happens once the server has the order — fresh commit or
   // reconciled replay. One function, because the two paths must not diverge.
-  function handleOrderConfirmed(order: any, entry: QueueEntry) {
-    if (order?.id) {
-      setPlacedOrderId(order.id)
-      try {
-        writeStored('lastOrderId', order.id)
-      } catch {}
-    }
+  async function handleOrderConfirmed(
+    order: any,
+    entry: QueueEntry,
+    finalize?: () => void,
+  ): Promise<boolean> {
+    const submittedItems = entry.payload?.items ?? []
 
     if (order?.sessionToken && order?.sessionId) {
-      setSessionToken(order.sessionToken)
-      setSessionId(order.sessionId)
       const tId = tenant?.id || sessionTenantId
       const tblId = table?.id || sessionTableId
+      const adoptingNewSession = order.sessionToken !== sessionToken
+      const lockScope = entry.sourceCartSuffix || order.sessionToken
+
+      try {
+        await withCrossTabCheckoutLock(
+          typeof window !== 'undefined' ? window.localStorage : null,
+          tId || 'diner',
+          lockScope,
+          () => {
+            let existingSessionCart: CartItem[] = []
+            try {
+              const raw = readStored('cart', order.sessionToken)
+              if (raw) {
+                const parsed = JSON.parse(raw)
+                if (Array.isArray(parsed)) existingSessionCart = parsed
+              }
+            } catch {}
+
+            let nextCart: CartItem[]
+            const tenantKey = tId || 'diner'
+            const recordedTarget = getPendingConfirmationTarget(tenantKey, entry.key)
+            const fromSeparateBrowsingCart =
+              Boolean(entry.cartDeducted) ||
+              Boolean(
+                entry.sourceCartSuffix &&
+                  entry.sourceCartSuffix !== order.sessionToken &&
+                  !adoptingNewSession,
+              )
+
+            if (adoptingNewSession) {
+              if (recordedTarget !== null) {
+                nextCart = recordedTarget
+                if (nextCart.length > 0) {
+                  writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
+                }
+              } else if (!entry.cartDeducted) {
+                const browsingSuffix = tblId ? `browsing:${tblId}` : null
+                let latestBrowsing: CartItem[] = [...cartRef.current]
+                if (browsingSuffix) {
+                  try {
+                    const rawBrowsing = readStored('cart', browsingSuffix)
+                    if (rawBrowsing) {
+                      const parsed = JSON.parse(rawBrowsing)
+                      if (Array.isArray(parsed)) latestBrowsing = parsed
+                    }
+                  } catch {}
+                }
+                const baseline =
+                  browsingSuffix && lastSyncedCartRef.current.suffix === browsingSuffix
+                    ? lastSyncedCartRef.current.items
+                    : latestBrowsing
+                const remainingBrowsing = reconcileCartOnConfirm(
+                  cartRef.current,
+                  baseline,
+                  latestBrowsing,
+                  submittedItems,
+                )
+                nextCart =
+                  remainingBrowsing.length > 0
+                    ? mergeBrowsingRemainderIntoSession(existingSessionCart, remainingBrowsing)
+                    : existingSessionCart
+                savePendingConfirmationTarget(tenantKey, entry.key, nextCart)
+                if (nextCart.length > 0) {
+                  writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
+                }
+              } else {
+                nextCart = existingSessionCart
+              }
+              if (tId && tblId) {
+                setStoredDinerSessionStrict(tId, tblId, {
+                  sessionId: order.sessionId,
+                  sessionToken: order.sessionToken,
+                })
+              }
+              if (tblId) {
+                removeStoredStrict('cart', `browsing:${tblId}`)
+              }
+            } else if (fromSeparateBrowsingCart) {
+              // Quantities for this recovered checkout came from a separate browsing
+              // cart; do not deduct them from the session cart.
+              if (recordedTarget !== null) {
+                nextCart = recordedTarget
+              } else if (lastSyncedCartRef.current.suffix === order.sessionToken) {
+                nextCart = reconcileCartOnSave(
+                  cartRef.current,
+                  lastSyncedCartRef.current.items,
+                  existingSessionCart,
+                )
+                savePendingConfirmationTarget(tenantKey, entry.key, nextCart)
+              } else {
+                nextCart = existingSessionCart
+                savePendingConfirmationTarget(tenantKey, entry.key, nextCart)
+              }
+              writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
+            } else {
+              // Reconcile confirmed quantities against the previous sync baseline and
+              // latest saved cart, persisting target before writing cart so any
+              // partial failure replays idempotently without double deduction.
+              if (recordedTarget !== null) {
+                nextCart = recordedTarget
+              } else {
+                const baseline =
+                  lastSyncedCartRef.current.suffix === order.sessionToken
+                    ? lastSyncedCartRef.current.items
+                    : existingSessionCart
+                nextCart = reconcileCartOnConfirm(
+                  cartRef.current,
+                  baseline,
+                  existingSessionCart,
+                  submittedItems,
+                )
+                savePendingConfirmationTarget(tenantKey, entry.key, nextCart)
+              }
+              writeStoredStrict('cart', JSON.stringify(nextCart), order.sessionToken)
+            }
+
+            finalize?.()
+            lastSyncedCartRef.current = { suffix: order.sessionToken, items: nextCart }
+            setCart(nextCart)
+            cartRef.current = nextCart
+          },
+        )
+      } catch {
+        return false
+      }
+
+      if (order?.id) {
+        setPlacedOrderId(order.id)
+        try {
+          writeStored('lastOrderId', order.id)
+        } catch {}
+      }
+
+      if (adoptingNewSession && tblId) {
+        try {
+          removeStored('cart', `browsing:${tblId}`)
+        } catch {}
+      }
       if (tId && tblId) {
         setStoredDinerSession(tId, tblId, {
           sessionId: order.sessionId,
           sessionToken: order.sessionToken,
         })
       }
+      setSessionToken(order.sessionToken)
+      setSessionId(order.sessionId)
+    } else {
+      let remainingCart = [...cartRef.current]
+      for (const line of submittedItems) {
+        const qty = Math.max(1, Number(line.quantity) || 1)
+        remainingCart = remainingCart
+          .map((c) =>
+            sameCartLine(c, line.menuItemId, line.portion ?? null, line.portionId ?? null)
+              ? { ...c, quantity: c.quantity - qty }
+              : c,
+          )
+          .filter((c) => c.quantity > 0)
+      }
+      finalize?.()
+      if (order?.id) {
+        setPlacedOrderId(order.id)
+        try {
+          writeStored('lastOrderId', order.id)
+        } catch {}
+      }
+      setCart(remainingCart)
+      cartRef.current = remainingCart
     }
 
     // Refresh diner order tracker immediately
@@ -1142,22 +1660,6 @@ export function PublicMenu() {
       table: order.table,
       items: Array.isArray(order.items) ? order.items : [],
     })
-    // Remove exactly what this order consumed — dishes added after the
-    // submit stay in the cart.
-    setCart((prev) => {
-      let next = [...prev]
-      for (const line of entry.payload?.items ?? []) {
-        const qty = Math.max(1, Number(line.quantity) || 1)
-        next = next
-          .map((c) =>
-            sameCartLine(c, line.menuItemId, line.portion ?? null, line.portionId ?? null)
-              ? { ...c, quantity: c.quantity - qty }
-              : c,
-          )
-          .filter((c) => c.quantity > 0)
-      }
-      return next
-    })
     if (order?.pendingActivation) {
       // Not a failure and not a confirmation: the order exists, but the kitchen
       // has not been told about it yet.
@@ -1167,6 +1669,7 @@ export function PublicMenu() {
       setAwaitingActivation(false)
       toast.success('Order placed!', { duration: 2500 })
     }
+    return true
   }
 
   // The queue lifecycle follows the session or table: same scope (tenant + actorKey)
@@ -1176,13 +1679,94 @@ export function PublicMenu() {
     const currentQrToken = pendingScanToken || (typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('table') : null)
     const actorKey = sessionToken || (table?.id ? `table_${table.id}` : (currentQrToken ? `qr_${currentQrToken}` : null))
     if (!effectiveTenantId || !actorKey) return
+    let migrationPending = false
+    const tryMigrateToSession = () => {
+      if (!sessionToken || typeof window === 'undefined') return true
+      const tblId = table?.id || sessionTableId
+      try {
+        const merged = performBrowsingTransferToSession(
+          effectiveTenantId,
+          tblId,
+          sessionToken,
+          currentQrToken,
+        )
+        if (merged) {
+          lastSyncedCartRef.current = { suffix: sessionToken, items: merged }
+          cartRef.current = merged
+          setCart(merged)
+        }
+        return true
+      } catch {
+        return false
+      }
+    }
+    if (sessionToken && typeof window !== 'undefined') {
+      migrationPending = !tryMigrateToSession()
+    }
     const q = orderQueue(effectiveTenantId, actorKey, {
-      onConfirmed: (order, entry) => {
+      onConfirmed: (order, entry, finalize) => {
         placingRef.current = false
-        handleOrderConfirmed(order, entry)
+        return handleOrderConfirmed(order, entry, finalize)
       },
-      onFailed: (error, entry) => {
+      onFailed: (error, entry, code) => {
         placingRef.current = false
+        let workingCart = [...cartRef.current]
+        if (entry.cartDeducted && Array.isArray(entry.payload?.items)) {
+          const restored: CartItem[] = entry.payload.items.map((line: any) => {
+            const menuMatch = menuItems.find((m) => m.id === line.menuItemId)
+            const snap = entry.cartSnapshot?.find((s) =>
+              sameSyncCartLine(s, line.menuItemId, line.portion ?? null, line.portionId ?? null),
+            )
+            return {
+              menuItemId: line.menuItemId,
+              name: snap?.name || menuMatch?.name || line.name || 'Item',
+              portionId: snap?.portionId ?? line.portionId ?? null,
+              portion: snap?.portion ?? line.portion ?? null,
+              price: resolveRestoredLinePrice(
+                menuMatch,
+                snap?.portion ?? line.portion,
+                snap?.portionId ?? line.portionId,
+                snap?.price ?? line.price,
+              ),
+              image: snap?.image ?? menuMatch?.image ?? null,
+              quantity: Math.max(1, Number(line.quantity) || 1),
+              notes: snap?.notes || line.notes || undefined,
+              prepTime: snap?.prepTime ?? menuMatch?.prepTime,
+            }
+          })
+          workingCart = mergeBrowsingRemainderIntoSession(workingCart, restored)
+          cartRef.current = workingCart
+          setCart(workingCart)
+        }
+
+        const failedToken = entry.payload?.tableSessionToken
+        const tblId = table?.id || sessionTableId
+        if (failedToken && tblId && isDefinitiveSessionRejection(error, code)) {
+          const currentStored = getStoredDinerSession(effectiveTenantId, tblId)
+          if (currentStored?.sessionToken === failedToken) {
+            removeStoredDinerSession(effectiveTenantId, tblId)
+          }
+          if (sessionTokenRef.current === failedToken) {
+            const browsingSuffix = `browsing:${tblId}`
+            let existingBrowsing: CartItem[] = []
+            try {
+              const raw = readStored('cart', browsingSuffix)
+              if (raw) {
+                const parsed = JSON.parse(raw)
+                if (Array.isArray(parsed)) existingBrowsing = parsed
+              }
+            } catch {}
+            const mergedBrowsing = mergeBrowsingRemainderIntoSession(existingBrowsing, workingCart)
+            try {
+              writeStored('cart', JSON.stringify(mergedBrowsing), browsingSuffix)
+            } catch {}
+            lastSyncedCartRef.current = { suffix: browsingSuffix, items: mergedBrowsing }
+            cartRef.current = mergedBrowsing
+            setCart(mergedBrowsing)
+            setSessionToken(null)
+            setSessionId(null)
+          }
+        }
         const msg = cleanOrderErrorMessage(error)
         toast.error(`Order Failed: ${msg}`)
         q.retire(entry.key)
@@ -1197,15 +1781,37 @@ export function PublicMenu() {
     q.retireAllFailed()
     setQueueEntries(q.load())
     const stop = startOrderQueue(effectiveTenantId, actorKey, {})
-    const onOn = () => setOffline(false)
+    let migrationTimer: ReturnType<typeof setInterval> | null = null
+    const retryMigration = () => {
+      if (!migrationPending) return
+      if (tryMigrateToSession()) {
+        migrationPending = false
+        if (migrationTimer) {
+          clearInterval(migrationTimer)
+          migrationTimer = null
+        }
+        setQueueEntries(q.load())
+        void q.process()
+      }
+    }
+    if (migrationPending) {
+      migrationTimer = setInterval(retryMigration, 1000)
+    }
+    const onOn = () => {
+      setOffline(false)
+      retryMigration()
+    }
     const onOff = () => setOffline(true)
     window.addEventListener('online', onOn)
     window.addEventListener('offline', onOff)
+    window.addEventListener('focus', retryMigration)
     setOffline(!window.navigator.onLine)
     return () => {
       stop()
+      if (migrationTimer) clearInterval(migrationTimer)
       window.removeEventListener('online', onOn)
       window.removeEventListener('offline', onOff)
+      window.removeEventListener('focus', retryMigration)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionTenantId, tenant?.id, sessionToken, table?.id])
