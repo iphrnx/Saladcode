@@ -9,6 +9,7 @@ import {
   migratePendingTableQueueToSession,
   reconcileCartOnConfirm,
   reconcileCartOnSave,
+  resolveRestoredLinePrice,
   subtractUnresolvedQueueQuantities,
 } from '../src/lib/diner-cart-sync'
 
@@ -1059,7 +1060,7 @@ await check('P1-12: lost response + QR reload migrates table queue to session qu
   assert.equal(tableQueue.load().length, 1)
 
   // Step 2: Tab B reloads via QR URL, adopts sessionToken, migrates queue & subtracts unresolved items from cart.
-  const migrated = migratePendingTableQueueToSession(store, tenantId, tableId, sessionToken, qrToken)
+  const { migratedEntries: migrated } = migratePendingTableQueueToSession(store, tenantId, tableId, sessionToken, qrToken)
   assert.equal(migrated.length, 1)
   assert.equal(migrated[0].key, entry.key)
   assert.equal(tableQueue.load().length, 0, 'table queue must be drained after migration')
@@ -1260,7 +1261,7 @@ await check('P1-15: queue migration persists destination first, supports legacy 
 
   // Restore writes and retry migration.
   failDestWrite = false
-  const migrated = migratePendingTableQueueToSession(flakyStorage, tenantId, tableId, sessionToken, null, true)
+  const { migratedEntries: migrated } = migratePendingTableQueueToSession(flakyStorage, tenantId, tableId, sessionToken, null, true)
   assert.equal(migrated.length, 1)
   assert.equal(migrated[0].key, 'idem-legacy-1')
   assert.equal(migrated[0].state, 'pending')
@@ -1290,6 +1291,106 @@ await check('P2-16: reconcileCartOnSave preserves other tab note edit while appl
   const reconciled = reconcileCartOnSave(staleBLocal, baseline, storedAfterA)
   assert.equal(reconciled.find((c) => c.menuItemId === 'dish-a')?.quantity, 1)
   assert.equal(reconciled.find((c) => c.menuItemId === 'dish-b')?.notes, 'Less sugar')
+})
+
+// ---------------------------------------------------------------------------
+// 17. P1: Duplicate checkout prevention across tabs before storage sync
+// ---------------------------------------------------------------------------
+await check('P1-17: second tab sees synchronous localStorage reservation and does not enqueue duplicate order', () => {
+  const store = new MemoryStorage()
+  const tenantId = 'tenant-1'
+  const sessionToken = 'tok-shared'
+  const sharedCart = [{ menuItemId: 'dish-1', name: 'Paneer', price: 250, quantity: 2 }]
+
+  const qA = new OrderQueue(
+    store,
+    keyName('orderQueue', `${tenantId}-${sessionToken}`),
+    (async () => new Response('{}', { status: 503 })) as typeof fetch,
+    {},
+    () => 1000,
+  )
+  const entryA = qA.enqueue('diner', { orderType: 'DINE_IN', tableSessionToken: sessionToken, items: sharedCart }, 1)
+
+  // Tab B attempts checkout synchronously before receiving storage event.
+  const qB = new OrderQueue(
+    store,
+    keyName('orderQueue', `${tenantId}-${sessionToken}`),
+    (async () => new Response('{}', { status: 503 })) as typeof fetch,
+    {},
+    () => 1001,
+  )
+  const unresolved = qB.load().filter((e) => e.state === 'pending' || e.state === 'submitting')
+  const submittable = subtractUnresolvedQueueQuantities(sharedCart, unresolved)
+  assert.equal(submittable.length, 0, 'duplicate shared cart quantities must be blocked')
+  assert.equal(qB.load().length, 1)
+  assert.equal(qB.load()[0].key, entryA.key)
+
+  // Unrelated dish added in Tab B remains submittable.
+  const withExtra = [...sharedCart, { menuItemId: 'dish-2', name: 'Lassi', price: 90, quantity: 1 }]
+  const submittableExtra = subtractUnresolvedQueueQuantities(withExtra, unresolved)
+  assert.equal(submittableExtra.length, 1)
+  assert.equal(submittableExtra[0].menuItemId, 'dish-2')
+})
+
+// ---------------------------------------------------------------------------
+// 18. P1: Reload with unrelated reservation in destination session
+// ---------------------------------------------------------------------------
+await check('P1-18: migratePendingTableQueueToSession does not deduct Tab A existing session reservation from Tab B browsing cart', () => {
+  const store = new MemoryStorage()
+  const tenantId = 'tenant-1'
+  const tableId = 'tbl-1'
+  const sessionToken = 'tok-a'
+  const sessionQueueKey = keyName('orderQueue', `${tenantId}-${sessionToken}`)
+
+  // Tab A has an unresolved follow-up order for 1 unit of dish-1 in sessionQueue.
+  store.setItem(
+    sessionQueueKey,
+    JSON.stringify([
+      {
+        key: 'idem-a-followup',
+        kind: 'diner',
+        payload: { orderType: 'DINE_IN', tableSessionToken: sessionToken, items: [{ menuItemId: 'dish-1', quantity: 1 }] },
+        state: 'submitting',
+        attempts: 0,
+        nextAttemptAt: 1000,
+        createdAt: 1000,
+        itemCount: 1,
+      },
+    ]),
+  )
+
+  // Tab B independently has 2 units of dish-1 in browsing cart and NO browsing queue entries.
+  const browsingItems = [{ menuItemId: 'dish-1', name: 'Paneer', price: 250, quantity: 2 }]
+  const { sessionEntries, migratedEntries } = migratePendingTableQueueToSession(
+    store,
+    tenantId,
+    tableId,
+    sessionToken,
+    'qr-1',
+    true,
+  )
+
+  assert.equal(sessionEntries.length, 1, 'Tab A checkout remains recoverable in sessionEntries')
+  assert.equal(migratedEntries.length, 0, 'no browsing queue entries were migrated')
+  const unsubmittedB = subtractUnresolvedQueueQuantities(browsingItems, migratedEntries)
+  assert.equal(unsubmittedB[0].quantity, 2, 'Tab B retains both independent units')
+})
+
+// ---------------------------------------------------------------------------
+// 19. P2: Restore selected portion unit price on failed checkout
+// ---------------------------------------------------------------------------
+await check('P2-19: resolveRestoredLinePrice restores selected portion price instead of base dish price', () => {
+  const dish = {
+    id: 'dish-1',
+    price: 250,
+    portions: [
+      { id: 'half', name: 'Half', price: 150 },
+      { id: 'large', name: 'Large', price: 380 },
+    ],
+  }
+  const restoredPrice = resolveRestoredLinePrice(dish, 'Large', 'large', undefined)
+  assert.equal(restoredPrice, 380)
+  assert.equal(restoredPrice * 2, 760)
 })
 
 console.log(`\n${pass} passed, ${fail} failed`)

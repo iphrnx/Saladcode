@@ -177,6 +177,11 @@ const NON_SESSION_CODES = new Set([
  * session credential is ended, expired, or invalid (and should be cleared so
  * a retry can re-authenticate via the scanned QR).
  */
+export interface MigrationResult {
+  sessionEntries: QueueEntry[]
+  migratedEntries: QueueEntry[]
+}
+
 /**
  * Move any unresolved (`pending` / `submitting`) checkouts from the table- or
  * QR-scoped queue into the adopted session-scoped queue, preserving each
@@ -189,7 +194,7 @@ export function migratePendingTableQueueToSession(
   sessionToken: string,
   qrToken?: string | null,
   markCartDeducted = false,
-): QueueEntry[] {
+): MigrationResult {
   const sessionQueueKey = keyName('orderQueue', `${tenantId}-${sessionToken}`)
   const readEntries = (k: string): QueueEntry[] => {
     try {
@@ -204,6 +209,7 @@ export function migratePendingTableQueueToSession(
 
   let sessionEntries = readEntries(sessionQueueKey)
   const seenKeys = new Set(sessionEntries.map((e) => e.key))
+  const migratedEntries: QueueEntry[] = []
 
   const sourceActors = [
     tableId ? `table_${tableId}` : null,
@@ -232,17 +238,16 @@ export function migratePendingTableQueueToSession(
             // ensure attempts >= 1 so OrderQueue reconciles by key before re-POSTing.
             const attempts =
               entry.state === 'submitting' ? Math.max(1, entry.attempts || 0) : entry.attempts
-            sessionEntries = [
-              ...sessionEntries,
-              {
-                ...entry,
-                state: 'pending',
-                attempts,
-                claimId: null,
-                claimAt: null,
-                ...(markCartDeducted ? { cartDeducted: true } : {}),
-              },
-            ]
+            const migratedEntry: QueueEntry = {
+              ...entry,
+              state: 'pending',
+              attempts,
+              claimId: null,
+              claimAt: null,
+              ...(markCartDeducted ? { cartDeducted: true } : {}),
+            }
+            sessionEntries = [...sessionEntries, migratedEntry]
+            migratedEntries.push(migratedEntry)
             changed = true
           }
         } else {
@@ -265,7 +270,37 @@ export function migratePendingTableQueueToSession(
     if (remaining.length === 0) storage.removeItem(key)
     else storage.setItem(key, JSON.stringify(remaining))
   }
-  return sessionEntries
+  return { sessionEntries, migratedEntries }
+}
+
+/**
+ * Resolve the unit price for a restored cart line, preferring the selected
+ * portion's price from the menu item before falling back to the base price.
+ */
+export function resolveRestoredLinePrice(
+  menuItem: {
+    price?: number | null
+    portions?: Array<{ id?: string | null; name?: string | null; price?: number | null }> | null
+  } | null | undefined,
+  portion?: string | null,
+  portionId?: string | null,
+  explicitPrice?: number | null,
+): number {
+  const targetKey = normalizePortionKey(portion, portionId)
+  if (targetKey && Array.isArray(menuItem?.portions)) {
+    const matched = menuItem.portions.find((p) => {
+      const pIdKey = p?.id ? normalizePortionKey(null, p.id) : ''
+      const pNameKey = p?.name ? normalizePortionKey(p.name, null) : ''
+      return (pIdKey && pIdKey === targetKey) || (pNameKey && pNameKey === targetKey)
+    })
+    if (matched && typeof matched.price === 'number' && Number.isFinite(matched.price)) {
+      return matched.price
+    }
+  }
+  if (typeof explicitPrice === 'number' && Number.isFinite(explicitPrice)) {
+    return explicitPrice
+  }
+  return Number(menuItem?.price ?? 0)
 }
 
 /**

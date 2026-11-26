@@ -34,6 +34,7 @@ import {
   migratePendingTableQueueToSession,
   reconcileCartOnConfirm,
   reconcileCartOnSave,
+  resolveRestoredLinePrice,
   subtractUnresolvedQueueQuantities,
 } from '@/lib/diner-cart-sync'
 import { keyName, readStored, removeStored, writeStored } from '@/lib/storage-keys'
@@ -693,8 +694,9 @@ export function PublicMenu() {
             // Migrate any unresolved checkout from the table/QR queue into the
             // adopted session queue before merging the browsing cart so the
             // original checkout resumes with its idempotency key and submitted
-            // quantities stay out of the cart while unresolved.
-            const migratedEntries =
+            // quantities stay out of the cart while unresolved. Only entries
+            // migrated from this browsing queue are deducted from browsingItems.
+            const { migratedEntries } =
               typeof window !== 'undefined' && data?.tenant?.id
                 ? migratePendingTableQueueToSession(
                     window.localStorage,
@@ -704,7 +706,7 @@ export function PublicMenu() {
                     qrToken,
                     browsingItems.length > 0,
                   )
-                : []
+                : { migratedEntries: [] }
 
             // If this tab had unsubmitted items in the pre-order browsing cart
             // before reload discovered an active session, merge them into the
@@ -1206,9 +1208,35 @@ export function PublicMenu() {
     const activeToken = sessionToken || existingStoredSession?.sessionToken || null
 
     const actorKey = sessionToken || (table?.id ? `table_${table.id}` : `qr_${currentQrToken}`)
+    const q = orderQueue(effectiveTenantId, actorKey, {})
+
+    // Check unresolved reservations synchronously in shared localStorage across
+    // both the current queue and (when browsing with a saved session) the
+    // session queue so two tabs cannot submit the same cart contents under two
+    // separate idempotency keys.
+    const activeUnresolved = [
+      ...q.load(),
+      ...(activeToken && activeToken !== actorKey
+        ? orderQueue(effectiveTenantId, activeToken, {}).load()
+        : []),
+    ].filter((e) => e.state === 'pending' || e.state === 'submitting')
+
+    const submittableCart = subtractUnresolvedQueueQuantities(cart, activeUnresolved)
+    if (submittableCart.length === 0) {
+      toast.info('Your order is already being submitted.')
+      return
+    }
+
+    const submittableItems = submittableCart.map((c) => ({
+      menuItemId: c.menuItemId,
+      portionId: c.portionId || undefined,
+      portion: c.portion || undefined,
+      quantity: c.quantity,
+      notes: c.notes || '',
+    }))
     const payload: Record<string, any> = {
       orderType: 'DINE_IN',
-      items,
+      items: submittableItems,
     }
     if (activeToken) {
       payload.tableSessionToken = activeToken
@@ -1217,10 +1245,10 @@ export function PublicMenu() {
       if (table?.id) payload.tableId = table.id
     }
     placingRef.current = true
-    orderQueue(effectiveTenantId, actorKey, {}).enqueue(
+    q.enqueue(
       'diner',
       payload,
-      items.length,
+      submittableItems.length,
     )
   }
 
@@ -1404,7 +1432,12 @@ export function PublicMenu() {
               name: menuMatch?.name || line.name || 'Item',
               portionId: line.portionId ?? null,
               portion: line.portion ?? null,
-              price: Number(line.price ?? menuMatch?.price ?? 0),
+              price: resolveRestoredLinePrice(
+                menuMatch,
+                line.portion,
+                line.portionId,
+                line.price,
+              ),
               image: menuMatch?.image ?? null,
               quantity: Math.max(1, Number(line.quantity) || 1),
               notes: line.notes || undefined,

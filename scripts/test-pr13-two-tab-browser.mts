@@ -38,7 +38,19 @@ const TABLE = {
 const CATEGORIES = [{ id: 'cat-1', name: 'Mains', icon: '🍛', sortOrder: 1 }]
 
 const MENU_ITEMS = [
-  { id: '10000000-0000-4000-8000-000000000001', categoryId: 'cat-1', name: 'Paneer Tikka', price: 250, prepTime: 15, available: true, rating: 4.8 },
+  {
+    id: '10000000-0000-4000-8000-000000000001',
+    categoryId: 'cat-1',
+    name: 'Paneer Tikka',
+    price: 250,
+    portions: [
+      { id: 'half', name: 'Half', price: 150 },
+      { id: 'large', name: 'Large', price: 380 },
+    ],
+    prepTime: 15,
+    available: true,
+    rating: 4.8,
+  },
   { id: '10000000-0000-4000-8000-000000000002', categoryId: 'cat-1', name: 'Masala Dosa', price: 140, prepTime: 10, available: true, rating: 4.7 },
   { id: '10000000-0000-4000-8000-000000000003', categoryId: 'cat-1', name: 'Mango Lassi', price: 90, prepTime: 5, available: true, rating: 4.9 },
 ]
@@ -60,6 +72,9 @@ const state = {
   sessions: new Map<string, { id: string; token: string; status: 'ACTIVE' | 'ENDED' }>(),
   orders: [] as BackendOrder[],
   dropNextPostResponse: false,
+  holdNextPost: false,
+  releaseHeldPost: null as (() => void) | null,
+  rejectNextPostUnavailable: false,
   byKeyCalls: [] as Array<{ key: string; qrToken: string | null; token: string | null }>,
 }
 
@@ -185,6 +200,12 @@ const backend = http.createServer(async (req, res) => {
 
   if (path === '/functions/v1/orders' && req.method === 'POST') {
     const body = await readJson(req)
+    if (state.rejectNextPostUnavailable) {
+      state.rejectNextPostUnavailable = false
+      res.writeHead(409, headers)
+      res.end(JSON.stringify({ error: 'One or more items are no longer available', code: 'ITEM_UNAVAILABLE' }))
+      return
+    }
     const token = (req.headers['x-session-token'] as string) || body.tableSessionToken
     let sess = token ? state.sessions.get(token) : undefined
 
@@ -219,6 +240,14 @@ const backend = http.createServer(async (req, res) => {
         status: 'PENDING',
       }
       state.orders.push(order)
+    }
+
+    if (state.holdNextPost) {
+      state.holdNextPost = false
+      await new Promise<void>((resolve) => {
+        state.releaseHeldPost = resolve
+      })
+      state.releaseHeldPost = null
     }
 
     if (state.dropNextPostResponse) {
@@ -463,11 +492,142 @@ try {
   await waitFor(() => (state.orders.length === 3 ? true : false))
   assert.equal(state.orders[2].sessionToken, 'tok-browser-2')
   console.log('  ok    Browser test 2: Ended session clears page state & storage and retries via QR without reload')
-} finally {
-  try { ws?.close() } catch {}
-  try { chrome?.kill('SIGKILL') } catch {}
-  try { nextApp?.kill('SIGKILL') } catch {}
-  try { backend.close() } catch {}
+
+  // 3. Duplicate checkout across two tabs with the same shared cart:
+  await send('Page.reload', {}, sidA)
+  await send('Page.reload', {}, sidB)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Mango Lassi')`))
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Mango Lassi')`))
+
+  // Put the same shared cart (1 Mango Lassi) in both tabs.
+  await evalIn(sidB, `[...document.querySelectorAll('button[aria-label^="Add "]')][2]?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await send('Page.reload', {}, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+
+  // Open View Order in both tabs, hold A's checkout response, then submit from B before A finishes.
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Place Order')`))
+
+  const ordersBeforeDup = state.orders.length
+  state.holdNextPost = true
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
   await sleep(300)
-  try { fs.rmSync(PROFILE_DIR, { recursive: true, force: true }) } catch {}
+  state.releaseHeldPost!()
+  await waitFor(() => (state.orders.length === ordersBeforeDup + 1 ? true : false))
+  await sleep(400)
+  assert.equal(state.orders.length, ordersBeforeDup + 1, 'must create exactly 1 order for duplicate shared-cart checkout')
+  console.log('  ok    Browser test 3: Duplicate shared-cart checkout across two tabs produces exactly 1 order')
+
+  // 4. Reload with an unrelated reservation:
+  // Reset browser storage, open both tabs in browsing mode, establish session in A,
+  // hold A's follow-up order for 1 Masala Dosa, independently add 2 Masala Dosa in B,
+  // reload B twice via QR, then resolve A and verify B's 2 units remain intact.
+  await evalIn(sidA, `localStorage.clear(); sessionStorage.clear()`)
+  await send('Page.navigate', { url: QR_URL }, sidA)
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
+
+  // A places first order to establish session tok-browser-3.
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][0]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.sessions.has('tok-browser-3') ? true : false))
+
+  // A adds 1 Masala Dosa and holds its follow-up checkout response.
+  await send('Page.reload', {}, sidA)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Masala Dosa')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button[aria-label^="Add "]')][1]?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('View Order')`))
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidA, `document.body?.innerText?.includes('Place Order')`))
+  state.holdNextPost = true
+  await evalIn(sidA, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('Place Order'))?.click()`)
+  await waitFor(() => (state.releaseHeldPost !== null ? true : false))
+
+  // B (still browsing) independently adds 2 Masala Dosa, then reloads twice through QR.
+  await evalIn(
+    sidB,
+    `(() => {
+      const btn = [...document.querySelectorAll('button[aria-label^="Add "]')][1];
+      btn?.click();
+      btn?.click();
+    })()`,
+  )
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('View Order')`))
+  await sleep(100)
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('Masala Dosa')`))
+
+  const cartB1 = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)) || '[]')
+  assert.equal(cartB1.find((c: any) => c.menuItemId === MENU_ITEMS[1].id)?.quantity, 3, 'A pending 1 + B independent 2 = 3 across both reloads')
+
+  // Resolve A's held follow-up order and verify B's 2 units remain intact.
+  state.releaseHeldPost!()
+  await waitFor(async () => {
+    const raw = await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)
+    const items = JSON.parse(raw || '[]')
+    return items.find((c: any) => c.menuItemId === MENU_ITEMS[1].id)?.quantity === 2
+  })
+  const cartB2 = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)) || '[]')
+  assert.equal(cartB2.find((c: any) => c.menuItemId === MENU_ITEMS[1].id)?.quantity, 2, 'B retains 2 units after A confirms')
+  console.log('  ok    Browser test 4: Reload with unrelated A reservation preserves B 2 independent units')
+
+  // 5. Failed checkout with portion-price override:
+  // Seed a queued cartDeducted checkout for 2 units of Paneer Tikka (Large = ₹380, base = ₹250)
+  // that fails definitively with ITEM_UNAVAILABLE, and assert cart restores 2 units of Large at ₹380 (subtotal ₹760).
+  await evalIn(
+    sidB,
+    `(() => {
+      localStorage.setItem('the-salad-cart-session-tok-browser-3', '[]');
+      localStorage.setItem(
+        'the-salad-order-queue-00000000-0000-4000-8000-000000000001-table_00000000-0000-4000-8000-000000000010',
+        JSON.stringify([{
+          key: '11111111-1111-4111-8111-111111111111',
+          kind: 'diner',
+          payload: {
+            orderType: 'DINE_IN',
+            tableSessionToken: 'tok-browser-3',
+            items: [{ menuItemId: '${MENU_ITEMS[0].id}', portionId: 'large', portion: 'Large', quantity: 2, notes: '' }]
+          },
+          state: 'pending',
+          attempts: 0,
+          nextAttemptAt: Date.now() - 1000,
+          createdAt: Date.now() - 2000,
+          itemCount: 1,
+          cartDeducted: true
+        }])
+      );
+    })()`,
+  )
+  state.rejectNextPostUnavailable = true
+  await send('Page.navigate', { url: QR_URL }, sidB)
+  await waitFor(async () => {
+    const raw = await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)
+    const items = JSON.parse(raw || '[]')
+    return items.length === 1 && items[0].quantity === 2 ? items : false
+  })
+  const restoredCart = JSON.parse((await evalIn(sidB, `localStorage.getItem('the-salad-cart-session-tok-browser-3')`)) || '[]')
+  assert.equal(restoredCart[0].portion, 'Large')
+  assert.equal(restoredCart[0].price, 380)
+  assert.equal(restoredCart[0].quantity, 2)
+  await evalIn(sidB, `[...document.querySelectorAll('button')].find(b => b.textContent?.includes('View Order'))?.click()`)
+  await waitFor(() => evalIn(sidB, `document.body?.innerText?.includes('760')`))
+  console.log('  ok    Browser test 5: Failed portioned checkout restores 2x Large at ₹380 with subtotal ₹760')
+} finally {
+  try { ws?.close() } catch { }
+  try { chrome?.kill('SIGKILL') } catch { }
+  try { nextApp?.kill('SIGKILL') } catch { }
+  try { backend.close() } catch { }
+  await sleep(300)
+  try { fs.rmSync(PROFILE_DIR, { recursive: true, force: true }) } catch { }
 }
