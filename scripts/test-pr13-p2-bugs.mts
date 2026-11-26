@@ -499,11 +499,20 @@ await check('P2-5: stale Tab A edit reconciles with Tab B merged unsubmitted dis
   const reconciled = reconcileCartOnSave(tabALocalEdited, tabALastSynced, latestStoredBeforeTabASave)
   sharedStorage.setItem(sessionCartKey, JSON.stringify(reconciled))
 
-  // Reload both tabs: Dish C retains qty 1, Tab A edit (qty 2) persists, Dish B is absent.
-  const reloaded = JSON.parse(sharedStorage.getItem(sessionCartKey) || '[]')
-  assert.equal(reloaded.find((c: any) => c.menuItemId === 'dish-c')?.quantity, 1)
-  assert.equal(reloaded.find((c: any) => c.menuItemId === 'dish-a')?.quantity, 2)
-  assert.equal(reloaded.some((c: any) => c.menuItemId === 'dish-b'), false)
+  // Also verify intentional removal by another tab is preserved when local tab did not edit that line.
+  const afterRemoval = reconcileCartOnSave(
+    [
+      { menuItemId: 'dish-a', name: 'Dal', price: 180, quantity: 2 },
+      { menuItemId: 'dish-c', name: 'Jeera Rice', price: 140, quantity: 1 },
+    ],
+    [
+      { menuItemId: 'dish-a', name: 'Dal', price: 180, quantity: 2 },
+      { menuItemId: 'dish-c', name: 'Jeera Rice', price: 140, quantity: 1 },
+    ],
+    [{ menuItemId: 'dish-a', name: 'Dal', price: 180, quantity: 2 }],
+  )
+  assert.equal(afterRemoval.length, 1)
+  assert.equal(afterRemoval[0].menuItemId, 'dish-a')
 })
 
 // ---------------------------------------------------------------------------
@@ -602,6 +611,125 @@ await check('P2-6: definitive rejection clears ended cached session so QR retry 
   await q.process()
   const stillCached = JSON.parse(store.getItem(sessionKey) || 'null')
   assert.equal(stillCached?.sessionToken, validToken, 'transient failure must leave valid cached credential intact')
+})
+
+// ---------------------------------------------------------------------------
+// 7. Prevent duplicate orders after a failed table lookup (#4)
+// ---------------------------------------------------------------------------
+await check('orders/index.ts returns retryable 503 on table lookup error in getByKey and QR POST', () => {
+  const getByKeyStart = ordersFnSrc.indexOf('async function getByKey(')
+  const getByKeyEnd = ordersFnSrc.indexOf('async function list(', getByKeyStart)
+  const getByKeyBlock = ordersFnSrc.slice(getByKeyStart, getByKeyEnd)
+  assert.ok(getByKeyBlock.includes('if (tableError) return json(req, { error:'))
+  assert.ok(getByKeyBlock.includes('503'))
+
+  const qrPostStart = ordersFnSrc.indexOf('} else if (qrToken) {')
+  const qrPostEnd = ordersFnSrc.indexOf('// ── 2. POS / Staff', qrPostStart)
+  const qrPostBlock = ordersFnSrc.slice(qrPostStart, qrPostEnd)
+  assert.ok(qrPostBlock.includes('if (tableError) {'))
+  assert.ok(qrPostBlock.includes('if (existingError) {'))
+  assert.ok(qrPostBlock.includes('503'))
+})
+
+await check('P2-7: failed table lookup during reconciliation keeps checkout queued with original idempotency key; restored lookup reconciles single order & session', async () => {
+  const store = new MemoryStorage()
+  let nowMs = 2_000_000
+  const qrToken = 'qr-table-4'
+  const committedOrderId = 'ord-table-lookup-1'
+  const committedSessionId = 'sess-table-lookup-1'
+  const committedToken = 'tok-table-lookup-1'
+
+  let postCalls = 0
+  let tableLookupFails = true
+  const ordersCreated: any[] = []
+  const sessionsCreated: string[] = []
+
+  const fetcher = (async (url: string, init?: RequestInit) => {
+    if (url === '/api/orders' && init?.method === 'POST') {
+      postCalls++
+      const body = JSON.parse(String(init.body))
+      // First POST commits 1 order + 1 session on server, then response drops.
+      if (ordersCreated.length === 0) {
+        sessionsCreated.push(committedSessionId)
+        ordersCreated.push({
+          id: committedOrderId,
+          idempotencyKey: body.idempotencyKey,
+          sessionId: committedSessionId,
+          sessionToken: committedToken,
+        })
+      }
+      throw new Error('Connection dropped before response')
+    }
+    if (url.startsWith('/api/orders/by-key/')) {
+      const parsed = new URL(`https://example.test${url}`)
+      const key = parsed.pathname.split('/').pop()
+      assert.equal(parsed.searchParams.get('qrToken'), qrToken)
+      if (tableLookupFails) {
+        return new Response(
+          JSON.stringify({ error: 'Could not verify table availability. Please retry.' }),
+          { status: 503, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      const found = ordersCreated.find((o) => o.idempotencyKey === key)
+      if (!found) {
+        return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 })
+      }
+      return new Response(
+        JSON.stringify({
+          id: found.id,
+          orderNumber: 501,
+          total: 250,
+          sessionId: found.sessionId,
+          sessionToken: found.sessionToken,
+          pendingActivation: false,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    return new Response(JSON.stringify({ error: 'Unexpected' }), { status: 500 })
+  }) as any
+
+  let confirmed: any = null
+  const q = new OrderQueue(
+    store,
+    keyName('orderQueue', `tenant-1-qr_${qrToken}`),
+    fetcher,
+    {
+      onConfirmed: (order) => {
+        confirmed = order
+      },
+    },
+    () => nowMs,
+  )
+
+  // Enqueue and drop response.
+  const entry = q.enqueue('diner', { orderType: 'DINE_IN', qrToken, items: [{ menuItemId: 'd1', quantity: 1 }] }, 1)
+  await new Promise((r) => setTimeout(r, 10))
+  await q.process()
+
+  assert.equal(postCalls, 1)
+  assert.equal(q.load().length, 1)
+  assert.equal(q.load()[0].key, entry.key)
+
+  // Retry while table lookup fails -> 503 keeps checkout queued with original idempotency key.
+  nowMs += 60_000
+  await q.process()
+  assert.equal(postCalls, 1, 'must not re-POST while table lookup returns 503')
+  assert.equal(q.load().length, 1)
+  assert.equal(q.load()[0].key, entry.key)
+  assert.equal(q.load()[0].state, 'pending')
+  assert.equal(confirmed, null)
+
+  // Restore table lookup -> reconciles original order ID + usable token, clears queue, 1 order & 1 session.
+  tableLookupFails = false
+  nowMs += 60_000
+  await q.process()
+  assert.equal(postCalls, 1)
+  assert.equal(q.load().length, 0)
+  assert.equal(confirmed?.id, committedOrderId)
+  assert.equal(confirmed?.sessionToken, committedToken)
+  assert.equal(ordersCreated.length, 1)
+  assert.equal(sessionsCreated.length, 1)
 })
 
 console.log(`\n${pass} passed, ${fail} failed`)

@@ -304,12 +304,13 @@ async function getByKey(req: Request, key: string): Promise<Response> {
   if (!qrToken) {
     return json(req, { error: "Missing session credentials. Please scan the table QR code." }, 401);
   }
-  const { data: tableRow } = await db
+  const { data: tableRow, error: tableError } = await db
     .from("tables")
     .select("id, tenant_id, active, tenant:tenants(id, active)")
     .eq("qr_token", qrToken)
     .eq("active", true)
     .maybeSingle();
+  if (tableError) return json(req, { error: "Could not verify table availability. Please retry." }, 503);
   if (!tableRow) return json(req, { error: "Not found" }, 404);
   const tenantRel = (tableRow as any).tenant;
   const tenantRow = Array.isArray(tenantRel) ? tenantRel[0] : tenantRel;
@@ -981,13 +982,16 @@ async function create(req: Request): Promise<Response> {
       }, 201);
     } else if (qrToken) {
       // First order on scanned QR table: mint session only now, strictly isolating this diner
-      const { data: tableRow } = await db
+      const { data: tableRow, error: tableError } = await db
         .from("tables")
         .select("id, tenant_id, active, tenant:tenants(id, active)")
         .eq("qr_token", String(qrToken))
         .eq("active", true)
         .maybeSingle();
 
+      if (tableError) {
+        return json(req, { error: "Could not verify table availability. Please retry." }, 503);
+      }
       if (!tableRow) {
         return json(req, { error: "Invalid QR code or table is inactive." }, 404);
       }
@@ -999,13 +1003,16 @@ async function create(req: Request): Promise<Response> {
 
       // Authorized retry check: resolve existing idempotency key before creating a new session
       if (idempotencyKey) {
-        const { data: existingOrder } = await db
+        const { data: existingOrder, error: existingError } = await db
           .from("orders")
           .select(ORDER_SELECT)
           .eq("idempotency_key", idempotencyKey)
           .eq("tenant_id", tableRow.tenant_id)
           .eq("table_id", tableRow.id)
           .maybeSingle();
+        if (existingError) {
+          return json(req, { error: "Could not verify existing order. Please retry." }, 503);
+        }
 
         if (existingOrder) {
           const { data: sessRow, error: sessError } = await db

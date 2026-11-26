@@ -54,12 +54,35 @@ export function reconcileCartOnSave<T extends SyncableCartItem>(
       } else {
         result.push({ ...ext })
       }
-    } else if (ext.quantity > prev.quantity && localIdx >= 0) {
-      // Externally incremented while this tab also kept the line.
-      result[localIdx] = {
-        ...result[localIdx],
-        quantity: result[localIdx].quantity + (ext.quantity - prev.quantity),
+    } else if (ext.quantity !== prev.quantity && localIdx >= 0) {
+      // Apply external quantity delta (increment or decrement) when this tab kept the line.
+      const nextQty = result[localIdx].quantity + (ext.quantity - prev.quantity)
+      if (nextQty <= 0) {
+        result.splice(localIdx, 1)
+      } else {
+        result[localIdx] = {
+          ...result[localIdx],
+          quantity: nextQty,
+        }
       }
+    }
+  }
+
+  // Respect intentional removals by another tab for lines this tab did not modify.
+  for (const prev of lastSyncedCart) {
+    const stillInStored = latestStoredCart.some((ext) =>
+      sameSyncCartLine(ext, prev.menuItemId, prev.portion ?? null, prev.portionId ?? null),
+    )
+    if (stillInStored) continue
+    const localIdx = result.findIndex((l) =>
+      sameSyncCartLine(l, prev.menuItemId, prev.portion ?? null, prev.portionId ?? null),
+    )
+    if (
+      localIdx >= 0 &&
+      result[localIdx].quantity === prev.quantity &&
+      (result[localIdx].notes || '') === (prev.notes || '')
+    ) {
+      result.splice(localIdx, 1)
     }
   }
 
