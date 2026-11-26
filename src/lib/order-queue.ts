@@ -138,7 +138,12 @@ export async function submitEntry(
         // 401/403 (session ended) is definitive for this entry; anything
         // else (5xx) means we still do not know.
         if (lookup.status === 401 || lookup.status === 403) {
-          return { outcome: 'rejected', error: 'Session ended' }
+          const errBody = await lookup.json().catch(() => null)
+          return {
+            outcome: 'rejected',
+            error: errBody?.error || 'Session ended',
+            code: errBody?.code || 'SESSION_ENDED',
+          }
         }
         return { outcome: 'uncertain', error: `Lookup failed (${lookup.status})` }
       }

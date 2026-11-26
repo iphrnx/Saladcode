@@ -6,6 +6,7 @@ import { keyName } from '../src/lib/storage-keys'
 import {
   isDefinitiveSessionRejection,
   mergeBrowsingRemainderIntoSession,
+  reconcileCartOnConfirm,
   reconcileCartOnSave,
 } from '../src/lib/diner-cart-sync'
 
@@ -290,8 +291,8 @@ await check('public-menu.tsx merges remaining browsing cart into existing sessio
   const confirmEnd = publicMenuSrc.indexOf('useEffect(() => {\n    const effectiveTenantId =', confirmStart)
   const confirmBlock = publicMenuSrc.slice(confirmStart, confirmEnd)
   assert.ok(confirmBlock.includes("readStored('cart', order.sessionToken)"))
-  assert.ok(confirmBlock.includes('if (remainingCart.length > 0)'))
-  assert.ok(confirmBlock.includes('nextCart = existingSessionCart'))
+  assert.ok(confirmBlock.includes('remainingCart.length > 0'))
+  assert.ok(confirmBlock.includes(': existingSessionCart'))
 })
 
 await check('P2-3 behavior: two-tab checkout preserves Tab A unsubmitted session cart when Tab B submits browsing cart', async () => {
@@ -730,6 +731,256 @@ await check('P2-7: failed table lookup during reconciliation keeps checkout queu
   assert.equal(confirmed?.sessionToken, committedToken)
   assert.equal(ordersCreated.length, 1)
   assert.equal(sessionsCreated.length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// 8. Follow-up confirmation keeps confirmed dish out of session cart
+// ---------------------------------------------------------------------------
+await check('P2-8: follow-up order removes confirmed dish from persisted cart and reload keeps it out', () => {
+  const store = new MemoryStorage()
+  const sessionToken = 'tok-followup'
+  const sessionCartKey = keyName('cart', sessionToken)
+
+  const initialCart = [
+    { menuItemId: 'dish-submitted', name: 'Idli', price: 60, quantity: 1 },
+    { menuItemId: 'dish-unsubmitted', name: 'Vada', price: 70, quantity: 2 },
+  ]
+  store.setItem(sessionCartKey, JSON.stringify(initialCart))
+
+  // Reconcile confirmed order against baseline and stored cart, then persist before advancing baseline.
+  const latestStored = JSON.parse(store.getItem(sessionCartKey)!)
+  const nextCart = reconcileCartOnConfirm(
+    initialCart,
+    initialCart,
+    latestStored,
+    [{ menuItemId: 'dish-submitted', quantity: 1 }],
+  )
+  store.setItem(sessionCartKey, JSON.stringify(nextCart))
+  const newBaseline = nextCart
+
+  // Even if save effect runs next, dish-submitted stays out and dish-unsubmitted stays qty 2.
+  const afterSave = reconcileCartOnSave(
+    nextCart,
+    newBaseline,
+    JSON.parse(store.getItem(sessionCartKey)!),
+  )
+  store.setItem(sessionCartKey, JSON.stringify(afterSave))
+
+  const reloaded = JSON.parse(store.getItem(sessionCartKey)!)
+  assert.equal(reloaded.some((c: any) => c.menuItemId === 'dish-submitted'), false)
+  assert.equal(reloaded.find((c: any) => c.menuItemId === 'dish-unsubmitted')?.quantity, 2)
+})
+
+// ---------------------------------------------------------------------------
+// 9. Unavailable dish keeps valid session credential; late rejection leaves newer token
+// ---------------------------------------------------------------------------
+await check('P2-9: unavailable dish rejection keeps token and cart; late rejection does not evict newer token', async () => {
+  const store = new MemoryStorage()
+  const tenantId = 'tenant-1'
+  const tableId = 'tbl-1'
+  const sessionKey = `restro_session:${tenantId}:${tableId}`
+  const validToken = 'tok-valid-active'
+  store.setItem(sessionKey, JSON.stringify({ sessionId: 'sess-1', sessionToken: validToken }))
+
+  let cart = [
+    { menuItemId: 'dish-unavailable', name: 'Special', price: 300, quantity: 1 },
+    { menuItemId: 'dish-good', name: 'Tea', price: 40, quantity: 1 },
+  ]
+  const sentTokens: string[] = []
+  let failUnavailable = true
+
+  const fetcher = (async (url: string, init?: RequestInit) => {
+    if (url === '/api/orders' && init?.method === 'POST') {
+      const body = JSON.parse(String(init.body))
+      sentTokens.push(body.tableSessionToken || '')
+      if (failUnavailable) {
+        return new Response(
+          JSON.stringify({ error: 'One or more items are no longer available', code: 'ITEM_UNAVAILABLE' }),
+          { status: 409, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      return new Response(
+        JSON.stringify({
+          id: 'ord-fixed-1',
+          orderNumber: 601,
+          total: 40,
+          sessionId: 'sess-1',
+          sessionToken: validToken,
+          items: body.items,
+        }),
+        { status: 201, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 })
+  }) as any
+
+  let confirmed = false
+  const q = new OrderQueue(
+    store,
+    keyName('orderQueue', `${tenantId}-table_${tableId}-unavail`),
+    fetcher,
+    {
+      onFailed: (error, entry, code) => {
+        const failedToken = entry.payload?.tableSessionToken
+        if (failedToken && isDefinitiveSessionRejection(error, code)) {
+          const cur = JSON.parse(store.getItem(sessionKey) || 'null')
+          if (cur?.sessionToken === failedToken) store.removeItem(sessionKey)
+        }
+        q.retire(entry.key)
+      },
+      onConfirmed: () => {
+        confirmed = true
+      },
+    },
+    () => 1000,
+  )
+
+  q.enqueue('diner', { orderType: 'DINE_IN', tableSessionToken: validToken, items: cart }, 2)
+  await new Promise((r) => setTimeout(r, 10))
+  await q.process()
+
+  // Token and cart survive ITEM_UNAVAILABLE.
+  assert.equal(JSON.parse(store.getItem(sessionKey)!).sessionToken, validToken)
+  assert.equal(cart.length, 2)
+
+  // Diner removes unavailable item and retries -> uses existing session without opening a new check.
+  cart = cart.filter((c) => c.menuItemId !== 'dish-unavailable')
+  failUnavailable = false
+  q.enqueue('diner', { orderType: 'DINE_IN', tableSessionToken: validToken, items: cart }, 1)
+  await new Promise((r) => setTimeout(r, 10))
+  await q.process()
+  assert.equal(confirmed, true)
+  assert.deepEqual(sentTokens, [validToken, validToken])
+
+  // Late rejection of an old token must not evict a newer cached token.
+  const newerToken = 'tok-newer'
+  store.setItem(sessionKey, JSON.stringify({ sessionId: 'sess-new', sessionToken: newerToken }))
+  const lateFailedToken = 'tok-older'
+  if (isDefinitiveSessionRejection('Session ended', 'SESSION_ENDED')) {
+    const cur = JSON.parse(store.getItem(sessionKey) || 'null')
+    if (cur?.sessionToken === lateFailedToken) store.removeItem(sessionKey)
+  }
+  assert.equal(JSON.parse(store.getItem(sessionKey)!).sessionToken, newerToken)
+})
+
+// ---------------------------------------------------------------------------
+// 10. Transient session lookup failure keeps order queued; ended session clears
+// ---------------------------------------------------------------------------
+await check('P2-10: validateDinerSession lookup error returns 503 so order stays queued and recovers; ended session clears token', async () => {
+  const validateStart = ordersFnSrc.indexOf('async function validateDinerSession(')
+  const validateEnd = ordersFnSrc.indexOf('async function endTableSession(', validateStart)
+  const validateBlock = ordersFnSrc.slice(validateStart, validateEnd)
+  assert.ok(validateBlock.includes('if (error) {'))
+  assert.ok(validateBlock.includes('503'))
+  assert.ok(validateBlock.includes('LOOKUP_FAILED'))
+
+  const store = new MemoryStorage()
+  let nowMs = 3_000_000
+  const token = 'tok-sess-lookup'
+  const sessionKey = `restro_session:tenant-1:tbl-1`
+  store.setItem(sessionKey, JSON.stringify({ sessionId: 'sess-1', sessionToken: token }))
+
+  let postCalls = 0
+  let lookupFails = true
+  const ordersCreated: any[] = []
+
+  const fetcher = (async (url: string, init?: RequestInit) => {
+    if (url === '/api/orders' && init?.method === 'POST') {
+      postCalls++
+      const body = JSON.parse(String(init.body))
+      if (ordersCreated.length === 0) {
+        ordersCreated.push({ id: 'ord-sess-1', idempotencyKey: body.idempotencyKey, sessionToken: token })
+      }
+      throw new Error('Dropped response')
+    }
+    if (url.startsWith('/api/orders/by-key/')) {
+      if (lookupFails) {
+        return new Response(
+          JSON.stringify({ error: 'Could not verify table availability. Please retry.', code: 'LOOKUP_FAILED' }),
+          { status: 503, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      return new Response(
+        JSON.stringify({ id: 'ord-sess-1', orderNumber: 701, total: 100, sessionId: 'sess-1', sessionToken: token }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 })
+  }) as any
+
+  let confirmedOrder: any = null
+  const q = new OrderQueue(
+    store,
+    keyName('orderQueue', `tenant-1-${token}`),
+    fetcher,
+    { onConfirmed: (o) => { confirmedOrder = o } },
+    () => nowMs,
+  )
+
+  const entry = q.enqueue('diner', { orderType: 'DINE_IN', tableSessionToken: token, items: [{ menuItemId: 'd1', quantity: 1 }] }, 1)
+  await new Promise((r) => setTimeout(r, 10))
+  await q.process()
+
+  // Retry while session lookup fails -> 503 keeps entry + credential + idempotency key.
+  nowMs += 60_000
+  await q.process()
+  assert.equal(q.load().length, 1)
+  assert.equal(q.load()[0].key, entry.key)
+  assert.equal(JSON.parse(store.getItem(sessionKey)!).sessionToken, token)
+  assert.equal(confirmedOrder, null)
+
+  // Restore lookup -> recovers original order, clears queue, 1 order total.
+  lookupFails = false
+  nowMs += 60_000
+  await q.process()
+  assert.equal(q.load().length, 0)
+  assert.equal(confirmedOrder?.id, 'ord-sess-1')
+  assert.equal(postCalls, 1)
+  assert.equal(ordersCreated.length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// 11. QR reload restores browsing cart once without duplicating on repeat reloads
+// ---------------------------------------------------------------------------
+await check('P2-11: QR reload imports browsing cart into active session once without overwriting A or duplicating', () => {
+  const store = new MemoryStorage()
+  const tableId = 'tbl-1'
+  const sessionToken = 'tok-a'
+  const browsingKey = keyName('cart', `browsing:${tableId}`)
+  const sessionKey = keyName('cart', sessionToken)
+
+  // Verify public-menu.tsx activateAndLoad performs this merge on data?.session.
+  assert.ok(publicMenuSrc.includes("const browsingRaw = readStored('cart', `browsing:${data.table.id}`)"))
+  assert.ok(publicMenuSrc.includes("removeStored('cart', `browsing:${data.table.id}`)"))
+
+  // Tab A has an item in session cart; Tab B has qty 2 in browsing cart.
+  store.setItem(sessionKey, JSON.stringify([{ menuItemId: 'dish-a', name: 'Idli', price: 50, quantity: 1 }]))
+  store.setItem(browsingKey, JSON.stringify([{ menuItemId: 'dish-b', name: 'Coffee', price: 40, quantity: 2 }]))
+
+  const simulateQrReload = () => {
+    const browsingRaw = store.getItem(browsingKey)
+    if (browsingRaw) {
+      const browsingItems = JSON.parse(browsingRaw)
+      if (Array.isArray(browsingItems) && browsingItems.length > 0) {
+        const sessionRaw = store.getItem(sessionKey)
+        const sessionItems = sessionRaw ? JSON.parse(sessionRaw) : []
+        const merged = mergeBrowsingRemainderIntoSession(sessionItems, browsingItems)
+        store.setItem(sessionKey, JSON.stringify(merged))
+      }
+      store.removeItem(browsingKey)
+    }
+    return JSON.parse(store.getItem(sessionKey) || '[]')
+  }
+
+  // Reload 1: both A's dish and B's dish (qty 2) are present.
+  const reload1 = simulateQrReload()
+  assert.equal(reload1.find((c: any) => c.menuItemId === 'dish-a')?.quantity, 1)
+  assert.equal(reload1.find((c: any) => c.menuItemId === 'dish-b')?.quantity, 2)
+  assert.equal(store.getItem(browsingKey), null)
+
+  // Reload 2: dish-b stays qty 2 (never imported twice).
+  const reload2 = simulateQrReload()
+  assert.equal(reload2.find((c: any) => c.menuItemId === 'dish-b')?.quantity, 2)
 })
 
 console.log(`\n${pass} passed, ${fail} failed`)

@@ -116,11 +116,56 @@ export function mergeBrowsingRemainderIntoSession<T extends SyncableCartItem>(
 }
 
 /**
+ * Reconcile confirmed order quantities against the previous sync baseline and
+ * the latest saved cart, removing only confirmed quantities while preserving
+ * unsubmitted edits from either tab.
+ */
+export function reconcileCartOnConfirm<T extends SyncableCartItem>(
+  localCart: T[],
+  lastSyncedCart: T[],
+  latestStoredCart: T[],
+  submittedItems: Array<{ menuItemId: string; portion?: string | null; portionId?: string | null; quantity?: number }>,
+): T[] {
+  let next = reconcileCartOnSave(localCart, lastSyncedCart, latestStoredCart)
+  for (const line of submittedItems) {
+    const qty = Math.max(1, Number(line.quantity) || 1)
+    next = next
+      .map((c) =>
+        sameSyncCartLine(c, line.menuItemId, line.portion ?? null, line.portionId ?? null)
+          ? { ...c, quantity: c.quantity - qty }
+          : c,
+      )
+      .filter((c) => c.quantity > 0)
+  }
+  return next
+}
+
+const DEFINITIVE_SESSION_CODES = new Set([
+  'SESSION_ENDED',
+  'SESSION_INVALID',
+  'SESSION_EXPIRED',
+  'TABLE_UNAVAILABLE',
+  'RESTAURANT_UNAVAILABLE',
+])
+
+const NON_SESSION_CODES = new Set([
+  'ITEM_UNAVAILABLE',
+  'ORDER_PRICING_CHANGED',
+  'PROMO_REJECTED',
+  'PROMO_STALE',
+  'LOOKUP_FAILED',
+])
+
+/**
  * True when a definitive checkout rejection indicates the cached diner
  * session credential is ended, expired, or invalid (and should be cleared so
  * a retry can re-authenticate via the scanned QR).
  */
-export function isDefinitiveSessionRejection(errorMessage: string): boolean {
+export function isDefinitiveSessionRejection(errorMessage: string, errorCode?: string): boolean {
+  if (errorCode) {
+    if (NON_SESSION_CODES.has(errorCode)) return false
+    if (DEFINITIVE_SESSION_CODES.has(errorCode)) return true
+  }
   const lower = (errorMessage || '').toLowerCase()
   return (
     lower.includes('session has ended') ||
@@ -128,6 +173,7 @@ export function isDefinitiveSessionRejection(errorMessage: string): boolean {
     lower.includes('session expired') ||
     lower.includes('invalid session') ||
     lower.includes('session_invalid_or_ended') ||
-    lower.includes('no longer available')
+    lower.includes('this table is no longer available') ||
+    lower.includes('this restaurant is currently unavailable')
   )
 }
