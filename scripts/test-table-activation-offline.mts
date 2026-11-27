@@ -114,7 +114,7 @@ console.log("\n── deployable before the migration, and after it ──");
 {
   const orders = read("supabase/functions/orders/index.ts");
   check("the session lookup does not name a column the old schema lacks",
-    /select\("\*, table:tables\(id, active\)"\)/.test(orders) && !/select\("[^"]*activation_status/.test(orders));
+    /select\("\*, table:tables\(id, active\)(?:, tenant:tenants\(id, active\))?"\)/.test(orders) && !/select\("[^"]*activation_status/.test(orders));
   check("the status argument is only sent when it is the new value",
     /args\.status === "PENDING_ACTIVATION" \? \{ p_status: "PENDING_ACTIVATION" \} : \{\}/.test(orders));
 

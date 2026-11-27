@@ -1094,10 +1094,7 @@ export function OrdersView() {
                 sitting={sitting}
                 currencySymbol={cs}
                 check={sitting.checkId ? checks[sitting.checkId] : undefined}
-                checkCanSettle={!sitting.checkId || (
-                  checkServing.get(sitting.checkId)?.allServed === true &&
-                  checkServing.get(sitting.checkId)?.orderCount === checks[sitting.checkId]?.orderCount
-                )}
+                checkCanSettle={!sitting.checkId || (checkServing.get(sitting.checkId)?.allServed ?? sitting.allServed)}
                 dishImages={dishImages}
                 timeZone={restaurantTimeZone}
                 now={now}
@@ -1113,7 +1110,18 @@ export function OrdersView() {
                   setFocusOrderId(null)
                   openSitting(target)
                 }}
-                onCompletePay={(target) => setPaySitting(target)}
+                onCompletePay={(target) => {
+                  const elig = getSittingPaymentEligibility(target, {
+                    check: target.checkId ? checks[target.checkId] : undefined,
+                    checkAllServed: !target.checkId || (checkServing.get(target.checkId)?.allServed ?? target.allServed),
+                    hasPayPerm: canComplete && canCollectPay,
+                  })
+                  if (!elig.eligible) {
+                    if (elig.reason) toast.error(elig.reason)
+                    return
+                  }
+                  setPaySitting(target)
+                }}
                 onBill={(target, autoPrint) =>
                   setBillDoc({
                     checkId: target.checkId,
@@ -1560,13 +1568,41 @@ export function OrdersView() {
             openSitting(sitting)
           }
         }}
+        canGoToPayment={(() => {
+          if (!detailOrder) return false
+          const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder.id))
+          if (!sitting) return false
+          return getSittingPaymentEligibility(sitting, {
+            check: sitting.checkId ? checks[sitting.checkId] : undefined,
+            checkAllServed: !sitting.checkId || (checkServing.get(sitting.checkId)?.allServed ?? sitting.allServed),
+            hasPayPerm: canComplete && canCollectPay,
+          }).eligible
+        })()}
+        paymentBlockedReason={(() => {
+          if (!detailOrder) return undefined
+          const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder.id))
+          if (!sitting) return undefined
+          return getSittingPaymentEligibility(sitting, {
+            check: sitting.checkId ? checks[sitting.checkId] : undefined,
+            checkAllServed: !sitting.checkId || (checkServing.get(sitting.checkId)?.allServed ?? sitting.allServed),
+            hasPayPerm: canComplete && canCollectPay,
+          }).reason
+        })()}
         onGoToPayment={() => {
           if (!detailOrder) return
           const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder.id))
-          openOrderDetail(null)
-          if (sitting) {
-            setPaySitting(sitting)
+          if (!sitting) return
+          const elig = getSittingPaymentEligibility(sitting, {
+            check: sitting.checkId ? checks[sitting.checkId] : undefined,
+            checkAllServed: !sitting.checkId || (checkServing.get(sitting.checkId)?.allServed ?? sitting.allServed),
+            hasPayPerm: canComplete && canCollectPay,
+          })
+          if (!elig.eligible) {
+            if (elig.reason) toast.error(elig.reason)
+            return
           }
+          openOrderDetail(null)
+          setPaySitting(sitting)
         }}
       />
 
@@ -1610,14 +1646,23 @@ export function OrdersView() {
           paymentMethod={ordersSitting.latest.paymentMethod || 'Cash'}
           paidAt={ordersSitting.endedAt || ordersSitting.latest.completedAt || ordersSitting.latest.createdAt}
           canPay={
-            ordersSitting.state === 'Active' &&
-            ordersSitting.allServed &&
-            canComplete &&
-            canCollectPay &&
-            (ordersSitting.checkId ? !ordersSitting.paidOff : ordersSitting.latest.paymentStatus !== 'PAID')
+            getSittingPaymentEligibility(ordersSitting, {
+              check: ordersSitting.checkId ? checks[ordersSitting.checkId] : undefined,
+              checkAllServed: !ordersSitting.checkId || (checkServing.get(ordersSitting.checkId)?.allServed ?? ordersSitting.allServed),
+              hasPayPerm: canComplete && canCollectPay,
+            }).eligible
           }
           onCompletePay={() => {
             const target = ordersSitting
+            const elig = getSittingPaymentEligibility(target, {
+              check: target.checkId ? checks[target.checkId] : undefined,
+              checkAllServed: !target.checkId || (checkServing.get(target.checkId)?.allServed ?? target.allServed),
+              hasPayPerm: canComplete && canCollectPay,
+            })
+            if (!elig.eligible) {
+              if (elig.reason) toast.error(elig.reason)
+              return
+            }
             openSitting(null)
             if (target.checkId || target.sessionId || target.tableId) {
               setPaySitting(target)
@@ -1751,6 +1796,54 @@ export function OrdersView() {
 
     </div>
   )
+}
+
+/**
+ * Single source of truth for session-wide payment eligibility, shared across
+ * SittingCard ("Complete & Pay"), OrderDetailDrawer ("Go to Payment"), and
+ * SessionOrdersDrawer. Scoped strictly to orders in the selected sitting.
+ */
+function getSittingPaymentEligibility(
+  sitting: Sitting,
+  opts: {
+    check?: { status: string; invoiceNumber?: string | null; orderCount: number }
+    checkAllServed?: boolean
+    hasPayPerm: boolean
+  },
+): { eligible: boolean; reason?: string; paidOff: boolean; awaiting: boolean } {
+  const active = sitting.state === 'Active'
+  const { check, checkAllServed = true, hasPayPerm } = opts
+  const hasBill = check ? check.orderCount > 0 : !sitting.awaiting
+  const awaiting = !hasBill
+  const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber)
+  const allOrdersCompleted = sitting.orders.every((order) => ['COMPLETED', 'CANCELLED'].includes(order.status))
+  const allOrdersPaid = sitting.orders.every((order) => order.paymentStatus === 'PAID')
+  const paidOff = Boolean(
+    sitting.paidOff ||
+      isSettledCheck ||
+      (allOrdersPaid && allOrdersCompleted) ||
+      sitting.latest.paymentStatus === 'PAID',
+  )
+  const unservedInSession = sitting.orders.some((o) =>
+    ['PENDING_ACTIVATION', 'PENDING', 'PREPARING', 'READY'].includes(o.status),
+  )
+  const allSessionOrdersServed = !unservedInSession && sitting.allServed && checkAllServed
+  const hasTarget = Boolean(
+    (sitting.tableId && sitting.checkId) || (!sitting.checkId && sitting.latest.status !== 'COMPLETED'),
+  )
+  const eligible = active && hasPayPerm && allSessionOrdersServed && !paidOff && hasBill && hasTarget
+
+  const reason = !hasPayPerm
+    ? 'Payment permission is required'
+    : !allSessionOrdersServed
+      ? 'Serve all orders in this session before settling the bill'
+      : paidOff
+        ? 'This bill is paid'
+        : awaiting
+          ? 'No bill yet'
+          : undefined
+
+  return { eligible, reason, paidOff, awaiting }
 }
 
 const ORDER_TYPE_LABEL: Record<string, string> = {
@@ -2186,21 +2279,14 @@ function SittingCard({
   const started = sessionWhen(sitting.startedAt, dateFormat)
   const hasPayPerm = canComplete && canCollectPay
   const onlyPendingActivation = sitting.orders.every((order) => order.status === 'PENDING_ACTIVATION')
-  const hasBill = check ? check.orderCount > 0 : !sitting.awaiting
-  const awaiting = !hasBill
-  const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber)
-  const allOrdersCompleted = sitting.orders.every((order) => ['COMPLETED', 'CANCELLED'].includes(order.status))
-  const allOrdersPaid = sitting.orders.every((order) => order.paymentStatus === 'PAID')
-  const paidOff = Boolean(
-    sitting.paidOff
-    || isSettledCheck
-    || (allOrdersPaid && allOrdersCompleted)
-    || sitting.latest.paymentStatus === 'PAID'
-  )
-  const canPay = active && hasPayPerm && sitting.allServed && checkCanSettle &&
-    !paidOff && hasBill && Boolean(
-      (sitting.tableId && sitting.checkId) || (!sitting.checkId && sitting.latest.status !== 'COMPLETED'),
-    )
+  const eligibility = getSittingPaymentEligibility(sitting, {
+    check,
+    checkAllServed: checkCanSettle,
+    hasPayPerm,
+  })
+  const paidOff = eligibility.paidOff
+  const awaiting = eligibility.awaiting
+  const canPay = eligibility.eligible
   const isSettledEnded = !active && !onlyPendingActivation && !awaiting && paidOff
 
   // The parent keys each card by session ID, so another sitting cannot reuse this state.
@@ -2317,12 +2403,7 @@ function SittingCard({
     : toServe.length > 0 ? (remainingQty > 0 ? `${remainingQty} to Serve` : 'Service Pending')
     : sitting.allServed ? 'All Served'
     : 'Awaiting Acceptance'
-  const paymentReason = !hasPayPerm ? 'Payment permission is required'
-    : !sitting.allServed ? 'Serve all orders before settling the bill'
-    : !checkCanSettle ? 'Confirm serving status for the full table check'
-    : paidOff ? 'This bill is paid'
-    : awaiting ? 'No bill yet'
-    : undefined
+  const paymentReason = eligibility.reason
   const billTotal = check?.total ?? sitting.total
   const billPaid = check?.paid ?? (paidOff ? sitting.total : sitting.paid)
   const billDue = check != null
