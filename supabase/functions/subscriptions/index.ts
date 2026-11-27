@@ -800,7 +800,16 @@ async function state(req: Request, tenantId: string): Promise<Response> {
     payments: (payments ?? []).map((row) => {
       const key = row.razorpay_payment_id ?? row.transaction_id;
       const refundDocs = refundsByPayment.get(row.id) ?? refundsByPayment.get(key) ?? [];
-      const processedRefunds = processedByPayment.get(row.id) ?? processedByPayment.get(key) ?? [];
+      const rawProcessed = processedByPayment.get(row.id) ?? processedByPayment.get(key) ?? [];
+      const legacyDocs = refundDocs.filter((d: any) => !d.razorpay_refund_id);
+      const canReconcileLegacy =
+        rawProcessed.length === 1 &&
+        !rawProcessed[0].receipt &&
+        legacyDocs.length === 1 &&
+        refundDocs.length === 1;
+      const processedRefunds = canReconcileLegacy
+        ? [{ ...rawProcessed[0], receipt: legacyDocs[0] }]
+        : rawProcessed;
       return {
         ...row,
         document: invoiceByPayment.get(key) ?? null,
@@ -2216,6 +2225,22 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
           .eq("razorpay_refund_id", targetRefund.razorpay_refund_id)
           .maybeSingle();
         existing = byRefundId ?? null;
+        if (!existing && (processedRefunds ?? []).length === 1) {
+          // Reconcile an unambiguous legacy ID-less receipt on a single-refund payment
+          // so we reuse its existing receipt number instead of issuing a second one.
+          const { data: allPaymentRefundDocs } = await db
+            .from("billing_refunds")
+            .select("*")
+            .eq("payment_id", paymentId)
+            .order("refund_date", { ascending: false })
+            .order("created_at", { ascending: false });
+          if (
+            (allPaymentRefundDocs ?? []).length === 1 &&
+            !allPaymentRefundDocs![0].razorpay_refund_id
+          ) {
+            existing = allPaymentRefundDocs![0];
+          }
+        }
       } else {
         const { data: existingRows } = await db
           .from("billing_refunds")

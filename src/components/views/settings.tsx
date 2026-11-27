@@ -1106,13 +1106,17 @@ export function SettingsView() {
     }
   }, [tenantId, canViewReviews])
 
-  // Billing load
+  // Billing load — guarded by a monotonic sequence ref so slower earlier
+  // refreshes never overwrite newer receipt state from a concurrent download.
+  const billingReqSeqRef = useRef(0)
   const loadBilling = useCallback(async () => {
+    const seq = ++billingReqSeqRef.current
     setBillingLoading(true)
     try {
       const res = await edgeFetch('/api/subscriptions', { headers: { 'x-tenant-id': tenantId } })
       await failIfNotOk(res, 'your billing details')
       const body = await res.json()
+      if (seq !== billingReqSeqRef.current) return
       setPlans(body.plans ?? [])
       setPayments(body.payments ?? [])
       setRestaurant(body.restaurant ?? { name: null, email: null })
@@ -1122,9 +1126,12 @@ export function SettingsView() {
       setLocationCount(typeof body.locationCount === 'number' ? body.locationCount : null)
       setStatePlan(body.plan ?? null)
     } catch (err) {
+      if (seq !== billingReqSeqRef.current) return
       handleLoad(err, 'your billing details')
     } finally {
-      setBillingLoading(false)
+      if (seq === billingReqSeqRef.current) {
+        setBillingLoading(false)
+      }
     }
   }, [tenantId, handleLoad])
 
@@ -1216,56 +1223,82 @@ export function SettingsView() {
     const periodEnd = doc?.period_end ?? (planIsOneTime(p.plan_id)
       ? new Date(new Date(periodStart ?? p.created_at).getTime() + 30 * 86_400_000).toISOString()
       : null)
-    const billingDoc = refund ?? doc
+    if (refund) {
+      return {
+        kind: 'refund' as const,
+        title: 'REFUND',
+        number: refund.refund_number ?? doc?.invoice_number ?? p.transaction_id ?? p.id.slice(0, 8),
+        date: docDate(refund.refund_date ?? paidIso),
+        badge: 'REFUNDED',
+        sellerName: refund.seller_name || 'The Salad',
+        sellerLines: String(refund.seller_address ?? '')
+          .split('\n').map((l) => l.trim()).filter(Boolean),
+        sellerEmail: refund.seller_email || null,
+        sellerPhone: refund.seller_phone || null,
+        buyerName: refund.buyer_name ?? '—',
+        buyerEmail: refund.buyer_email ?? null,
+        // Preserve explicit null buyer_address from the persisted refund snapshot.
+        buyerLines: String(refund.buyer_address ?? '').split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 3),
+        planName: refund.description ?? planName(p.plan_id),
+        period: null,
+        totalLabel: 'Total refunded',
+        money: docMoney(
+          refund.currency ?? p.currency,
+          refund.amount != null ? Number(refund.amount) : 0,
+        ),
+        originalInvoice: ([
+          ['Invoice number', refund.original_invoice_number],
+          ['Invoice date', refund.original_invoice_date ? docDate(refund.original_invoice_date) : null],
+        ] as Array<[string, string | null]>).filter((row): row is [string, string] => Boolean(row[1])),
+        detailTitle: 'REFUND DETAILS',
+        detailRows: ([
+          ['Razorpay refund ID', refund.razorpay_refund_id] as [string, string | null],
+          ['Razorpay payment ID', p.razorpay_payment_id ?? p.transaction_id],
+          ['Razorpay order ID', p.razorpay_order_id],
+          ['Refunded on', docDate(refund.refund_date ?? paidIso)],
+          ['Status', 'Refunded'],
+        ] as Array<[string, string | null]>).filter((row): row is [string, string] => Boolean(row[1])),
+        notes: [
+          'This document records a refund of the payment on the original invoice referenced above.',
+          'Both documents together are the complete record of the transaction.',
+        ],
+      }
+    }
     return {
-      kind: (refund ? 'refund' : 'invoice') as 'refund' | 'invoice',
-      title: refund ? 'REFUND' : 'INVOICE',
-      number: refund?.refund_number ?? doc?.invoice_number ?? p.transaction_id ?? p.id.slice(0, 8),
-      date: docDate(refund?.refund_date ?? paidIso),
-      badge: refund ? 'REFUNDED' : 'PAID',
-      sellerName: billingDoc?.seller_name ?? doc?.seller_name ?? 'The Salad',
-      sellerLines: String(billingDoc?.seller_address ?? doc?.seller_address ?? '')
+      kind: 'invoice' as const,
+      title: 'INVOICE',
+      number: doc?.invoice_number ?? p.transaction_id ?? p.id.slice(0, 8),
+      date: docDate(paidIso),
+      badge: 'PAID',
+      sellerName: doc?.seller_name ?? 'The Salad',
+      sellerLines: String(doc?.seller_address ?? '')
         .split('\n').map((l) => l.trim()).filter(Boolean),
-      sellerEmail: billingDoc?.seller_email ?? doc?.seller_email ?? null,
-      sellerPhone: billingDoc?.seller_phone ?? doc?.seller_phone ?? null,
-      buyerName: billingDoc?.buyer_name ?? doc?.buyer_name ?? restaurant.name ?? '—',
-      buyerEmail: billingDoc?.buyer_email ?? doc?.buyer_email ?? restaurant.email,
+      sellerEmail: doc?.seller_email ?? null,
+      sellerPhone: doc?.seller_phone ?? null,
+      buyerName: doc?.buyer_name ?? restaurant.name ?? '—',
+      buyerEmail: doc?.buyer_email ?? restaurant.email,
       // The issued record snapshots the buyer's address too — the PDF
       // prints it, so the receipt must show the same lines.
-      buyerLines: String(billingDoc?.buyer_address ?? doc?.buyer_address ?? '').split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 3),
-      planName: billingDoc?.description ?? doc?.description ?? planName(p.plan_id),
-      period: !refund && periodStart && periodEnd
+      buyerLines: String(doc?.buyer_address ?? '').split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 3),
+      planName: doc?.description ?? planName(p.plan_id),
+      period: periodStart && periodEnd
         ? `${docDate(periodStart)} – ${docDate(periodEnd)}`
         : null,
-      totalLabel: refund ? 'Total refunded' : 'Total paid',
-      money: docMoney(
-        p.currency,
-        Number(refund ? (refund.amount ?? p.refunded_amount ?? p.amount) : p.amount),
-      ),
-      originalInvoice: refund
-        ? ([
-            ['Invoice number', refund.original_invoice_number],
-            ['Invoice date', refund.original_invoice_date ? docDate(refund.original_invoice_date) : null],
-          ] as Array<[string, string | null]>).filter((row): row is [string, string] => Boolean(row[1]))
-        : null,
-      detailTitle: refund ? 'REFUND DETAILS' : 'PAYMENT DETAILS',
+      totalLabel: 'Total paid',
+      money: docMoney(p.currency, Number(p.amount)),
+      originalInvoice: null,
+      detailTitle: 'PAYMENT DETAILS',
       detailRows: ([
-        ...(refund ? [['Razorpay refund ID', refund.razorpay_refund_id] as [string, string | null]] : []),
         ['Razorpay payment ID', p.razorpay_payment_id ?? p.transaction_id],
         ['Razorpay order ID', p.razorpay_order_id],
-        ...(refund ? [] : [['Method', p.payment_method] as [string, string | null]]),
-        [refund ? 'Refunded on' : 'Paid on', docDate(refund?.refund_date ?? paidIso)],
-        ['Status', refund ? 'Refunded' : 'Succeeded'],
+        ['Method', p.payment_method] as [string, string | null],
+        ['Paid on', docDate(paidIso)],
+        ['Status', 'Succeeded'],
       ] as Array<[string, string | null]>).filter((row): row is [string, string] => Boolean(row[1])),
-      notes: refund
-        ? [
-            'This document records a refund of the payment on the original invoice referenced above.',
-            'Both documents together are the complete record of the transaction.',
-          ]
-        : [
-            'This is a computer-generated invoice for a payment made through Razorpay.',
-            'The amounts and reference numbers above are recorded exactly as the payment was settled.',
-          ],
+      notes: [
+        'This is a computer-generated invoice for a payment made through Razorpay.',
+        'The amounts and reference numbers above are recorded exactly as the payment was settled.',
+      ],
     }
   }
 

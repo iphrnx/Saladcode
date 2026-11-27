@@ -520,13 +520,14 @@ export async function dispatchPending(
     return { sent: 0, failed: 0, skipped: 0, problems: configCheck.problems };
   }
 
-  const { data: due } = await db
-    .from("email_events")
-    .select("*")
-    .eq("status", "pending")
-    .lte("next_attempt_at", new Date().toISOString())
-    .order("created_at", { ascending: true })
-    .limit(limit);
+  const { data: due, error: claimError } = await db.rpc("claim_pending_emails", {
+    p_limit: limit,
+    p_lease_seconds: 120,
+  });
+  if (claimError) {
+    console.error("email: could not claim pending outbox rows", claimError.message);
+    return { sent: 0, failed: 0, skipped: 0 };
+  }
 
   let sent = 0, failed = 0, skipped = 0;
   for (const row of (due ?? []) as any[]) {
@@ -548,7 +549,11 @@ export async function dispatchPending(
     try {
       res = await fetch(RESEND_API, {
         method: "POST",
-        headers: { authorization: `Bearer ${config.key}`, "content-type": "application/json" },
+        headers: {
+          authorization: `Bearer ${config.key}`,
+          "content-type": "application/json",
+          ...(row.event_key ? { "Idempotency-Key": String(row.event_key) } : {}),
+        },
         body: JSON.stringify({
           from: config.from,
           to: [row.recipient],
