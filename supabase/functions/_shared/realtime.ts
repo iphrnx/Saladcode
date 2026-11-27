@@ -21,14 +21,16 @@ import {
   dinerTopicName,
   isCapabilityTopic,
   orderEvent,
+  securityTopicName,
   staffTopicName,
   type OrderEventFacts,
 } from "./realtime-payload.ts";
 
-export { dinerTopicName, isCapabilityTopic, orderEvent, staffTopicName };
+export { dinerTopicName, isCapabilityTopic, orderEvent, securityTopicName, staffTopicName };
 export type { OrderEventFacts };
 
 const topicCache = new Map<string, string>();
+const securityTopicCache = new Map<string, string>();
 
 /**
  * Resolve (and cache for this invocation) the staff topic of a tenant.
@@ -101,11 +103,32 @@ export async function publishToStaff(
 }
 
 /**
+ * Resolve (and cache for this invocation) the independent Security topic of a tenant.
+ * Uses its own per-tenant secret so security.view never grants access to Orders/Tables.
+ */
+export async function securityTopic(tenantId: string): Promise<string | null> {
+  const cached = securityTopicCache.get(tenantId);
+  if (cached) return cached;
+  try {
+    const { data, error } = await admin().rpc("ensure_tenant_security_realtime_secret", {
+      p_tenant: tenantId,
+    });
+    if (error || !data) return null;
+    const topic = securityTopicName(tenantId, String(data));
+    securityTopicCache.set(tenantId, topic);
+    return topic;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Notify a restaurant's Security dashboard to re-read /api/security without
- * publishing staff_sessions rows or tokens over Realtime.
+ * publishing staff_sessions rows, tokens, or audit details over Realtime.
  */
 export async function publishSecuritySignal(tenantId: string): Promise<void> {
-  send(`security:${await staffTopic(tenantId)}`, "SECURITY_UPDATED", {});
+  const topic = await securityTopic(tenantId);
+  if (topic) send(topic, "SECURITY_UPDATED", {});
 }
 
 /** Publish one event to a single diner's topic. */
