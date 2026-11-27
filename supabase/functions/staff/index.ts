@@ -15,6 +15,7 @@ import { clientIp } from "../_shared/ip.ts";
 import { embedCount, toCamel } from "../_shared/case.ts";
 import { body, json, preflight, subPath } from "../_shared/http.ts";
 import { enforceWriteLimit } from "../_shared/plans.ts";
+import { publishSecuritySignal } from "../_shared/realtime.ts";
 import { staffModules } from "../_shared/staff-modules.ts";
 
 /**
@@ -258,6 +259,8 @@ async function authenticateStaff(tenantId: string, employeeId: string, pin: stri
     meta: "Staff login via PIN",
   });
 
+  await publishSecuritySignal(tenantId);
+
   return { ok: true, staff, token: session.token };
 }
 
@@ -289,6 +292,9 @@ async function endStaffSession(token: string): Promise<void> {
   }
 
   await db.from("staff_sessions").delete().eq("id", session.id);
+  if (tenantId) {
+    await publishSecuritySignal(tenantId);
+  }
 }
 
 // ---------------------------------------------------------------------------

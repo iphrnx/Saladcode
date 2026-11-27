@@ -1097,22 +1097,21 @@ async function auditRefundIdempotent(
     isFullyRefunded: unknown;
   },
 ) {
-  let existingQuery = db
-    .from("subscription_audit_logs")
-    .select("id")
-    .eq("tenant_id", tenantId)
-    .eq("change_type", "refunded");
-
-  if (detail.refundId) {
-    existingQuery = existingQuery.eq("detail->>refundId", detail.refundId);
-  } else {
-    existingQuery = existingQuery.eq("razorpay_event_id", eventId);
+  const { error } = await db.from("subscription_audit_logs").insert({
+    tenant_id: tenantId,
+    old_plan: oldPlan,
+    new_plan: newPlan,
+    change_type: "refunded",
+    razorpay_event_id: eventId,
+    detail,
+  });
+  if (error) {
+    const isDuplicate =
+      String((error as any).code ?? "") === "23505" ||
+      String(error.message).includes("duplicate key");
+    if (isDuplicate) return;
+    throw new Error(`could not write refund audit log: ${error.message}`);
   }
-
-  const { data: existing } = await existingQuery.limit(1).maybeSingle();
-  if (existing) return;
-
-  await audit(db, tenantId, oldPlan, newPlan, "refunded", eventId, detail);
 }
 
 async function audit(

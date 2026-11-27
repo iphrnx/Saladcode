@@ -6,7 +6,8 @@
 --      skipped those columns.
 --   2. Reconcile supabase_realtime publication for tables the app subscribes to
 --      (orders, order_items, tables, table_sessions, table_checks,
---       security_logs, staff_sessions) idempotently.
+--       security_logs) idempotently, while keeping staff_sessions private (never
+--      published to Realtime so session tokens never cross the wire).
 -- ============================================================================
 
 alter table public.staff_sessions
@@ -23,11 +24,20 @@ declare
     'tables',
     'table_sessions',
     'table_checks',
-    'security_logs',
-    'staff_sessions'
+    'security_logs'
   ];
 begin
   if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+    if exists (
+      select 1
+        from pg_publication_tables
+       where pubname = 'supabase_realtime'
+         and schemaname = 'public'
+         and tablename = 'staff_sessions'
+    ) then
+      alter publication supabase_realtime drop table public.staff_sessions;
+    end if;
+
     foreach v_table in array v_tables loop
       if exists (
         select 1

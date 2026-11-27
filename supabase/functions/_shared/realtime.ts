@@ -100,6 +100,14 @@ export async function publishToStaff(
   send(await staffTopic(tenantId), type, payload);
 }
 
+/**
+ * Notify a restaurant's Security dashboard to re-read /api/security without
+ * publishing staff_sessions rows or tokens over Realtime.
+ */
+export async function publishSecuritySignal(tenantId: string): Promise<void> {
+  send(`security:${await staffTopic(tenantId)}`, "SECURITY_UPDATED", {});
+}
+
 /** Publish one event to a single diner's topic. */
 export function publishToDiner(sessionToken: string, type: string, payload: Record<string, unknown>): void {
   if (!sessionToken) return;

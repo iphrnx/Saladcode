@@ -264,7 +264,7 @@ export async function issueRefundDocument(
   const existingQuery = db.from("billing_refunds").select("*");
   const { data: existingDoc } = details.razorpayRefundId
     ? await existingQuery.eq("razorpay_refund_id", details.razorpayRefundId).maybeSingle()
-    : await existingQuery.eq("payment_id", payment.id).maybeSingle();
+    : await existingQuery.eq("payment_id", payment.id).is("razorpay_refund_id", null).maybeSingle();
   if (existingDoc) return existingDoc;
 
   // The original invoice must exist for the link.
@@ -335,7 +335,7 @@ export async function issueRefundDocument(
       const racedQuery = db.from("billing_refunds").select("*");
       const { data: raced } = details.razorpayRefundId
         ? await racedQuery.eq("razorpay_refund_id", details.razorpayRefundId).maybeSingle()
-        : await racedQuery.eq("payment_id", payment.id).maybeSingle();
+        : await racedQuery.eq("payment_id", payment.id).is("razorpay_refund_id", null).maybeSingle();
       return raced ?? null;
     }
     console.error("billing documents: could not issue the refund document", error.message);

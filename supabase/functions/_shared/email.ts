@@ -621,7 +621,7 @@ export async function queueForTenant(
   let restaurantName = event.restaurantName ?? null;
 
   if (!recipient || !restaurantName) {
-    const [{ data: tenant }, { data: owner }] = await Promise.all([
+    const [{ data: tenant, error: tenantErr }, { data: owner, error: ownerErr }] = await Promise.all([
       db.from("tenants").select("name, email").eq("id", tenantId).maybeSingle(),
       db
         .from("profiles")
@@ -631,6 +631,10 @@ export async function queueForTenant(
         .limit(1)
         .maybeSingle(),
     ]);
+    if (event.throwOnInsertError && (tenantErr || ownerErr)) {
+      const msg = tenantErr?.message ?? ownerErr?.message ?? "recipient lookup failed";
+      throw new Error(`email recipient lookup failed: ${msg}`);
+    }
     recipient = recipient ?? (owner as any)?.email ?? (tenant as any)?.email ?? null;
     recipientName = recipientName ?? (owner as any)?.name ?? null;
     restaurantName = restaurantName ?? (tenant as any)?.name ?? null;
@@ -638,6 +642,9 @@ export async function queueForTenant(
 
   if (!recipient) {
     console.error("email: no address for tenant", tenantId, event.eventType);
+    if (event.throwOnInsertError) {
+      throw new Error(`email: no recipient address for tenant ${tenantId}`);
+    }
     return null;
   }
 

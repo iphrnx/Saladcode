@@ -578,6 +578,7 @@ export function SecurityView() {
   const stats = data?.securityStats ?? null
 
   const tenantId = data?.tenant.id ?? null
+  const realtimeTopic = data?.realtimeTopic ?? null
 
   const headers = {
     'x-tenant-id': data?.tenant.id ?? '',
@@ -636,17 +637,8 @@ export function SecurityView() {
     }
 
     const channel = supabase
-      .channel(`security:${tenantId}`)
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'security_logs', filter: `tenant_id=eq.${tenantId}` },
-        soon,
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'staff_sessions' },
-        soon,
-      )
+      .channel(`security:${realtimeTopic || `orders:${tenantId}`}`)
+      .on('broadcast', { event: 'SECURITY_UPDATED' }, soon)
       .subscribe()
 
     /**
@@ -673,7 +665,7 @@ export function SecurityView() {
       window.removeEventListener('focus', onVisible)
       void supabase.removeChannel(channel)
     }
-  }, [tenantId])
+  }, [tenantId, realtimeTopic])
 
   const revokeSession = async (sessionId: string, sessionIds?: string[]) => {
     setRevoking(sessionId)
