@@ -279,6 +279,7 @@ export interface AppData {
    * the caller may not read orders or the floor.
    */
   realtimeTopic?: string | null
+  securityTopic?: string | null
   /** The plan in force. Absent only if the server could not work it out. */
   subscription?: SubscriptionState
   settings: Record<string, string>

@@ -326,13 +326,31 @@ type BillingPayment = {
     buyer_email: string | null
     buyer_address: string | null
   } | null
+  refunded_amount?: number | null
   refundDocument: {
     refund_number: string
     refund_date: string
+    amount?: number
+    currency?: string
     original_invoice_number: string | null
     original_invoice_date: string | null
     razorpay_refund_id: string | null
   } | null
+  refundDocuments?: Array<{
+    refund_number: string
+    refund_date: string
+    amount?: number
+    currency?: string
+    original_invoice_number: string | null
+    original_invoice_date: string | null
+    razorpay_refund_id: string | null
+  }>
+}
+
+type BillingRefundDoc = NonNullable<BillingPayment['refundDocument']>
+
+function defaultRefundFor(p: BillingPayment): BillingRefundDoc | null {
+  return p.refundDocuments?.[0] ?? p.refundDocument ?? null
 }
 
 /**
@@ -346,8 +364,8 @@ function PaymentHistoryRows(props: {
   directory: PlanDirectory
   timeZone: string
   invoiceBusy: string | null
-  onDownload: (p: BillingPayment, kind?: 'invoice' | 'refund') => void
-  onReceipt: (p: BillingPayment) => void
+  onDownload: (p: BillingPayment, kind?: 'invoice' | 'refund', refundId?: string | null) => void
+  onReceipt: (p: BillingPayment, refund?: BillingRefundDoc | null) => void
 }) {
   const { payments, directory, timeZone, invoiceBusy, onDownload, onReceipt } = props
   const pillTone = (status: string): 'success' | 'warn' | 'danger' =>
@@ -411,35 +429,85 @@ function PaymentHistoryRows(props: {
                 Download
               </Button>
             )}
-            {p.status === 'refunded' && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-9 gap-1.5 rounded-lg border-[#f97316]/40 bg-[#f97316]/5 px-3.5 text-[12.5px] font-semibold text-[#ea580c] hover:bg-[#f97316]/15 hover:text-[#ea580c]"
-                title="Download the refund document (PDF)"
-                disabled={invoiceBusy === `refund:${p.id}`}
-                onClick={() => onDownload(p, 'refund')}
-              >
-                {invoiceBusy === `refund:${p.id}` ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <RotateCcw className="h-4 w-4" />
-                )}
-                Refund
-              </Button>
-            )}
-            {(p.status === 'succeeded' || p.status === 'refunded') && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-9 gap-1.5 rounded-lg border-[#f97316]/40 bg-[#f97316]/5 px-3.5 text-[12.5px] font-semibold text-[#ea580c] hover:bg-[#f97316]/15 hover:text-[#ea580c]"
-                title="Print the bill"
-                onClick={() => onReceipt(p)}
-              >
-                <Printer className="h-4 w-4" />
-                Print
-              </Button>
-            )}
+            {(() => {
+              const refundDocs = p.refundDocuments?.length
+                ? p.refundDocuments
+                : (p.refundDocument ? [p.refundDocument] : [])
+              const hasRefund =
+                p.status === 'refunded' || Number(p.refunded_amount ?? 0) > 0 || refundDocs.length > 0
+              const defaultRefund = defaultRefundFor(p)
+              if (refundDocs.length > 1) {
+                return (
+                  <>
+                    {refundDocs.map((rf) => {
+                      const busyKey = `refund:${p.id}:${rf.razorpay_refund_id ?? rf.refund_number}`
+                      return (
+                        <span key={rf.razorpay_refund_id ?? rf.refund_number} className="contents">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-9 gap-1.5 rounded-lg border-[#f97316]/40 bg-[#f97316]/5 px-3.5 text-[12.5px] font-semibold text-[#ea580c] hover:bg-[#f97316]/15 hover:text-[#ea580c]"
+                            title={`Download refund ${rf.refund_number} (PDF)`}
+                            disabled={invoiceBusy === busyKey}
+                            onClick={() => onDownload(p, 'refund', rf.razorpay_refund_id)}
+                          >
+                            {invoiceBusy === busyKey ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <RotateCcw className="h-4 w-4" />
+                            )}
+                            Refund {rf.amount != null ? money(rf.currency ?? p.currency, Number(rf.amount)) : rf.refund_number}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-9 gap-1.5 rounded-lg border-[#f97316]/40 bg-[#f97316]/5 px-3.5 text-[12.5px] font-semibold text-[#ea580c] hover:bg-[#f97316]/15 hover:text-[#ea580c]"
+                            title={`Print refund ${rf.refund_number}`}
+                            onClick={() => onReceipt(p, rf)}
+                          >
+                            <Printer className="h-4 w-4" />
+                            Print
+                          </Button>
+                        </span>
+                      )
+                    })}
+                  </>
+                )
+              }
+              return (
+                <>
+                  {hasRefund && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-9 gap-1.5 rounded-lg border-[#f97316]/40 bg-[#f97316]/5 px-3.5 text-[12.5px] font-semibold text-[#ea580c] hover:bg-[#f97316]/15 hover:text-[#ea580c]"
+                      title="Download the refund document (PDF)"
+                      disabled={invoiceBusy === `refund:${p.id}:${defaultRefund?.razorpay_refund_id ?? ''}`}
+                      onClick={() => onDownload(p, 'refund', defaultRefund?.razorpay_refund_id ?? null)}
+                    >
+                      {invoiceBusy === `refund:${p.id}:${defaultRefund?.razorpay_refund_id ?? ''}` ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <RotateCcw className="h-4 w-4" />
+                      )}
+                      Refund
+                    </Button>
+                  )}
+                  {(p.status === 'succeeded' || p.status === 'refunded') && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-9 gap-1.5 rounded-lg border-[#f97316]/40 bg-[#f97316]/5 px-3.5 text-[12.5px] font-semibold text-[#ea580c] hover:bg-[#f97316]/15 hover:text-[#ea580c]"
+                      title="Print the bill"
+                      onClick={() => onReceipt(p, hasRefund ? defaultRefund : null)}
+                    >
+                      <Printer className="h-4 w-4" />
+                      Print
+                    </Button>
+                  )}
+                </>
+              )
+            })()}
             <StatusPill tone={pillTone(p.status)} label={p.status} />
           </div>
         </div>
@@ -650,7 +718,19 @@ export function SettingsView() {
    * subscription is actually on, or the one a landing-page CTA carried here. */
   const [billingInterval, setBillingInterval] = useState<BillingInterval>('monthly')
   const [payments, setPayments] = useState<BillingPayment[]>([])
-  const [receiptFor, setReceiptFor] = useState<(typeof payments)[number] | null>(null)
+  const [receiptFor, setReceiptFor] = useState<{
+    payment: (typeof payments)[number]
+    refund: BillingRefundDoc | null
+  } | null>(null)
+  const openReceipt = (payment: (typeof payments)[number], refund?: BillingRefundDoc | null) => {
+    const resolvedRefund =
+      refund !== undefined
+        ? refund
+        : (payment.status === 'refunded' || Number(payment.refunded_amount ?? 0) > 0
+            ? defaultRefundFor(payment)
+            : null)
+    setReceiptFor({ payment, refund: resolvedRefund })
+  }
   const [restaurant, setRestaurant] = useState<{ name: string | null; email: string | null }>({ name: null, email: null })
   const [razorpayConfigured, setRazorpayConfigured] = useState(true)
   const [billingLoading, setBillingLoading] = useState(true)
@@ -999,9 +1079,14 @@ export function SettingsView() {
    * plan description and seller snapshot are shown verbatim; only payments
    * filed before issuance existed fall back to what the payment row knows.
    */
-  function receiptModel(p: (typeof payments)[number]) {
+  function receiptModel(p: (typeof payments)[number], selectedRefund?: BillingRefundDoc | null) {
     const doc = p.document ?? null
-    const refund = p.status === 'refunded' ? p.refundDocument ?? null : null
+    const refund =
+      selectedRefund !== undefined
+        ? selectedRefund
+        : (p.status === 'refunded' || Number(p.refunded_amount ?? 0) > 0
+            ? defaultRefundFor(p)
+            : null)
     const paidIso = doc?.invoice_date ?? p.created_at
     const periodStart = doc?.period_start ?? null
     const periodEnd = doc?.period_end ?? (planIsOneTime(p.plan_id)
@@ -1028,7 +1113,10 @@ export function SettingsView() {
         ? `${docDate(periodStart)} – ${docDate(periodEnd)}`
         : null,
       totalLabel: refund ? 'Total refunded' : 'Total paid',
-      money: docMoney(p.currency, Number(p.amount)),
+      money: docMoney(
+        p.currency,
+        Number(refund ? (refund.amount ?? p.refunded_amount ?? p.amount) : p.amount),
+      ),
       originalInvoice: refund
         ? ([
             ['Invoice number', refund.original_invoice_number],
@@ -1061,8 +1149,8 @@ export function SettingsView() {
    * typography as the issued PDF, so what the owner prints is the same
    * document the Download button produces.
    */
-  function printReceipt(p: (typeof payments)[number]) {
-    const m = receiptModel(p)
+  function printReceipt(p: (typeof payments)[number], selectedRefund?: BillingRefundDoc | null) {
+    const m = receiptModel(p, selectedRefund)
     const esc = (s: string) =>
       s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
     const sellerLines = [
@@ -1199,25 +1287,35 @@ export function SettingsView() {
    * PDF, and replays the same immutable document on every later
    * request. `kind` selects the invoice or its linked refund document.
    */
-  async function downloadInvoice(p: (typeof payments)[number], kind: 'invoice' | 'refund' = 'invoice') {
-    setInvoiceBusy(`${kind}:${p.id}`)
+  async function downloadInvoice(
+    p: (typeof payments)[number],
+    kind: 'invoice' | 'refund' = 'invoice',
+    refundId?: string | null,
+  ) {
+    const resolvedRefund =
+      kind === 'refund'
+        ? (refundId
+            ? (p.refundDocuments?.find(
+                (r) => r.razorpay_refund_id === refundId || r.refund_number === refundId,
+              ) ?? defaultRefundFor(p))
+            : defaultRefundFor(p))
+        : null
+    const targetRefundId = kind === 'refund' ? (refundId ?? resolvedRefund?.razorpay_refund_id ?? null) : null
+    setInvoiceBusy(kind === 'refund' ? `${kind}:${p.id}:${targetRefundId ?? ''}` : `${kind}:${p.id}`)
     const subject = kind === 'refund' ? 'the refund document' : 'the invoice'
     try {
-      const res = await edgeFetch(`/api/subscriptions/invoice?paymentId=${p.id}&kind=${kind}&download=1`, { headers })
+      const qs = new URLSearchParams({ paymentId: p.id, kind, download: '1' })
+      if (targetRefundId) qs.set('refundId', targetRefundId)
+      const res = await edgeFetch(`/api/subscriptions/invoice?${qs.toString()}`, { headers })
       await failIfNotOk(res, subject)
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      // The server names the file after the issued document
-      // (Invoice-INV-2026-27-00001.pdf / Refund-RFND-….pdf) — the very
-      // number the receipt shows. Trust the Content-Disposition header so
-      // the download can never drift from the canonical document; fall
-      // back to the document number from state, then the transaction id.
       const disposition = res.headers.get('Content-Disposition') ?? ''
       const serverName = /filename="?([^";]+)"?/.exec(disposition)?.[1]?.trim()
       const docNumber = kind === 'refund'
-        ? p.refundDocument?.refund_number
+        ? resolvedRefund?.refund_number
         : p.document?.invoice_number
       a.download = serverName
         ?? `${kind === 'refund' ? 'Refund' : 'Invoice'}-${docNumber ?? p.transaction_id ?? p.id.slice(0, 8)}.pdf`
@@ -2312,7 +2410,7 @@ export function SettingsView() {
                 onCancelScheduled={(change) => setCancelScheduledFor(change)}
                 onBrowsePlans={() => setManaging(false)}
                 onDownload={downloadInvoice}
-                onReceipt={setReceiptFor}
+                onReceipt={openReceipt}
                 invoiceBusy={invoiceBusy}
               />
             )}
@@ -2503,7 +2601,7 @@ export function SettingsView() {
                   )}
                   {(latestPayment.status === 'succeeded' || latestPayment.status === 'refunded') && (
                     <div className="mt-3 flex justify-end">
-                      <Button size="sm" variant="outline" onClick={() => setReceiptFor(latestPayment)}>
+                      <Button size="sm" variant="outline" onClick={() => openReceipt(latestPayment)}>
                         <Printer className="h-3.5 w-3.5 mr-1.5" />
                         Receipt
                       </Button>
@@ -2725,7 +2823,7 @@ export function SettingsView() {
                     timeZone={billingTimeZone}
                     invoiceBusy={invoiceBusy}
                     onDownload={downloadInvoice}
-                    onReceipt={setReceiptFor}
+                    onReceipt={openReceipt}
                   />
                 )}
               </BillingCard>
@@ -2769,7 +2867,7 @@ export function SettingsView() {
                 <DialogContent className="max-w-lg bg-white text-[#1b202c] p-0 overflow-hidden">
                   <DialogTitle className="sr-only">Payment receipt</DialogTitle>
                   {receiptFor && (() => {
-                    const m = receiptModel(receiptFor)
+                    const m = receiptModel(receiptFor.payment, receiptFor.refund)
                     const sellerLines = [
                       ...m.sellerLines,
                       ...(m.sellerEmail ? [m.sellerEmail] : []),
@@ -2864,7 +2962,7 @@ export function SettingsView() {
 
                           <Button
                             className="mt-4 h-10 w-full gap-2 rounded-lg bg-[#f97316] text-sm font-semibold text-white hover:bg-[#ea580c]"
-                            onClick={() => printReceipt(receiptFor)}
+                            onClick={() => printReceipt(receiptFor.payment, receiptFor.refund)}
                           >
                             <Printer className="h-4 w-4" />
                             Print / save as PDF
@@ -3373,8 +3471,8 @@ function ManageBillingView(props: {
   cancelling: boolean
   onCancelScheduled: (change: ScheduledChange) => void
   onBrowsePlans: () => void
-  onDownload: (p: BillingPayment, kind?: 'invoice' | 'refund') => void
-  onReceipt: (p: BillingPayment) => void
+  onDownload: (p: BillingPayment, kind?: 'invoice' | 'refund', refundId?: string | null) => void
+  onReceipt: (p: BillingPayment, refund?: BillingRefundDoc | null) => void
   invoiceBusy: string | null
 }) {
   const {

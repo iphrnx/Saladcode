@@ -146,6 +146,10 @@ async function uploadPdf(db: any, path: string, bytes: Uint8Array): Promise<bool
     upsert: false,
   });
   if (error) {
+    const status = String((error as any).statusCode ?? (error as any).status ?? "");
+    if (status === "409" || /already exists|duplicate/i.test(String(error.message ?? ""))) {
+      return true;
+    }
     console.error("billing documents: could not store the PDF", error.message);
     return false;
   }
@@ -258,15 +262,6 @@ export async function issueRefundDocument(
   payment: any,
   details: { refundedAt?: Date; razorpayRefundId?: string | null; amount?: number } = {},
 ): Promise<any | null> {
-  // Idempotency: if a refund document was already issued for this Razorpay
-  // refund (or for this payment when no refund ID exists), return it without
-  // consuming another RFND sequence number.
-  const existingQuery = db.from("billing_refunds").select("*");
-  const { data: existingDoc } = details.razorpayRefundId
-    ? await existingQuery.eq("razorpay_refund_id", details.razorpayRefundId).maybeSingle()
-    : await existingQuery.eq("payment_id", payment.id).is("razorpay_refund_id", null).maybeSingle();
-  if (existingDoc) return existingDoc;
-
   // The original invoice must exist for the link.
   let { data: invoice } = await db
     .from("billing_invoices")
@@ -292,54 +287,41 @@ export async function issueRefundDocument(
   const refundedAt = details.refundedAt ?? new Date();
   const fiscalYear = fiscalYearOf(refundedAt);
 
-  const number = await takeNumber(db, "RFND", fiscalYear);
-  if (!number) return null;
+  // Atomically claim one receipt row and reserve one RFND number before
+  // uploading the PDF. Concurrent deliveries receive the same row, and retries
+  // after a failed upload resume with the same number and storage path.
+  const { data: claimed, error: claimError } = await db.rpc("claim_billing_refund_document", {
+    p_tenant_id: tenantId,
+    p_payment_id: payment.id,
+    p_invoice_id: invoice?.id ?? null,
+    p_refund_date: refundedAt.toISOString(),
+    p_fiscal_year: fiscalYear,
+    p_seller_name: seller.name,
+    p_seller_address: seller.addressLines.join("\n") || null,
+    p_seller_email: seller.email ?? "",
+    p_seller_phone: seller.phone ?? "",
+    p_buyer_name: tenant?.name ?? "Restaurant",
+    p_buyer_email: tenant?.email ?? null,
+    p_buyer_address: tenant?.address ?? null,
+    p_original_invoice_number: invoice?.invoice_number ?? null,
+    p_original_invoice_date: invoice?.invoice_date ?? null,
+    p_amount: details.amount ?? Number(payment.amount),
+    p_currency: payment.currency ?? "INR",
+    p_description: planRow?.name ?? payment.plan_id,
+    p_razorpay_payment_id: payment.razorpay_payment_id ?? null,
+    p_razorpay_order_id: payment.razorpay_order_id ?? null,
+    p_razorpay_refund_id: details.razorpayRefundId ?? null,
+  });
 
-  const insert = {
-    tenant_id: tenantId,
-    payment_id: payment.id,
-    invoice_id: invoice?.id ?? null,
-    refund_number: number,
-    refund_date: refundedAt.toISOString(),
-    fiscal_year: fiscalYear,
-    seller_name: seller.name,
-    seller_address: seller.addressLines.join("\n") || null,
-    seller_email: seller.email ?? "",
-    seller_phone: seller.phone ?? "",
-    buyer_name: tenant?.name ?? "Restaurant",
-    buyer_email: tenant?.email ?? null,
-    buyer_address: tenant?.address ?? null,
-    original_invoice_number: invoice?.invoice_number ?? null,
-    original_invoice_date: invoice?.invoice_date ?? null,
-    // What Razorpay actually returned, not the payment's full amount:
-    // a partial refund documents the partial figure.
-    amount: details.amount ?? Number(payment.amount),
-    currency: payment.currency ?? "INR",
-    description: planRow?.name ?? payment.plan_id,
-    razorpay_payment_id: payment.razorpay_payment_id ?? null,
-    razorpay_order_id: payment.razorpay_order_id ?? null,
-    razorpay_refund_id: details.razorpayRefundId ?? null,
-    pdf_path: `${tenantId}/${number}.pdf`,
-  };
-
-  const bytes = buildRefundPdf(refundFactsFromRow(insert, seller));
-  await uploadPdf(db, insert.pdf_path, bytes);
-
-  const { data: inserted, error } = await db
-    .from("billing_refunds")
-    .insert(insert)
-    .select("*")
-    .single();
-  if (error) {
-    if (String(error.code) === "23505") {
-      const racedQuery = db.from("billing_refunds").select("*");
-      const { data: raced } = details.razorpayRefundId
-        ? await racedQuery.eq("razorpay_refund_id", details.razorpayRefundId).maybeSingle()
-        : await racedQuery.eq("payment_id", payment.id).is("razorpay_refund_id", null).maybeSingle();
-      return raced ?? null;
-    }
-    console.error("billing documents: could not issue the refund document", error.message);
+  if (claimError || !claimed) {
+    console.error("billing documents: could not claim refund document", claimError?.message);
     return null;
   }
-  return inserted;
+
+  const bytes = buildRefundPdf(refundFactsFromRow(claimed, seller));
+  const uploaded = await uploadPdf(db, claimed.pdf_path, bytes);
+  if (!uploaded) {
+    return null;
+  }
+  return claimed;
 }

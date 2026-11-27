@@ -443,6 +443,9 @@ Deno.serve(async (req: Request) => {
         effectivePermissions.some((p: string) => ["orders.view", "tables.view"].includes(p))
           ? await staffTopic(g.session.tenantId)
           : null,
+      securityTopic: effectivePermissions.includes("security.view")
+        ? `security:${await staffTopic(g.session.tenantId)}`
+        : null,
       users: canSeePeople ? users : [],
       roles: canSeePeople ? roles : [],
       staff: canSeePeople ? staff : [],

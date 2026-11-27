@@ -708,18 +708,25 @@ async function state(req: Request, tenantId: string): Promise<Response> {
   const { data: refunds, error: refundsError } = await admin()
     .from("billing_refunds")
     .select(
-      "razorpay_payment_id, refund_number, refund_date, original_invoice_number, original_invoice_date, razorpay_refund_id",
+      "id, payment_id, razorpay_payment_id, refund_number, refund_date, amount, currency, original_invoice_number, original_invoice_date, razorpay_refund_id",
     )
-    .eq("tenant_id", tenantId);
+    .eq("tenant_id", tenantId)
+    .order("refund_date", { ascending: false })
+    .order("created_at", { ascending: false });
   if (refundsError) {
     console.error("subscriptions state: refunds unreadable", refundsError.message);
   }
   const invoiceByPayment = new Map(
     (invoices ?? []).map((row) => [row.razorpay_payment_id, row]),
   );
-  const refundByPayment = new Map(
-    (refunds ?? []).map((row) => [row.razorpay_payment_id, row]),
-  );
+  const refundsByPayment = new Map<string, any[]>();
+  for (const row of refunds ?? []) {
+    const k = row.razorpay_payment_id;
+    if (!k) continue;
+    const list = refundsByPayment.get(k) ?? [];
+    list.push(row);
+    refundsByPayment.set(k, list);
+  }
 
   // Every plan's display facts — retired ones included. The catalogue the
   // grid is built from is active-only, so without this a retired plan's
@@ -760,10 +767,12 @@ async function state(req: Request, tenantId: string): Promise<Response> {
     locationCount: locationCount ?? 1,
     payments: (payments ?? []).map((row) => {
       const key = row.razorpay_payment_id ?? row.transaction_id;
+      const refundDocs = refundsByPayment.get(key) ?? [];
       return {
         ...row,
         document: invoiceByPayment.get(key) ?? null,
-        refundDocument: refundByPayment.get(key) ?? null,
+        refundDocument: refundDocs[0] ?? null,
+        refundDocuments: refundDocs,
       };
     }),
   });
