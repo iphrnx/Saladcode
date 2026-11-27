@@ -118,9 +118,13 @@ Deno.serve(async (req: Request) => {
             .order("created_at", { ascending: false })
             .limit(50)
         : Promise.resolve({ data: [], error: null }),
-      db.from("staff").select("*, role:roles(*)").eq("tenant_id", tenantId).order("name", {
-        ascending: true,
-      }),
+      db
+        .from("staff")
+        .select(
+          "id, tenant_id, location_id, role_id, name, employee_id, avatar, active, locked_until, last_login, created_at, updated_at, role:roles(id, name, description, permissions, is_system, color)",
+        )
+        .eq("tenant_id", tenantId)
+        .order("name", { ascending: true }),
       // Settings and the security trio join the same wave. They used to run as
       // two further sequential rounds (settings, then three more queries), so
       // every bootstrap paid three round trips for data that depends on
@@ -372,7 +376,7 @@ Deno.serve(async (req: Request) => {
     if (g.session.kind === "staff") {
       const { data: staffRow } = await db
         .from("staff")
-        .select("*")
+        .select("id, employee_id, avatar")
         .eq("id", g.session.subjectId)
         .eq("tenant_id", tenantId)
         .maybeSingle();
