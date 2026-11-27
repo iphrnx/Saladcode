@@ -536,6 +536,18 @@ async function recordPayment(req: Request): Promise<Response> {
   }
   if (!data) return json(req, { error: "No open bill for that table." }, 404);
 
+  // Block any payment (Cash, UPI, or Card) if any active order on the full check is still unserved.
+  const hasUnservedOrder = (data.orders ?? []).some((o: any) =>
+    ["PENDING_ACTIVATION", "PENDING", "PREPARING", "READY"].includes(String(o.status ?? "").toUpperCase()),
+  );
+  if (hasUnservedOrder) {
+    return json(
+      req,
+      { error: "Something is still being prepared on this table.", code: "orders_open" },
+      409,
+    );
+  }
+
   const amount = b.amount !== undefined && b.amount !== null ? Number(b.amount) : null;
   if (amount !== null && (!Number.isFinite(amount) || amount <= 0)) {
     return json(req, { error: "Enter an amount greater than zero." }, 400);
@@ -582,6 +594,13 @@ async function recordPayment(req: Request): Promise<Response> {
       return json(
         req,
         { error: `${outstandingDue} is still due on this table — check the amount.`, code: "overpayment" },
+        409,
+      );
+    }
+    if (message.includes("ORDERS_OPEN:")) {
+      return json(
+        req,
+        { error: "Something is still being prepared on this table.", code: "orders_open" },
         409,
       );
     }
@@ -779,6 +798,18 @@ async function finalize(req: Request): Promise<Response> {
   }
   if (!data) return json(req, { error: "No open bill for that table." }, 404);
 
+  // Block any payment (Cash, UPI, or Card) if any active order on the full check is still unserved.
+  const hasUnservedOrder = (data.orders ?? []).some((o: any) =>
+    ["PENDING_ACTIVATION", "PENDING", "PREPARING", "READY"].includes(String(o.status ?? "").toUpperCase()),
+  );
+  if (hasUnservedOrder) {
+    return json(
+      req,
+      { error: "Something is still being prepared on this table.", code: "orders_open" },
+      409,
+    );
+  }
+
   const { data: result, error } = await admin().rpc("finalize_table_check", {
     p_tenant: g.session.tenantId,
     p_check: data.check.id,
@@ -870,6 +901,18 @@ async function settleCash(req: Request): Promise<Response> {
     return json(req, { error: `Could not prepare payment: ${(err as Error).message}` }, 500);
   }
   if (!data) return json(req, { error: "No open bill for that table." }, 404);
+
+  // Block any payment (Cash, UPI, or Card) if any active order on the full check is still unserved.
+  const hasUnservedOrder = (data.orders ?? []).some((o: any) =>
+    ["PENDING_ACTIVATION", "PENDING", "PREPARING", "READY"].includes(String(o.status ?? "").toUpperCase()),
+  );
+  if (hasUnservedOrder) {
+    return json(
+      req,
+      { error: "Something is still being prepared on this table.", code: "orders_open" },
+      409,
+    );
+  }
 
   const { data: result, error } = await admin().rpc("settle_check_cash_tx", {
     p_tenant: g.session.tenantId,

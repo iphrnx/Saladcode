@@ -2469,7 +2469,7 @@ async function sync(req: Request): Promise<Response> {
       ? db.from("table_checks").select("id, status, invoice_number, closed_at, subtotal, tax, service_charge, total, paid_total").in("id", checkIds).eq("tenant_id", tenantId)
       : Promise.resolve({ data: [] }),
     checkIds.length
-      ? db.from("orders").select("check_id, total, items_total, discount, tax").in("check_id", checkIds)
+      ? db.from("orders").select("check_id, status, total, items_total, discount, tax").in("check_id", checkIds)
         .eq("tenant_id", tenantId).not("status", "in", "(CANCELLED,PENDING_ACTIVATION)")
       : Promise.resolve({ data: [] }),
     checkIds.length
@@ -2483,6 +2483,7 @@ async function sync(req: Request): Promise<Response> {
 
   const checks: Record<string, {
     orderCount: number;
+    allServed: boolean;
     /** Before tax: the items, less discount. What the food cost. */
     subtotal: number;
     tax: number;
@@ -2503,6 +2504,7 @@ async function sync(req: Request): Promise<Response> {
     for (const c of checkRows) {
       checks[c.id] = {
         orderCount: 0,
+        allServed: true,
         subtotal: 0,
         tax: 0,
         serviceCharge: Number(c.service_charge ?? 0),
@@ -2518,6 +2520,7 @@ async function sync(req: Request): Promise<Response> {
       const c = checks[(o as any).check_id];
       if (!c) continue;
       c.orderCount += 1;
+      c.allServed = c.allServed && ["SERVED", "COMPLETED"].includes(String((o as any).status ?? "").toUpperCase());
       c.subtotal += Number((o as any).items_total ?? 0) - Number((o as any).discount ?? 0);
       c.tax += Number((o as any).tax ?? 0);
       c.total += Number((o as any).total ?? 0);

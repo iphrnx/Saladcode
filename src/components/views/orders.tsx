@@ -933,16 +933,16 @@ export function OrdersView() {
           orderId: sitting.latest.id,
           table: sitting.tableName
             ? {
-                name: sitting.tableName,
+              name: sitting.tableName,
+              seats: sitting.seats ?? 0,
+              area: sitting.area ?? '',
+            }
+            : sitting.tableId
+              ? {
+                name: 'Table',
                 seats: sitting.seats ?? 0,
                 area: sitting.area ?? '',
               }
-            : sitting.tableId
-              ? {
-                  name: 'Table',
-                  seats: sitting.seats ?? 0,
-                  area: sitting.area ?? '',
-                }
               : null,
           autoPrint: true,
         })
@@ -1010,8 +1010,8 @@ export function OrdersView() {
                 tab.key === 'all'
                   ? orders.length
                   : orders.filter(
-                      (o) => (o.status === 'PENDING_ACTIVATION' ? 'PENDING' : o.status) === tab.key,
-                    ).length
+                    (o) => (o.status === 'PENDING_ACTIVATION' ? 'PENDING' : o.status) === tab.key,
+                  ).length
               return (
                 <button
                   key={tab.key}
@@ -1128,16 +1128,16 @@ export function OrdersView() {
                     orderId: target.latest.id,
                     table: target.tableName
                       ? {
-                          name: target.tableName,
+                        name: target.tableName,
+                        seats: target.seats ?? 0,
+                        area: target.area ?? '',
+                      }
+                      : target.tableId
+                        ? {
+                          name: 'Table',
                           seats: target.seats ?? 0,
                           area: target.area ?? '',
                         }
-                      : target.tableId
-                        ? {
-                            name: 'Table',
-                            seats: target.seats ?? 0,
-                            area: target.area ?? '',
-                          }
                         : null,
                     autoPrint,
                   })
@@ -1678,16 +1678,16 @@ export function OrdersView() {
               orderId: target.latest.id,
               table: target.tableName
                 ? {
-                    name: target.tableName,
+                  name: target.tableName,
+                  seats: target.seats ?? 0,
+                  area: target.area ?? '',
+                }
+                : target.tableId
+                  ? {
+                    name: 'Table',
                     seats: target.seats ?? 0,
                     area: target.area ?? '',
                   }
-                : target.tableId
-                  ? {
-                      name: 'Table',
-                      seats: target.seats ?? 0,
-                      area: target.area ?? '',
-                    }
                   : null,
               autoPrint: true,
             })
@@ -1699,16 +1699,16 @@ export function OrdersView() {
               orderId: target.latest.id,
               table: target.tableName
                 ? {
-                    name: target.tableName,
+                  name: target.tableName,
+                  seats: target.seats ?? 0,
+                  area: target.area ?? '',
+                }
+                : target.tableId
+                  ? {
+                    name: 'Table',
                     seats: target.seats ?? 0,
                     area: target.area ?? '',
                   }
-                : target.tableId
-                  ? {
-                      name: 'Table',
-                      seats: target.seats ?? 0,
-                      area: target.area ?? '',
-                    }
                   : null,
               autoPrint: false,
             })
@@ -1737,8 +1737,8 @@ export function OrdersView() {
         tableHint={
           paySitting
             ? [paySitting.area || 'Main Hall', ORDER_TYPE_LABEL[paySitting.orderType] ?? paySitting.orderType]
-                .filter(Boolean)
-                .join(' · ')
+              .filter(Boolean)
+              .join(' · ')
             : undefined
         }
         currencySymbol={cs}
@@ -1815,33 +1815,51 @@ function getSittingPaymentEligibility(
   const { check, checkAllServed = true, hasPayPerm } = opts
   const hasBill = check ? check.orderCount > 0 : !sitting.awaiting
   const awaiting = !hasBill
-  const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber)
+  const checkStatus = check?.status?.toUpperCase()
+  const isVoidedCheck = checkStatus === 'VOID' || checkStatus === 'VOIDED' || checkStatus === 'CANCELLED'
+  const isSettledCheck = checkStatus === 'PAID' || Boolean(check?.invoiceNumber)
+  const isEndedUnsettledCheck =
+    !active && Boolean(sitting.checkId) && (checkStatus === 'UNSETTLED' || checkStatus === 'OPEN')
   const allOrdersCompleted = sitting.orders.every((order) => ['COMPLETED', 'CANCELLED'].includes(order.status))
   const allOrdersPaid = sitting.orders.every((order) => order.paymentStatus === 'PAID')
   const paidOff = Boolean(
     sitting.paidOff ||
-      isSettledCheck ||
-      (allOrdersPaid && allOrdersCompleted) ||
-      sitting.latest.paymentStatus === 'PAID',
+    isSettledCheck ||
+    (allOrdersPaid && allOrdersCompleted) ||
+    sitting.latest.paymentStatus === 'PAID',
   )
   const unservedInSession = sitting.orders.some((o) =>
     ['PENDING_ACTIVATION', 'PENDING', 'PREPARING', 'READY'].includes(o.status),
   )
   const allSessionOrdersServed = !unservedInSession && sitting.allServed && checkAllServed
+  const isTakeawayOrDelivery = sitting.orderType === 'TAKEAWAY' || sitting.orderType === 'DELIVERY'
   const hasTarget = Boolean(
-    (sitting.tableId && sitting.checkId) || (!sitting.checkId && sitting.latest.status !== 'COMPLETED'),
+    isEndedUnsettledCheck
+      ? sitting.checkId
+      : isTakeawayOrDelivery
+        ? (sitting.checkId || sitting.sessionId || sitting.latest.status !== 'COMPLETED')
+        : ((sitting.tableId && sitting.checkId) || (!sitting.checkId && sitting.latest.status !== 'COMPLETED')),
   )
-  const eligible = active && hasPayPerm && allSessionOrdersServed && !paidOff && hasBill && hasTarget
+  const eligible =
+    (active || isEndedUnsettledCheck) &&
+    hasPayPerm &&
+    allSessionOrdersServed &&
+    !paidOff &&
+    !isVoidedCheck &&
+    hasBill &&
+    hasTarget
 
   const reason = !hasPayPerm
     ? 'Payment permission is required'
-    : !allSessionOrdersServed
-      ? 'Serve all orders in this session before settling the bill'
-      : paidOff
-        ? 'This bill is paid'
-        : awaiting
-          ? 'No bill yet'
-          : undefined
+    : isVoidedCheck
+      ? 'This bill is voided'
+      : !allSessionOrdersServed
+        ? 'Serve all orders in this session before settling the bill'
+        : paidOff
+          ? 'This bill is paid'
+          : awaiting
+            ? 'No bill yet'
+            : undefined
 
   return { eligible, reason, paidOff, awaiting }
 }
@@ -2399,10 +2417,10 @@ function SittingCard({
   )
   const servingLabel = onlyPendingActivation ? 'Awaiting Acceptance'
     : validOrders.length === 0 ? 'No Items to Serve'
-    : validOrders.every((order) => order.status === 'PREPARING') ? 'All Items Preparing'
-    : toServe.length > 0 ? (remainingQty > 0 ? `${remainingQty} to Serve` : 'Service Pending')
-    : sitting.allServed ? 'All Served'
-    : 'Awaiting Acceptance'
+      : validOrders.every((order) => order.status === 'PREPARING') ? 'All Items Preparing'
+        : toServe.length > 0 ? (remainingQty > 0 ? `${remainingQty} to Serve` : 'Service Pending')
+          : sitting.allServed ? 'All Served'
+            : 'Awaiting Acceptance'
   const paymentReason = eligibility.reason
   const billTotal = check?.total ?? sitting.total
   const billPaid = check?.paid ?? (paidOff ? sitting.total : sitting.paid)
@@ -2414,8 +2432,8 @@ function SittingCard({
   const cardName = sitting.tableName
     ? (sitting.sessionLabel ? `${sitting.tableName} · ${sitting.sessionLabel}` : sitting.tableName)
     : (sitting.latest.customerName
-        ? `${ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType} · ${sitting.latest.customerName}`
-        : `Order #${sitting.latest.orderNumber}`)
+      ? `${ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType} · ${sitting.latest.customerName}`
+      : `Order #${sitting.latest.orderNumber}`)
   const sessionStats = [
     {
       icon: ClipboardCheck,
@@ -2643,20 +2661,20 @@ function SittingCard({
             disabled={active && !canPay}
             title={active && !canPay ? paymentReason : undefined}
             onClick={() => {
-              if (!active) onOpenOrders(sitting)
-              else if (canPay && sitting.checkId) onCompletePay(sitting)
+              if (canPay && (sitting.checkId || sitting.sessionId)) onCompletePay(sitting)
               else if (canPay) onPay(sitting.latest)
+              else if (!active) onOpenOrders(sitting)
             }}
             className={cn(
               'h-10 flex-1 min-w-[11rem] gap-1.5 rounded-xl px-3.5 text-center font-bold text-xs sm:text-[13px] whitespace-nowrap transition-all duration-200',
-              active && canPay
+              canPay
                 ? 'bg-gradient-to-r from-[#f97316] to-[#ea580c] hover:from-[#ea580c] hover:to-[#c2410c] text-white shadow-sm shadow-orange-500/20 active:scale-[0.99] cursor-pointer'
                 : active
                   ? 'border border-neutral-200/80 bg-neutral-100 text-neutral-400 dark:border-border/60 dark:bg-secondary/40 dark:text-muted-foreground/50 shadow-none disabled:opacity-70 disabled:cursor-not-allowed disabled:pointer-events-none'
                   : 'border border-border bg-card text-foreground hover:bg-secondary cursor-pointer shadow-xs',
             )}
           >
-            <span>{active ? 'Complete & Pay' : 'Session Details'}</span>
+            <span>{active || canPay ? 'Complete & Pay' : 'Session Details'}</span>
             <ChevronRight aria-hidden className="size-4 stroke-[2.5] shrink-0" />
           </Button>
         </div>
@@ -2757,7 +2775,7 @@ function OrderRow({
   const state = ORDER_STATUS[order.status as keyof typeof ORDER_STATUS]
   const StatusIcon = order.status === 'PREPARING' ? ChefHat
     : ['PENDING', 'PENDING_ACTIVATION'].includes(order.status) ? Hourglass
-    : order.status === 'CANCELLED' ? XCircle : CircleCheck
+      : order.status === 'CANCELLED' ? XCircle : CircleCheck
   const statusLabel = order.status === 'PENDING_ACTIVATION' ? 'Awaiting Acceptance' : state?.label ?? order.status
   const previewNames = order.items.map((item) => item.name).join(', ')
   const visibleItems = showAllItems ? order.items : order.items.slice(0, 2)
