@@ -2666,9 +2666,9 @@ function SittingCard({
               else if (!active) onOpenOrders(sitting)
             }}
             className={cn(
-              'h-10 flex-1 min-w-[11rem] gap-1.5 rounded-xl px-3.5 text-center font-bold text-xs sm:text-[13px] whitespace-nowrap transition-all duration-200',
+              'h-10 flex-1 min-w-[10.5rem] gap-1.5 rounded-xl px-3.5 text-center font-bold text-xs sm:text-[13px] whitespace-nowrap transition-all duration-200',
               canPay
-                ? 'bg-gradient-to-r from-[#f97316] to-[#ea580c] hover:from-[#ea580c] hover:to-[#c2410c] text-white shadow-sm shadow-orange-500/20 active:scale-[0.99] cursor-pointer'
+                ? 'bg-gradient-to-r from-[#c2410c] to-[#9a3412] hover:from-[#9a3412] hover:to-[#7c2d12] text-white shadow-sm shadow-orange-900/20 active:scale-[0.99] cursor-pointer'
                 : active
                   ? 'border border-neutral-200/80 bg-neutral-100 text-neutral-400 dark:border-border/60 dark:bg-secondary/40 dark:text-muted-foreground/50 shadow-none disabled:opacity-70 disabled:cursor-not-allowed disabled:pointer-events-none'
                   : 'border border-border bg-card text-foreground hover:bg-secondary cursor-pointer shadow-xs',

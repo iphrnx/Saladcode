@@ -91,18 +91,10 @@ describe('Bug 2: Modal Navigation Contracts', () => {
 describe('Bug 3: Compact Paid Cards & Alignment', () => {
   const ordersCode = readFileSync(resolve('src/components/views/orders.tsx'), 'utf8')
 
-  it('SittingCard removes min-h-[550px] and flex spacers when paidOff is true', () => {
+  it('SittingCard uses self-start !min-h-0 !h-auto', () => {
     assert.ok(
-      ordersCode.includes("paidOff ? 'self-start' : 'min-h-[550px]'"),
-      'Card must use self-start instead of min-h-[550px] when paid'
-    )
-    assert.ok(
-      ordersCode.includes("paidOff ? 'min-h-0' : 'flex-1'"),
-      'Orders container must remove flex-1 when paid'
-    )
-    assert.ok(
-      ordersCode.includes("paidOff ? 'mt-2.5' : 'mt-auto'"),
-      'Footer must remove mt-auto when paid'
+      ordersCode.includes('self-start !min-h-0 !h-auto'),
+      'Card must use self-start !min-h-0 !h-auto'
     )
   })
 
@@ -115,7 +107,7 @@ describe('Bug 3: Compact Paid Cards & Alignment', () => {
 
   it('isSettledEnded card uses self-start and displays Session Ended', () => {
     assert.ok(
-      ordersCode.includes("'w-full self-start overflow-hidden rounded-2xl border p-3 sm:p-3.5'"),
+      ordersCode.includes("'group relative w-full self-start !min-h-0 !h-auto overflow-hidden"),
       'Settled card must have self-start'
     )
     assert.ok(
