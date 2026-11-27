@@ -955,6 +955,15 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       }
 
       if (refundOutcome === "processed" || refundOutcome === "already_processed") {
+        // Record the refund audit entry immediately once the ledger confirms
+        // the refund, before PDF/email side effects that may fail and retry.
+        await auditRefundIdempotent(db, tenantId, tenant.plan, planId, eventId, {
+          paymentId: targetPaymentId,
+          refundId: verifiedRefundId,
+          totalRefunded: (refundRpcRes as any)?.total_refunded ?? null,
+          isFullyRefunded: (refundRpcRes as any)?.is_fully_refunded ?? null,
+        });
+
         // Ensure the refund document and notification email are issued even on
         // retries where the ledger update already succeeded on an earlier run.
         // issueRefundDocument and queueForTenant are idempotent by refund/event key.
@@ -1000,13 +1009,6 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
           }
         }
       }
-
-      await auditRefundIdempotent(db, tenantId, tenant.plan, planId, eventId, {
-        paymentId: targetPaymentId,
-        refundId: verifiedRefundId,
-        totalRefunded: (refundRpcRes as any)?.total_refunded ?? null,
-        isFullyRefunded: (refundRpcRes as any)?.is_fully_refunded ?? null,
-      });
 
       if (refundOutcome === "already_processed") {
         return { summary: "refund already processed", tenantId };

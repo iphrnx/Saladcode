@@ -708,7 +708,7 @@ async function state(req: Request, tenantId: string): Promise<Response> {
   const { data: refunds, error: refundsError } = await admin()
     .from("billing_refunds")
     .select(
-      "id, payment_id, razorpay_payment_id, refund_number, refund_date, amount, currency, original_invoice_number, original_invoice_date, razorpay_refund_id",
+      "id, payment_id, razorpay_payment_id, refund_number, refund_date, amount, currency, description, seller_name, seller_address, seller_email, seller_phone, buyer_name, buyer_email, buyer_address, original_invoice_number, original_invoice_date, razorpay_refund_id",
     )
     .eq("tenant_id", tenantId)
     .order("refund_date", { ascending: false })
