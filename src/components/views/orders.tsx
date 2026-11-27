@@ -901,8 +901,8 @@ export function OrdersView() {
    * ending by table alone would close the other party's sitting too.
    */
   const endSitting = async (sitting: Sitting, force = false) => {
-    if ((!sitting.tableId && !sitting.sessionId) || endingSession) return
-    const targetKey = sitting.sessionId ?? sitting.tableId
+    if (!sitting.sessionId || endingSession) return
+    const targetKey = sitting.sessionId
     setEndingSession(targetKey)
     try {
       const res = await edgeFetch('/api/table-session/end', {
@@ -910,7 +910,7 @@ export function OrdersView() {
         headers: { 'content-type': 'application/json', 'x-tenant-id': tenant!.id },
         body: JSON.stringify({
           ...(sitting.tableId ? { tableId: sitting.tableId } : {}),
-          ...(sitting.sessionId ? { sessionId: sitting.sessionId } : {}),
+          sessionId: sitting.sessionId,
           force,
         }),
       })
@@ -2468,7 +2468,7 @@ function SittingCard({
               <DropdownMenuItem onClick={() => onOpenOrders(sitting)}>
                 <Layers className="mr-2 size-4" /> View orders &amp; bill
               </DropdownMenuItem>
-              {canEndSession && (
+              {canEndSession && Boolean(sitting.sessionId) && (
                 <DropdownMenuItem
                   disabled={!active || ending}
                   onClick={() => onEndSession(sitting)}

@@ -131,7 +131,7 @@ console.log("\n── 5. Edge Function Session Routing & Billing ──");
   );
   check(
     "table-session end passes session id to settle_check_on_session_end",
-    tableSessionFn.includes("p_session: sessionId ?? null")
+    tableSessionFn.includes("p_session: sessionId")
   );
 }
 

@@ -29,6 +29,7 @@ const ordersView = readFileSync("src/components/views/orders.tsx", "utf8");
 const billDialog = readFileSync("src/components/shared/bill-dialog.tsx", "utf8");
 const sessionPayment = readFileSync("src/components/shared/session-payment-dialog.tsx", "utf8");
 const sessionDrawer = readFileSync("src/components/shared/session-orders-drawer.tsx", "utf8");
+const tableSessionFn = readFileSync("supabase/functions/table-session/index.ts", "utf8");
 
 console.log("\n── 1. Independent Session Creation & No Shared-Table Fallback ──");
 const createOrderBody = migCreateOrder.slice(migCreateOrder.indexOf("create or replace function"));
@@ -92,6 +93,24 @@ check(
   sessionPayment.includes("Bill Summary") &&
     sessionPayment.includes("Select Payment Method") &&
     sessionDrawer.includes("Bill Summary"),
+);
+
+console.log("\n── 4. Scoped End Session & Close Anyway ──");
+check(
+  "Orders board renders End session only when sitting.sessionId exists",
+  ordersView.includes("canEndSession && Boolean(sitting.sessionId)"),
+);
+check(
+  "endSitting requires sitting.sessionId and sends sessionId on normal and Close anyway paths",
+  ordersView.includes("if (!sitting.sessionId || endingSession) return") &&
+    ordersView.includes("sessionId: sitting.sessionId") &&
+    ordersView.includes("endSitting(sitting, true)"),
+);
+check(
+  "table-session/end requires sessionId, verifies tenant ownership, and checks tableId match",
+  tableSessionFn.includes('if (!sessionId) {\n    return json(req, { error: "sessionId is required." }, 400);') &&
+    tableSessionFn.includes("if (tableId && sessionRow.table_id !== tableId)") &&
+    tableSessionFn.includes('.eq("table_session_id", sessionId)'),
 );
 
 console.log(`\n${pass} passed, ${fail} failed`);
