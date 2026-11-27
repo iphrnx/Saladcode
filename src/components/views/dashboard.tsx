@@ -7,7 +7,6 @@ import { useStore } from '@/lib/store'
 import { edgeFetch } from '@/lib/edge'
 import { failIfNotOk, describeFailure } from '@/lib/api-error'
 import { useAccessDenied } from '@/lib/use-access-denied'
-import { TableCheckDialog } from '@/components/shared/table-check-dialog'
 import { AccessDenied } from '@/components/shared/access-denied'
 import { hasPermission, hasEffectivePermission } from '@/lib/permissions'
 import { sortTables } from '@/lib/table-order'
@@ -713,8 +712,6 @@ export function DashboardView() {
   const [endingTable, setEndingTable] = useState<string | null>(null)
   /** The session whose accept/decline request is in flight. */
   const [activatingSession, setActivatingSession] = useState<string | null>(null)
-  /** The table whose consolidated bill is open. */
-  const [billTable, setBillTable] = useState<{ id: string; name: string; checkId?: string | null } | null>(null)
 
   // A repeating poll: only the first load may take over the screen. After that,
   // a failure leaves the previous list in place rather than blanking a page
@@ -971,15 +968,17 @@ export function DashboardView() {
           (o: any) => o.tableSessionId === s.id && o.status !== 'CANCELLED' && o.status !== 'PENDING_ACTIVATION'
         )
 
-        // Gather all dish items across orders
-        const allItems: Array<{ name: string; quantity: number; portion?: string | null; status?: string }> = []
+        // Gather all dish items across orders (preserve saved unit price at order time, including ₹0.00)
+        const allItems: Array<{ id?: string; name: string; quantity: number; price: number; portion?: string | null; status?: string }> = []
         const combinedOrderSources = matchingAppOrders.length > 0 ? matchingAppOrders : activeOrders
         for (const ord of combinedOrderSources) {
           if (Array.isArray(ord.items)) {
             for (const it of ord.items) {
               allItems.push({
+                id: it.id,
                 name: it.name,
-                quantity: Number(it.quantity || 1),
+                quantity: Number(it.quantity ?? 1),
+                price: Number(it.price ?? 0),
                 portion: it.portion,
                 status: it.status || ord.status,
               })
@@ -1625,14 +1624,6 @@ export function DashboardView() {
           ? `${tenant?.currencySymbol ?? '₹'}${Number(body?.settlement?.outstanding ?? 0).toLocaleString('en-IN')} is still due — the bill is waiting in "Awaiting payment".`
           : 'The diner must scan the QR code again to order.',
       })
-      // The prompt the cashier needs, at the moment they need it.
-      if (stillOwed && canCollect) {
-        setBillTable({
-          id: tableId,
-          name: tableName ?? 'Table',
-          checkId: body?.settlement?.checkId,
-        })
-      }
       await loadSessions()
     } catch (err) {
       handleAction(err, 'the table session')
@@ -2036,16 +2027,6 @@ export function DashboardView() {
           </div>
         </DialogContent>
       </Dialog>
-
-      <TableCheckDialog
-        tableId={billTable?.id ?? null}
-        tableName={billTable?.name ?? null}
-        checkId={billTable?.checkId ?? null}
-        open={billTable !== null}
-        onOpenChange={(v) => !v && setBillTable(null)}
-        currencySymbol={tenant.currencySymbol}
-        onSettled={loadSessions}
-      />
 
       {/* Cart panel — desktop */}
       <div className="hidden lg:flex w-[380px] xl:w-[400px] shrink-0 border-l border-border bg-card flex-col">
@@ -2468,9 +2449,6 @@ function CartPanel(p: CartPanelProps) {
 
   const committedItems = useMemo(() => {
     if (!p.selectedSessionId) return []
-    if (cardMatch?.items && cardMatch.items.length > 0) {
-      return cardMatch.items
-    }
     if (p.committedOrders && p.committedOrders.length > 0) {
       const items: any[] = []
       for (const ord of p.committedOrders) {
@@ -2480,14 +2458,17 @@ function CartPanel(p: CartPanelProps) {
               id: it.id,
               name: it.name,
               portion: it.portion,
-              price: Number(it.price || 0),
-              quantity: Number(it.quantity || 1),
+              price: Number(it.price ?? 0),
+              quantity: Number(it.quantity ?? 1),
               status: it.status || ord.status,
             })
           }
         }
       }
       if (items.length > 0) return items
+    }
+    if (cardMatch?.items && cardMatch.items.length > 0) {
+      return cardMatch.items
     }
     return []
   }, [p.selectedSessionId, cardMatch?.items, p.committedOrders])
@@ -2677,7 +2658,7 @@ function CartPanel(p: CartPanelProps) {
                   </div>
                   <div className="flex items-center gap-2 shrink-0 ml-2">
                     <span className="text-[11px] font-semibold text-muted-foreground">
-                      {formatCurrency(Number(item.price || 0) * Number(item.quantity || 1), p.currencySymbol)}
+                      {formatCurrency(Number(item.price ?? 0) * Number(item.quantity ?? 1), p.currencySymbol)}
                     </span>
                     {item.status && (
                       <span className={cn(

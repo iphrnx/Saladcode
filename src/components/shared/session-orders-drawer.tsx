@@ -93,7 +93,6 @@ export function SessionOrdersDrawer({
   paymentMethod?: string | null
   paidAt?: string | null
   onCompletePay?: () => void
-  onSessionDetails?: () => void
   onPrintBill?: () => void
   onDownloadBill?: () => void
   activity: { id: string; label: string; at: string }[]

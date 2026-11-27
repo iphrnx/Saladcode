@@ -57,6 +57,8 @@ export function OrderDetailDrawer({
   onCancel,
   onBack,
   onGoToPayment,
+  canGoToPayment = true,
+  paymentBlockedReason,
 }: {
   order: Order | null
   open: boolean
@@ -79,6 +81,8 @@ export function OrderDetailDrawer({
   /** Back arrow — returns to the sitting's other orders. */
   onBack?: () => void
   onGoToPayment?: () => void
+  canGoToPayment?: boolean
+  paymentBlockedReason?: string
 }) {
   const [confirmCancelOpen, setConfirmCancelOpen] = useState(false)
   const [cancelReason, setCancelReason] = useState('')
@@ -304,7 +308,7 @@ export function OrderDetailDrawer({
             )
           ) : nextStep ? (
             /* Kitchen progression — there is a forward step to take */
-            <>
+            <div className={cn('grid w-full gap-2', canCancelThisOrder ? 'grid-cols-2' : 'grid-cols-1')}>
               {canCancelThisOrder && (
                 <button
                   type="button"
@@ -315,15 +319,10 @@ export function OrderDetailDrawer({
                   }}
                   disabled={cancelling || busy}
                   title={!canCancel ? 'Only Owner, Manager, and Cashier can cancel orders' : undefined}
-                  className={cn(
-                    'flex h-11 items-center justify-center gap-1.5 rounded-xl border border-border bg-card font-semibold text-destructive transition-colors hover:border-destructive/30 hover:bg-destructive/10 cursor-pointer',
-                    order.status === 'PENDING'
-                      ? 'flex-1 text-[13.5px]'
-                      : 'shrink-0 px-3 text-[12px] border-destructive/25'
-                  )}
+                  className="flex h-11 w-full min-w-0 items-center justify-center gap-1.5 rounded-xl border border-border bg-card px-3 text-[13.5px] font-semibold text-destructive transition-colors hover:border-destructive/30 hover:bg-destructive/10 cursor-pointer"
                 >
-                  <XCircle className="size-3.5" />
-                  {order.status === 'PENDING' ? 'Cancel Order' : 'Cancel'}
+                  <XCircle className="size-4 shrink-0" />
+                  Cancel Order
                 </button>
               )}
               <button
@@ -331,30 +330,44 @@ export function OrderDetailDrawer({
                 disabled={!nextStep.allowed || busy}
                 title={!nextStep.allowed ? "You don't have permission for this step" : undefined}
                 className={cn(
-                  'flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl text-[13.5px] font-semibold transition-colors cursor-pointer',
+                  'flex h-11 w-full min-w-0 items-center justify-center gap-1.5 rounded-xl px-3 text-[13.5px] font-semibold transition-colors cursor-pointer',
                   nextStep.allowed
                     ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                     : 'bg-secondary text-muted-foreground',
                   busy && 'opacity-70 cursor-not-allowed',
-                  !canCancelThisOrder && 'w-full flex-none',
                 )}
               >
                 {busy ? <Loader2 className="size-4 animate-spin" /> : <ChefHat className="size-4" />}
                 {busy ? 'Updating…' : nextStep.label}
               </button>
-            </>
+            </div>
           ) : !done && !cancelled ? (
             /* Served state — order is served to diners; Cancel Order button is completely removed */
             <div className="flex w-full flex-col gap-2">
               {onGoToPayment ? (
-                <button
-                  type="button"
-                  onClick={onGoToPayment}
-                  className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-primary text-[14px] font-bold text-primary-foreground shadow-sm hover:bg-primary/90 transition-colors cursor-pointer"
-                >
-                  <CreditCard className="size-4" />
-                  Go to Payment →
-                </button>
+                <div className="flex w-full flex-col gap-1.5">
+                  <button
+                    type="button"
+                    disabled={!canGoToPayment}
+                    title={!canGoToPayment ? paymentBlockedReason : undefined}
+                    onClick={() => {
+                      if (!canGoToPayment) return
+                      onGoToPayment()
+                    }}
+                    className={cn(
+                      'flex h-11 w-full items-center justify-center gap-2 rounded-xl text-[14px] font-bold transition-colors',
+                      canGoToPayment
+                        ? 'bg-primary text-primary-foreground shadow-sm hover:bg-primary/90 cursor-pointer'
+                        : 'bg-secondary text-muted-foreground opacity-70 cursor-not-allowed',
+                    )}
+                  >
+                    <CreditCard className="size-4" />
+                    Go to Payment →
+                  </button>
+                  {!canGoToPayment && paymentBlockedReason && (
+                    <p className="text-center text-[11.5px] text-muted-foreground">{paymentBlockedReason}</p>
+                  )}
+                </div>
               ) : (
                 <div className="flex w-full items-center justify-center gap-2 rounded-xl bg-secondary/60 py-2.5 text-[12px] text-muted-foreground">
                   <Check className="size-3.5 shrink-0 text-emerald-600" />

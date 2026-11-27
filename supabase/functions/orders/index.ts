@@ -1210,36 +1210,11 @@ async function create(req: Request): Promise<Response> {
               code: "SESSION_INACTIVE",
             }, 400);
           }
-        } else if (b.createNewSitting) {
-          // Explicitly creating a new sitting: create session + check + order atomically inside create_order_tx
+        } else {
+          // No session selected (POS table selection without an active sitting):
+          // always create an independent session and check atomically inside create_order_tx.
           tableSessionId = null;
           createNewSession = true;
-        } else {
-          // Safe resolution when no session was explicitly specified:
-          // If multiple active diner sittings exist on this table, reject ambiguous placement
-          // to prevent cross-diner billing corruption.
-          const { data: activeSessions } = await db
-            .from("table_sessions")
-            .select("id, orders(id)")
-            .eq("tenant_id", tenantId)
-            .eq("table_id", tableId)
-            .eq("status", "ACTIVE");
-          if (activeSessions && activeSessions.length > 1) {
-            return json(req, {
-              error: "This table has multiple active diner sessions. Please select the specific sitting/check before placing an order.",
-              code: "AMBIGUOUS_TABLE_SESSION",
-            }, 400);
-          }
-          if (activeSessions && activeSessions.length === 1) {
-            // Only attach if it already has orders; never silently attach to an empty session (e.g. <3m QR scan)
-            const hasOrders = Array.isArray(activeSessions[0].orders) && activeSessions[0].orders.length > 0;
-            if (hasOrders) {
-              tableSessionId = activeSessions[0].id;
-            }
-          }
-          if (!tableSessionId) {
-            createNewSession = true;
-          }
         }
       }
     } else if (orderType === "TAKEAWAY" || orderType === "DELIVERY") {
@@ -2494,7 +2469,7 @@ async function sync(req: Request): Promise<Response> {
       ? db.from("table_checks").select("id, status, invoice_number, closed_at, subtotal, tax, service_charge, total, paid_total").in("id", checkIds).eq("tenant_id", tenantId)
       : Promise.resolve({ data: [] }),
     checkIds.length
-      ? db.from("orders").select("check_id, total, items_total, discount, tax").in("check_id", checkIds)
+      ? db.from("orders").select("check_id, status, total, items_total, discount, tax").in("check_id", checkIds)
         .eq("tenant_id", tenantId).not("status", "in", "(CANCELLED,PENDING_ACTIVATION)")
       : Promise.resolve({ data: [] }),
     checkIds.length
@@ -2508,6 +2483,7 @@ async function sync(req: Request): Promise<Response> {
 
   const checks: Record<string, {
     orderCount: number;
+    allServed: boolean;
     /** Before tax: the items, less discount. What the food cost. */
     subtotal: number;
     tax: number;
@@ -2528,6 +2504,7 @@ async function sync(req: Request): Promise<Response> {
     for (const c of checkRows) {
       checks[c.id] = {
         orderCount: 0,
+        allServed: true,
         subtotal: 0,
         tax: 0,
         serviceCharge: Number(c.service_charge ?? 0),
@@ -2543,6 +2520,7 @@ async function sync(req: Request): Promise<Response> {
       const c = checks[(o as any).check_id];
       if (!c) continue;
       c.orderCount += 1;
+      c.allServed = c.allServed && ["SERVED", "COMPLETED"].includes(String((o as any).status ?? "").toUpperCase());
       c.subtotal += Number((o as any).items_total ?? 0) - Number((o as any).discount ?? 0);
       c.tax += Number((o as any).tax ?? 0);
       c.total += Number((o as any).total ?? 0);

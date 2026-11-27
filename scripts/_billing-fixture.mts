@@ -456,12 +456,11 @@ function bootstrap(b: ReturnType<typeof bundle>) {
       paymentStatus: "UNPAID", paymentMethod: null, customerName: null, customerPhone: null,
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), completedAt: null,
     }] : [],
-    reservations: [],
     promos: [],
     sessions: [],
     securityLogs: [],
     securityStats: { failedLogins24h: 0, auditEvents7d: 0 },
-    summary: { revenue: 0, ordersToday: 0, activeOrders: 0, totalTables: 0, totalMenuItems: 0, pendingReservations: 0 },
+    summary: { revenue: 0, ordersToday: 0, activeOrders: 0, totalTables: 0, totalMenuItems: 0 },
   };
 }
 

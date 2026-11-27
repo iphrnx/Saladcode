@@ -19,7 +19,7 @@ import { toISTDateString } from "../_shared/promo.ts";
  *
  * Returns the entire dashboard payload for the caller's tenant in one round
  * trip: tenant, settings, users, roles, staff, categories, menu, tables,
- * orders, reservations, promos, sessions, security logs and a summary.
+ * orders, promos, sessions, security logs and a summary.
  *
  * Every read is scoped to `g.session.tenantId`; the Next.js version it replaces
  * already did this, and the owner/staff distinction now comes straight from the
@@ -75,7 +75,6 @@ Deno.serve(async (req: Request) => {
       menuRes,
       tablesRes,
       ordersRes,
-      reservationsRes,
       promosRes,
       securityLogsRes,
       staffRes,
@@ -108,11 +107,6 @@ Deno.serve(async (req: Request) => {
         .eq("tenant_id", tenantId)
         .order("created_at", { ascending: false })
         .limit(200),
-      db
-        .from("reservations")
-        .select("*, table:tables(*)")
-        .eq("tenant_id", tenantId)
-        .order("date", { ascending: true }),
       db.from("promo_codes").select("*").eq("tenant_id", tenantId).order("created_at", {
         ascending: false,
       }),
@@ -124,9 +118,13 @@ Deno.serve(async (req: Request) => {
             .order("created_at", { ascending: false })
             .limit(50)
         : Promise.resolve({ data: [], error: null }),
-      db.from("staff").select("*, role:roles(*)").eq("tenant_id", tenantId).order("name", {
-        ascending: true,
-      }),
+      db
+        .from("staff")
+        .select(
+          "id, tenant_id, location_id, role_id, name, employee_id, avatar, active, locked_until, last_login, created_at, updated_at, role:roles(id, name, description, permissions, is_system, color)",
+        )
+        .eq("tenant_id", tenantId)
+        .order("name", { ascending: true }),
       // Settings and the security trio join the same wave. They used to run as
       // two further sequential rounds (settings, then three more queries), so
       // every bootstrap paid three round trips for data that depends on
@@ -156,7 +154,6 @@ Deno.serve(async (req: Request) => {
     if (menuRes.error) return json(req, { error: menuRes.error.message }, 500);
     if (tablesRes.error) return json(req, { error: tablesRes.error.message }, 500);
     if (ordersRes.error) return json(req, { error: ordersRes.error.message }, 500);
-    if (reservationsRes.error) return json(req, { error: reservationsRes.error.message }, 500);
     if (promosRes.error) return json(req, { error: promosRes.error.message }, 500);
     if (securityLogsRes.error) return json(req, { error: securityLogsRes.error.message }, 500);
     if (staffRes.error) return json(req, { error: staffRes.error.message }, 500);
@@ -205,7 +202,6 @@ Deno.serve(async (req: Request) => {
     });
     const tables = toCamel(tablesRes.data ?? []);
     const orders = toCamel(ordersRes.data ?? []);
-    const reservations = toCamel(reservationsRes.data ?? []);
     const promos = toCamel(promosRes.data ?? []).map((p: any) => ({
       ...p,
       validFrom: toISTDateString(p.validFrom),
@@ -380,7 +376,7 @@ Deno.serve(async (req: Request) => {
     if (g.session.kind === "staff") {
       const { data: staffRow } = await db
         .from("staff")
-        .select("*")
+        .select("id, employee_id, avatar")
         .eq("id", g.session.subjectId)
         .eq("tenant_id", tenantId)
         .maybeSingle();
@@ -456,7 +452,6 @@ Deno.serve(async (req: Request) => {
       orders,
       tableSessions,
       checks,
-      reservations,
       promos,
       sessions,
       securityLogs,
@@ -467,7 +462,6 @@ Deno.serve(async (req: Request) => {
         activeOrders,
         totalTables: tables.length,
         totalMenuItems: menuItems.length,
-        pendingReservations: (reservations as any[]).filter((r) => r.status === "PENDING").length,
       },
     });
   } catch (err) {

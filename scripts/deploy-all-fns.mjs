@@ -13,6 +13,13 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const ROOT = "supabase/functions";
+const RETIRED_FUNCTIONS = ["reservations"];
+const PROJECT_ID =
+  process.env.SUPABASE_PROJECT_ID ??
+  (process.env.NEXT_PUBLIC_SUPABASE_URL
+    ? new URL(process.env.NEXT_PUBLIC_SUPABASE_URL).hostname.split(".")[0]
+    : "jeuixphibaasbxgaexfg");
+const yesFlag = process.argv.includes("--yes") ? ["--yes"] : [];
 
 const names = readdirSync(ROOT, { withFileTypes: true })
   .filter((e) => e.isDirectory() && !e.name.startsWith("_"))
@@ -22,11 +29,30 @@ const names = readdirSync(ROOT, { withFileTypes: true })
 const failed = [];
 for (const name of names) {
   try {
-    execFileSync("node", ["scripts/deploy-fn.mjs", name], { stdio: "pipe", encoding: "utf8" });
+    execFileSync("node", ["scripts/deploy-fn.mjs", name, ...yesFlag], { stdio: "pipe", encoding: "utf8" });
     console.log(`  ✔ ${name}`);
   } catch (err) {
     failed.push(name);
     console.log(`  ✗ ${name}  ${String(err.stdout ?? err.message).slice(-200)}`);
+  }
+}
+
+for (const retired of RETIRED_FUNCTIONS) {
+  try {
+    execFileSync(
+      "npx",
+      ["supabase", "functions", "delete", retired, `--remote=${PROJECT_ID}`, ...yesFlag],
+      { stdio: "pipe", encoding: "utf8" },
+    );
+    console.log(`  ✔ ${retired} (retired & removed)`);
+  } catch (err) {
+    const out = `${err.stdout ?? ""}\n${err.stderr ?? ""}\n${err.message ?? ""}`;
+    if (/not found|does not exist|404/i.test(out)) {
+      console.log(`  ✔ ${retired} (already absent)`);
+    } else {
+      failed.push(retired);
+      console.log(`  ✗ ${retired} (cleanup)  ${out.slice(-200)}`);
+    }
   }
 }
 

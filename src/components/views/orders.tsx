@@ -6,7 +6,6 @@ import { reconcileOrderExpansion, toggleOrderExpansion, type OrderExpansion } fr
 import { cn } from '@/lib/utils'
 import { useT } from '@/lib/i18n'
 import { formatDateWithPattern, type DateFormatPattern } from '@/lib/date-format'
-import { TableCheckDialog } from '@/components/shared/table-check-dialog'
 import { SessionPaymentDialog } from '@/components/shared/session-payment-dialog'
 import { SessionOrdersDrawer } from '@/components/shared/session-orders-drawer'
 import { OrderDetailDrawer } from '@/components/shared/order-detail-drawer'
@@ -250,14 +249,8 @@ export function OrdersView() {
   const [payOrder, setPayOrder] = useState<Order | null>(null)
   const [viewOrder, setViewOrder] = useState<Order | null>(null)
   const [addItemsOrder, setAddItemsOrder] = useState<Order | null>(null)
-  // The bill action opens the TABLE's check, not the single order: a sitting
-  // can be several orders and one payment, and the card is about the table.
-  const [billTable, setBillTable] = useState<{ id: string; name: string; checkId: string | null } | null>(null)
   /**
    * The payment modal, opened by Complete & Pay.
-   *
-   * Separate from `billTable`: that one is the detail sheet ("Session Details"),
-   * which shows the bill without taking money. This one is the till.
    */
   const [paySitting, setPaySitting] = useState<Sitting | null>(null)
   /** The drawer: the whole sitting, opened from its card or any of its rows. */
@@ -387,16 +380,11 @@ export function OrdersView() {
   const sittings = useMemo<Sitting[]>(() => {
     const buckets = new Map<string, Order[]>()
     for (const o of orders) {
-      const isTakeawayOrDelivery = o.orderType === 'TAKEAWAY' || o.orderType === 'DELIVERY'
       const key = o.tableSessionId
         ? `session:${o.tableSessionId}`
         : o.checkId
           ? `check:${o.checkId}`
-          : isTakeawayOrDelivery
-            ? `order:${o.id}`
-            : (o.orderType === 'DINE_IN' && o.tableId)
-              ? `table:${o.tableId}`
-              : `order:${o.id}`
+          : `order:${o.id}`
       const list = buckets.get(key)
       if (list) list.push(o)
       else buckets.set(key, [o])
@@ -913,8 +901,8 @@ export function OrdersView() {
    * ending by table alone would close the other party's sitting too.
    */
   const endSitting = async (sitting: Sitting, force = false) => {
-    if ((!sitting.tableId && !sitting.sessionId) || endingSession) return
-    const targetKey = sitting.sessionId ?? sitting.tableId
+    if (!sitting.sessionId || endingSession) return
+    const targetKey = sitting.sessionId
     setEndingSession(targetKey)
     try {
       const res = await edgeFetch('/api/table-session/end', {
@@ -922,7 +910,7 @@ export function OrdersView() {
         headers: { 'content-type': 'application/json', 'x-tenant-id': tenant!.id },
         body: JSON.stringify({
           ...(sitting.tableId ? { tableId: sitting.tableId } : {}),
-          ...(sitting.sessionId ? { sessionId: sitting.sessionId } : {}),
+          sessionId: sitting.sessionId,
           force,
         }),
       })
@@ -945,16 +933,16 @@ export function OrdersView() {
           orderId: sitting.latest.id,
           table: sitting.tableName
             ? {
-                name: sitting.tableName,
+              name: sitting.tableName,
+              seats: sitting.seats ?? 0,
+              area: sitting.area ?? '',
+            }
+            : sitting.tableId
+              ? {
+                name: 'Table',
                 seats: sitting.seats ?? 0,
                 area: sitting.area ?? '',
               }
-            : sitting.tableId
-              ? {
-                  name: 'Table',
-                  seats: sitting.seats ?? 0,
-                  area: sitting.area ?? '',
-                }
               : null,
           autoPrint: true,
         })
@@ -1022,8 +1010,8 @@ export function OrdersView() {
                 tab.key === 'all'
                   ? orders.length
                   : orders.filter(
-                      (o) => (o.status === 'PENDING_ACTIVATION' ? 'PENDING' : o.status) === tab.key,
-                    ).length
+                    (o) => (o.status === 'PENDING_ACTIVATION' ? 'PENDING' : o.status) === tab.key,
+                  ).length
               return (
                 <button
                   key={tab.key}
@@ -1106,10 +1094,7 @@ export function OrdersView() {
                 sitting={sitting}
                 currencySymbol={cs}
                 check={sitting.checkId ? checks[sitting.checkId] : undefined}
-                checkCanSettle={!sitting.checkId || (
-                  checkServing.get(sitting.checkId)?.allServed === true &&
-                  checkServing.get(sitting.checkId)?.orderCount === checks[sitting.checkId]?.orderCount
-                )}
+                checkCanSettle={!sitting.checkId || (checkServing.get(sitting.checkId)?.allServed ?? sitting.allServed)}
                 dishImages={dishImages}
                 timeZone={restaurantTimeZone}
                 now={now}
@@ -1125,23 +1110,34 @@ export function OrdersView() {
                   setFocusOrderId(null)
                   openSitting(target)
                 }}
-                onCompletePay={(target) => setPaySitting(target)}
+                onCompletePay={(target) => {
+                  const elig = getSittingPaymentEligibility(target, {
+                    check: target.checkId ? checks[target.checkId] : undefined,
+                    checkAllServed: !target.checkId || (checkServing.get(target.checkId)?.allServed ?? target.allServed),
+                    hasPayPerm: canComplete && canCollectPay,
+                  })
+                  if (!elig.eligible) {
+                    if (elig.reason) toast.error(elig.reason)
+                    return
+                  }
+                  setPaySitting(target)
+                }}
                 onBill={(target, autoPrint) =>
                   setBillDoc({
                     checkId: target.checkId,
                     orderId: target.latest.id,
                     table: target.tableName
                       ? {
-                          name: target.tableName,
+                        name: target.tableName,
+                        seats: target.seats ?? 0,
+                        area: target.area ?? '',
+                      }
+                      : target.tableId
+                        ? {
+                          name: 'Table',
                           seats: target.seats ?? 0,
                           area: target.area ?? '',
                         }
-                      : target.tableId
-                        ? {
-                            name: 'Table',
-                            seats: target.seats ?? 0,
-                            area: target.area ?? '',
-                          }
                         : null,
                     autoPrint,
                   })
@@ -1168,18 +1164,14 @@ export function OrdersView() {
                 onView={() => setViewOrder(ticket.order)}
                 onViewBill={() => {
                   const ordTable = ticket.order.table ?? (ticket.order.tableId ? (data?.tables ?? []).find((t) => t.id === ticket.order.tableId) : null)
-                  return ticket.order.tableId
-                    ? setBillTable({
-                        id: ticket.order.tableId,
-                        name: ordTable?.name ?? 'Table',
-                        checkId: ticket.order.checkId ?? null,
-                      })
-                    : setBillDoc({
-                        checkId: ticket.order.checkId ?? null,
-                        orderId: ticket.order.id,
-                        table: null,
-                        autoPrint: false,
-                      })
+                  return setBillDoc({
+                    checkId: ticket.order.checkId ?? null,
+                    orderId: ticket.order.id,
+                    table: ordTable
+                      ? { name: ordTable.name, seats: ordTable.seats ?? 0, area: ordTable.area ?? '' }
+                      : null,
+                    autoPrint: false,
+                  })
                 }}
                 canPrepare={canPrepare}
                 canReady={canReady}
@@ -1533,17 +1525,6 @@ export function OrdersView() {
         </DialogContent>
       </Dialog>
 
-      {/* Bill dialog */}
-      <TableCheckDialog
-        tableId={billTable?.id ?? null}
-        tableName={billTable?.name ?? null}
-        checkId={billTable?.checkId ?? null}
-        open={billTable !== null}
-        onOpenChange={(v) => !v && setBillTable(null)}
-        currencySymbol={cs}
-        canCollect={canCollectPay}
-      />
-
       {/* Add Items Modal (Takeaway & Delivery only) */}
       <AddItemsModal
         open={Boolean(addItemsOrder)}
@@ -1587,13 +1568,41 @@ export function OrdersView() {
             openSitting(sitting)
           }
         }}
+        canGoToPayment={(() => {
+          if (!detailOrder) return false
+          const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder.id))
+          if (!sitting) return false
+          return getSittingPaymentEligibility(sitting, {
+            check: sitting.checkId ? checks[sitting.checkId] : undefined,
+            checkAllServed: !sitting.checkId || (checkServing.get(sitting.checkId)?.allServed ?? sitting.allServed),
+            hasPayPerm: canComplete && canCollectPay,
+          }).eligible
+        })()}
+        paymentBlockedReason={(() => {
+          if (!detailOrder) return undefined
+          const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder.id))
+          if (!sitting) return undefined
+          return getSittingPaymentEligibility(sitting, {
+            check: sitting.checkId ? checks[sitting.checkId] : undefined,
+            checkAllServed: !sitting.checkId || (checkServing.get(sitting.checkId)?.allServed ?? sitting.allServed),
+            hasPayPerm: canComplete && canCollectPay,
+          }).reason
+        })()}
         onGoToPayment={() => {
           if (!detailOrder) return
           const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder.id))
-          openOrderDetail(null)
-          if (sitting) {
-            setPaySitting(sitting)
+          if (!sitting) return
+          const elig = getSittingPaymentEligibility(sitting, {
+            check: sitting.checkId ? checks[sitting.checkId] : undefined,
+            checkAllServed: !sitting.checkId || (checkServing.get(sitting.checkId)?.allServed ?? sitting.allServed),
+            hasPayPerm: canComplete && canCollectPay,
+          })
+          if (!elig.eligible) {
+            if (elig.reason) toast.error(elig.reason)
+            return
           }
+          openOrderDetail(null)
+          setPaySitting(sitting)
         }}
       />
 
@@ -1637,14 +1646,23 @@ export function OrdersView() {
           paymentMethod={ordersSitting.latest.paymentMethod || 'Cash'}
           paidAt={ordersSitting.endedAt || ordersSitting.latest.completedAt || ordersSitting.latest.createdAt}
           canPay={
-            ordersSitting.state === 'Active' &&
-            ordersSitting.allServed &&
-            canComplete &&
-            canCollectPay &&
-            (ordersSitting.checkId ? !ordersSitting.paidOff : ordersSitting.latest.paymentStatus !== 'PAID')
+            getSittingPaymentEligibility(ordersSitting, {
+              check: ordersSitting.checkId ? checks[ordersSitting.checkId] : undefined,
+              checkAllServed: !ordersSitting.checkId || (checkServing.get(ordersSitting.checkId)?.allServed ?? ordersSitting.allServed),
+              hasPayPerm: canComplete && canCollectPay,
+            }).eligible
           }
           onCompletePay={() => {
             const target = ordersSitting
+            const elig = getSittingPaymentEligibility(target, {
+              check: target.checkId ? checks[target.checkId] : undefined,
+              checkAllServed: !target.checkId || (checkServing.get(target.checkId)?.allServed ?? target.allServed),
+              hasPayPerm: canComplete && canCollectPay,
+            })
+            if (!elig.eligible) {
+              if (elig.reason) toast.error(elig.reason)
+              return
+            }
             openSitting(null)
             if (target.checkId || target.sessionId || target.tableId) {
               setPaySitting(target)
@@ -1660,16 +1678,16 @@ export function OrdersView() {
               orderId: target.latest.id,
               table: target.tableName
                 ? {
-                    name: target.tableName,
+                  name: target.tableName,
+                  seats: target.seats ?? 0,
+                  area: target.area ?? '',
+                }
+                : target.tableId
+                  ? {
+                    name: 'Table',
                     seats: target.seats ?? 0,
                     area: target.area ?? '',
                   }
-                : target.tableId
-                  ? {
-                      name: 'Table',
-                      seats: target.seats ?? 0,
-                      area: target.area ?? '',
-                    }
                   : null,
               autoPrint: true,
             })
@@ -1681,27 +1699,18 @@ export function OrdersView() {
               orderId: target.latest.id,
               table: target.tableName
                 ? {
-                    name: target.tableName,
+                  name: target.tableName,
+                  seats: target.seats ?? 0,
+                  area: target.area ?? '',
+                }
+                : target.tableId
+                  ? {
+                    name: 'Table',
                     seats: target.seats ?? 0,
                     area: target.area ?? '',
                   }
-                : target.tableId
-                  ? {
-                      name: 'Table',
-                      seats: target.seats ?? 0,
-                      area: target.area ?? '',
-                    }
                   : null,
               autoPrint: false,
-            })
-          }}
-          onSessionDetails={() => {
-            const target = ordersSitting
-            openSitting(null)
-            setBillTable({
-              id: target.tableId!,
-              name: target.tableName ?? 'Table',
-              checkId: target.checkId,
             })
           }}
           focusOrderId={focusOrderId}
@@ -1728,8 +1737,8 @@ export function OrdersView() {
         tableHint={
           paySitting
             ? [paySitting.area || 'Main Hall', ORDER_TYPE_LABEL[paySitting.orderType] ?? paySitting.orderType]
-                .filter(Boolean)
-                .join(' · ')
+              .filter(Boolean)
+              .join(' · ')
             : undefined
         }
         currencySymbol={cs}
@@ -1787,6 +1796,72 @@ export function OrdersView() {
 
     </div>
   )
+}
+
+/**
+ * Single source of truth for session-wide payment eligibility, shared across
+ * SittingCard ("Complete & Pay"), OrderDetailDrawer ("Go to Payment"), and
+ * SessionOrdersDrawer. Scoped strictly to orders in the selected sitting.
+ */
+function getSittingPaymentEligibility(
+  sitting: Sitting,
+  opts: {
+    check?: { status: string; invoiceNumber?: string | null; orderCount: number }
+    checkAllServed?: boolean
+    hasPayPerm: boolean
+  },
+): { eligible: boolean; reason?: string; paidOff: boolean; awaiting: boolean } {
+  const active = sitting.state === 'Active'
+  const { check, checkAllServed = true, hasPayPerm } = opts
+  const hasBill = check ? check.orderCount > 0 : !sitting.awaiting
+  const awaiting = !hasBill
+  const checkStatus = check?.status?.toUpperCase()
+  const isVoidedCheck = checkStatus === 'VOID' || checkStatus === 'VOIDED' || checkStatus === 'CANCELLED'
+  const isSettledCheck = checkStatus === 'PAID' || Boolean(check?.invoiceNumber)
+  const isEndedUnsettledCheck =
+    !active && Boolean(sitting.checkId) && (checkStatus === 'UNSETTLED' || checkStatus === 'OPEN')
+  const allOrdersCompleted = sitting.orders.every((order) => ['COMPLETED', 'CANCELLED'].includes(order.status))
+  const allOrdersPaid = sitting.orders.every((order) => order.paymentStatus === 'PAID')
+  const paidOff = Boolean(
+    sitting.paidOff ||
+    isSettledCheck ||
+    (allOrdersPaid && allOrdersCompleted) ||
+    sitting.latest.paymentStatus === 'PAID',
+  )
+  const unservedInSession = sitting.orders.some((o) =>
+    ['PENDING_ACTIVATION', 'PENDING', 'PREPARING', 'READY'].includes(o.status),
+  )
+  const allSessionOrdersServed = !unservedInSession && sitting.allServed && checkAllServed
+  const isTakeawayOrDelivery = sitting.orderType === 'TAKEAWAY' || sitting.orderType === 'DELIVERY'
+  const hasTarget = Boolean(
+    isEndedUnsettledCheck
+      ? sitting.checkId
+      : isTakeawayOrDelivery
+        ? (sitting.checkId || sitting.sessionId || sitting.latest.status !== 'COMPLETED')
+        : ((sitting.tableId && sitting.checkId) || (!sitting.checkId && sitting.latest.status !== 'COMPLETED')),
+  )
+  const eligible =
+    (active || isEndedUnsettledCheck) &&
+    hasPayPerm &&
+    allSessionOrdersServed &&
+    !paidOff &&
+    !isVoidedCheck &&
+    hasBill &&
+    hasTarget
+
+  const reason = !hasPayPerm
+    ? 'Payment permission is required'
+    : isVoidedCheck
+      ? 'This bill is voided'
+      : !allSessionOrdersServed
+        ? 'Serve all orders in this session before settling the bill'
+        : paidOff
+          ? 'This bill is paid'
+          : awaiting
+            ? 'No bill yet'
+            : undefined
+
+  return { eligible, reason, paidOff, awaiting }
 }
 
 const ORDER_TYPE_LABEL: Record<string, string> = {
@@ -2222,21 +2297,14 @@ function SittingCard({
   const started = sessionWhen(sitting.startedAt, dateFormat)
   const hasPayPerm = canComplete && canCollectPay
   const onlyPendingActivation = sitting.orders.every((order) => order.status === 'PENDING_ACTIVATION')
-  const hasBill = check ? check.orderCount > 0 : !sitting.awaiting
-  const awaiting = !hasBill
-  const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber)
-  const allOrdersCompleted = sitting.orders.every((order) => ['COMPLETED', 'CANCELLED'].includes(order.status))
-  const allOrdersPaid = sitting.orders.every((order) => order.paymentStatus === 'PAID')
-  const paidOff = Boolean(
-    sitting.paidOff
-    || isSettledCheck
-    || (allOrdersPaid && allOrdersCompleted)
-    || sitting.latest.paymentStatus === 'PAID'
-  )
-  const canPay = active && hasPayPerm && sitting.allServed && checkCanSettle &&
-    !paidOff && hasBill && Boolean(
-      (sitting.tableId && sitting.checkId) || (!sitting.checkId && sitting.latest.status !== 'COMPLETED'),
-    )
+  const eligibility = getSittingPaymentEligibility(sitting, {
+    check,
+    checkAllServed: checkCanSettle,
+    hasPayPerm,
+  })
+  const paidOff = eligibility.paidOff
+  const awaiting = eligibility.awaiting
+  const canPay = eligibility.eligible
   const isSettledEnded = !active && !onlyPendingActivation && !awaiting && paidOff
 
   // The parent keys each card by session ID, so another sitting cannot reuse this state.
@@ -2349,16 +2417,11 @@ function SittingCard({
   )
   const servingLabel = onlyPendingActivation ? 'Awaiting Acceptance'
     : validOrders.length === 0 ? 'No Items to Serve'
-    : validOrders.every((order) => order.status === 'PREPARING') ? 'All Items Preparing'
-    : toServe.length > 0 ? (remainingQty > 0 ? `${remainingQty} to Serve` : 'Service Pending')
-    : sitting.allServed ? 'All Served'
-    : 'Awaiting Acceptance'
-  const paymentReason = !hasPayPerm ? 'Payment permission is required'
-    : !sitting.allServed ? 'Serve all orders before settling the bill'
-    : !checkCanSettle ? 'Confirm serving status for the full table check'
-    : paidOff ? 'This bill is paid'
-    : awaiting ? 'No bill yet'
-    : undefined
+      : validOrders.every((order) => order.status === 'PREPARING') ? 'All Items Preparing'
+        : toServe.length > 0 ? (remainingQty > 0 ? `${remainingQty} to Serve` : 'Service Pending')
+          : sitting.allServed ? 'All Served'
+            : 'Awaiting Acceptance'
+  const paymentReason = eligibility.reason
   const billTotal = check?.total ?? sitting.total
   const billPaid = check?.paid ?? (paidOff ? sitting.total : sitting.paid)
   const billDue = check != null
@@ -2369,8 +2432,8 @@ function SittingCard({
   const cardName = sitting.tableName
     ? (sitting.sessionLabel ? `${sitting.tableName} · ${sitting.sessionLabel}` : sitting.tableName)
     : (sitting.latest.customerName
-        ? `${ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType} · ${sitting.latest.customerName}`
-        : `Order #${sitting.latest.orderNumber}`)
+      ? `${ORDER_TYPE_LABEL[sitting.orderType] ?? sitting.orderType} · ${sitting.latest.customerName}`
+      : `Order #${sitting.latest.orderNumber}`)
   const sessionStats = [
     {
       icon: ClipboardCheck,
@@ -2504,7 +2567,7 @@ function SittingCard({
               <DropdownMenuItem onClick={() => onOpenOrders(sitting)}>
                 <Layers className="mr-2 size-4" /> View orders &amp; bill
               </DropdownMenuItem>
-              {canEndSession && (
+              {canEndSession && Boolean(sitting.sessionId) && (
                 <DropdownMenuItem
                   disabled={!active || ending}
                   onClick={() => onEndSession(sitting)}
@@ -2566,7 +2629,7 @@ function SittingCard({
       {/* Payment summary and bottom actions */}
       <div className="relative z-10 pt-0">
         <div className="rounded-xl border border-orange-200/55 dark:border-border/55 bg-orange-50/60 dark:bg-secondary/40 p-2">
-          <dl aria-label={sitting.sharedBill ? "Shared table check" : "Bill totals"} className="grid grid-cols-3 divide-x divide-orange-200/50 dark:divide-border/50">
+          <dl aria-label="Bill totals" className="grid grid-cols-3 divide-x divide-orange-200/50 dark:divide-border/50">
             <Figure label="Total" icon={Layers} amount={billTotal} currencySymbol={currencySymbol} />
             <Figure label="Due" icon={ReceiptText} amount={billDue} currencySymbol={currencySymbol} tone={billDue ? 'due' : undefined} />
             <Figure label="Paid" icon={Wallet} amount={billPaid} currencySymbol={currencySymbol} tone="paid" />
@@ -2598,20 +2661,20 @@ function SittingCard({
             disabled={active && !canPay}
             title={active && !canPay ? paymentReason : undefined}
             onClick={() => {
-              if (!active) onOpenOrders(sitting)
-              else if (canPay && sitting.checkId) onCompletePay(sitting)
+              if (canPay && (sitting.checkId || sitting.sessionId)) onCompletePay(sitting)
               else if (canPay) onPay(sitting.latest)
+              else if (!active) onOpenOrders(sitting)
             }}
             className={cn(
               'h-10 flex-1 min-w-[11rem] gap-1.5 rounded-xl px-3.5 text-center font-bold text-xs sm:text-[13px] whitespace-nowrap transition-all duration-200',
-              active && canPay
+              canPay
                 ? 'bg-gradient-to-r from-[#f97316] to-[#ea580c] hover:from-[#ea580c] hover:to-[#c2410c] text-white shadow-sm shadow-orange-500/20 active:scale-[0.99] cursor-pointer'
                 : active
                   ? 'border border-neutral-200/80 bg-neutral-100 text-neutral-400 dark:border-border/60 dark:bg-secondary/40 dark:text-muted-foreground/50 shadow-none disabled:opacity-70 disabled:cursor-not-allowed disabled:pointer-events-none'
                   : 'border border-border bg-card text-foreground hover:bg-secondary cursor-pointer shadow-xs',
             )}
           >
-            <span>{active ? 'Complete & Pay' : 'Session Details'}</span>
+            <span>{active || canPay ? 'Complete & Pay' : 'Session Details'}</span>
             <ChevronRight aria-hidden className="size-4 stroke-[2.5] shrink-0" />
           </Button>
         </div>
@@ -2712,7 +2775,7 @@ function OrderRow({
   const state = ORDER_STATUS[order.status as keyof typeof ORDER_STATUS]
   const StatusIcon = order.status === 'PREPARING' ? ChefHat
     : ['PENDING', 'PENDING_ACTIVATION'].includes(order.status) ? Hourglass
-    : order.status === 'CANCELLED' ? XCircle : CircleCheck
+      : order.status === 'CANCELLED' ? XCircle : CircleCheck
   const statusLabel = order.status === 'PENDING_ACTIVATION' ? 'Awaiting Acceptance' : state?.label ?? order.status
   const previewNames = order.items.map((item) => item.name).join(', ')
   const visibleItems = showAllItems ? order.items : order.items.slice(0, 2)

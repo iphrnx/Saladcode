@@ -25,7 +25,6 @@ function actionFor(method: string, pathname: string): string {
     menu: 'this menu item',
     tables: 'this table',
     promos: 'this promo code',
-    reservations: 'this reservation',
     staff: 'this staff account',
     roles: 'this role',
     settings: 'these settings',

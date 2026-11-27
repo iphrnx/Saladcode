@@ -103,7 +103,6 @@ const PROBES: { label: string; method: string; path: string; permission: string 
   { label: "promos create", method: "POST", path: "/api/promos", permission: "promos.manage", body: {} },
   { label: "promo validate", method: "POST", path: "/api/promos/validate", permission: "orders.discount", body: {} },
   { label: "analytics", method: "GET", path: "/api/analytics", permission: "analytics.view" },
-  { label: "reservations", method: "GET", path: "/api/reservations", permission: "tables.view" },
   { label: "reviews", method: "GET", path: "/api/reviews", permission: "settings.view" },
   { label: "roles list", method: "GET", path: "/api/roles", permission: "roles.view" },
   { label: "roles create", method: "POST", path: "/api/roles", permission: "roles.manage", body: {} },

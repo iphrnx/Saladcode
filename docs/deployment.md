@@ -96,6 +96,12 @@ node scripts/deploy-all-fns.mjs
 node scripts/deploy-fn.mjs menu
 ```
 
+`deploy-all-fns.mjs` also deletes the retired `reservations` Edge Function from the target project (`SUPABASE_PROJECT_ID` or `NEXT_PUBLIC_SUPABASE_URL` ref) and treats an already-absent function as a clean no-op so fresh deployments and repeated runs succeed. When deploying functions individually, remove the retired endpoint explicitly (safe to re-run when absent):
+
+```bash
+npx supabase functions delete reservations --remote=<ref> --yes || true
+```
+
 ## 3. Cloudflare Workers
 
 Configure `wrangler.jsonc` and set these environment variables / secrets:
@@ -137,5 +143,6 @@ through the API.
 - [ ] Leaked password protection enabled
 - [ ] Auth redirect URLs include the production origin
 - [ ] Supabase advisors re-checked (Database → Advisors) with no new warnings
+- [ ] Retired `reservations` Edge Function absent from the target Supabase project
 - [ ] the `health` edge function returns 200
 - [ ] One end-to-end diner order placed from a real phone

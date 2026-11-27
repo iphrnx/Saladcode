@@ -1984,7 +1984,7 @@ export function SettingsView() {
               >
                 <div className="space-y-2 pt-2">
                   {[
-                    { key: 'emailAlerts' as const, label: 'Email Alerts', desc: 'New orders & reservations via email', icon: Mail },
+                    { key: 'emailAlerts' as const, label: 'Email Alerts', desc: 'New orders & alerts via email', icon: Mail },
                     { key: 'pushAlerts' as const, label: 'Push Notifications', desc: 'Real-time browser push alerts', icon: Bell },
                     { key: 'soundAlerts' as const, label: 'Sound Alerts', desc: 'Play sound when new order arrives', icon: Bell },
                     { key: 'dailyDigest' as const, label: 'Daily Digest', desc: 'Daily summary email at 9 AM', icon: Mail },
@@ -3212,7 +3212,7 @@ export function SettingsView() {
               Delete {tenantForm.name || 'restaurant'}?
             </AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently delete all data including orders, menu items, reservations, and staff accounts. This action cannot be undone.
+              This will permanently delete all data including orders, menu items, and staff accounts. This action cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <div className="space-y-2">

@@ -131,16 +131,17 @@ console.log("\n── 5. Edge Function Session Routing & Billing ──");
   );
   check(
     "table-session end passes session id to settle_check_on_session_end",
-    tableSessionFn.includes("p_session: sessionId ?? null")
+    tableSessionFn.includes("p_session: sessionId")
   );
 }
 
 console.log("\n── 6. Frontend UI Session Grouping & Labeling ──");
 {
   check(
-    "sittings prioritizes session:tableSessionId over check:checkId for dine-in",
-    ordersView.includes("const isTakeawayOrDelivery = o.orderType === 'TAKEAWAY' || o.orderType === 'DELIVERY'") &&
-    ordersView.includes("? `session:${o.tableSessionId}`")
+    "sittings prioritizes session:tableSessionId over check:checkId for dine-in and never groups by tableId alone",
+    ordersView.includes("? `session:${o.tableSessionId}`") &&
+    ordersView.includes(": `order:${o.id}`") &&
+    !ordersView.includes("`table:${o.tableId}`")
   );
   check(
     "concurrent diner sessions on the same table receive distinct Diner labels",

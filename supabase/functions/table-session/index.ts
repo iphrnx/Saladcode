@@ -871,74 +871,75 @@ async function endSession(req: Request): Promise<Response> {
   const tableId = b.tableId ? String(b.tableId) : undefined;
   const sessionId = b.sessionId ? String(b.sessionId) : undefined;
 
-  // Read the tokens of the sessions about to end, so each diner can be told on
-  // their own topic. Ending is by table, so this is every active session on it
-  // — several diners can hold one table at once.
-  let endedTokens: string[] = [];
-  {
-    let q = admin().from("table_sessions").select("token").eq("tenant_id", tenantId).eq("status", "ACTIVE");
-    if (sessionId) q = q.eq("id", sessionId);
-    if (tableId) q = q.eq("table_id", tableId);
-    const { data } = await q;
-    endedTokens = (data ?? []).map((r: any) => r.token).filter(Boolean);
+  if (!sessionId) {
+    return json(req, { error: "sessionId is required." }, 400);
   }
 
+  const { data: sessionRow, error: sessionErr } = await admin()
+    .from("table_sessions")
+    .select("id, tenant_id, table_id, status, token")
+    .eq("id", sessionId)
+    .eq("tenant_id", tenantId)
+    .maybeSingle();
+
+  if (sessionErr) return json(req, { error: sessionErr.message }, 500);
+  if (!sessionRow) {
+    return json(req, { error: "Session not found." }, 404);
+  }
+  if (tableId && sessionRow.table_id !== tableId) {
+    return json(req, { error: "Session does not belong to the specified table." }, 400);
+  }
+
+  const effectiveTableId: string | undefined = sessionRow.table_id ?? tableId ?? undefined;
+  const endedTokens: string[] =
+    sessionRow.status === "ACTIVE" && sessionRow.token ? [String(sessionRow.token)] : [];
+
   // ── Safe closure ────────────────────────────────────────────────────────
-  // Closing a table with food still on the pass, or with money still owed,
+  // Closing a sitting with food still on the pass, or with money still owed,
   // loses track of both: the card disappears, and the order that was never
   // paid for is now only findable in the orders list. So the closure is
   // refused, with what is outstanding, unless the caller explicitly forces it.
   //
-  // Force exists because a restaurant must be able to close a table it has
+  // Force exists because a restaurant must be able to close a sitting it has
   // decided to write off — but it is a second, deliberate click, never the
   // default.
   const force = b.force === true;
-  if (!force) {
-    let target = admin()
-      .from("table_sessions")
-      .select("id")
+  if (!force && sessionRow.status === "ACTIVE") {
+    const { data: outstanding } = await admin()
+      .from("orders")
+      .select("id, order_number, status, payment_status")
       .eq("tenant_id", tenantId)
-      .eq("status", "ACTIVE");
-    if (sessionId) target = target.eq("id", sessionId);
-    if (tableId) target = target.eq("table_id", tableId);
-    const { data: openSessions } = await target;
+      .eq("table_session_id", sessionId)
+      .not("status", "in", "(COMPLETED,CANCELLED)");
 
-    if ((openSessions ?? []).length > 0) {
-      const { data: outstanding } = await admin()
-        .from("orders")
-        .select("id, order_number, status, payment_status")
-        .in("table_session_id", (openSessions ?? []).map((r: any) => r.id))
-        .not("status", "in", "(COMPLETED,CANCELLED)");
-
-      const list = outstanding ?? [];
-      if (list.length > 0) {
-        const unpaid = list.filter((o: any) => !["PAID", "REFUNDED"].includes(String(o.payment_status).toUpperCase()));
-        return json(
-          req,
-          {
-            error:
-              `${list.length} order${list.length === 1 ? "" : "s"} on this table ` +
-              `still ${list.length === 1 ? "is" : "are"} open` +
-              (unpaid.length ? `, ${unpaid.length} unpaid` : "") +
-              `. Settle them first, or close the table anyway.`,
-            code: "outstanding",
-            outstanding: list.map((o: any) => ({
-              id: o.id,
-              orderNumber: o.order_number,
-              status: o.status,
-              paymentStatus: o.payment_status,
-            })),
-          },
-          409,
-        );
-      }
+    const list = outstanding ?? [];
+    if (list.length > 0) {
+      const unpaid = list.filter((o: any) => !["PAID", "REFUNDED"].includes(String(o.payment_status).toUpperCase()));
+      return json(
+        req,
+        {
+          error:
+            `${list.length} order${list.length === 1 ? "" : "s"} on this sitting ` +
+            `still ${list.length === 1 ? "is" : "are"} open` +
+            (unpaid.length ? `, ${unpaid.length} unpaid` : "") +
+            `. Settle them first, or close anyway.`,
+          code: "outstanding",
+          outstanding: list.map((o: any) => ({
+            id: o.id,
+            orderNumber: o.order_number,
+            status: o.status,
+            paymentStatus: o.payment_status,
+          })),
+        },
+        409,
+      );
     }
   }
 
-  const result = await endTableSession({ tenantId, tableId, sessionId });
+  const result = await endTableSession({ tenantId, tableId: effectiveTableId, sessionId });
   if (!result.ok) return json(req, { error: result.error }, result.status);
 
-  // Closing a table — especially over an override — is an audited act: it is
+  // Closing a sitting — especially over an override — is an audited act: it is
   // the moment a sitting stops existing, and the only record that an unpaid
   // balance was closed on purpose rather than lost.
   await admin().from("security_logs").insert({
@@ -948,29 +949,29 @@ async function endSession(req: Request): Promise<Response> {
     action: force ? "TABLE_CLOSED_FORCED" : "TABLE_CLOSED",
     user_agent: req.headers.get("user-agent") || "unknown",
     meta: force
-      ? `Session closed over an outstanding balance (${tableId ?? sessionId ?? "table"})`
-      : `Session closed (${tableId ?? sessionId ?? "table"})`,
+      ? `Session closed over an outstanding balance (${sessionId})`
+      : `Session closed (${sessionId})`,
   }).then(() => {}).catch(() => {});
 
   // The sitting is over — close or flag its bill. A settled check is numbered
   // and closed; one that still owes money stays OPEN, carrying what is due.
   // Never marked paid, never deleted.
   let settlement: any = null;
-  if (tableId || sessionId) {
+  {
     const { data } = await admin().rpc("settle_check_on_session_end", {
       p_tenant: tenantId,
-      p_table: tableId ?? null,
+      p_table: effectiveTableId ?? null,
       p_actor: g.session.kind === "owner" ? g.session.subjectId : null,
-      p_session: sessionId ?? null,
+      p_session: sessionId,
     });
     settlement = data;
     if ((data as any)?.action === "finalized") {
-      await publishToStaff(tenantId, "CHECK_UPDATED", { tableId: tableId ?? null, sessionId: sessionId ?? null, reason: "FINALISED" });
+      await publishToStaff(tenantId, "CHECK_UPDATED", { tableId: effectiveTableId ?? null, sessionId, reason: "FINALISED" });
     }
   }
 
-  await publishSessionEnded(tenantId, { tableId, sessionId, status: "ENDED" }, null);
-  for (const token of endedTokens) publishToDiner(token, "SESSION_ENDED", { tableId, status: "ENDED" });
+  await publishSessionEnded(tenantId, { tableId: effectiveTableId, sessionId, status: "ENDED" }, null);
+  for (const token of endedTokens) publishToDiner(token, "SESSION_ENDED", { tableId: effectiveTableId, status: "ENDED" });
 
   return json(req, { success: true, ended: result.ended, settlement });
 }
