@@ -7,7 +7,6 @@ import { useStore } from '@/lib/store'
 import { edgeFetch } from '@/lib/edge'
 import { failIfNotOk, describeFailure } from '@/lib/api-error'
 import { useAccessDenied } from '@/lib/use-access-denied'
-import { TableCheckDialog } from '@/components/shared/table-check-dialog'
 import { AccessDenied } from '@/components/shared/access-denied'
 import { hasPermission, hasEffectivePermission } from '@/lib/permissions'
 import { sortTables } from '@/lib/table-order'
@@ -713,8 +712,6 @@ export function DashboardView() {
   const [endingTable, setEndingTable] = useState<string | null>(null)
   /** The session whose accept/decline request is in flight. */
   const [activatingSession, setActivatingSession] = useState<string | null>(null)
-  /** The table whose consolidated bill is open. */
-  const [billTable, setBillTable] = useState<{ id: string; name: string; checkId?: string | null } | null>(null)
 
   // A repeating poll: only the first load may take over the screen. After that,
   // a failure leaves the previous list in place rather than blanking a page
@@ -1625,14 +1622,6 @@ export function DashboardView() {
           ? `${tenant?.currencySymbol ?? '₹'}${Number(body?.settlement?.outstanding ?? 0).toLocaleString('en-IN')} is still due — the bill is waiting in "Awaiting payment".`
           : 'The diner must scan the QR code again to order.',
       })
-      // The prompt the cashier needs, at the moment they need it.
-      if (stillOwed && canCollect) {
-        setBillTable({
-          id: tableId,
-          name: tableName ?? 'Table',
-          checkId: body?.settlement?.checkId,
-        })
-      }
       await loadSessions()
     } catch (err) {
       handleAction(err, 'the table session')
@@ -2036,16 +2025,6 @@ export function DashboardView() {
           </div>
         </DialogContent>
       </Dialog>
-
-      <TableCheckDialog
-        tableId={billTable?.id ?? null}
-        tableName={billTable?.name ?? null}
-        checkId={billTable?.checkId ?? null}
-        open={billTable !== null}
-        onOpenChange={(v) => !v && setBillTable(null)}
-        currencySymbol={tenant.currencySymbol}
-        onSettled={loadSessions}
-      />
 
       {/* Cart panel — desktop */}
       <div className="hidden lg:flex w-[380px] xl:w-[400px] shrink-0 border-l border-border bg-card flex-col">

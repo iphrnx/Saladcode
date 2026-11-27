@@ -21,7 +21,6 @@ const ordersFn = readFileSync("supabase/functions/orders/index.ts", "utf8");
 const billFn = readFileSync("supabase/functions/bill/index.ts", "utf8");
 const tablesFn = readFileSync("supabase/functions/tables/index.ts", "utf8");
 const tableSessionFn = readFileSync("supabase/functions/table-session/index.ts", "utf8");
-const reservationsFn = readFileSync("supabase/functions/reservations/index.ts", "utf8");
 const ordersView = readFileSync("src/components/views/orders.tsx", "utf8");
 const dataContext = readFileSync("src/components/app/data-context.tsx", "utf8");
 const subGuard = readFileSync("supabase/functions/_shared/subscription-guard.ts", "utf8");
@@ -119,28 +118,6 @@ console.log("\n── D6: Multi-Course Sibling Session Preservation (SM-11) ─�
     ordersFn.includes('.not("status", "in", "(COMPLETED,CANCELLED)");') &&
     ordersFn.includes('if (!unresolved) {') &&
     ordersFn.includes('await endTableSession(order.tenantId, undefined, order.tableSessionId);')
-  );
-}
-
-console.log("\n── D7: Reservation State Machine Transitions (SM-8) ──");
-{
-  check(
-    "reservations Edge Function defines explicit RESERVATION_NEXT transition graph",
-    reservationsFn.includes("const RESERVATION_NEXT: Record<string, string[]> = {") &&
-    reservationsFn.includes('PENDING: ["CONFIRMED", "CANCELLED"],') &&
-    reservationsFn.includes('CONFIRMED: ["SEATED", "CANCELLED", "NO_SHOW"],') &&
-    reservationsFn.includes('SEATED: ["COMPLETED"],') &&
-    reservationsFn.includes('CANCELLED: [],') &&
-    reservationsFn.includes('NO_SHOW: [],')
-  );
-  check(
-    "reservations Edge Function rejects invalid state jumps with 409 Conflict",
-    reservationsFn.includes("target !== current.status && !allowed.includes(target)") &&
-    reservationsFn.includes(",\n        409,\n      );")
-  );
-  check(
-    "reservations Edge Function requires table assignment before SEATED transition",
-    reservationsFn.includes('if (target === "SEATED" && !b.tableId && !current.table_id)')
   );
 }
 

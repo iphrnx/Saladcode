@@ -65,7 +65,6 @@ for (const path of [
   "analytics",
   "tables",
   "categories",
-  "reservations",
   "security",
   "roles",
   "tenants",

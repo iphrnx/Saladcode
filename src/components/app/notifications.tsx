@@ -9,13 +9,13 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Badge } from '@/components/ui/badge'
-import { Bell, ChefHat, CalendarClock, PackageX, ShieldAlert, CheckCircle2, Inbox } from 'lucide-react'
+import { Bell, ChefHat, PackageX, ShieldAlert, CheckCircle2, Inbox } from 'lucide-react'
 import { readStored, writeStored } from '@/lib/storage-keys'
 
 /** How long a "seen" mark lasts before everything counts as unread again. */
 
 
-type Kind = 'order' | 'ready' | 'reservation' | 'soldout' | 'security'
+type Kind = 'order' | 'ready' | 'soldout' | 'security'
 
 interface Notice {
   id: string
@@ -31,7 +31,6 @@ interface Notice {
 const TONES: Record<Kind, { icon: typeof Bell; cls: string }> = {
   order: { icon: ChefHat, cls: 'bg-primary/15 text-primary' },
   ready: { icon: CheckCircle2, cls: 'bg-emerald-500/15 text-emerald-500' },
-  reservation: { icon: CalendarClock, cls: 'bg-blue-500/15 text-blue-500' },
   soldout: { icon: PackageX, cls: 'bg-amber-500/15 text-amber-500' },
   security: { icon: ShieldAlert, cls: 'bg-destructive/15 text-destructive' },
 }
@@ -109,21 +108,6 @@ export function Notifications() {
         title: ready.length === 1 ? `Order #${ready[0].orderNumber} is ready to serve` : `${ready.length} orders are ready to serve`,
         body: ready.length === 1 && ready[0].table?.name ? ready[0].table.name : 'Waiting to be carried out',
         at: Math.max(...ready.map((o) => new Date(o.createdAt).getTime())),
-      })
-    }
-
-    // Bookings stay individual — they are few, and each is a specific person.
-    const today = new Date().toISOString().slice(0, 10)
-    for (const r of data.reservations ?? []) {
-      if (r.status === 'CANCELLED' || r.status === 'SEATED') continue
-      const when = new Date(`${r.date}T${(r.time || '00:00').slice(0, 5)}:00`).getTime()
-      if (Number.isNaN(when)) continue
-      if (r.date !== today && !(when < now && when > now - 6 * 60 * 60 * 1000)) continue
-      out.push({
-        id: `res-${r.id}`, kind: 'reservation', view: 'orders',
-        title: `${r.name} · ${r.partySize} ${r.partySize === 1 ? 'guest' : 'guests'}`,
-        body: `${r.date === today ? 'Today' : r.date} at ${r.time}${r.table?.name ? ` · ${r.table.name}` : ''}`,
-        at: when,
       })
     }
 

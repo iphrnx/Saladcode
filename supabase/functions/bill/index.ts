@@ -71,15 +71,11 @@ Deno.serve(async (req: Request) => {
 async function checkForTenant(
   tenantId: string,
   sessionId: string | null,
-  tableId: string | null,
   checkId: string | null = null,
 ): Promise<{ check: any; orders: any[]; payments: any[]; gstin: string | null; fssai: string | null; tenant: any; table: any } | null> {
   const db = admin();
 
-  // A named check wins, and does not need the table at all. Resolving by
-  // table returns that table's *newest* check, which is the wrong sitting
-  // whenever two parties have sat at the same table: the Orders board groups
-  // by sitting, and its bill must be that sitting's bill.
+  // A named check wins.
   if (checkId) {
     const { data: named } = await db
       .from("table_checks")
@@ -91,8 +87,8 @@ async function checkForTenant(
     return await loadCheck(tenantId, named);
   }
 
-  // A session-scoped check takes precedence over table-level resolution
-  // so each diner session at the same table has its own independent bill
+  // Strictly session-scoped: each diner session has its own independent bill.
+  // Never fall back to table_id alone, which would merge or leak another sitting's check.
   if (sessionId) {
     const { data: sessionCheck } = await db
       .from("table_checks")
@@ -105,32 +101,21 @@ async function checkForTenant(
     if (sessionCheck) {
       return await loadCheck(tenantId, sessionCheck);
     }
-  }
 
-  let table = tableId;
-  if (!table && sessionId) {
-    const { data: session } = await db
-      .from("table_sessions")
-      .select("table_id, tenant_id")
-      .eq("id", sessionId)
+    const { data: anchoredCheck } = await db
+      .from("table_checks")
+      .select("*")
       .eq("tenant_id", tenantId)
+      .eq("anchor_session_id", sessionId)
+      .order("opened_at", { ascending: false })
+      .limit(1)
       .maybeSingle();
-    table = session?.table_id ?? null;
+    if (anchoredCheck) {
+      return await loadCheck(tenantId, anchoredCheck);
+    }
   }
-  if (!table) return null;
 
-  // The open check, or the most recently settled one for that table.
-  const { data: open } = await db
-    .from("table_checks")
-    .select("*")
-    .eq("tenant_id", tenantId)
-    .eq("table_id", table)
-    .order("opened_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (!open) return null;
-
-  return await loadCheck(tenantId, open);
+  return null;
 }
 
 /**
@@ -364,7 +349,7 @@ function dinerDocument(
       ? { name: table.name.trim(), seats: Number(table.seats ?? 0), area: table.area?.trim() ?? "" }
       : null,
     orderType: orders[0]?.order_type ?? (table ? "DINE_IN" : "TAKEAWAY"),
-    // No customer identity on a shared table bill.
+    // No customer identity on a session bill.
     customerName: null,
     customerPhone: null,
     servedBy: null,
@@ -415,7 +400,6 @@ async function getCheck(req: Request): Promise<Response> {
   const g = await guard(req, { permission: "orders.view" });
   let tenantId: string;
   let sessionId: string | null = url.searchParams.get("sessionId");
-  let tableId: string | null = url.searchParams.get("tableId");
   // A sitting, named outright. Staff only — the diner path below pins the
   // lookup to their own session and never reads this.
   let checkId: string | null = url.searchParams.get("checkId");
@@ -428,13 +412,12 @@ async function getCheck(req: Request): Promise<Response> {
     if (!session) return g.response;
     tenantId = session.tenantId;
     sessionId = session.id;
-    tableId = null;
     checkId = null;
   }
 
   let data;
   try {
-    data = await checkForTenant(tenantId, sessionId, tableId, checkId);
+    data = await checkForTenant(tenantId, sessionId, checkId);
   } catch (err) {
     return json(req, { error: `Could not load bill: ${(err as Error).message}` }, 500);
   }
@@ -546,7 +529,6 @@ async function recordPayment(req: Request): Promise<Response> {
     data = await checkForTenant(
       g.session.tenantId,
       b.sessionId ? String(b.sessionId) : null,
-      b.tableId ? String(b.tableId) : null,
       b.checkId ? String(b.checkId) : null,
     );
   } catch (err) {
@@ -733,23 +715,6 @@ async function broadcastCheck(tenantId: string, checkId: string, reason: string)
         });
       }
     }
-  } else if (check.table_id) {
-    const { data: sessions } = await admin()
-      .from("table_sessions")
-      .select("id, token")
-      .eq("table_id", check.table_id)
-      .eq("tenant_id", tenantId)
-      .eq("status", "ACTIVE");
-    for (const s of sessions ?? []) {
-      publishToDiner(s.token, "CHECK_UPDATED", { checkId, reason });
-      if (reason === "FINALISED") {
-        publishToDiner(s.token, "SESSION_ENDED", {
-          tableId: check.table_id,
-          sessionId: s.id,
-          status: "ENDED",
-        });
-      }
-    }
   }
 }
 
@@ -807,7 +772,6 @@ async function finalize(req: Request): Promise<Response> {
     data = await checkForTenant(
       g.session.tenantId,
       b.sessionId ? String(b.sessionId) : null,
-      b.tableId ? String(b.tableId) : null,
       b.checkId ? String(b.checkId) : null,
     );
   } catch (err) {
@@ -900,7 +864,6 @@ async function settleCash(req: Request): Promise<Response> {
     data = await checkForTenant(
       g.session.tenantId,
       b.sessionId ? String(b.sessionId) : null,
-      b.tableId ? String(b.tableId) : null,
       b.checkId ? String(b.checkId) : null,
     );
   } catch (err) {

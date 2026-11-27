@@ -6,7 +6,6 @@ import { reconcileOrderExpansion, toggleOrderExpansion, type OrderExpansion } fr
 import { cn } from '@/lib/utils'
 import { useT } from '@/lib/i18n'
 import { formatDateWithPattern, type DateFormatPattern } from '@/lib/date-format'
-import { TableCheckDialog } from '@/components/shared/table-check-dialog'
 import { SessionPaymentDialog } from '@/components/shared/session-payment-dialog'
 import { SessionOrdersDrawer } from '@/components/shared/session-orders-drawer'
 import { OrderDetailDrawer } from '@/components/shared/order-detail-drawer'
@@ -250,14 +249,8 @@ export function OrdersView() {
   const [payOrder, setPayOrder] = useState<Order | null>(null)
   const [viewOrder, setViewOrder] = useState<Order | null>(null)
   const [addItemsOrder, setAddItemsOrder] = useState<Order | null>(null)
-  // The bill action opens the TABLE's check, not the single order: a sitting
-  // can be several orders and one payment, and the card is about the table.
-  const [billTable, setBillTable] = useState<{ id: string; name: string; checkId: string | null } | null>(null)
   /**
    * The payment modal, opened by Complete & Pay.
-   *
-   * Separate from `billTable`: that one is the detail sheet ("Session Details"),
-   * which shows the bill without taking money. This one is the till.
    */
   const [paySitting, setPaySitting] = useState<Sitting | null>(null)
   /** The drawer: the whole sitting, opened from its card or any of its rows. */
@@ -1168,18 +1161,14 @@ export function OrdersView() {
                 onView={() => setViewOrder(ticket.order)}
                 onViewBill={() => {
                   const ordTable = ticket.order.table ?? (ticket.order.tableId ? (data?.tables ?? []).find((t) => t.id === ticket.order.tableId) : null)
-                  return ticket.order.tableId
-                    ? setBillTable({
-                        id: ticket.order.tableId,
-                        name: ordTable?.name ?? 'Table',
-                        checkId: ticket.order.checkId ?? null,
-                      })
-                    : setBillDoc({
-                        checkId: ticket.order.checkId ?? null,
-                        orderId: ticket.order.id,
-                        table: null,
-                        autoPrint: false,
-                      })
+                  return setBillDoc({
+                    checkId: ticket.order.checkId ?? null,
+                    orderId: ticket.order.id,
+                    table: ordTable
+                      ? { name: ordTable.name, seats: ordTable.seats ?? 0, area: ordTable.area ?? '' }
+                      : null,
+                    autoPrint: false,
+                  })
                 }}
                 canPrepare={canPrepare}
                 canReady={canReady}
@@ -1533,17 +1522,6 @@ export function OrdersView() {
         </DialogContent>
       </Dialog>
 
-      {/* Bill dialog */}
-      <TableCheckDialog
-        tableId={billTable?.id ?? null}
-        tableName={billTable?.name ?? null}
-        checkId={billTable?.checkId ?? null}
-        open={billTable !== null}
-        onOpenChange={(v) => !v && setBillTable(null)}
-        currencySymbol={cs}
-        canCollect={canCollectPay}
-      />
-
       {/* Add Items Modal (Takeaway & Delivery only) */}
       <AddItemsModal
         open={Boolean(addItemsOrder)}
@@ -1693,15 +1671,6 @@ export function OrdersView() {
                     }
                   : null,
               autoPrint: false,
-            })
-          }}
-          onSessionDetails={() => {
-            const target = ordersSitting
-            openSitting(null)
-            setBillTable({
-              id: target.tableId!,
-              name: target.tableName ?? 'Table',
-              checkId: target.checkId,
             })
           }}
           focusOrderId={focusOrderId}
@@ -2566,7 +2535,7 @@ function SittingCard({
       {/* Payment summary and bottom actions */}
       <div className="relative z-10 pt-0">
         <div className="rounded-xl border border-orange-200/55 dark:border-border/55 bg-orange-50/60 dark:bg-secondary/40 p-2">
-          <dl aria-label={sitting.sharedBill ? "Shared table check" : "Bill totals"} className="grid grid-cols-3 divide-x divide-orange-200/50 dark:divide-border/50">
+          <dl aria-label="Bill totals" className="grid grid-cols-3 divide-x divide-orange-200/50 dark:divide-border/50">
             <Figure label="Total" icon={Layers} amount={billTotal} currencySymbol={currencySymbol} />
             <Figure label="Due" icon={ReceiptText} amount={billDue} currencySymbol={currencySymbol} tone={billDue ? 'due' : undefined} />
             <Figure label="Paid" icon={Wallet} amount={billPaid} currencySymbol={currencySymbol} tone="paid" />

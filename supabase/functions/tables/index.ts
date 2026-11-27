@@ -59,7 +59,7 @@ async function list(req: Request): Promise<Response> {
 
   const { data: tables, error } = await db
     .from("tables")
-    .select("*, orders(count), reservations(count)")
+    .select("*, orders(count)")
     .eq("tenant_id", tenantId)
     .order("name", { ascending: true });
 
@@ -80,12 +80,11 @@ async function list(req: Request): Promise<Response> {
   return json(
     req,
     (tables ?? []).map((row: any) => {
-      const { orders, reservations, ...rest } = row;
+      const { orders, ...rest } = row;
       return {
         ...toCamel(rest),
         _count: {
           orders: embedCount(orders),
-          reservations: embedCount(reservations),
         },
         currentStatus: tableStatus[row.id] || "AVAILABLE",
       };

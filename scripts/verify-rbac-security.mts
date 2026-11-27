@@ -494,12 +494,6 @@ try {
     });
     check("a Waiter can still end a table session (tables.manage)", endOk.status !== 403, `${endOk.status} ${JSON.stringify(endOk.body).slice(0, 160)}`);
 
-    const reservations = await call("reservations", { headers: kitchen.headers });
-    check("Kitchen cannot read the guest book", reservations.status === 403, `${reservations.status} ${JSON.stringify(reservations.body).slice(0, 160)}`);
-
-    const reservationsOk = await call("reservations", { headers: waiter.headers });
-    check("a Waiter can still read the guest book (tables.view)", reservationsOk.status === 200, `${reservationsOk.status} ${JSON.stringify(reservationsOk.body).slice(0, 160)}`);
-
     const reviews = await call("reviews", { headers: kitchen.headers });
     check("Kitchen cannot read customer reviews", reviews.status === 403, `${reviews.status} ${JSON.stringify(reviews.body).slice(0, 160)}`);
 

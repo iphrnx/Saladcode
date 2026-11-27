@@ -73,10 +73,9 @@ console.log("\n── RBAC holds where the money is ──");
 
 console.log("\n── no false success in the UI ──");
 {
-  const dialog = read("src/components/shared/table-check-dialog.tsx");
-  check("settle is disabled until the balance is zero", /outstanding <= 0/.test(dialog));
+  const dialog = read("src/components/shared/session-payment-dialog.tsx");
   check("the server refuses an unpaid settle regardless", /UNPAID:/.test(read("supabase/migrations/0078_check_sitting_binding.sql")));
-  check("a failed payment is reported, not swallowed", /toast\.error/.test(dialog));
+  check("a failed payment is reported, not swallowed", /describeFailure/.test(dialog));
 }
 
 console.log("\n── a finalised invoice cannot be changed ──");
@@ -92,11 +91,9 @@ console.log("\n── a finalised invoice cannot be changed ──");
 console.log("\n── refunds are itemised ──");
 {
   const bill = read("supabase/functions/bill/index.ts");
-  const dialog = read("src/components/shared/table-check-dialog.tsx");
   const diner = read("src/components/shared/bill-dialog.tsx");
   check("the check returns what was refunded", /refunded: refundedTotal/.test(bill));
   check("voided payments are listed, not hidden", /status === "VOID"/.test(bill));
-  check("the POS bill shows a refunded line", /Refunded/.test(dialog));
   check("the diner's bill does too", /refundedTotal/.test(diner));
 }
 

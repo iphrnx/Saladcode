@@ -134,22 +134,6 @@ export interface Table {
   _count?: { orders: number }
 }
 
-export interface Reservation {
-  id: string
-  tableId: string | null
-  name: string
-  phone: string
-  email: string | null
-  partySize: number
-  date: string
-  time: string
-  status: string
-  occasion: string | null
-  notes: string | null
-  createdAt: string
-  table?: { id: string; name: string } | null
-}
-
 export interface PromoCode {
   id: string
   code: string
@@ -316,7 +300,6 @@ export interface AppData {
   menuItems: MenuItem[]
   tables: Table[]
   orders: Order[]
-  reservations: Reservation[]
   promos: PromoCode[]
   sessions: Session[]
   securityLogs: SecurityLog[]
@@ -328,7 +311,6 @@ export interface AppData {
     activeOrders: number
     totalTables: number
     totalMenuItems: number
-    pendingReservations: number
   }
 }
 
