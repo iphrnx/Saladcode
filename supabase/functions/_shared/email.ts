@@ -102,6 +102,7 @@ export type EmailEvent = {
   currency?: string | null;
   billingInterval?: string | null;
   payload?: Record<string, unknown>;
+  throwOnInsertError?: boolean;
 };
 
 type Rendered = { subject: string; html: string; text: string };
@@ -484,11 +485,15 @@ export async function queueEmail(db: SupabaseClient, event: EmailEvent): Promise
     .maybeSingle();
 
   if (error) {
-    // 23505 = unique violation: this event was already queued. Anything else
-    // is a real failure and is worth a log line, but never a throw — an email
-    // must not be able to fail a payment webhook.
-    if (!String(error.message).includes("duplicate key")) {
-      console.error("email: could not queue", event.eventType, error.message);
+    const isDuplicate =
+      String((error as any).code ?? "") === "23505" ||
+      String(error.message).includes("duplicate key");
+    if (isDuplicate) {
+      return null;
+    }
+    console.error("email: could not queue", event.eventType, error.message);
+    if ((event as any).throwOnInsertError) {
+      throw new Error(`email queue insert failed: ${error.message}`);
     }
     return null;
   }
@@ -606,7 +611,10 @@ export async function dispatchPending(
 export async function queueForTenant(
   db: SupabaseClient,
   tenantId: string,
-  event: Omit<EmailEvent, "tenantId" | "recipient"> & { recipient?: string | null },
+  event: Omit<EmailEvent, "tenantId" | "recipient"> & {
+    recipient?: string | null;
+    throwOnInsertError?: boolean;
+  },
 ): Promise<string | null> {
   let recipient = event.recipient ?? null;
   let recipientName = event.recipientName ?? null;

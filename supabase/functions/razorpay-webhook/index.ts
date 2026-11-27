@@ -985,6 +985,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
             planName: (ledgerRow as any).plan_id,
             amount: docAmount,
             currency: (ledgerRow as any).currency ?? verifiedCurrency,
+            throwOnInsertError: true,
             payload: {
               refundedAt: refund?.created_at ? new Date(refund.created_at * 1000).toISOString() : now,
               refundId: verifiedRefundId,
@@ -1000,16 +1001,17 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
         }
       }
 
-      if (refundOutcome === "already_processed") {
-        return { summary: "refund already processed", tenantId };
-      }
-
-      await audit(db, tenantId, tenant.plan, planId, "refunded", eventId, {
+      await auditRefundIdempotent(db, tenantId, tenant.plan, planId, eventId, {
         paymentId: targetPaymentId,
         refundId: verifiedRefundId,
         totalRefunded: (refundRpcRes as any)?.total_refunded ?? null,
         isFullyRefunded: (refundRpcRes as any)?.is_fully_refunded ?? null,
       });
+
+      if (refundOutcome === "already_processed") {
+        return { summary: "refund already processed", tenantId };
+      }
+
       return { summary: "payment refunded", tenantId };
     }
 
@@ -1080,6 +1082,37 @@ async function rejectIncomingCharge(
       refundReview: decision === "reject-linked-billable",
     },
   });
+}
+
+async function auditRefundIdempotent(
+  db: any,
+  tenantId: string,
+  oldPlan: string | null,
+  newPlan: string | null,
+  eventId: string,
+  detail: {
+    paymentId: unknown;
+    refundId: string | null;
+    totalRefunded: unknown;
+    isFullyRefunded: unknown;
+  },
+) {
+  let existingQuery = db
+    .from("subscription_audit_logs")
+    .select("id")
+    .eq("tenant_id", tenantId)
+    .eq("change_type", "refunded");
+
+  if (detail.refundId) {
+    existingQuery = existingQuery.eq("detail->>refundId", detail.refundId);
+  } else {
+    existingQuery = existingQuery.eq("razorpay_event_id", eventId);
+  }
+
+  const { data: existing } = await existingQuery.limit(1).maybeSingle();
+  if (existing) return;
+
+  await audit(db, tenantId, oldPlan, newPlan, "refunded", eventId, detail);
 }
 
 async function audit(

@@ -2097,6 +2097,7 @@ async function cancel(req: Request, tenantId: string): Promise<Response> {
 async function invoice(req: Request, tenantId: string): Promise<Response> {
   const url = new URL(req.url);
   const paymentId = String(url.searchParams.get("paymentId") ?? "").trim();
+  const refundIdParam = String(url.searchParams.get("refundId") ?? "").trim() || null;
   const kind = url.searchParams.get("kind") === "refund" ? "refund" : "invoice";
   const download = url.searchParams.get("download") === "1";
   if (!paymentId) return json(req, { error: "paymentId is required" }, 400);
@@ -2106,7 +2107,7 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
   const { data: payment, error: paymentError } = await db
     .from("subscription_payments")
     .select(
-      "id, tenant_id, amount, currency, status, payment_method, plan_id, billing_period, created_at, razorpay_payment_id, razorpay_order_id",
+      "id, tenant_id, amount, refunded_amount, currency, status, payment_method, plan_id, billing_period, created_at, razorpay_payment_id, razorpay_order_id",
     )
     .eq("id", paymentId)
     .maybeSingle();
@@ -2122,12 +2123,62 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
     if (payment.status !== "refunded" && !(Number(payment.refunded_amount ?? 0) > 0)) {
       return json(req, { error: "No refund has been recorded for this payment." }, 404);
     }
-    const { data: existing } = await db
-      .from("billing_refunds")
-      .select("*")
+
+    const { data: processedRefunds, error: refundsErr } = await db
+      .from("subscription_refunds")
+      .select("id, razorpay_refund_id, amount, processed_at, created_at")
       .eq("payment_id", paymentId)
-      .maybeSingle();
-    const row = existing ?? await issueRefundDocument(db, tenantId, payment, {});
+      .eq("status", "processed")
+      .order("processed_at", { ascending: false, nullsFirst: false })
+      .order("created_at", { ascending: false });
+    if (refundsErr) {
+      console.error("subscriptions invoice: could not read processed refunds", refundsErr.message);
+      return json(req, { error: "Could not read refund details just now." }, 503);
+    }
+
+    const targetRefund = refundIdParam
+      ? (processedRefunds ?? []).find(
+          (r: any) => r.id === refundIdParam || r.razorpay_refund_id === refundIdParam,
+        ) ?? null
+      : (processedRefunds ?? [])[0] ?? null;
+
+    if (refundIdParam && !targetRefund) {
+      return json(req, { error: "No matching processed refund for this payment." }, 404);
+    }
+
+    let existing: any = null;
+    if (targetRefund?.razorpay_refund_id) {
+      const { data: byRefundId } = await db
+        .from("billing_refunds")
+        .select("*")
+        .eq("razorpay_refund_id", targetRefund.razorpay_refund_id)
+        .maybeSingle();
+      existing = byRefundId ?? null;
+    } else {
+      const { data: existingRows } = await db
+        .from("billing_refunds")
+        .select("*")
+        .eq("payment_id", paymentId)
+        .order("refund_date", { ascending: false })
+        .order("created_at", { ascending: false })
+        .limit(1);
+      existing = existingRows?.[0] ?? null;
+    }
+
+    const row = existing ?? await issueRefundDocument(
+      db,
+      tenantId,
+      payment,
+      targetRefund
+        ? {
+            razorpayRefundId: targetRefund.razorpay_refund_id,
+            amount: Number(targetRefund.amount),
+            refundedAt: targetRefund.processed_at ? new Date(targetRefund.processed_at) : undefined,
+          }
+        : {
+            amount: Number(payment.refunded_amount ?? payment.amount),
+          },
+    );
     if (!row) {
       return json(req, { error: "The refund document is not available just now. Please try again." }, 503);
     }

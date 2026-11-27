@@ -22,6 +22,25 @@ drop policy if exists "reviews_public_insert" on public.customer_reviews;
 revoke all on table public.customer_reviews from public, anon, authenticated;
 grant all on table public.customer_reviews to service_role;
 
+-- Deterministically reconcile any legacy duplicate non-null table_session_id
+-- rows before creating the partial unique index, keeping the earliest row per
+-- session and detaching extra rows (preserving all review content).
+with ranked as (
+  select
+    id,
+    row_number() over (
+      partition by table_session_id
+      order by created_at asc, id asc
+    ) as rn
+  from public.customer_reviews
+  where table_session_id is not null
+)
+update public.customer_reviews cr
+set table_session_id = null
+from ranked r
+where cr.id = r.id
+  and r.rn > 1;
+
 create unique index if not exists idx_customer_reviews_session_unique
   on public.customer_reviews (table_session_id)
   where table_session_id is not null;
