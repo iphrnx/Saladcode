@@ -258,6 +258,15 @@ export async function issueRefundDocument(
   payment: any,
   details: { refundedAt?: Date; razorpayRefundId?: string | null; amount?: number } = {},
 ): Promise<any | null> {
+  // Idempotency: if a refund document was already issued for this Razorpay
+  // refund (or for this payment when no refund ID exists), return it without
+  // consuming another RFND sequence number.
+  const existingQuery = db.from("billing_refunds").select("*");
+  const { data: existingDoc } = details.razorpayRefundId
+    ? await existingQuery.eq("razorpay_refund_id", details.razorpayRefundId).maybeSingle()
+    : await existingQuery.eq("payment_id", payment.id).maybeSingle();
+  if (existingDoc) return existingDoc;
+
   // The original invoice must exist for the link.
   let { data: invoice } = await db
     .from("billing_invoices")

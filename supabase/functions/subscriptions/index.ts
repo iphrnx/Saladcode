@@ -2119,7 +2119,7 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
   }
 
   if (kind === "refund") {
-    if (payment.status !== "refunded") {
+    if (payment.status !== "refunded" && !(Number(payment.refunded_amount ?? 0) > 0)) {
       return json(req, { error: "No refund has been recorded for this payment." }, 404);
     }
     const { data: existing } = await db
