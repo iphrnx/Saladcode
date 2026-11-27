@@ -1210,36 +1210,11 @@ async function create(req: Request): Promise<Response> {
               code: "SESSION_INACTIVE",
             }, 400);
           }
-        } else if (b.createNewSitting) {
-          // Explicitly creating a new sitting: create session + check + order atomically inside create_order_tx
+        } else {
+          // No session selected (POS table selection without an active sitting):
+          // always create an independent session and check atomically inside create_order_tx.
           tableSessionId = null;
           createNewSession = true;
-        } else {
-          // Safe resolution when no session was explicitly specified:
-          // If multiple active diner sittings exist on this table, reject ambiguous placement
-          // to prevent cross-diner billing corruption.
-          const { data: activeSessions } = await db
-            .from("table_sessions")
-            .select("id, orders(id)")
-            .eq("tenant_id", tenantId)
-            .eq("table_id", tableId)
-            .eq("status", "ACTIVE");
-          if (activeSessions && activeSessions.length > 1) {
-            return json(req, {
-              error: "This table has multiple active diner sessions. Please select the specific sitting/check before placing an order.",
-              code: "AMBIGUOUS_TABLE_SESSION",
-            }, 400);
-          }
-          if (activeSessions && activeSessions.length === 1) {
-            // Only attach if it already has orders; never silently attach to an empty session (e.g. <3m QR scan)
-            const hasOrders = Array.isArray(activeSessions[0].orders) && activeSessions[0].orders.length > 0;
-            if (hasOrders) {
-              tableSessionId = activeSessions[0].id;
-            }
-          }
-          if (!tableSessionId) {
-            createNewSession = true;
-          }
         }
       }
     } else if (orderType === "TAKEAWAY" || orderType === "DELIVERY") {

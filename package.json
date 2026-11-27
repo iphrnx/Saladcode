@@ -92,6 +92,7 @@
     "test:billing-ui": "tsx scripts/_billing-verify.mts",
     "test:realtime-privacy": "tsx scripts/test-realtime-privacy-offline.mts",
     "test:table-activation": "tsx scripts/test-table-activation-offline.mts",
+    "test:table-checks": "tsx scripts/test-independent-billing-regression.mts",
     "test:security-hardening": "tsx scripts/test-security-hardening-offline.mts",
     "test:core-invariants": "tsx --env-file=.env.local scripts/test-core-invariants.mts",
     "test:resilience": "tsx scripts/test-resilience-recovery.mts",

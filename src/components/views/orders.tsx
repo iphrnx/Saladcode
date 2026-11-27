@@ -380,16 +380,11 @@ export function OrdersView() {
   const sittings = useMemo<Sitting[]>(() => {
     const buckets = new Map<string, Order[]>()
     for (const o of orders) {
-      const isTakeawayOrDelivery = o.orderType === 'TAKEAWAY' || o.orderType === 'DELIVERY'
       const key = o.tableSessionId
         ? `session:${o.tableSessionId}`
         : o.checkId
           ? `check:${o.checkId}`
-          : isTakeawayOrDelivery
-            ? `order:${o.id}`
-            : (o.orderType === 'DINE_IN' && o.tableId)
-              ? `table:${o.tableId}`
-              : `order:${o.id}`
+          : `order:${o.id}`
       const list = buckets.get(key)
       if (list) list.push(o)
       else buckets.set(key, [o])
