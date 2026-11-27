@@ -13,7 +13,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const ROOT = "supabase/functions";
-const RETIRED_FUNCTIONS = ["reservations"];
+const RETIRED_FUNCTIONS = ["reservations", "test-shared"];
 const PROJECT_ID =
   process.env.SUPABASE_PROJECT_ID ??
   (process.env.NEXT_PUBLIC_SUPABASE_URL
