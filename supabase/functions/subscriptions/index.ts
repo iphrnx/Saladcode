@@ -782,7 +782,7 @@ async function state(req: Request, tenantId: string): Promise<Response> {
     const list = reconciliationsByPayment.get(k) ?? [];
     list.push({
       id: row.id,
-      amount: Number(row.amount),
+      amount: row.amount === null || row.amount === undefined ? null : Number(row.amount),
       currency: row.currency,
       status: row.status,
       created_at: row.created_at,

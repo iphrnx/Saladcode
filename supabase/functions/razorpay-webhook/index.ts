@@ -1002,20 +1002,39 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
           const emailEventKey = internalRefundId
             ? `payment_refunded:${internalRefundId}`
             : `payment_refunded:${String(targetPaymentId)}:${verifiedRefundId ?? "doc"}`;
-          await queueForTenant(db, tenantId, {
-            eventKey: emailEventKey,
-            eventType: "payment_refunded",
-            planName: (ledgerRow as any).plan_id,
-            amount: docAmount,
-            currency: (ledgerRow as any).currency ?? verifiedCurrency,
-            throwOnInsertError: true,
-            payload: {
-              refundedAt: refund?.created_at ? new Date(refund.created_at * 1000).toISOString() : now,
-              refundId: verifiedRefundId,
-              refundNumber: (refundDoc as any)?.refund_number ?? null,
-              paymentRef: String(targetPaymentId),
-            },
-          });
+          const legacyEmailKeys = [
+            emailEventKey,
+            ...(verifiedRefundId
+              ? [`payment_refunded:${String(targetPaymentId)}:${verifiedRefundId}`]
+              : [`payment_refunded:${String(targetPaymentId)}:doc`]),
+          ];
+          const { data: existingRefundEmails, error: existingEmailErr } = await db
+            .from("email_events")
+            .select("id, status, event_key")
+            .eq("tenant_id", tenantId)
+            .eq("event_type", "payment_refunded")
+            .in("event_key", Array.from(new Set(legacyEmailKeys)))
+            .in("status", ["pending", "sent"])
+            .limit(1);
+          if (existingEmailErr) {
+            throw new Error(`could not check refund email outbox: ${existingEmailErr.message}`);
+          }
+          if (!existingRefundEmails || existingRefundEmails.length === 0) {
+            await queueForTenant(db, tenantId, {
+              eventKey: emailEventKey,
+              eventType: "payment_refunded",
+              planName: (ledgerRow as any).plan_id,
+              amount: docAmount,
+              currency: (ledgerRow as any).currency ?? verifiedCurrency,
+              throwOnInsertError: true,
+              payload: {
+                refundedAt: refund?.created_at ? new Date(refund.created_at * 1000).toISOString() : now,
+                refundId: verifiedRefundId,
+                refundNumber: (refundDoc as any)?.refund_number ?? null,
+                paymentRef: String(targetPaymentId),
+              },
+            });
+          }
           try {
             await dispatchPending(db, 5);
           } catch (e) {

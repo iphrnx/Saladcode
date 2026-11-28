@@ -397,7 +397,7 @@ type BillingPayment = {
   }>
   pendingReconciliations?: Array<{
     id: string
-    amount: number
+    amount: number | null
     currency: string
     status: string
     created_at: string
@@ -612,7 +612,9 @@ function PaymentHistoryRows(props: {
                         className="inline-flex items-center rounded-lg border border-amber-300/70 bg-amber-50/70 px-2.5 py-1 text-[11.5px] font-medium text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300"
                         title="Refund event is awaiting provider identity verification"
                       >
-                        {money(rec.currency ?? p.currency, Number(rec.amount))} awaiting verification
+                        {rec.amount === null || rec.amount === undefined
+                          ? 'Refund amount awaiting verification'
+                          : `${money(rec.currency ?? p.currency, Number(rec.amount))} awaiting verification`}
                       </span>
                     ))}
                   </>
@@ -628,7 +630,9 @@ function PaymentHistoryRows(props: {
                         className="inline-flex items-center rounded-lg border border-amber-300/70 bg-amber-50/70 px-2.5 py-1 text-[11.5px] font-medium text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300"
                         title="Refund event is awaiting provider identity verification"
                       >
-                        {money(rec.currency ?? p.currency, Number(rec.amount))} awaiting verification
+                        {rec.amount === null || rec.amount === undefined
+                          ? 'Refund amount awaiting verification'
+                          : `${money(rec.currency ?? p.currency, Number(rec.amount))} awaiting verification`}
                       </span>
                     ))}
                     {p.status === 'succeeded' && (
@@ -2851,7 +2855,9 @@ export function SettingsView() {
                       return (
                         <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
                           <span className="inline-flex items-center rounded-lg border border-amber-300/70 bg-amber-50/70 px-2.5 py-1 text-[11.5px] font-medium text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
-                            Refund {money(latestRecon.currency ?? latestPayment.currency, Number(latestRecon.amount))} awaiting verification
+                            {latestRecon.amount === null || latestRecon.amount === undefined
+                              ? 'Refund amount awaiting verification'
+                              : `Refund ${money(latestRecon.currency ?? latestPayment.currency, Number(latestRecon.amount))} awaiting verification`}
                           </span>
                           <Button size="sm" variant="outline" onClick={() => openReceipt(latestPayment, null)}>
                             <Printer className="h-3.5 w-3.5 mr-1.5" />
