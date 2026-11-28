@@ -673,26 +673,19 @@ async function active(req: Request): Promise<Response> {
     };
   });
 
-  // The running bill for each table and individual session, so cards show
+  // The running bill for each individual session, so cards show
   // what is owed accurately, including multiple independent diner sessions at one table
   // and independent Takeaway & Delivery sessions.
-  const tableIds = [...new Set(sessions.map((s) => s.tableId).filter(Boolean))] as string[];
   const sessionIds = [...new Set(sessions.map((s) => s.id).filter(Boolean))] as string[];
   const checkBySession: Record<string, { id: string; total: number; paid: number; outstanding: number; status: string }> = {};
-  const checkByTable: Record<string, { id: string; total: number; paid: number; outstanding: number; status: string }> = {};
 
-  if (tableIds.length || sessionIds.length) {
-    let checkQuery = admin()
+  if (sessionIds.length) {
+    const { data: checks } = await admin()
       .from("table_checks")
       .select("id, table_id, session_id, anchor_session_id, status, total, paid_total, opened_at")
-      .eq("tenant_id", tenantId);
-
-    const orConditions: string[] = [];
-    if (tableIds.length) orConditions.push(`table_id.in.(${tableIds.join(",")})`);
-    if (sessionIds.length) orConditions.push(`session_id.in.(${sessionIds.join(",")})`);
-    checkQuery = checkQuery.or(orConditions.join(","));
-
-    const { data: checks } = await checkQuery.order("opened_at", { ascending: false });
+      .eq("tenant_id", tenantId)
+      .or(`session_id.in.(${sessionIds.join(",")}),anchor_session_id.in.(${sessionIds.join(",")})`)
+      .order("opened_at", { ascending: false });
 
     for (const c of checks ?? []) {
       const total = Number(c.total ?? 0);
@@ -703,9 +696,6 @@ async function active(req: Request): Promise<Response> {
       }
       if (c.anchor_session_id && !checkBySession[c.anchor_session_id]) {
         checkBySession[c.anchor_session_id] = entry;
-      }
-      if (c.table_id && !checkByTable[c.table_id]) {
-        checkByTable[c.table_id] = entry;
       }
     }
   }
@@ -772,7 +762,7 @@ async function active(req: Request): Promise<Response> {
   // Attach the bill figures to each group.
   const groups = Object.values(byTable).map((g) => ({
     ...g,
-    check: (g.tableId && checkByTable[g.tableId]) || (g.sessions[0]?.id && checkBySession[g.sessions[0].id]) || null,
+    check: (g.sessions[0]?.id && checkBySession[g.sessions[0].id]) || null,
   }));
 
   // Bills with money still due, including sittings that have already ended.

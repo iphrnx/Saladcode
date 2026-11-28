@@ -45,10 +45,10 @@ Saladcode/
 
 ## Supabase Edge Functions (`supabase/functions/`)
 
-27 functions sharing `supabase/functions/_shared/`:
+26 functions sharing `supabase/functions/_shared/`:
 
 - **Auth & Tenant**: `auth`, `bootstrap`, `onboarding`, `tenants`, `settings`, `security`, `staff`, `roles`
-- **Menu & Orders**: `menu`, `categories`, `orders`, `table-session`, `tables`, `qr`, `bill`, `promos`, `reservations`, `reviews`
+- **Menu & Orders**: `menu`, `categories`, `orders`, `table-session`, `tables`, `qr`, `bill`, `promos`, `reviews`
 - **Analytics & AI**: `analytics`, `ai-extract-menu`, `ai-generate-image`
 - **Billing & Platform**: `plans`, `subscriptions`, `razorpay-webhook`, `emails`, `super-admin`, `health`
 

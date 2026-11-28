@@ -83,9 +83,8 @@ console.log("\n── 4. UI Consolidated Billing & Sitting Cards ──");
     ordersView.includes("`check:${o.checkId}`")
   );
   check(
-    "orders view falls back to tableId for active dine-in orders",
-    ordersView.includes("o.orderType === 'DINE_IN' && o.tableId") &&
-    ordersView.includes("`table:${o.tableId}`")
+    "orders view does not fall back to shared tableId grouping for dine-in orders",
+    !ordersView.includes("`table:${o.tableId}`")
   );
   check(
     "ending prop is safe against null tableId (no false Ending... on Takeaway/Delivery)",
@@ -93,8 +92,8 @@ console.log("\n── 4. UI Consolidated Billing & Sitting Cards ──");
     (ordersView.includes("endingSession") || ordersView.includes("endingTable"))
   );
   check(
-    "End session menu item is conditionally rendered only for table sittings",
-    ordersView.includes("{sitting.tableId && (") &&
+    "End session menu item is rendered when sitting has a sessionId",
+    ordersView.includes("Boolean(sitting.sessionId)") &&
     ordersView.includes("End session")
   );
   check(

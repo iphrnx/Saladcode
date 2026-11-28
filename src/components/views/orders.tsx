@@ -176,9 +176,6 @@ type Sitting = {
   total: number
   paid: number
   due: number
-  /** The table's open bill also covers another sitting, so its paid figure is
-   *  not this sitting's paid figure. */
-  sharedBill: boolean
   /** Nothing is owed because nothing has been accepted yet. */
   awaiting: boolean
   /**
@@ -415,30 +412,26 @@ export function OrdersView() {
        * paid for it.
        */
       const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber)
-      const sharedBill = Boolean(check) && check!.orderCount !== onTheBill.length
-      const total = !check || sharedBill ? fallbackTotal : check.total
-      // Pre-tax and tax, from the same source as the total. When the check is
-      // this sitting's own these are the server's sums; when it is shared (or
-      // absent) they are this sitting's own orders, so the three figures still
-      // add up to the total shown next to them.
+      const total = !check ? fallbackTotal : check.total
+      // Pre-tax and tax, from the same source as the total.
       const localSubtotal = +onTheBill
         .reduce((n, o) => n + o.itemsTotal - o.discount, 0)
         .toFixed(2)
       const localTax = +onTheBill.reduce((n, o) => n + o.tax, 0).toFixed(2)
       const localService = +onTheBill.reduce((n, o) => n + (o.serviceCharge ?? 0), 0).toFixed(2)
-      const subtotal = !check || sharedBill ? localSubtotal : (check.subtotal ?? localSubtotal)
-      const tax = !check || sharedBill ? localTax : (check.tax ?? localTax)
+      const subtotal = !check ? localSubtotal : (check.subtotal ?? localSubtotal)
+      const tax = !check ? localTax : (check.tax ?? localTax)
       // Whatever the total carries beyond food and tax is service charge. Shown
       // separately so the three figures on the card add up to the fourth, which
       // is the whole point of labelling them.
-      const service = !check || sharedBill
+      const service = !check
         ? localService
         : (check.serviceCharge !== undefined
           ? check.serviceCharge
           : (localService > 0 ? localService : +Math.max(0, total - subtotal - tax).toFixed(2)))
       const allOrdersCompleted = rows.every((o) => ['COMPLETED', 'CANCELLED'].includes(o.status))
       const allOrdersPaid = rows.every((o) => o.paymentStatus === 'PAID')
-      const paid = !check || sharedBill
+      const paid = !check
         ? (isSettledCheck
           ? fallbackTotal
           : (allOrdersPaid
@@ -449,7 +442,7 @@ export function OrdersView() {
           : check.paid)
       const due = isSettledCheck
         ? 0
-        : (!check || sharedBill
+        : (!check
           ? +Math.max(0, total - paid).toFixed(2)
           : Math.max(0, check.outstanding))
 
@@ -524,7 +517,6 @@ export function OrdersView() {
         total,
         paid,
         due,
-        sharedBill,
         awaiting: total <= 0,
         // The server's own rule (finalize_table_check refuses while any order is
         // PENDING_ACTIVATION, PENDING, PREPARING or READY), stated once here so
@@ -1637,7 +1629,6 @@ export function OrdersView() {
             total: ordersSitting.total,
             paid: ordersSitting.paid,
             due: ordersSitting.due,
-            sharedBill: ordersSitting.sharedBill,
             awaiting: ordersSitting.awaiting,
           }}
           invoiceNumber={

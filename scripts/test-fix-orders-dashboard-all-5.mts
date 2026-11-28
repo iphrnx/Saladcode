@@ -154,14 +154,14 @@ describe('Bug 1: Multi-Diner Isolation & Atomic Updates', () => {
   const ordersCode = readFileSync(resolve('src/components/views/orders.tsx'), 'utf8')
   const dataContextCode = readFileSync(resolve('src/components/app/data-context.tsx'), 'utf8')
 
-  it('shared-check safeguard applies regardless of payment status', () => {
+  it('uses session-scoped check figures directly without sharedBill fallback', () => {
     assert.ok(
-      ordersCode.includes('const sharedBill = Boolean(check) && check!.orderCount !== onTheBill.length'),
-      'sharedBill must be based on check orderCount without being suppressed by isSettledCheck'
+      !ordersCode.includes('sharedBill'),
+      'sharedBill compatibility layer must be removed'
     )
     assert.ok(
-      !ordersCode.includes('!isSettledCheck && check!.orderCount !== onTheBill.length'),
-      'isSettledCheck must not bypass sharedBill safeguard'
+      ordersCode.includes('const total = !check ? fallbackTotal : check.total'),
+      'total must use authoritative session check total when present'
     )
   })
 

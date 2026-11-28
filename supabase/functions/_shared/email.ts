@@ -377,7 +377,7 @@ export function renderEmail(event: EmailEvent): Rendered {
         subject: "Your The Salad account has been deleted",
         html: frame({
           heading: "Your account has been deleted",
-          intro: `<strong>${restaurant}</strong> and its data — menu, orders, staff, reservations — have been permanently removed, as you asked.`,
+          intro: `<strong>${restaurant}</strong> and its data — menu, orders, staff — have been permanently removed, as you asked.`,
           rows: [
             ["Deleted on", fmtDate(p.deletedAt)],
             ["Plan at deletion", String(p.plan ?? "")],
