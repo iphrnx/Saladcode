@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Banknote, CalendarDays, Check, CreditCard, Info, Layers, Loader2, Power, ReceiptText, RotateCw, Table2, Timer, Wallet, X } from 'lucide-react'
 import { edgeFetch } from '@/lib/edge'
 import { describeFailure } from '@/lib/api-error'
+import { createEndedCheckAttempt, sendEndedCheckPayment, type EndedCheckAttempt } from '@/lib/ended-check-payment'
 import { formatCurrency } from '@/lib/constants'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
@@ -103,6 +104,11 @@ export function SessionPaymentDialog({
   /** One key per attempt: a retry after a dropped connection settles the same
    *  payment rather than taking the money twice. */
   const keyRef = useRef<string>('')
+  const endedAttempts = useRef(new Map<string, EndedCheckAttempt>())
+  const endedAttemptBusy = useRef(false)
+  const [attemptAmount, setAttemptAmount] = useState<number | null>(null)
+  const attemptScope = endedCheckOnly && checkId && sessionId ? `${sessionId}:${checkId}` : null
+  const attemptMessage = 'Retry to confirm the original payment. Do not take another payment.'
   const onPaidRef = useRef(onPaid)
   useEffect(() => {
     onPaidRef.current = onPaid
@@ -203,7 +209,7 @@ export function SessionPaymentDialog({
     } finally {
       setLoading(false)
     }
-  }, [tableId, checkId, sessionId, tableHint, endedCheckOnly])
+  }, [tableId, checkId, sessionId, endedCheckOnly])
 
   useEffect(() => {
     if (!open) {
@@ -215,13 +221,23 @@ export function SessionPaymentDialog({
       setTender(null)
       return
     }
+    const attempt = attemptScope ? endedAttempts.current.get(attemptScope) : undefined
+    if (attempt) {
+      setMethod(attempt.method)
+      setAttemptAmount(attempt.amount)
+      setStage('failed')
+      setError(attemptMessage)
+      setLoadError(null)
+      setLoading(false)
+      return
+    }
     setLoading(true)
     setLoadError(null)
     setTotals(null)
     setTender(null)
     keyRef.current = crypto.randomUUID()
     void load()
-  }, [open, load])
+  }, [open, load, attemptScope, attemptMessage])
 
   const completeSettlement = async (settledPayload: any, chosenMethod: Method) => {
     let subtotal = settledPayload?.subtotal !== undefined ? Number(settledPayload.subtotal) : undefined
@@ -401,8 +417,34 @@ export function SessionPaymentDialog({
    * For already-settled checks (Due = ₹0): Returns existing settlement and invoice idempotently.
    */
   const pay = async () => {
-    if (!canCollectPayment || !totals || busy || loading || loadError || (endedCheckOnly && (!checkId || !sessionId || totals.outstanding <= 0))) return
-    const endedCheckScope = endedCheckOnly ? { endedSessionId: sessionId } : {}
+    if (!canCollectPayment || busy || loading || loadError) return
+    if (endedCheckOnly) {
+      if (!attemptScope || !checkId || !sessionId || endedAttemptBusy.current) return
+      let attempt = endedAttempts.current.get(attemptScope)
+      if (!attempt) {
+        if (!totals || totals.outstanding <= 0) return
+        attempt = createEndedCheckAttempt(checkId, sessionId, method, totals.outstanding)
+        endedAttempts.current.set(attemptScope, attempt)
+      }
+      endedAttemptBusy.current = true
+      setAttemptAmount(attempt.amount)
+      setBusy(true)
+      setError(null)
+      try {
+        const receipt = await sendEndedCheckPayment(edgeFetch, attempt)
+        await completeSettlement(receipt, attempt.method)
+        endedAttempts.current.delete(attemptScope)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'The payment could not be confirmed.')
+        setFailedAt(new Date())
+        setStage('failed')
+      } finally {
+        endedAttemptBusy.current = false
+        setBusy(false)
+      }
+      return
+    }
+    if (!totals) return
     setBusy(true)
     setError(null)
     try {
@@ -416,7 +458,6 @@ export function SessionPaymentDialog({
             tableId,
             checkId,
             sessionId,
-            ...endedCheckScope,
           }),
         })
         if (settleRes.ok) {
@@ -436,7 +477,6 @@ export function SessionPaymentDialog({
             checkId,
             sessionId,
             idempotencyKey: keyRef.current,
-            ...endedCheckScope,
           }),
         })
 
@@ -467,7 +507,6 @@ export function SessionPaymentDialog({
             amount,
             method,
             idempotencyKey: keyRef.current,
-            ...endedCheckScope,
           }),
         })
         if (!payRes.ok) {
@@ -480,13 +519,6 @@ export function SessionPaymentDialog({
           )
           setFailedAt(new Date())
           setStage('failed')
-          return
-        }
-        // The existing record-payment RPC finalizes a full check atomically.
-        // Don't call the finalize endpoint again if that invoice already exists.
-        const recorded = await payRes.json().catch(() => null)
-        if (endedCheckOnly && recorded?.invoiceNumber && recorded.outstanding === 0) {
-          await completeSettlement(recorded, method)
           return
         }
 
@@ -503,7 +535,7 @@ export function SessionPaymentDialog({
       const settleRes = await edgeFetch('/api/bill/finalize', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ tableId, checkId, sessionId, ...endedCheckScope }),
+        body: JSON.stringify({ tableId, checkId, sessionId }),
       })
       if (!settleRes.ok) {
         const body = await settleRes.json().catch(() => null)
@@ -569,17 +601,18 @@ export function SessionPaymentDialog({
   }, [amountToPay, currencySymbol])
 
   const handleClose = useCallback(() => {
+    if (endedCheckOnly && endedAttemptBusy.current) return
     onOpenChange(false)
-  }, [onOpenChange])
+  }, [endedCheckOnly, onOpenChange])
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={(next) => next ? onOpenChange(true) : handleClose()}>
       <DialogContent
         showCloseButton={false}
         className="w-[calc(100%-1.25rem)] max-w-[420px] max-h-[90dvh] flex flex-col gap-0 overflow-hidden rounded-[28px] border border-border/60 bg-card p-0 shadow-2xl sm:max-w-[440px]"
       >
         <DialogTitle className="sr-only">
-          {stage === 'done' ? 'Payment successful' : stage === 'failed' ? 'Payment failed' : 'Complete payment'}
+          {stage === 'done' ? 'Payment successful' : stage === 'failed' ? (endedCheckOnly ? 'Payment unconfirmed' : 'Payment failed') : 'Complete payment'}
         </DialogTitle>
 
         {/* Pinned Header */}
@@ -623,7 +656,7 @@ export function SessionPaymentDialog({
           {stage === 'failed' && (
             <div className="text-center pr-9">
               <h2 className="text-[20px] font-extrabold leading-tight tracking-tight text-destructive sm:text-[22px]">
-                Payment Failed
+                {endedCheckOnly ? 'Payment Unconfirmed' : 'Payment Failed'}
               </h2>
               <p className="mt-0.5 truncate text-[12px] text-muted-foreground">
                 {contextSubtitle}
@@ -810,7 +843,7 @@ export function SessionPaymentDialog({
                 <div className="min-w-0 px-2">
                   <p className="text-[11.5px] font-medium text-muted-foreground">Total</p>
                   <p className="mt-1 truncate text-[14.5px] font-bold tabular-nums text-foreground sm:text-[15.5px]">
-                    {amountText}
+                    {endedCheckOnly && attemptAmount !== null ? money(attemptAmount) : amountText}
                   </p>
                 </div>
                 <div className="min-w-0 px-2">
@@ -823,7 +856,7 @@ export function SessionPaymentDialog({
                 <div className="min-w-0 px-2">
                   <p className="text-[11.5px] font-medium text-muted-foreground">Status</p>
                   <span className="mt-1 inline-flex items-center rounded-full bg-red-500/12 px-2.5 py-0.5 text-[12px] font-bold text-red-600 dark:text-red-400">
-                    Failed
+                    {endedCheckOnly ? 'Unconfirmed' : 'Failed'}
                   </span>
                 </div>
               </div>
@@ -836,7 +869,7 @@ export function SessionPaymentDialog({
                     {error || `Your ${selectedMethod.label} payment could not be completed.`}
                   </p>
                   <p className="mt-0.5 text-[12px] leading-snug text-muted-foreground">
-                    Please try again or choose another payment method.
+                    {endedCheckOnly ? attemptMessage : 'Please try again or choose another payment method.'}
                   </p>
                 </div>
               </div>
@@ -995,9 +1028,9 @@ export function SessionPaymentDialog({
             <div className="flex flex-col gap-2">
               <Button
                 onClick={() => {
-                  setStage('pay')
-                  if ((totals?.outstanding ?? 0) > 0) {
-                    keyRef.current = crypto.randomUUID()
+                  if (!endedCheckOnly) {
+                    setStage('pay')
+                    if ((totals?.outstanding ?? 0) > 0) keyRef.current = crypto.randomUUID()
                   }
                   void pay()
                 }}
@@ -1007,14 +1040,14 @@ export function SessionPaymentDialog({
                 {busy ? <Loader2 className="mr-2 size-4.5 animate-spin" /> : <RotateCw className="mr-2 size-4" />}
                 Retry Payment ({selectedMethod.label})
               </Button>
-              <Button
+              {!endedCheckOnly && <Button
                 variant="outline"
                 onClick={() => setStage('pay')}
                 className="h-10 w-full rounded-xl text-[14px] font-semibold text-foreground hover:bg-secondary cursor-pointer"
               >
                 <CreditCard className="mr-2 size-4 text-muted-foreground" />
                 Choose Another Method
-              </Button>
+              </Button>}
             </div>
           )}
         </div>

@@ -6,8 +6,8 @@ cd "$(dirname "$0")/.."
 mode=${1:-fresh}
 [[ "$mode" == fresh || "$mode" == upgrade ]] || { echo 'Usage: bash scripts/test-launch-migrations-local.sh [fresh|upgrade]' >&2; exit 2; }
 prefix="saladcode-launch-$mode-$$"
-db="$prefix-db"; auth="$prefix-auth"; storage="$prefix-storage"
-trap 'docker rm -fv "$storage" "$auth" "$db" >/dev/null 2>&1 || true' EXIT
+db="$prefix-db"; auth="$prefix-auth"; storage="$prefix-storage"; rest="$prefix-rest"
+trap 'docker rm -fv "$rest" "$storage" "$auth" "$db" >/dev/null 2>&1 || true' EXIT
 for image in postgres:17.11.0.018 gotrue:v2.198.0 storage-api:v1.98.0; do
   docker image inspect "public.ecr.aws/supabase/$image" >/dev/null
 done
@@ -58,4 +58,17 @@ if [[ "$mode" == upgrade ]]; then
   sql -Atc "select (select amount from public.subscription_payments where razorpay_payment_id='pay_upgrade_sentinel') = 100" | grep -qx t
 fi
 sql < scripts/test-launch-integrity.sql
+if [[ "${TEST_ENDED_CHECK_RETRY:-0}" == 1 ]]; then
+  docker run --pull never -d --rm --name "$rest" --network "container:$db" \
+    -e PGRST_DB_URI=postgres://postgres:isolated-local-only@127.0.0.1:5432/postgres \
+    -e PGRST_DB_SCHEMAS=public -e PGRST_DB_ANON_ROLE=anon \
+    -e PGRST_JWT_SECRET=ended-check-test-local-only-not-a-production-secret \
+    -e PGRST_SERVER_HOST=127.0.0.1 \
+    public.ecr.aws/supabase/postgrest:v14.18 >/dev/null
+  for ((i=0;i<30;i++)); do
+    if docker exec "$db" curl -fs -o /dev/null http://127.0.0.1:3000/; then break; fi
+    sleep 1
+  done
+  ./node_modules/.bin/tsx scripts/test-ended-check-retry-integration.mts "$db"
+fi
 echo "PASS $mode migration and seed rehearsal"
