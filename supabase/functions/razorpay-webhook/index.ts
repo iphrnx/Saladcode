@@ -5,7 +5,7 @@ import { json, preflight } from "../_shared/http.ts";
 import { dispatchPending, queueForTenant } from "../_shared/email.ts";
 import { cancelSubscription, fetchPayment, fetchRefund, fetchSubscription, verifyWebhookSignature } from "../_shared/razorpay.ts";
 import { eventCreatedAt, fromMinorUnits, webhookEventId } from "../_shared/billing.ts";
-import { issueInvoiceDocument, issueRefundDocument } from "../_shared/billing-documents.ts";
+import { issueInvoiceDocument, issueRefundDocument, ensureRefundAuditIdempotent } from "../_shared/billing-documents.ts";
 import { cancelSupersededLink } from "../_shared/mandate-switch.ts";
 import { decideChargeLink, type LiveSubscription } from "../_shared/subscription-guard.ts";
 
@@ -1099,20 +1099,15 @@ async function auditRefundIdempotent(
     isFullyRefunded: unknown;
   },
 ) {
-  const { error } = await db.from("subscription_audit_logs").insert({
-    tenant_id: tenantId,
-    old_plan: oldPlan,
-    new_plan: newPlan,
-    change_type: "refunded",
-    razorpay_event_id: eventId,
+  const res = await ensureRefundAuditIdempotent(db, {
+    tenantId,
+    oldPlan,
+    newPlan,
+    eventId,
     detail,
   });
-  if (error) {
-    const isDuplicate =
-      String((error as any).code ?? "") === "23505" ||
-      String(error.message).includes("duplicate key");
-    if (isDuplicate) return;
-    throw new Error(`could not write refund audit log: ${error.message}`);
+  if (!res.ok) {
+    throw new Error(`could not write refund audit log: ${res.error}`);
   }
 }
 

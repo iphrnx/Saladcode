@@ -313,7 +313,7 @@ export async function issueRefundDocument(
     p_razorpay_refund_id: details.razorpayRefundId ?? null,
   });
 
-  if (claimError || !claimed) {
+  if (claimError || !claimed || !claimed.id) {
     console.error("billing documents: could not claim refund document", claimError?.message);
     return null;
   }
@@ -335,4 +335,41 @@ export async function issueRefundDocument(
     }
   }
   return claimed;
+}
+
+/**
+ * Idempotently record or confirm the refund audit entry in
+ * subscription_audit_logs before generating a refund PDF.
+ */
+export async function ensureRefundAuditIdempotent(
+  db: any,
+  opts: {
+    tenantId: string;
+    oldPlan: string | null;
+    newPlan: string | null;
+    eventId: string | null;
+    detail: {
+      paymentId: unknown;
+      refundId: string | null;
+      totalRefunded: unknown;
+      isFullyRefunded: unknown;
+    };
+  },
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const { error } = await db.from("subscription_audit_logs").insert({
+    tenant_id: opts.tenantId,
+    old_plan: opts.oldPlan,
+    new_plan: opts.newPlan,
+    change_type: "refunded",
+    razorpay_event_id: opts.eventId,
+    detail: opts.detail,
+  });
+  if (error) {
+    const isDuplicate =
+      String((error as any).code ?? "") === "23505" ||
+      String(error.message).includes("duplicate key");
+    if (isDuplicate) return { ok: true };
+    return { ok: false, error: error.message };
+  }
+  return { ok: true };
 }

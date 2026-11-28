@@ -42,6 +42,7 @@ import {
   type ScheduledChange,
 } from "../_shared/billing-manage.ts";
 import {
+  ensureRefundAuditIdempotent,
   issueInvoiceDocument,
   issueRefundDocument,
   invoiceFactsFromRow,
@@ -708,7 +709,7 @@ async function state(req: Request, tenantId: string): Promise<Response> {
   const { data: refunds, error: refundsError } = await admin()
     .from("billing_refunds")
     .select(
-      "id, payment_id, razorpay_payment_id, razorpay_order_id, refund_number, refund_date, amount, currency, description, seller_name, seller_address, seller_email, seller_phone, buyer_name, buyer_email, buyer_address, original_invoice_number, original_invoice_date, razorpay_refund_id",
+      "id, payment_id, razorpay_payment_id, razorpay_order_id, refund_number, refund_date, amount, currency, description, seller_name, seller_address, seller_email, seller_phone, buyer_name, buyer_email, buyer_address, original_invoice_number, original_invoice_date, razorpay_refund_id, linked_razorpay_refund_id",
     )
     .eq("tenant_id", tenantId)
     .order("refund_date", { ascending: false })
@@ -736,8 +737,9 @@ async function state(req: Request, tenantId: string): Promise<Response> {
   const refundsByPayment = new Map<string, any[]>();
   const receiptByRefundId = new Map<string, any>();
   for (const row of refunds ?? []) {
-    if (row.razorpay_refund_id) {
-      receiptByRefundId.set(row.razorpay_refund_id, row);
+    const linkKey = row.linked_razorpay_refund_id ?? row.razorpay_refund_id;
+    if (linkKey) {
+      receiptByRefundId.set(linkKey, row);
     }
     const k = row.payment_id ?? row.razorpay_payment_id;
     if (!k) continue;
@@ -804,7 +806,7 @@ async function state(req: Request, tenantId: string): Promise<Response> {
       const key = row.razorpay_payment_id ?? row.transaction_id;
       const refundDocs = refundsByPayment.get(row.id) ?? refundsByPayment.get(key) ?? [];
       const rawProcessed = processedByPayment.get(row.id) ?? processedByPayment.get(key) ?? [];
-      const legacyDocs = refundDocs.filter((d: any) => !d.razorpay_refund_id);
+      const legacyDocs = refundDocs.filter((d: any) => !d.razorpay_refund_id && !d.linked_razorpay_refund_id);
       const canReconcileLegacy =
         rawProcessed.length === 1 &&
         !rawProcessed[0].receipt &&
@@ -826,7 +828,7 @@ async function state(req: Request, tenantId: string): Promise<Response> {
 }
 
 function canReconcileLegacyReceipt(processed: any, receipt: any, payment: any): boolean {
-  if (!processed || !receipt || receipt.razorpay_refund_id) return false;
+  if (!processed || !receipt || receipt.razorpay_refund_id || receipt.linked_razorpay_refund_id) return false;
   if (processed.amount == null || receipt.amount == null) return false;
   if (Number(processed.amount) !== Number(receipt.amount)) return false;
   const procCurrency = String(processed.currency || payment?.currency || "INR").trim().toUpperCase();
@@ -839,7 +841,14 @@ function canReconcileLegacyReceipt(processed: any, receipt: any, payment: any): 
   ) {
     return false;
   }
-  return true;
+  const isFullPaymentRefund =
+    payment?.amount != null &&
+    Number(receipt.amount) === Number(payment.amount) &&
+    Number(processed.amount) === Number(payment.amount);
+  const timestampsMatch =
+    Boolean(processed.processed_at && receipt.refund_date) &&
+    Math.abs(new Date(processed.processed_at).getTime() - new Date(receipt.refund_date).getTime()) <= 2000;
+  return isFullPaymentRefund || timestampsMatch;
 }
 
 /** The part of the plan the browser is allowed to see. */
@@ -2218,7 +2227,7 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
     } else {
       const { data: processedRefunds, error: refundsErr } = await db
         .from("subscription_refunds")
-        .select("id, razorpay_refund_id, amount, processed_at, created_at")
+        .select("id, razorpay_refund_id, amount, currency, webhook_event_id, processed_at, created_at")
         .eq("payment_id", paymentId)
         .eq("status", "processed")
         .order("processed_at", { ascending: false, nullsFirst: false })
@@ -2243,7 +2252,7 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
         const { data: byRefundId } = await db
           .from("billing_refunds")
           .select("*")
-          .eq("razorpay_refund_id", targetRefund.razorpay_refund_id)
+          .or(`razorpay_refund_id.eq.${targetRefund.razorpay_refund_id},linked_razorpay_refund_id.eq.${targetRefund.razorpay_refund_id}`)
           .maybeSingle();
         existing = byRefundId ?? null;
       } else {
@@ -2252,12 +2261,36 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
           .select("*")
           .eq("payment_id", paymentId)
           .is("razorpay_refund_id", null)
+          .is("linked_razorpay_refund_id", null)
           .order("refund_date", { ascending: false })
           .order("created_at", { ascending: false })
           .limit(1);
         const candidate = existingRows?.[0] ?? null;
         if (candidate && (!targetRefund || canReconcileLegacyReceipt(targetRefund, candidate, payment))) {
           existing = candidate;
+        }
+      }
+
+      if (!existing) {
+        const auditRes = await ensureRefundAuditIdempotent(db, {
+          tenantId,
+          oldPlan: payment.plan_id ?? null,
+          newPlan: payment.plan_id ?? null,
+          eventId: targetRefund?.webhook_event_id ?? (
+            targetRefund?.razorpay_refund_id
+              ? `ondemand:${targetRefund.razorpay_refund_id}`
+              : `ondemand:${paymentId}`
+          ),
+          detail: {
+            paymentId: payment.razorpay_payment_id ?? paymentId,
+            refundId: targetRefund?.razorpay_refund_id ?? null,
+            totalRefunded: payment.refunded_amount ?? null,
+            isFullyRefunded: payment.status === "refunded",
+          },
+        });
+        if (!auditRes.ok) {
+          console.error("subscriptions invoice: refund audit prerequisite failed", auditRes.error);
+          return json(req, { error: "The refund document is not available just now. Please try again." }, 503);
         }
       }
 
