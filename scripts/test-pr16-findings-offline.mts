@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { sittingBillAmounts } from '../src/lib/sitting-bill'
+import { canCollectEndedCheck, completedOrderForSettlementRetry, sittingBillAmounts } from '../src/lib/sitting-bill'
 import { workspaceOrderReadScope } from '../supabase/functions/_shared/order-read-scope.ts'
 
 let passed = 0
@@ -145,6 +145,25 @@ assert(
   subsSrc.includes('row.amount === null || row.amount === undefined ? null : Number(row.amount)') &&
     settingsSrc.includes('Refund amount awaiting verification'),
 )
+
+console.log('\n── Ended check collection and persisted settlement recovery ──')
+const unpaid = { status: 'OPEN', orderCount: 1, outstanding: 50, invoiceNumber: null }
+for (const status of ['OPEN', 'UNSETTLED']) {
+  assert(`${status} ended check is collectible`, canCollectEndedCheck({ ...unpaid, status }, true, true, true))
+}
+for (const status of ['PAID', 'CANCELLED', 'VOID', 'VOIDED']) {
+  assert(`${status} check is not collectible`, !canCollectEndedCheck({ ...unpaid, status }, true, true, true))
+}
+assert('collection requires payment permission', !canCollectEndedCheck(unpaid, false, true, true))
+assert('any unserved order blocks collection', !canCollectEndedCheck(unpaid, true, false, true))
+assert('all-cancelled check cannot be collected', !canCollectEndedCheck(unpaid, true, true, false))
+assert('an already-issued invoice blocks collection', !canCollectEndedCheck({ ...unpaid, invoiceNumber: 'INV-1' }, true, true, true))
+assert('zero outstanding is not collectible', !canCollectEndedCheck({ ...unpaid, outstanding: 0 }, true, true, true))
+const persistedOrder = { id: 'already-committed', status: 'COMPLETED' }
+assert('persisted completed order can retry an active session after refresh', completedOrderForSettlementRetry('sitting', 'ACTIVE', 'OPEN', [persistedOrder]) === persistedOrder)
+assert('persisted completed order can retry an ended session with a still-open check', completedOrderForSettlementRetry('sitting', 'ENDED', 'OPEN', [persistedOrder]) === persistedOrder)
+assert('a served sibling ticket in this same session keeps it open', !completedOrderForSettlementRetry('sitting', 'ACTIVE', 'OPEN', [persistedOrder, { id: 'still-serving', status: 'SERVED' }]))
+assert('a settled ended session does not offer retry', !completedOrderForSettlementRetry('sitting', 'ENDED', 'PAID', [persistedOrder]))
 
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) process.exit(1)

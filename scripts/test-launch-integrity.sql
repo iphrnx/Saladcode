@@ -4,6 +4,16 @@ create function pg_temp.reject_fixture_settlement() returns trigger language plp
 begin
   raise exception 'fixture storage failure';
 end $$;
+create temp table fixture_session_ends (session_id uuid);
+create function pg_temp.count_fixture_session_end() returns trigger language plpgsql as $$
+begin
+  if old.status = 'ACTIVE' and new.status = 'ENDED' then
+    insert into fixture_session_ends values (new.id);
+  end if;
+  return new;
+end $$;
+create trigger count_fixture_session_end after update of status on public.table_sessions
+  for each row execute function pg_temp.count_fixture_session_end();
 do $$
 declare
   a uuid := gen_random_uuid();
@@ -16,6 +26,11 @@ declare
   sitting uuid;
   sibling uuid;
   bill_id uuid;
+  other_sitting uuid;
+  other_check uuid;
+  ended_sitting uuid;
+  ended_check uuid;
+  check_state text;
   issued_invoice text;
   failed_attempt integer;
   newer_attempt integer;
@@ -97,6 +112,10 @@ begin
   insert into public.tables (tenant_id, name, qr_token) values (a,'Fixture table','qr_launch_fixture') returning id into fixture_table;
   insert into public.table_sessions (tenant_id, table_id, status) values (a,fixture_table,'ACTIVE') returning id into sitting;
   insert into public.table_checks (tenant_id, table_id, anchor_session_id, total) values (a,fixture_table,sitting,50) returning id into bill_id;
+  insert into public.table_sessions (tenant_id, table_id, status) values (a,fixture_table,'ACTIVE') returning id into other_sitting;
+  insert into public.table_checks (tenant_id, table_id, anchor_session_id, total) values (a,fixture_table,other_sitting,75) returning id into other_check;
+  insert into public.orders (tenant_id, table_id, table_session_id, check_id, status,total,items_total)
+    values (a,fixture_table,other_sitting,other_check,'SERVED',75,75);
   insert into public.orders (tenant_id, table_id, table_session_id, check_id, status,total,items_total)
     values (a,fixture_table,sitting,bill_id,'SERVED',50,50) returning id into sibling;
   if public.close_completed_order_sitting(a,sitting) or public.close_completed_order_sitting(b,sitting) then
@@ -114,6 +133,7 @@ begin
   end;
   drop trigger reject_fixture_settlement on public.table_checks;
   if not exists(select 1 from public.table_sessions where id=sitting and status='ACTIVE') then raise exception 'session closure did not roll back'; end if;
+  if not exists(select 1 from public.orders where id=sibling and status='COMPLETED') then raise exception 'fixture did not preserve the committed split state'; end if;
   if not public.close_completed_order_sitting(a,sitting) then raise exception 'first closure did not transition'; end if;
   select invoice_number into issued_invoice from public.table_checks where id=bill_id and status='PAID';
   if issued_invoice is null then raise exception 'retry did not finalize paid bill'; end if;
@@ -123,6 +143,41 @@ begin
   if not exists (select 1 from public.table_sessions where id=sitting and status='ENDED' and ended_at is not null) then
     raise exception 'closed sitting was not persisted';
   end if;
+  if (select count(*) from fixture_session_ends where session_id=sitting) <> 1 then raise exception 'session ended more than once'; end if;
+
+  foreach check_state in array array['OPEN','UNSETTLED','VOID'] loop
+    insert into public.table_sessions (tenant_id, table_id, status) values (a,fixture_table,'ACTIVE') returning id into ended_sitting;
+    insert into public.table_checks (tenant_id, table_id, anchor_session_id, total) values (a,fixture_table,ended_sitting,30) returning id into ended_check;
+    insert into public.orders (tenant_id, table_id, table_session_id, check_id, status,total,items_total)
+      values (a,fixture_table,ended_sitting,ended_check,'SERVED',30,30);
+    update public.table_sessions set status='ENDED', ended_at=now() where id=ended_sitting;
+    update public.table_checks set status=check_state where id=ended_check;
+    if check_state = 'VOID' then
+      begin
+        perform public.settle_check_cash_tx(a,ended_check,null,'void-do-not-charge',null);
+        raise exception 'void check was charged';
+      exception when raise_exception then
+        if sqlerrm <> 'CHECK_VOID' then raise; end if;
+      end;
+      if exists (select 1 from public.check_payments where check_id=ended_check) then raise exception 'void check has a payment'; end if;
+    else
+      if check_state = 'OPEN' then
+        result := public.settle_check_cash_tx(a,ended_check,null,'ended-cash',null);
+      else
+        result := public.record_check_payment(a,ended_check,30,'UPI','ended-upi',null,null);
+      end if;
+      issued_invoice := result->>'invoiceNumber';
+      if issued_invoice is null then raise exception 'ended check did not invoice'; end if;
+      perform public.settle_check_cash_tx(a,ended_check,null,'duplicate-key-for-paid-check',null);
+      perform public.record_check_payment(a,ended_check,30,'UPI','second-duplicate-key',null,null);
+      if (select invoice_number from public.table_checks where id=ended_check) is distinct from issued_invoice
+        or (select count(*) from public.check_payments where check_id=ended_check) <> 1 then raise exception 'ended payment charged twice'; end if;
+      if (select count(*) from fixture_session_ends where session_id=ended_sitting) <> 1 then raise exception 'payment re-ended the sitting'; end if;
+    end if;
+  end loop;
+  if not exists (select 1 from public.table_sessions where id=other_sitting and status='ACTIVE' and ended_at is null)
+    or not exists (select 1 from public.table_checks where id=other_check and status='OPEN' and invoice_number is null)
+    or exists (select 1 from public.check_payments where check_id=other_check) then raise exception 'settlement touched another diner at the same table'; end if;
   raise notice 'launch integrity: refund, grants, cursor, lease fencing and sitting closure passed';
 end $$;
 rollback;

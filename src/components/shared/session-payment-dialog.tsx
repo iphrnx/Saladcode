@@ -47,6 +47,7 @@ export function SessionPaymentDialog({
   tableHint,
   currencySymbol = '₹',
   canCollectPayment,
+  endedCheckOnly = false,
   open,
   onOpenChange,
   onPaid,
@@ -63,6 +64,7 @@ export function SessionPaymentDialog({
   tableHint?: string
   currencySymbol?: string
   canCollectPayment: boolean
+  endedCheckOnly?: boolean
   open: boolean
   onOpenChange: (v: boolean) => void
   /** Fired after a successful settle, so the board can refresh. */
@@ -122,6 +124,16 @@ export function SessionPaymentDialog({
         return
       }
       const body = await res.json()
+      if (endedCheckOnly && (
+        !checkId || !sessionId || body?.checkId !== checkId || !['OPEN', 'UNSETTLED'].includes(body?.status) ||
+        body?.invoiceNumber || !(Number(body?.totals?.outstanding) > 0) ||
+        !(body.orders ?? []).some((o: any) => ['SERVED', 'COMPLETED'].includes(o.status)) ||
+        (body.orders ?? []).some((o: any) => ['PENDING_ACTIVATION', 'PENDING', 'PREPARING', 'READY'].includes(o.status))
+      )) {
+        setLoadError('This check no longer has a collectible balance, or some orders have not been served.')
+        setTotals(null)
+        return
+      }
       setLoadError(null)
       const live = (body?.orders ?? []).filter((o: any) => o.status !== 'CANCELLED')
       setItems(
@@ -191,7 +203,7 @@ export function SessionPaymentDialog({
     } finally {
       setLoading(false)
     }
-  }, [tableId, checkId, sessionId, tableHint])
+  }, [tableId, checkId, sessionId, tableHint, endedCheckOnly])
 
   useEffect(() => {
     if (!open) {
@@ -389,7 +401,8 @@ export function SessionPaymentDialog({
    * For already-settled checks (Due = ₹0): Returns existing settlement and invoice idempotently.
    */
   const pay = async () => {
-    if (!canCollectPayment || !totals || busy) return
+    if (!canCollectPayment || !totals || busy || loading || loadError || (endedCheckOnly && (!checkId || !sessionId || totals.outstanding <= 0))) return
+    const endedCheckScope = endedCheckOnly ? { endedSessionId: sessionId } : {}
     setBusy(true)
     setError(null)
     try {
@@ -403,6 +416,7 @@ export function SessionPaymentDialog({
             tableId,
             checkId,
             sessionId,
+            ...endedCheckScope,
           }),
         })
         if (settleRes.ok) {
@@ -422,6 +436,7 @@ export function SessionPaymentDialog({
             checkId,
             sessionId,
             idempotencyKey: keyRef.current,
+            ...endedCheckScope,
           }),
         })
 
@@ -452,6 +467,7 @@ export function SessionPaymentDialog({
             amount,
             method,
             idempotencyKey: keyRef.current,
+            ...endedCheckScope,
           }),
         })
         if (!payRes.ok) {
@@ -464,6 +480,13 @@ export function SessionPaymentDialog({
           )
           setFailedAt(new Date())
           setStage('failed')
+          return
+        }
+        // The existing record-payment RPC finalizes a full check atomically.
+        // Don't call the finalize endpoint again if that invoice already exists.
+        const recorded = await payRes.json().catch(() => null)
+        if (endedCheckOnly && recorded?.invoiceNumber && recorded.outstanding === 0) {
+          await completeSettlement(recorded, method)
           return
         }
 
@@ -480,7 +503,7 @@ export function SessionPaymentDialog({
       const settleRes = await edgeFetch('/api/bill/finalize', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ tableId, checkId, sessionId }),
+        body: JSON.stringify({ tableId, checkId, sessionId, ...endedCheckScope }),
       })
       if (!settleRes.ok) {
         const body = await settleRes.json().catch(() => null)

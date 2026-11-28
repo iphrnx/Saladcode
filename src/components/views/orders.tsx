@@ -5,7 +5,7 @@ import { useApp, type CheckSummary, type Order, type OrderItem } from '@/compone
 import { reconcileOrderExpansion, toggleOrderExpansion, type OrderExpansion } from './order-expansion'
 import { cn } from '@/lib/utils'
 import { useT } from '@/lib/i18n'
-import { sittingBillAmounts } from '@/lib/sitting-bill'
+import { canCollectEndedCheck, completedOrderForSettlementRetry, sittingBillAmounts } from '@/lib/sitting-bill'
 import { SessionPaymentDialog } from '@/components/shared/session-payment-dialog'
 import { SessionOrdersDrawer } from '@/components/shared/session-orders-drawer'
 import { OrderDetailDrawer } from '@/components/shared/order-detail-drawer'
@@ -649,7 +649,20 @@ export function OrdersView() {
     sitting.state === 'Ended' && sitting.orders.some((order) => order.id === id),
   ))
   const detailReadOnly = sittingBoard && isEndedOrder(detailOrder?.id)
+  const collectingEndedCheck = paySitting?.state === 'Ended' && Boolean(paySitting.checkId && paySitting.sessionId)
   const paySittingEnded = Boolean(paySitting && sittings.some((s) => s.key === paySitting.key && s.state === 'Ended'))
+  const billSitting = billDoc ? sittings.find((s) => s.state === 'Ended' && s.checkId === billDoc.checkId &&
+    s.orders.some((o) => o.id === billDoc.orderId)) : undefined
+  const billCheck = billSitting?.checkId ? checks[billSitting.checkId] : undefined
+  const canCollectBill = Boolean(billSitting?.checkId && billSitting.sessionId && !billSitting.sharedBill &&
+    tableSessions[billSitting.sessionId]?.status === 'ENDED' && canCollectEndedCheck(
+    billCheck, canComplete && canCollectPay,
+    billSitting.allServed && (checkServing.get(billSitting.checkId)?.allServed ?? false),
+    billSitting.orders.some((o) => o.status === 'SERVED' || o.status === 'COMPLETED'),
+  ))
+  const billRecoveryOrder = canComplete && billSitting
+    ? completedOrderForSettlementRetry(billSitting.sessionId, billSitting.sessionId ? tableSessions[billSitting.sessionId]?.status : undefined, billCheck?.status, billSitting.orders)
+    : undefined
 
   interface KotTicket {
     key: string
@@ -804,10 +817,10 @@ export function OrdersView() {
     // One transition at a time per screen — a second tap while the first is in
     // flight would race the server's status machine.
     const busyKey = order.id + (kotNumber ? `-kot-${kotNumber}` : '') + status
-    if (busy) return
-    if (busyRef.current) return
+    if (busy || busyRef.current) return false
     busyRef.current = busyKey
     setBusy(busyKey)
+    const retrySettlement = order.status === 'COMPLETED' && status === 'COMPLETED' && !method && !kotNumber
     // Optimistic: the card moves now and the button stops spinning as soon as
     // the server confirms — not after a whole-app reload, which is what the
     // old `await refresh()` made the cashier watch. The payment fields ride
@@ -822,8 +835,8 @@ export function OrdersView() {
       updatedAt: new Date().toISOString(),
       ...(method ? { paymentMethod: method, paymentStatus: 'PAID' } : {}),
     }
-    addOrUpdateOrder(optimisticUpdatedOrder, false, { force: true })
-    if (detailOrderId === order.id) {
+    if (!retrySettlement) addOrUpdateOrder(optimisticUpdatedOrder, false, { force: true })
+    if (!retrySettlement && detailOrderId === order.id) {
       setFallbackDetailOrder(optimisticUpdatedOrder)
     }
     try {
@@ -839,6 +852,13 @@ export function OrdersView() {
           ...(method ? { paymentMethod: method, paymentStatus: 'PAID' } : {}),
         }),
       })
+      if (res.status === 503 && (await res.clone().json().catch(() => null))?.code === 'SITTING_SETTLEMENT_RETRY') {
+        // The order write committed. Do not put the older served status back.
+        // Refresh reads the actual order and shows the same recovery after a reload.
+        await refresh().catch(() => {})
+        toast.error('The order is completed, but the session could not be settled. Choose Retry settlement.')
+        return false
+      }
       await failIfNotOk(res, 'the order')
       const confirmed = await res.json()
       // The authoritative row replaces the optimistic one.
@@ -846,11 +866,14 @@ export function OrdersView() {
       if (detailOrderId === order.id) {
         setFallbackDetailOrder(confirmed)
       }
-      toast.success(
+      if (retrySettlement) {
+        await refresh().catch(() => {})
+      } else toast.success(
         kotNumber
           ? `Order #${order.orderNumber} (KOT ${kotNumber}) → ${capitalize(status.toLowerCase())}`
           : `Order #${order.orderNumber} → ${capitalize(status.toLowerCase())}`
       )
+      return true
     } catch (e) {
       // Roll back the optimistic move — the card returns to the status the
       // database actually holds, and the next sync keeps it there.
@@ -859,6 +882,7 @@ export function OrdersView() {
         setFallbackDetailOrder(order)
       }
       handleAction(e, 'the order')
+      return false
     } finally {
       busyRef.current = null
       setBusy(null)
@@ -1126,6 +1150,13 @@ export function OrdersView() {
                   })
                 }
                 onEndSession={(target) => void endSitting(target)}
+                settlementRetryOrder={canComplete && sitting.state === 'Active'
+                  ? completedOrderForSettlementRetry(
+                    sitting.sessionId, sitting.sessionId ? tableSessions[sitting.sessionId]?.status : undefined,
+                    sitting.checkId ? checks[sitting.checkId]?.status : undefined, sitting.orders,
+                  ) : undefined}
+                onRetrySettlement={(order) => void updateStatus(order, 'COMPLETED')}
+                retryingSettlement={Boolean(busy)}
                 onPay={(order) => {
                   setPayOrder(order)
                   setPaymentMethod('CASH')
@@ -1706,7 +1737,7 @@ export function OrdersView() {
         />
       )}
 
-      {/* The till. Opened by Complete & Pay only. */}
+      {/* The same till handles active settlement and a named ended check. */}
       <SessionPaymentDialog
         tableId={paySitting?.tableId ?? null}
         checkId={paySitting?.checkId ?? null}
@@ -1727,7 +1758,8 @@ export function OrdersView() {
         currencySymbol={cs}
         startedAt={paySitting?.startedAt ?? null}
         canCollectPayment={canCollectPay}
-        open={canCollectPay && paySitting !== null && !paySittingEnded}
+        endedCheckOnly={collectingEndedCheck}
+        open={canCollectPay && paySitting !== null && (!paySittingEnded || collectingEndedCheck)}
         onOpenChange={(v) => !v && setPaySitting(null)}
         onPaid={handlePaid}
         onViewBill={(originKey) => {
@@ -1774,6 +1806,17 @@ export function OrdersView() {
         checkId={billDoc?.checkId ?? null}
         tableHint={billDoc?.table ?? null}
         autoPrint={billDoc?.autoPrint ?? false}
+        staffActions={(canCollectBill || billRecoveryOrder) ? <>
+          {billRecoveryOrder && <Button type="button" size="sm" variant="outline" disabled={Boolean(busy)} onClick={() => void updateStatus(billRecoveryOrder, 'COMPLETED')}>
+            Retry settlement
+          </Button>}
+          {canCollectBill && billSitting?.checkId && <Button type="button" size="sm" onClick={() => {
+            setBillDoc(null)
+            setPaySitting(billSitting)
+          }}>
+            Collect payment
+          </Button>}
+        </> : undefined}
         open={billDoc !== null}
         onOpenChange={(v) => !v && setBillDoc(null)}
       />
@@ -2231,6 +2274,9 @@ function SittingCard({
   onEndSession,
   onPay,
   onAddItems,
+  settlementRetryOrder,
+  onRetrySettlement,
+  retryingSettlement,
 }: {
   sitting: Sitting
   check?: CheckSummary
@@ -2252,6 +2298,9 @@ function SittingCard({
   onEndSession: (sitting: Sitting) => void
   onPay: (order: Order) => void
   onAddItems?: (order: Order) => void
+  settlementRetryOrder?: Order
+  onRetrySettlement: (order: Order) => void
+  retryingSettlement?: boolean
 }) {
   const active = sitting.state === 'Active'
   const isTakeawayOrDelivery = sitting.orderType === 'TAKEAWAY' || sitting.orderType === 'DELIVERY'
@@ -2532,7 +2581,9 @@ function SittingCard({
               <ReceiptText aria-hidden className="size-4" /> Bill
             </Button>
           </>}
-          <Button
+          {settlementRetryOrder ? <Button type="button" variant="outline" disabled={retryingSettlement} onClick={() => onRetrySettlement(settlementRetryOrder)} className="h-11 flex-1 min-w-[10.5rem] rounded-xl">
+            Retry settlement
+          </Button> : <Button
             disabled={active && !canPay}
             title={active && !canPay ? paymentReason : undefined}
             onClick={() => {
@@ -2551,7 +2602,7 @@ function SittingCard({
           >
             <span>{active || canPay ? 'Complete & Pay' : 'Session Details'}</span>
             <ChevronRight aria-hidden className="size-4 stroke-[2.5] shrink-0" />
-          </Button>
+          </Button>}
         </div>
       </div>
     </Card>
