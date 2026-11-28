@@ -47,10 +47,10 @@ import {
   issueRefundDocument,
   invoiceFactsFromRow,
   readStoredPdf,
+  readIssuedRefundPdf,
   sellerIdentity,
-  refundFactsFromRow,
 } from "../_shared/billing-documents.ts";
-import { buildInvoicePdf, buildRefundPdf } from "../_shared/pdf.ts";
+import { buildInvoicePdf } from "../_shared/pdf.ts";
 import {
   decideScheduledCancel,
   decideCheckoutAction,
@@ -2309,10 +2309,8 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
     if (!row) {
       return json(req, { error: "The refund document is not available just now. Please try again." }, 503);
     }
-    // The re-render fallback reconstructs from the immutable row; the
-    // snapshot on it keeps even a re-render faithful to the original.
-    const bytes = await readStoredPdf(db, row.pdf_path)
-      ?? buildRefundPdf(refundFactsFromRow(row, await sellerIdentity(db)));
+    const bytes = await readIssuedRefundPdf(db, tenantId, row);
+    if (!bytes) return json(req, { error: "The stored refund PDF is unavailable. Please try again." }, 503);
     return pdfResponse(req, bytes, `Refund-${row.refund_number}.pdf`, download);
   }
 

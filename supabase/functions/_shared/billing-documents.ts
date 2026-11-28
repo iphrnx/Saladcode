@@ -172,6 +172,22 @@ export async function readStoredPdf(db: any, path: string | null): Promise<Uint8
   return new Uint8Array(await data.arrayBuffer());
 }
 
+/** Recover an unmaterialized refund using its issued identity; never replace
+ * an existing object or return a separately rendered version to a caller. */
+export async function readIssuedRefundPdf(db: any, tenantId: string, row: any): Promise<Uint8Array | null> {
+  const path = row.pdf_path ?? `${tenantId}/${row.refund_number}.pdf`;
+  const existing = await readStoredPdf(db, path);
+  if (existing) return existing;
+  const bytes = buildRefundPdf(refundFactsFromRow(row, await sellerIdentity(db)));
+  if (!await uploadPdf(db, path, bytes)) return null;
+  if (!row.pdf_path) {
+    const { error } = await db.from("billing_refunds").update({ pdf_path: path })
+      .eq("tenant_id", tenantId).eq("id", row.id).is("pdf_path", null);
+    if (error) return null;
+  }
+  return await readStoredPdf(db, path);
+}
+
 /**
  * Issue the invoice for a payment that has already been verified
  * server-side. Returns the row — the caller's or, on a race, the

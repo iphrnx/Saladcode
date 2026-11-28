@@ -5,7 +5,7 @@ import { useApp, type CheckSummary, type Order, type OrderItem } from '@/compone
 import { reconcileOrderExpansion, toggleOrderExpansion, type OrderExpansion } from './order-expansion'
 import { cn } from '@/lib/utils'
 import { useT } from '@/lib/i18n'
-import { formatDateWithPattern, type DateFormatPattern } from '@/lib/date-format'
+import { sittingBillAmounts } from '@/lib/sitting-bill'
 import { SessionPaymentDialog } from '@/components/shared/session-payment-dialog'
 import { SessionOrdersDrawer } from '@/components/shared/session-orders-drawer'
 import { OrderDetailDrawer } from '@/components/shared/order-detail-drawer'
@@ -73,7 +73,6 @@ import {
   Printer,
   MoreHorizontal,
   PlusCircle,
-  Info,
   ClipboardCheck,
   ConciergeBell,
   SlidersHorizontal,
@@ -402,7 +401,6 @@ export function OrdersView() {
       const onTheBill = rows.filter(
         (o) => !['CANCELLED', 'PENDING_ACTIVATION'].includes(o.status),
       )
-      const fallbackTotal = +onTheBill.reduce((n, o) => n + o.total, 0).toFixed(2)
       /**
        * Whether the server's check for this sitting is only this sitting.
        *
@@ -413,12 +411,7 @@ export function OrdersView() {
        * own total, and must not claim to know how much of the shared money was
        * paid for it.
        */
-      const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber)
-      const sharedBill = Boolean(check && (
-        check.orderCount !== onTheBill.length || !sessionId ||
-        check.orderSessionIds?.length !== 1 || check.orderSessionIds[0] !== sessionId
-      ))
-      const total = !check || sharedBill ? fallbackTotal : check.total
+      const { isSettledCheck, sharedBill, total, paid, due } = sittingBillAmounts(check, sessionId, onTheBill)
       // Pre-tax and tax, from the same source as the total.
       const localSubtotal = +onTheBill
         .reduce((n, o) => n + o.itemsTotal - o.discount, 0)
@@ -437,20 +430,6 @@ export function OrdersView() {
           : (localService > 0 ? localService : +Math.max(0, total - subtotal - tax).toFixed(2)))
       const allOrdersCompleted = rows.every((o) => ['COMPLETED', 'CANCELLED'].includes(o.status))
       const allOrdersPaid = rows.every((o) => o.paymentStatus === 'PAID')
-      const paid = sharedBill && !isSettledCheck ? null : !check || sharedBill
-        ? (isSettledCheck
-          ? fallbackTotal
-          : (allOrdersPaid
-            ? fallbackTotal
-            : +onTheBill.reduce((n, o) => n + (o.paymentStatus === 'PAID' ? o.total : 0), 0).toFixed(2)))
-        : (isSettledCheck
-          ? (check.paid ?? check.total ?? fallbackTotal)
-          : check.paid)
-      const due = isSettledCheck
-        ? 0
-        : paid === null ? null : (!check || sharedBill
-          ? +Math.max(0, total - paid).toFixed(2)
-          : Math.max(0, check.outstanding))
 
       // A sitting with a row is Active or Ended because the server says so. One
       // without a row (an order written before sessions existed, or a takeaway)
@@ -666,6 +645,11 @@ export function OrdersView() {
    * keep the per-order card, which never hides an item behind an expander.
    */
   const sittingBoard = canComplete || canCollectPay
+  const isEndedOrder = (id?: string) => Boolean(id && sittings.some((sitting) =>
+    sitting.state === 'Ended' && sitting.orders.some((order) => order.id === id),
+  ))
+  const detailReadOnly = sittingBoard && isEndedOrder(detailOrder?.id)
+  const paySittingEnded = Boolean(paySitting && sittings.some((s) => s.key === paySitting.key && s.state === 'Ended'))
 
   interface KotTicket {
     key: string
@@ -1526,7 +1510,7 @@ export function OrdersView() {
 
       {/* Add Items Modal (Takeaway & Delivery only) */}
       <AddItemsModal
-        open={Boolean(addItemsOrder)}
+        open={Boolean(addItemsOrder) && !isEndedOrder(addItemsOrder?.id)}
         onOpenChange={(open) => !open && setAddItemsOrder(null)}
         order={addItemsOrder}
         currencySymbol={cs}
@@ -1544,19 +1528,19 @@ export function OrdersView() {
         onOpenChange={(v) => !v && openOrderDetail(null)}
         currencySymbol={cs}
         dishImages={dishImages}
-        canPrepare={canPrepare}
-        canReady={canReady}
-        canServe={canServe}
-        canAccept={canAcceptHeld}
+        canPrepare={!detailReadOnly && canPrepare}
+        canReady={!detailReadOnly && canReady}
+        canServe={!detailReadOnly && canServe}
+        canAccept={!detailReadOnly && canAcceptHeld}
         accepting={detailOrder ? acceptingId === detailOrder.id : false}
-        canCancel={isOwnerManagerOrCashier && (canCancel || canEditOrders)}
+        canCancel={!detailReadOnly && isOwnerManagerOrCashier && (canCancel || canEditOrders)}
         cancelling={detailOrder ? cancellingId === detailOrder.id : false}
         busy={detailOrder ? Boolean(busy && busy.startsWith(detailOrder.id)) : false}
-        onAccept={() => detailOrder && void decideHeld(detailOrder, 'accept')}
-        onReject={() => detailOrder && void decideHeld(detailOrder, 'reject')}
-        onUpdate={(next) => detailOrder && void updateStatus(detailOrder, next)}
+        onAccept={() => !detailReadOnly && detailOrder && void decideHeld(detailOrder, 'accept')}
+        onReject={() => !detailReadOnly && detailOrder && void decideHeld(detailOrder, 'reject')}
+        onUpdate={(next) => !detailReadOnly && detailOrder && void updateStatus(detailOrder, next)}
         onCancel={(reason) => {
-          if (detailOrder) void handleCancelOrder(detailOrder, reason)
+          if (!detailReadOnly && detailOrder) void handleCancelOrder(detailOrder, reason)
         }}
         onBack={() => {
           const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder?.id))
@@ -1568,7 +1552,7 @@ export function OrdersView() {
           }
         }}
         canGoToPayment={(() => {
-          if (!detailOrder) return false
+          if (detailReadOnly || !detailOrder) return false
           const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder.id))
           if (!sitting) return false
           return getSittingPaymentEligibility(sitting, {
@@ -1578,7 +1562,7 @@ export function OrdersView() {
           }).eligible
         })()}
         paymentBlockedReason={(() => {
-          if (!detailOrder) return undefined
+          if (detailReadOnly || !detailOrder) return undefined
           const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder.id))
           if (!sitting) return undefined
           return getSittingPaymentEligibility(sitting, {
@@ -1588,7 +1572,7 @@ export function OrdersView() {
           }).reason
         })()}
         onGoToPayment={() => {
-          if (!detailOrder) return
+          if (detailReadOnly || !detailOrder) return
           const sitting = sittings.find((x) => x.orders.some((o) => o.id === detailOrder.id))
           if (!sitting) return
           const elig = getSittingPaymentEligibility(sitting, {
@@ -1641,10 +1625,10 @@ export function OrdersView() {
           invoiceNumber={
             ordersSitting.checkId ? (checks[ordersSitting.checkId]?.invoiceNumber || null) : null
           }
-          paymentMethod={ordersSitting.latest.paymentMethod || 'Cash'}
+          paymentMethod={ordersSitting.latest.paymentMethod}
           paidAt={ordersSitting.endedAt || ordersSitting.latest.completedAt || ordersSitting.latest.createdAt}
           canPay={
-            getSittingPaymentEligibility(ordersSitting, {
+            ordersSitting.state === 'Active' && getSittingPaymentEligibility(ordersSitting, {
               check: ordersSitting.checkId ? checks[ordersSitting.checkId] : undefined,
               checkAllServed: !ordersSitting.checkId || (checkServing.get(ordersSitting.checkId)?.allServed ?? ordersSitting.allServed),
               hasPayPerm: canComplete && canCollectPay,
@@ -1652,6 +1636,7 @@ export function OrdersView() {
           }
           onCompletePay={() => {
             const target = ordersSitting
+            if (target.state === 'Ended') return
             const elig = getSittingPaymentEligibility(target, {
               check: target.checkId ? checks[target.checkId] : undefined,
               checkAllServed: !target.checkId || (checkServing.get(target.checkId)?.allServed ?? target.allServed),
@@ -1742,7 +1727,7 @@ export function OrdersView() {
         currencySymbol={cs}
         startedAt={paySitting?.startedAt ?? null}
         canCollectPayment={canCollectPay}
-        open={canCollectPay && paySitting !== null}
+        open={canCollectPay && paySitting !== null && !paySittingEnded}
         onOpenChange={(v) => !v && setPaySitting(null)}
         onPaid={handlePaid}
         onViewBill={(originKey) => {
@@ -1870,7 +1855,7 @@ const ORDER_TYPE_LABEL: Record<string, string> = {
 }
 
 function formatPaymentMethod(m?: string | null): string {
-  if (!m) return 'Cash'
+  if (!m) return 'Unknown'
   const upper = m.toUpperCase()
   if (upper === 'CASH') return 'Cash'
   if (upper === 'CARD') return 'Card'
@@ -1891,25 +1876,6 @@ function timeOf(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
-/**
- * When a table sat down, split so it can never be cut off.
- *
- * The day goes in the label ("Started · Yesterday") and the clock in the value.
- * Whole, that sentence is 123px wide and the cell is 95–116px — it was being
- * clipped at both breakpoints. Time alone fits anywhere.
- */
-function sessionWhen(iso: string, dateFormat?: DateFormatPattern): { day: string; time: string } {
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return { day: '', time: '—' }
-  const startOfToday = new Date()
-  startOfToday.setHours(0, 0, 0, 0)
-  const startOfYesterday = new Date(startOfToday)
-  startOfYesterday.setDate(startOfYesterday.getDate() - 1)
-  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  if (d >= startOfToday) return { day: 'Today', time }
-  if (d >= startOfYesterday) return { day: 'Yesterday', time }
-  return { day: formatDateWithPattern(iso, dateFormat || 'DD/MM/YYYY'), time }
-}
 
 /**
  * Cell borders for the information strip.
@@ -2291,9 +2257,6 @@ function SittingCard({
   const isTakeawayOrDelivery = sitting.orderType === 'TAKEAWAY' || sitting.orderType === 'DELIVERY'
   const isPaid = sitting.latest.paymentStatus?.toUpperCase() === 'PAID'
   const canAddToThisOrder = isTakeawayOrDelivery && active && sitting.latest.status !== 'COMPLETED' && sitting.latest.status !== 'CANCELLED' && !isPaid
-  const { data } = useApp()
-  const dateFormat = (data?.settings?.pref_date_format as DateFormatPattern) || 'DD/MM/YYYY'
-  const started = sessionWhen(sitting.startedAt, dateFormat)
   const hasPayPerm = canComplete && canCollectPay
   const onlyPendingActivation = sitting.orders.every((order) => order.status === 'PENDING_ACTIVATION')
   const eligibility = getSittingPaymentEligibility(sitting, {
@@ -2301,110 +2264,13 @@ function SittingCard({
     checkAllServed: checkCanSettle,
     hasPayPerm,
   })
-  const paidOff = eligibility.paidOff
   const awaiting = eligibility.awaiting
-  const canPay = eligibility.eligible
-  const isSettledEnded = !active && !onlyPendingActivation && !awaiting && paidOff
+  const canPay = active && eligibility.eligible
 
   // The parent keys each card by session ID, so another sitting cannot reuse this state.
   const [expansion, setExpansion] = useState<OrderExpansion | null>(null)
   const currentExpansion = reconcileOrderExpansion(expansion, sitting.orders)
   if (currentExpansion !== expansion) setExpansion(currentExpansion)
-
-  if (isSettledEnded) {
-    const labelName = sitting.tableName
-      ? (sitting.sessionLabel ? `${sitting.tableName} · ${sitting.sessionLabel}` : sitting.tableName)
-      : `Order #${sitting.latest.orderNumber}`
-    const paymentMethod = formatPaymentMethod((check as any)?.payments?.[0]?.method || (check as any)?.paymentMethod || sitting.latest.paymentMethod || 'Cash')
-    const paidAmount = money(currencySymbol, check?.paid ?? sitting.total)
-
-    // Formatted session time or reference (distinguishes separate visits at the same table)
-    const sessionTimeRef = sitting.endedAt
-      ? formatOrderRelativeTime(sitting.endedAt, timeZone, now)
-      : (check as any)?.closedAt
-        ? formatOrderRelativeTime((check as any).closedAt, timeZone, now)
-        : sitting.startedAt
-          ? formatOrderRelativeTime(sitting.startedAt, timeZone, now)
-          : null
-
-    const summaryParts = [
-      `${sitting.orders.length} order${sitting.orders.length === 1 ? '' : 's'}`,
-      `${sitting.qtyCount} item${sitting.qtyCount === 1 ? '' : 's'}`,
-      sittingDuration(sitting.startedAt, sitting.endedAt, now),
-      sessionTimeRef,
-    ].filter(Boolean) as string[]
-
-    return (
-      <Card
-        data-order-card
-        data-session-card={sitting.sessionId ?? undefined}
-        className={cn(
-          'group relative w-full self-start !min-h-0 !h-auto overflow-hidden rounded-[20px] sm:rounded-[22px] border p-3.5 sm:p-4',
-          'border-neutral-200/80 dark:border-border/70 bg-card shadow-[0_2px_12px_-2px_rgba(0,0,0,0.04)] dark:shadow-none transition-all duration-200 hover:border-primary/40 hover:shadow-md cursor-pointer',
-        )}
-        onClick={() => onOpenOrders(sitting)}
-      >
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute -top-16 -right-16 size-40 rounded-full bg-gradient-to-br from-orange-400/10 via-orange-200/5 to-transparent blur-xl dark:from-orange-500/5 dark:via-transparent"
-        />
-        <div className="relative z-10 flex flex-col gap-2">
-          {/* Top: table name and Paid via Cash/UPI/Card badge */}
-          <div className="flex items-center justify-between gap-2">
-            <h3 className="font-bold text-foreground text-sm sm:text-[15px] truncate leading-tight">
-              {labelName}
-            </h3>
-            <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-800 border border-emerald-200/60 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-800/50">
-              <Check className="size-3 stroke-[2.5]" />
-              Paid via {paymentMethod}
-            </span>
-          </div>
-
-          {/* Below: paid amount, Session Ended badge */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-base sm:text-[17px] font-bold tabular-nums text-foreground tracking-tight">
-              {paidAmount}
-            </span>
-            <span className="inline-flex items-center rounded-md bg-secondary px-2 py-0.5 text-[10.5px] font-medium text-muted-foreground border border-border/40">
-              Session Ended
-            </span>
-          </div>
-
-          {/* Compact summary with order count, item count, duration, and session time (dots only between visible values) */}
-          <div className="flex items-center gap-1.5 flex-wrap text-xs text-muted-foreground">
-            {summaryParts.map((part, idx) => (
-              <span key={idx} className="inline-flex items-center gap-1.5">
-                {idx > 0 && <span aria-hidden className="text-muted-foreground/60 select-none">•</span>}
-                <span>{part}</span>
-              </span>
-            ))}
-          </div>
-
-          {/* Actions: Bill and Details close to the summary, wrapping cleanly on narrow screens */}
-          <div className="flex items-center gap-2 flex-wrap pt-0.5" onClick={(e) => e.stopPropagation()}>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => onBill(sitting, false)}
-              className="h-8 gap-1.5 rounded-xl px-3 text-xs font-semibold hover:border-orange-300 dark:hover:border-orange-500/40 cursor-pointer"
-            >
-              <ReceiptText className="size-3.5 text-orange-500" />
-              <span>Bill</span>
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => onOpenOrders(sitting)}
-              className="h-8 gap-1.5 rounded-xl px-3 text-xs font-semibold hover:border-orange-300 dark:hover:border-orange-500/40 cursor-pointer"
-            >
-              <Info className="size-3.5 text-muted-foreground" />
-              <span>Details</span>
-            </Button>
-          </div>
-        </div>
-      </Card>
-    )
-  }
 
   const validOrders = sitting.orders.filter((order) => order.status !== 'CANCELLED')
   const toServe = validOrders.filter((order) => ['PENDING', 'PREPARING', 'READY'].includes(order.status))
@@ -2414,6 +2280,12 @@ function SittingCard({
       .reduce((quantity, item) => quantity + item.quantity, 0),
     0,
   )
+  const cancelled = validOrders.length === 0
+  const endedMethods = [...new Set(sitting.orders.filter((o) => o.paymentStatus === 'PAID' && o.paymentMethod)
+    .map((o) => formatPaymentMethod(o.paymentMethod)))].sort()
+  const paymentLabel = sitting.paid === null ? 'Payment allocation unknown'
+    : sitting.paid > 0 ? (endedMethods.length ? endedMethods.join(' / ') : 'Payment method unknown')
+      : cancelled ? 'Cancelled' : 'No payment recorded'
   const servingLabel = onlyPendingActivation ? 'Awaiting Acceptance'
     : validOrders.length === 0 ? 'No Items to Serve'
       : validOrders.every((order) => order.status === 'PREPARING') ? 'All Items Preparing'
@@ -2421,15 +2293,11 @@ function SittingCard({
           : sitting.allServed ? 'All Served'
             : 'Awaiting Acceptance'
   const paymentReason = eligibility.reason
-  const billTotal = sitting.sharedBill ? sitting.total : (check?.total ?? sitting.total)
-  const billPaid = sitting.sharedBill ? sitting.paid : (check?.paid ?? (paidOff ? sitting.total : sitting.paid))
-  const billDue = sitting.sharedBill
-    ? sitting.due
-    : (check != null
-      ? Math.max(0, check.outstanding)
-      : billTotal === null || billPaid === null
-        ? null
-        : Math.max(0, billTotal - billPaid))
+  const billTotal = sitting.total
+  const billPaid = sitting.paid
+  const billDue = sitting.due
+  const shownOrderCount = active ? validOrders.length : sitting.orders.length
+  const shownItemCount = active ? sitting.qtyCount : sitting.orders.reduce((n, order) => n + order.items.reduce((qty, item) => qty + item.quantity, 0), 0)
   const cardName = sitting.tableName
     ? (sitting.sessionLabel ? `${sitting.tableName} · ${sitting.sessionLabel}` : sitting.tableName)
     : (sitting.latest.customerName
@@ -2438,17 +2306,17 @@ function SittingCard({
   const sessionStats = [
     {
       icon: ClipboardCheck,
-      full: `${validOrders.length} Order${validOrders.length === 1 ? '' : 's'}`,
-      count: String(validOrders.length),
-      suffix: validOrders.length === 1 ? 'Order' : 'Orders',
-      title: `${validOrders.length} Order${validOrders.length === 1 ? '' : 's'}`,
+      full: `${shownOrderCount} Order${shownOrderCount === 1 ? '' : 's'}`,
+      count: String(shownOrderCount),
+      suffix: shownOrderCount === 1 ? 'Order' : 'Orders',
+      title: `${shownOrderCount} Order${shownOrderCount === 1 ? '' : 's'}`,
     },
     {
       icon: Layers,
-      full: `${sitting.qtyCount} Item${sitting.qtyCount === 1 ? '' : 's'}`,
-      count: String(sitting.qtyCount),
-      suffix: sitting.qtyCount === 1 ? 'Item' : 'Items',
-      title: `${sitting.qtyCount} Item${sitting.qtyCount === 1 ? '' : 's'}`,
+      full: `${shownItemCount} Item${shownItemCount === 1 ? '' : 's'}`,
+      count: String(shownItemCount),
+      suffix: shownItemCount === 1 ? 'Item' : 'Items',
+      title: `${shownItemCount} Item${shownItemCount === 1 ? '' : 's'}`,
     },
     {
       icon: ConciergeBell,
@@ -2534,7 +2402,7 @@ function SittingCard({
                     : 'bg-muted-foreground',
               )}
             />
-            <span>{onlyPendingActivation ? 'Awaiting' : sitting.state}</span>
+            <span>{active && onlyPendingActivation ? 'Awaiting' : sitting.state}</span>
           </span>
 
           <DropdownMenu>
@@ -2552,7 +2420,7 @@ function SittingCard({
               <DropdownMenuItem onClick={() => onView(sitting.latest)}>
                 <Eye className="mr-2 size-4" /> Open latest order
               </DropdownMenuItem>
-              {canAddItems && isTakeawayOrDelivery && (
+              {active && canAddItems && isTakeawayOrDelivery && (
                 <DropdownMenuItem
                   disabled={!canAddToThisOrder}
                   onClick={() => onAddItems?.(sitting.latest)}
@@ -2569,7 +2437,7 @@ function SittingCard({
               <DropdownMenuItem onClick={() => onOpenOrders(sitting)}>
                 <Layers className="mr-2 size-4" /> View orders &amp; bill
               </DropdownMenuItem>
-              {canEndSession && Boolean(sitting.sessionId) && (
+              {active && canEndSession && Boolean(sitting.sessionId) && (
                 <DropdownMenuItem
                   disabled={!active || ending}
                   onClick={() => onEndSession(sitting)}
@@ -2639,7 +2507,7 @@ function SittingCard({
         </div>
 
         <div className="mt-2.5 flex flex-wrap items-center gap-2">
-          <div
+          {active ? <div
             data-serve-chip
             className={cn(
               'flex h-11 shrink-0 items-center justify-center gap-1.5 rounded-xl px-3.5 text-center text-xs font-bold whitespace-nowrap transition-colors duration-200 border',
@@ -2658,7 +2526,12 @@ function SittingCard({
               )}
             />
             <span>{servingLabel}</span>
-          </div>
+          </div> : <>
+            <span className="min-w-0 text-xs font-semibold text-muted-foreground">{paymentLabel}</span>
+            <Button size="sm" variant="outline" disabled={awaiting} onClick={() => onBill(sitting, false)} className="h-11 gap-1.5 rounded-xl px-3 text-xs font-semibold">
+              <ReceiptText aria-hidden className="size-4" /> Bill
+            </Button>
+          </>}
           <Button
             disabled={active && !canPay}
             title={active && !canPay ? paymentReason : undefined}
@@ -2710,6 +2583,7 @@ function Figure({ icon: Icon, label, amount, currencySymbol, tone }: {
         </dt>
       </div>
       <dd
+        aria-label={amount === null ? 'Unknown' : undefined}
         className={cn(
           'text-[18px] sm:text-[20px] font-extrabold tabular-nums leading-tight tracking-tight [overflow-wrap:anywhere]',
           tone === 'paid' && 'text-emerald-600 dark:text-emerald-400',

@@ -467,12 +467,6 @@ type RefundDownloadTarget = {
   refundNumber?: string | null
 }
 
-function openRefundPdf(pdf: Blob) {
-  const url = URL.createObjectURL(pdf)
-  window.open(url, '_blank', 'noopener,noreferrer')
-  window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
-}
-
 function PaymentHistoryRows(props: {
   payments: BillingPayment[]
   directory: PlanDirectory
@@ -480,9 +474,9 @@ function PaymentHistoryRows(props: {
   invoiceBusy: string | null
   onDownload: (p: BillingPayment, kind?: 'invoice' | 'refund', target?: RefundDownloadTarget | string | null) => void
   onReceipt: (p: BillingPayment, refund?: BillingRefundDoc | null) => void
-  downloadedRefunds: Record<string, Blob>
+  onPrintRefund: (p: BillingPayment, target: RefundDownloadTarget) => void
 }) {
-  const { payments, directory, timeZone, invoiceBusy, onDownload, onReceipt, downloadedRefunds } = props
+  const { payments, directory, timeZone, invoiceBusy, onDownload, onReceipt, onPrintRefund } = props
   const pillTone = (status: string): 'success' | 'warn' | 'danger' =>
     status === 'succeeded' ? 'success' : status === 'refunded' ? 'warn' : 'danger'
   return (
@@ -555,7 +549,11 @@ function PaymentHistoryRows(props: {
                     {entries.map((entry) => {
                       const targetId = entry.receipt?.id ?? entry.razorpayRefundId ?? entry.processedId ?? ''
                       const busyKey = `refund:${p.id}:${targetId}`
-                      const downloaded = downloadedRefunds[busyKey]
+                      const target = {
+                        receiptId: entry.receipt?.id ?? null,
+                        refundId: entry.razorpayRefundId ?? entry.processedId ?? null,
+                        refundNumber: entry.receipt?.refund_number ?? null,
+                      }
                       const amountLabel = entry.amount != null
                         ? money(entry.currency ?? p.currency, Number(entry.amount))
                         : entry.receipt?.refund_number ?? ''
@@ -569,13 +567,7 @@ function PaymentHistoryRows(props: {
                               ? `Download refund ${entry.receipt.refund_number} (PDF)`
                               : 'Generate & download refund receipt (PDF)'}
                             disabled={invoiceBusy === busyKey}
-                            onClick={() =>
-                              onDownload(p, 'refund', {
-                                receiptId: entry.receipt?.id ?? null,
-                                refundId: entry.razorpayRefundId ?? entry.processedId ?? null,
-                                refundNumber: entry.receipt?.refund_number ?? null,
-                              })
-                            }
+                            onClick={() => onDownload(p, 'refund', target)}
                           >
                             {invoiceBusy === busyKey ? (
                               <Loader2 className="h-4 w-4 animate-spin" />
@@ -590,11 +582,9 @@ function PaymentHistoryRows(props: {
                             size="sm"
                             variant="outline"
                             className="h-9 gap-1.5 rounded-lg border-[#f97316]/40 bg-[#f97316]/5 px-3.5 text-[12.5px] font-semibold text-[#ea580c] hover:bg-[#f97316]/15 hover:text-[#ea580c]"
-                            disabled={!entry.receipt && !downloaded}
-                            title={entry.receipt
-                              ? `Print refund ${entry.receipt.refund_number}`
-                              : downloaded ? 'Open the issued PDF to print' : 'Refund receipt is not issued yet — click Refund to generate PDF'}
-                            onClick={() => downloaded ? openRefundPdf(downloaded) : entry.receipt && onReceipt(p, entry.receipt)}
+                            disabled={!targetId || invoiceBusy === busyKey}
+                            title="Open the refund PDF to print"
+                            onClick={() => onPrintRefund(p, target)}
                           >
                             <Printer className="h-4 w-4" />
                             Print
@@ -929,7 +919,6 @@ export function SettingsView() {
   const [payState, setPayState] = useState<'idle' | 'starting' | 'paying' | 'verifying' | 'success' | 'failed'>('idle')
   const [payingPlan, setPayingPlan] = useState<string | null>(null)
   const [invoiceBusy, setInvoiceBusy] = useState<string | null>(null)
-  const [downloadedRefunds, setDownloadedRefunds] = useState<Record<string, Blob>>({})
   const invoiceRequests = useRef(new Set<string>())
   const [payError, setPayError] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
@@ -1537,6 +1526,7 @@ export function SettingsView() {
     p: (typeof payments)[number],
     kind: 'invoice' | 'refund' = 'invoice',
     target?: RefundDownloadTarget | string | null,
+    action: 'download' | 'print' = 'download',
   ) => {
     const normalized: RefundDownloadTarget =
       typeof target === 'string'
@@ -1552,23 +1542,31 @@ export function SettingsView() {
     const busySuffix = receiptId ?? refundId ?? ''
     const requestKey = kind === 'refund' ? `${kind}:${p.id}:${busySuffix}` : `${kind}:${p.id}`
     if (invoiceRequests.current.has(requestKey)) return
+    // Reserve a tab during the user gesture so async PDF retrieval is not
+    // blocked as a popup. The tab displays the actual issued PDF, not HTML.
+    const printTab = action === 'print' ? window.open('', '_blank') : null
+    if (action === 'print' && !printTab) {
+      toast.error('Allow pop-ups to open the refund PDF for printing.')
+      return
+    }
+    if (printTab) printTab.opener = null
     invoiceRequests.current.add(requestKey)
     setInvoiceBusy(requestKey)
     const subject = kind === 'refund' ? 'the refund document' : 'the invoice'
     try {
-      const qs = new URLSearchParams({ paymentId: p.id, kind, download: '1' })
+      const qs = new URLSearchParams({ paymentId: p.id, kind, download: action === 'download' ? '1' : '0' })
       if (receiptId) qs.set('receiptId', receiptId)
       else if (refundId) qs.set('refundId', refundId)
       const res = await edgeFetch(`/api/subscriptions/invoice?${qs.toString()}`, { headers })
       await failIfNotOk(res, subject)
       const blob = await res.blob()
-      if (kind === 'refund') {
-        setDownloadedRefunds((previous) => Object.fromEntries([
-          ...Object.entries(previous).filter(([key]) => key !== requestKey).slice(-7),
-          [requestKey, blob],
-        ]))
-      }
       const url = URL.createObjectURL(blob)
+      if (printTab) {
+        printTab.location.replace(url)
+        window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
+        await loadBilling()
+        return
+      }
       const a = document.createElement('a')
       a.href = url
       const disposition = res.headers.get('Content-Disposition') ?? ''
@@ -1586,6 +1584,7 @@ export function SettingsView() {
         await loadBilling()
       }
     } catch (err) {
+      printTab?.close()
       toast.error(describeFailure(err, subject).message)
     } finally {
       invoiceRequests.current.delete(requestKey)
@@ -1594,6 +1593,10 @@ export function SettingsView() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadBilling])
+
+  const printRefund = (p: BillingPayment, target: RefundDownloadTarget) => {
+    void downloadInvoice(p, 'refund', target, 'print')
+  }
 
   // ---- derived billing state ----
   const latestPayment = payments[0] ?? null
@@ -2676,7 +2679,7 @@ export function SettingsView() {
                 onBrowsePlans={() => setManaging(false)}
                 onDownload={downloadInvoice}
                 onReceipt={openReceipt}
-                downloadedRefunds={downloadedRefunds}
+                onPrintRefund={printRefund}
                 invoiceBusy={invoiceBusy}
               />
             )}
@@ -2903,7 +2906,11 @@ export function SettingsView() {
                     const targetId =
                       latestEntry?.receipt?.id ?? latestEntry?.razorpayRefundId ?? latestEntry?.processedId ?? ''
                     const busyKey = `refund:${latestPayment.id}:${targetId}`
-                    const downloaded = downloadedRefunds[busyKey]
+                    const target = {
+                      receiptId: latestEntry?.receipt?.id ?? null,
+                      refundId: latestEntry?.razorpayRefundId ?? latestEntry?.processedId ?? null,
+                      refundNumber: latestEntry?.receipt?.refund_number ?? null,
+                    }
                     const pendingReceipt = !latestEntry?.receipt
                     return (
                       <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
@@ -2925,11 +2932,7 @@ export function SettingsView() {
                           disabled={invoiceBusy === busyKey}
                           onClick={() =>
                             // eslint-disable-next-line react-hooks/refs
-                            downloadInvoice(latestPayment, 'refund', {
-                              receiptId: latestEntry?.receipt?.id ?? null,
-                              refundId: latestEntry?.razorpayRefundId ?? latestEntry?.processedId ?? null,
-                              refundNumber: latestEntry?.receipt?.refund_number ?? null,
-                            })
+                            downloadInvoice(latestPayment, 'refund', target)
                           }
                         >
                           {invoiceBusy === busyKey ? (
@@ -2942,13 +2945,9 @@ export function SettingsView() {
                         <Button
                           size="sm"
                           variant="outline"
-                          disabled={pendingReceipt && !downloaded}
-                          title={
-                            latestEntry?.receipt
-                              ? `Print refund ${latestEntry.receipt.refund_number}`
-                              : downloaded ? 'Open the issued PDF to print' : 'Refund receipt is not issued yet — generate to print'
-                          }
-                          onClick={() => downloaded ? openRefundPdf(downloaded) : latestEntry?.receipt && openReceipt(latestPayment, latestEntry.receipt)}
+                          disabled={!targetId || invoiceBusy === busyKey}
+                          title="Open the refund PDF to print"
+                          onClick={() => printRefund(latestPayment, target)}
                         >
                           <Printer className="h-3.5 w-3.5 mr-1.5" />
                           Print Refund
@@ -3183,7 +3182,7 @@ export function SettingsView() {
                     invoiceBusy={invoiceBusy}
                     onDownload={downloadInvoice}
                     onReceipt={openReceipt}
-                    downloadedRefunds={downloadedRefunds}
+                    onPrintRefund={printRefund}
                   />
                 )}
               </BillingCard>
@@ -3833,13 +3832,13 @@ function ManageBillingView(props: {
   onBrowsePlans: () => void
   onDownload: (p: BillingPayment, kind?: 'invoice' | 'refund', target?: RefundDownloadTarget | string | null) => void
   onReceipt: (p: BillingPayment, refund?: BillingRefundDoc | null) => void
-  downloadedRefunds: Record<string, Blob>
+  onPrintRefund: (p: BillingPayment, target: RefundDownloadTarget) => void
   invoiceBusy: string | null
 }) {
   const {
     snapshot, plan, payments, restaurant, timeZone, directory, manage, loading, error,
     onRetry, onBack, onCancelSubscription, cancelling, onCancelScheduled,
-    onBrowsePlans, onDownload, onReceipt, invoiceBusy, downloadedRefunds,
+    onBrowsePlans, onDownload, onReceipt, invoiceBusy, onPrintRefund,
   } = props
 
   const d = (iso: string | null | undefined) => fmtDate(iso, timeZone)
@@ -4161,7 +4160,7 @@ function ManageBillingView(props: {
                 invoiceBusy={invoiceBusy}
                 onDownload={onDownload}
                 onReceipt={onReceipt}
-                downloadedRefunds={downloadedRefunds}
+                onPrintRefund={onPrintRefund}
               />
             )}
           </BillingCard>

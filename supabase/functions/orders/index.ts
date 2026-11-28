@@ -4,6 +4,7 @@ import { guard } from "../_shared/auth.ts";
 import { admin } from "../_shared/db.ts";
 import { evaluatePromo, normalizePromoCode, normalizePromoType } from "../_shared/promo.ts";
 import { hasEffectivePermission, ORDER_STATUS_KEYS } from "../_shared/permissions.ts";
+import { workspaceOrderReadScope } from "../_shared/order-read-scope.ts";
 import { body, json, preflight, subPath } from "../_shared/http.ts";
 import { resolveOrderUnitPrice } from "../_shared/portions.ts";
 import { orderEvent, publishToDiner, publishToStaff } from "../_shared/realtime.ts";
@@ -283,7 +284,7 @@ async function getByKey(req: Request, key: string): Promise<Response> {
   if (g?.ok) {
     const { data, error } = await db
       .from("orders")
-      .select(ORDER_SELECT)
+      .select(workspaceOrderReadScope(g.session.permissions).select)
       .eq("idempotency_key", key)
       .eq("tenant_id", g.session.tenantId)
       .maybeSingle();
@@ -376,7 +377,7 @@ async function list(req: Request): Promise<Response> {
 
   let query = admin()
     .from("orders")
-    .select(ORDER_SELECT)
+    .select(workspaceOrderReadScope(g.session.permissions).select)
     .eq("tenant_id", tenantId)
     .order("created_at", { ascending: false })
     .limit(200);
@@ -396,7 +397,7 @@ async function getOne(req: Request, id: string): Promise<Response> {
 
   const { data, error } = await admin()
     .from("orders")
-    .select(ORDER_SELECT)
+    .select(workspaceOrderReadScope(g.session.permissions).select)
     .eq("id", id)
     .eq("tenant_id", g.session.tenantId) // tenant scoping — see header
     .maybeSingle();
@@ -1966,7 +1967,12 @@ async function update(req: Request, id: string | null): Promise<Response> {
     if (rereadError || !unchanged) {
       return json(req, { error: rereadError?.message || "Failed to update order" }, 500);
     }
-    return json(req, mapOrder(unchanged));
+    const order = mapOrder(unchanged);
+    if (String(b.status).toUpperCase() === "COMPLETED" && order.status === "COMPLETED") {
+      const failure = await closeCompletedSitting(req, db, order);
+      if (failure) return failure;
+    }
+    return json(req, order);
   }
 
   // The status write is conditional on the status we validated against, so two
@@ -1998,13 +2004,19 @@ async function update(req: Request, id: string | null): Promise<Response> {
     // Another caller moved the order to exactly where we were moving it —
     // the outcome we wanted exists, so this is a success, not a conflict.
     if (fresh && statusGuarded && fresh.status === data.status) {
-      const { data: winner } = await db
+      const { data: winner, error: winnerError } = await db
         .from("orders")
         .select(ORDER_SELECT)
         .eq("id", id)
         .eq("tenant_id", g.session.tenantId)
         .single();
-      return json(req, mapOrder(winner));
+      if (winnerError || !winner) return json(req, { error: "Could not confirm the order update" }, 503);
+      const order = mapOrder(winner);
+      if (order.status === "COMPLETED") {
+        const failure = await closeCompletedSitting(req, db, order);
+        if (failure) return failure;
+      }
+      return json(req, order);
     }
     // Zero rows updated means somebody else moved the order between our read
     // and our write. Tell the caller what the order is now, not a 500.
@@ -2023,40 +2035,30 @@ async function update(req: Request, id: string | null): Promise<Response> {
 
   const order = mapOrder(updated);
 
-  // If order was marked COMPLETED for a table or takeaway/delivery session, instantly end any active session
-  // for that table or session. Best-effort — a failure must not fail the request.
-  let closedSitting = false;
-  if (order.status === "COMPLETED" && order.tableSessionId) {
-    try {
-      // End THIS order's session, not the whole table — and only once nothing
-      // else on that session is still outstanding. A diner can place several
-      // orders in one visit; completing the first must not close their menu
-      // while the second is still being cooked.
-      const { data: ended, error: endError } = await db.rpc("close_completed_order_sitting", {
-        p_tenant: order.tenantId, p_session: order.tableSessionId,
-      });
-      if (endError) throw endError;
-      closedSitting = ended === true;
-      // Ending the sitting does not end the bill: a settled check is closed
-      // and numbered here, an unpaid one is left open and flagged.
-      if (closedSitting) await admin().rpc("settle_check_on_session_end", {
-        p_tenant: order.tenantId,
-        p_table: order.tableId ?? null,
-        p_actor: null,
-        p_session: order.tableSessionId ?? null,
-      });
-    } catch (e) {
-      console.error("Failed to end table session on order completion:", e);
-    }
-  }
-
   await publishOrderEvent({
     type: "ORDER_UPDATED",
     tenantId: order.tenantId,
     order,
     sessionToken: await sessionTokenFor(order),
   });
-  if (closedSitting) {
+  if (String(b.status).toUpperCase() === "COMPLETED" && order.status === "COMPLETED") {
+    const failure = await closeCompletedSitting(req, db, order);
+    if (failure) return failure;
+  }
+  return json(req, order);
+}
+
+// Safe to repeat when the order write committed but closing its sitting did not.
+async function closeCompletedSitting(req: Request, db: ReturnType<typeof admin>, order: ReturnType<typeof mapOrder>): Promise<Response | null> {
+  if (!order.tableSessionId) return null;
+  const { data: closed, error } = await db.rpc("close_completed_order_sitting", {
+    p_tenant: order.tenantId, p_session: order.tableSessionId,
+  });
+  if (error) {
+    console.error("Could not close and settle completed sitting", order.tableSessionId, error.message);
+    return json(req, { error: "The order is completed, but its sitting could not be settled. Retry completion.", code: "SITTING_SETTLEMENT_RETRY" }, 503);
+  }
+  if (closed === true) {
     await publishToStaff(order.tenantId, "SESSION_ENDED", {
       sessionId: order.tableSessionId ?? null,
       tableId: order.tableId ?? null,
@@ -2070,7 +2072,7 @@ async function update(req: Request, id: string | null): Promise<Response> {
     });
   }
 
-  return json(req, order);
+  return null;
 }
 
 async function remove(req: Request, id: string | null): Promise<Response> {
@@ -2358,6 +2360,7 @@ async function sync(req: Request): Promise<Response> {
   const g = await guard(req, { permission: "orders.view" });
   if (!g.ok) return g.response;
   const tenantId = g.session.tenantId;
+  const orderScope = workspaceOrderReadScope(g.session.permissions);
 
   const url = new URL(req.url);
   const since = url.searchParams.get("since");
@@ -2366,7 +2369,7 @@ async function sync(req: Request): Promise<Response> {
   // Incremental poll: orders changed after `since`.
   let changedQuery = db
     .from("orders")
-    .select("*, items:order_items(*), table:tables(*), servedBy:profiles(id,name)")
+    .select(orderScope.select)
     .eq("tenant_id", tenantId)
     .order("created_at", { ascending: false })
     .limit(100);
@@ -2387,13 +2390,13 @@ async function sync(req: Request): Promise<Response> {
   // 3. open checks discovery
   // 4. recent/active table sessions
   const [
-    { data: changedOrders },
+    { data: changedOrders, error: changedError },
     { data: summaryRow, error: summaryError },
-    { data: openChecks },
-    { data: sittingRows },
+    { data: openChecks, error: checksError },
+    { data: sittingRows, error: sittingsError },
   ] = await Promise.all([
     changedQuery,
-    db.rpc("tenant_order_summary", { p_tenant: tenantId }),
+    orderScope.canReadSummary ? db.rpc("tenant_order_summary", { p_tenant: tenantId }) : { data: null, error: null },
     db
       .from("table_checks")
       .select("id")
@@ -2408,7 +2411,8 @@ async function sync(req: Request): Promise<Response> {
 
   // If the aggregate fails, fail the poll: the client keeps the last summary it
   // had. Returning zeros instead would put "₹0 revenue" in front of an owner.
-  if (summaryError) return json(req, { error: summaryError.message }, 500);
+  const readError = changedError ?? summaryError ?? checksError ?? sittingsError;
+  if (readError) return json(req, { error: readError.message }, 500);
 
   const orders = (changedOrders || []).map(mapOrder);
 
@@ -2557,11 +2561,11 @@ async function sync(req: Request): Promise<Response> {
     orders,
     checks,
     tableSessions,
-    summary: {
+    ...(orderScope.canReadSummary ? { summary: {
       revenue: +revenue.toFixed(2),
       ordersToday,
       activeOrders,
-    },
+    } } : {}),
     serverTime: new Date().toISOString(),
   });
 }

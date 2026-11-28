@@ -108,7 +108,7 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const result = await handleEvent(event, eventType, eventId);
+    const result = await handleEvent(event, eventType, eventId, gate.attempt);
     const { data: finished, error: finishError } = await db.rpc("finish_subscription_delivery", {
       p_event_id: eventId, p_attempt: gate.attempt, p_succeeded: true, p_result: result.summary,
     });
@@ -131,7 +131,23 @@ Deno.serve(async (req: Request) => {
 
 type EventResult = { summary: string; tenantId?: string };
 
-async function handleEvent(event: any, eventType: string, eventId: string): Promise<EventResult> {
+// Replay by provider payment identity. A delayed charge may promote a failed
+// row, but must never overwrite an already-captured or refunded payment.
+async function recordRecurringPayment(db: ReturnType<typeof admin>, values: Record<string, unknown>) {
+  await db.from("subscription_payments")
+    .upsert(values, { onConflict: "razorpay_payment_id", ignoreDuplicates: true }).throwOnError();
+  const { data: existing } = await db.from("subscription_payments")
+    .select("tenant_id").eq("razorpay_payment_id", values.razorpay_payment_id).single().throwOnError();
+  if (existing?.tenant_id !== values.tenant_id) throw new Error("Provider payment is linked to a different tenant");
+  if (values.status === "succeeded") {
+    const { created_at: _originalTime, ...updates } = values;
+    await db.from("subscription_payments").update(updates)
+      .eq("razorpay_payment_id", values.razorpay_payment_id).eq("tenant_id", values.tenant_id)
+      .eq("status", "failed").throwOnError();
+  }
+}
+
+async function handleEvent(event: any, eventType: string, eventId: string, attempt: number): Promise<EventResult> {
   const db = admin();
 
   const subscription = event?.payload?.subscription?.entity ?? null;
@@ -170,7 +186,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       .from("subscription_checkouts")
       .select("tenant_id")
       .eq("razorpay_order_id", String(orderIdLookup))
-      .maybeSingle();
+      .maybeSingle().throwOnError();
     tenantId = checkoutRow?.tenant_id ?? undefined;
   }
   const refundPaymentId = payment?.id ?? refundEntity?.payment_id ?? null;
@@ -179,10 +195,13 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       .from("subscription_payments")
       .select("tenant_id")
       .eq("razorpay_payment_id", String(refundPaymentId))
-      .maybeSingle();
+      .maybeSingle().throwOnError();
     tenantId = payRow?.tenant_id ?? undefined;
   }
   if (!tenantId) {
+    if (eventType.startsWith("refund.") || eventType === "payment.refunded" || eventType === "subscription.charged") {
+      throw new Error("Financial webhook is waiting for its tenant or payment record");
+    }
     return { summary: "no tenant could be resolved from the event" };
   }
 
@@ -190,7 +209,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
     .from("tenants")
     .select("id, plan, subscription_plan, subscription_status, razorpay_subscription_id")
     .eq("id", tenantId)
-    .maybeSingle();
+    .maybeSingle().throwOnError();
   if (!tenant) {
     return { summary: "the restaurant in the event no longer exists", tenantId };
   }
@@ -204,7 +223,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       .from("subscription_plans")
       .select("id, razorpay_plan_id")
       .eq("razorpay_plan_id", razorpayPlanId)
-      .maybeSingle();
+      .maybeSingle().throwOnError();
     planId = planRow?.id ?? null;
     // Every Razorpay subscription is a monthly mandate: annual is paid once,
     // as an order, and never appears here.
@@ -221,6 +240,17 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
     : null;
 
   const razorpaySubscriptionId = subscription?.id ?? null;
+  const applyState = async () => {
+    const { data, error } = await db.rpc("apply_subscription_delivery_state", {
+      p_event_id: eventId, p_attempt: attempt, p_tenant: tenantId,
+      p_expected_subscription_id: tenant.razorpay_subscription_id ?? null,
+      p_plan: planId, p_interval: planInterval, p_start: periodStart, p_end: periodEnd,
+    });
+    if (error || (data !== "applied" && data !== "superseded")) {
+      throw new Error(`could not apply subscription transition: ${error?.message ?? data}`);
+    }
+    return data === "applied";
+  };
 
   /**
    * Terminal and interruption events describe ONE subscription — the one
@@ -303,19 +333,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
         return { summary: `activation not linked: ${linkDecision.kind}`, tenantId };
       }
 
-      await db
-        .from("tenants")
-        .update({
-          plan: planId,
-          subscription_plan: planId,
-          subscription_status: "active",
-          subscription_started_at: periodStart ?? now,
-          current_period_end: periodEnd,
-          cancel_at_period_end: false,
-          razorpay_subscription_id: razorpaySubscriptionId,
-          ...(planInterval ? { billing_interval: planInterval } : {}),
-        })
-        .eq("id", tenantId).throwOnError();
+      if (!await applyState()) return { summary: "superseded subscription activation", tenantId };
       // The tenant may have been linked to a different subscription before —
       // an upgrade that started a new mandate, or a duplicate from before
       // checkout dedupe existed. Whatever it was, if it can still take money
@@ -372,10 +390,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
         // describe reality — but the tenant does not move, no receipt or
         // invoice goes out, and the duplicate mandate is stopped.
         if (payment?.id) {
-          const { error: ledgerError } = await db
-            .from("subscription_payments")
-            .upsert(
-              {
+          await recordRecurringPayment(db, {
                 tenant_id: tenantId,
                 amount: Number(payment.amount ?? 0) / 100,
                 currency: payment.currency ?? "INR",
@@ -395,12 +410,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
                 failure_reason: null,
                 created_at: now,
                 updated_at: now,
-              },
-              { onConflict: "razorpay_payment_id" },
-            );
-          if (ledgerError) {
-            throw new Error(`could not record the rejected charge: ${ledgerError.message}`);
-          }
+          });
         }
         await rejectIncomingCharge(db, {
           tenantId,
@@ -416,24 +426,13 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
         return { summary: `charge not linked: ${linkDecision.kind}`, tenantId };
       }
 
-      // A renewal. The period moves forward and the plan is kept.
-      await db
-        .from("tenants")
-        .update({
-          plan: planId,
-          subscription_plan: planId,
-          subscription_status: "active",
-          current_period_end: periodEnd,
-          subscription_started_at: periodStart ?? undefined,
-          razorpay_subscription_id: razorpaySubscriptionId,
-          ...(planInterval ? { billing_interval: planInterval } : {}),
-        })
-        .eq("id", tenantId).throwOnError();
+      // A late charge still records money below, even if it cannot move entitlements.
+      const applied = await applyState();
 
       // Same one-mandate sweep as activation: a charge that re-links the
       // tenant retires whatever mandate the tenant pointed at before.
       try {
-        await cancelSupersededLink(db, {
+        if (applied) await cancelSupersededLink(db, {
           tenantId,
           previousSubscriptionId: linkedId,
           newSubscriptionId: razorpaySubscriptionId,
@@ -460,14 +459,12 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
             updated_at: now,
           })
           .eq("razorpay_subscription_id", razorpaySubscriptionId)
+          .eq("tenant_id", tenantId)
           .eq("status", "pending").throwOnError();
       }
 
       if (payment?.id) {
-        const { error: ledgerError } = await db
-          .from("subscription_payments")
-          .upsert(
-            {
+        await recordRecurringPayment(db, {
               tenant_id: tenantId,
               amount: Number(payment.amount ?? 0) / 100,
               currency: payment.currency ?? "INR",
@@ -492,16 +489,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
               webhook_event_id: eventId,
               created_at: now,
               updated_at: now,
-            },
-            { onConflict: "razorpay_payment_id" },
-          );
-        if (ledgerError) {
-          // A renewal whose payment cannot be recorded is thrown, not
-          // swallowed: the ledger has to describe reality, and a 500 makes
-          // Razorpay retry the delivery — safely, because the event gate
-          // has already recorded this id.
-          throw new Error(`could not record the renewal payment: ${ledgerError.message}`);
-        }
+        });
 
         // Receipt for the charge that just landed. Keyed on the payment, so a
         // webhook Razorpay delivers twice produces one receipt.
@@ -535,6 +523,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
               "id, amount, currency, status, payment_method, plan_id, billing_period, created_at, razorpay_payment_id, razorpay_order_id",
             )
             .eq("razorpay_payment_id", String(payment.id))
+            .eq("tenant_id", tenantId)
             .maybeSingle();
           if (ledgerRow) {
             const invoice = await issueInvoiceDocument(db, tenantId, ledgerRow, {
@@ -568,8 +557,8 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
           console.error("razorpay webhook: renewal invoice issuance failed", (e as Error)?.message);
         }
       }
-      await audit(db, tenantId, tenant.plan, planId, "renewed", eventId, { periodEnd });
-      return { summary: `renewed on ${planId}`, tenantId };
+      await audit(db, tenantId, tenant.plan, planId, applied ? "renewed" : "late_charge_recorded", eventId, { periodEnd });
+      return { summary: applied ? `renewed on ${planId}` : "late charge recorded without changing entitlements", tenantId };
     }
 
     case "subscription.cancelled":
@@ -583,18 +572,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       // `completed` is the mandate running out of cycles — for a one-year
       // annual mandate that is the normal end, not a cancellation. Both stop
       // future charges; only `completed` says the deal ended as agreed.
-      await db
-        .from("subscription_payments")
-        .update({ renewal_status: ended ? "mandate_expired" : "mandate_cancelled" })
-        .eq("razorpay_subscription_id", razorpaySubscriptionId)
-        .eq("renewal_status", "scheduled").throwOnError();
-      await db
-        .from("tenants")
-        .update({
-          subscription_status: ended ? "expired" : "cancelled",
-          cancel_at_period_end: !ended,
-        })
-        .eq("id", tenantId).throwOnError();
+      if (!await applyState()) return { summary: "superseded subscription ending", tenantId };
       await audit(db, tenantId, tenant.plan, planId, ended ? "completed" : "cancelled", eventId, {
         periodEnd,
       });
@@ -623,7 +601,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       if (!aboutCurrentSubscription) {
         return { summary: `event for a previous subscription (${razorpaySubscriptionId})`, tenantId };
       }
-      await db.from("tenants").update({ subscription_status: "paused" }).eq("id", tenantId).throwOnError();
+      if (!await applyState()) return { summary: "superseded subscription pause", tenantId };
       await audit(db, tenantId, tenant.plan, planId, "paused", eventId, {});
       return { summary: "paused", tenantId };
     }
@@ -633,15 +611,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       if (!aboutCurrentSubscription) {
         return { summary: `event for a previous subscription (${razorpaySubscriptionId})`, tenantId };
       }
-      await db
-        .from("subscription_payments")
-        .update({ renewal_status: "mandate_halted" })
-        .eq("razorpay_subscription_id", razorpaySubscriptionId)
-        .eq("renewal_status", "scheduled").throwOnError();
-      await db
-        .from("tenants")
-        .update({ subscription_status: eventType === "subscription.halted" ? "past_due" : "pending" })
-        .eq("id", tenantId).throwOnError();
+      if (!await applyState()) return { summary: "superseded subscription interruption", tenantId };
       await audit(db, tenantId, tenant.plan, planId, eventType.replace("subscription.", ""), eventId, {});
       return { summary: eventType, tenantId };
     }
@@ -665,10 +635,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
        * a paid period.
        */
       if (payment?.id) {
-        const { error: ledgerError } = await db
-          .from("subscription_payments")
-          .upsert(
-            {
+        await recordRecurringPayment(db, {
               tenant_id: tenantId,
               amount: Number(payment.amount ?? 0) / 100,
               currency: payment.currency ?? "INR",
@@ -684,12 +651,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
               failure_reason: payment.error_description ?? "The payment was declined.",
               created_at: now,
               updated_at: now,
-            },
-            { onConflict: "razorpay_payment_id" },
-          );
-        if (ledgerError) {
-          throw new Error(`could not record the failed payment: ${ledgerError.message}`);
-        }
+        });
       }
       await audit(db, tenantId, tenant.plan, planId, "payment_failed", eventId, {});
 
@@ -720,13 +682,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       if (!aboutCurrentSubscription) {
         return { summary: `event for a previous subscription (${razorpaySubscriptionId})`, tenantId };
       }
-      await db
-        .from("tenants")
-        .update({
-          subscription_status: "active",
-          ...(periodEnd ? { current_period_end: periodEnd } : {}),
-        })
-        .eq("id", tenantId).throwOnError();
+      if (!await applyState()) return { summary: "superseded subscription resumption", tenantId };
       await audit(db, tenantId, tenant.plan, planId, "resumed", eventId, { periodEnd });
       return { summary: "resumed", tenantId };
     }

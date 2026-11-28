@@ -2,6 +2,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { guard } from "../_shared/auth.ts";
 import { hasEffectivePermission } from "../_shared/permissions.ts";
+import { workspaceOrderReadScope } from "../_shared/order-read-scope.ts";
 import { securityTopic, staffTopic } from "../_shared/realtime.ts";
 import { admin } from "../_shared/db.ts";
 import { toCamel } from "../_shared/case.ts";
@@ -57,13 +58,13 @@ Deno.serve(async (req: Request) => {
     // tenant's audit history from the bootstrap payload.
     const can = (permission: string) => hasEffectivePermission(g.session.permissions, permission);
     const canSeeSecurity = can("security.view");
-    const canSeeOrders = can("orders.view");
+    const orderScope = workspaceOrderReadScope(g.session.permissions);
+    const canSeeOrders = orderScope.canReadOrders;
     const canSeeTables = can("tables.view");
     const canSeeMenu = can("menu.view") || can("orders.create");
     const canSeePeople = can("staff.view");
     const canSeeRoles = can("roles.view");
     const canSeeSettings = can("settings.view");
-    const canSeeContacts = can("orders.edit") || can("payments.collect");
     const noRows = { data: [], error: null };
 
     const { data: tenantRow, error: tenantError } = await db
@@ -109,7 +110,7 @@ Deno.serve(async (req: Request) => {
       }) : noRows,
       canSeeOrders ? db
         .from("orders")
-        .select(`id, tenant_id, table_id, table_session_id, check_id, order_number, order_type, status, items_total, discount, tax, service_charge, total, promo_code, customer_name, notes, payment_method, payment_status, served_by_id, created_at, updated_at, completed_at, paid_at, location_id, items:order_items(*), table:tables(id, name, seats, area), servedBy:profiles(id, name)${canSeeContacts ? ", customer_phone" : ""}`)
+        .select(orderScope.select)
         .eq("tenant_id", tenantId)
         .order("created_at", { ascending: false })
         .limit(200) : noRows,
@@ -232,7 +233,7 @@ Deno.serve(async (req: Request) => {
     // undercounted revenue and orders today. (tenant_order_summary, migration
     // 0060 — the same function the delta sync uses, so the numbers can never
     // disagree with each other.)
-    const { data: summaryRow, error: summaryError } = can("dashboard.view") && canSeeOrders ? await db.rpc(
+    const { data: summaryRow, error: summaryError } = orderScope.canReadSummary ? await db.rpc(
       "tenant_order_summary",
       { p_tenant: tenantId },
     ) : { data: null, error: null };

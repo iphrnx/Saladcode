@@ -201,28 +201,28 @@ export function SessionOrdersDrawer({
   const allServedOrDone =
     orders.length > 0 &&
     orders.every((o) => o.status === 'SERVED' || o.status === 'COMPLETED' || o.status === 'CANCELLED')
-  if (allServedOrDone || state === 'Ended') {
+  if (allServedOrDone && orders.some((o) => o.status === 'SERVED' || o.status === 'COMPLETED')) {
     const lastServedTime =
       orders[orders.length - 1]?.completedAt ||
       orders[orders.length - 1]?.createdAt ||
       effectiveEndedAt
     timelineEvents.push({
       id: 'all-served',
-      title: 'All Orders Served',
-      subtitle: `All ${orders.length} order${orders.length === 1 ? '' : 's'} marked as Served`,
+      title: 'All non-cancelled orders served',
+      subtitle: 'No orders left to serve',
       time: formatTime(lastServedTime),
       type: 'all_served',
     })
   }
 
   // 4. Payment Completed
-  if ((bill.paid ?? 0) > 0 || bill.due === 0) {
+  if ((bill.paid ?? 0) > 0) {
     const payMethodStr = formatPaymentMethod(paymentMethod || orders[0]?.paymentMethod)
     const invStr = formatInvoiceNumber(invoiceNumber)
     timelineEvents.push({
       id: 'payment-completed',
-      title: 'Payment Completed',
-      subtitle: `Paid ${money(paidAmount)} via ${payMethodStr} (${invStr})`,
+      title: bill.due === 0 ? 'Payment Completed' : 'Payment Recorded',
+      subtitle: `Paid ${money(paidAmount)}${payMethodStr === 'Unknown' ? '' : ` via ${payMethodStr}`} (${invStr})`,
       time: formatTime(effectiveEndedAt || orders[orders.length - 1]?.completedAt),
       type: 'payment',
     })
@@ -233,7 +233,7 @@ export function SessionOrdersDrawer({
     timelineEvents.push({
       id: 'session-ended',
       title: 'Session Ended',
-      subtitle: `${tableName} has been closed and settled`,
+      subtitle: `${tableName} has been closed`,
       time: formatTime(effectiveEndedAt || orders[orders.length - 1]?.completedAt),
       type: 'ended',
     })
@@ -566,7 +566,7 @@ export function SessionOrdersDrawer({
                       Total Paid
                     </span>
                     <span className="text-[16.5px] sm:text-[17px] font-black tabular-nums text-foreground">
-                      {money(paidAmount)}
+                      {bill.paid === null ? 'Unknown' : money(paidAmount)}
                     </span>
                   </div>
                 </div>
@@ -699,7 +699,7 @@ export function SessionOrdersDrawer({
                     Total Paid
                   </span>
                   <span className="text-[17px] sm:text-[18px] font-black text-foreground tabular-nums">
-                    {money(paidAmount)}
+                    {bill.paid === null ? 'Unknown' : money(paidAmount)}
                   </span>
                 </div>
               </div>
@@ -778,7 +778,7 @@ function formatFullDateTime(iso?: string | null): string {
 }
 
 function formatPaymentMethod(m?: string | null): string {
-  if (!m) return 'Cash'
+  if (!m) return 'Unknown'
   const upper = m.toUpperCase()
   if (upper === 'CASH') return 'Cash'
   if (upper === 'CARD') return 'Card'
