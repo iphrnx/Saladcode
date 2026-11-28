@@ -511,6 +511,25 @@ const MAX_ATTEMPTS = 5;
  * provider outage delays delivery instead of losing it, and a permanently
  * failing address stops after five tries rather than retrying for ever.
  */
+const KNOWN_EVENT_TYPES = new Set([
+  "subscription_activated",
+  "plan_changed",
+  "payment_succeeded",
+  "invoice_issued",
+  "payment_refunded",
+  "payment_failed",
+  "subscription_cancelled",
+  "renewal_reminder",
+  "trial_started",
+  "trial_ending",
+  "trial_ended",
+  "account_deleted",
+  "daily_digest",
+  "order_alert",
+]);
+
+const EMAIL_ADDRESS_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
 export async function dispatchPending(
   db: SupabaseClient,
   limit = 25,
@@ -533,11 +552,24 @@ export async function dispatchPending(
 
   let sent = 0, failed = 0, skipped = 0;
   for (const row of (due ?? []) as any[]) {
+    const recipient = String(row.recipient ?? row.to_email ?? "").trim();
+    const eventType = String(row.event_type ?? row.template ?? "").trim();
+    const eventKey = String(row.event_key ?? (row.id ? `legacy:${row.id}` : "")).trim();
+
+    if (!EMAIL_ADDRESS_RE.test(recipient) || !KNOWN_EVENT_TYPES.has(eventType) || !eventKey) {
+      await db.from("email_events").update({
+        status: "failed",
+        error: "unsendable legacy email row: missing or unsupported dispatch fields",
+        claim_token: null,
+      }).eq("id", row.id).eq("claim_token", row.claim_token);
+      continue;
+    }
+
     const rendered = renderEmail({
-      eventKey: row.event_key,
-      eventType: row.event_type,
+      eventKey,
+      eventType,
       tenantId: row.tenant_id,
-      recipient: row.recipient,
+      recipient,
       recipientName: row.recipient_name,
       restaurantName: row.restaurant_name,
       planName: row.plan_name,
@@ -554,11 +586,11 @@ export async function dispatchPending(
         headers: {
           authorization: `Bearer ${config.key}`,
           "content-type": "application/json",
-          ...(row.event_key ? { "Idempotency-Key": String(row.event_key) } : {}),
+          "Idempotency-Key": eventKey,
         },
         body: JSON.stringify({
           from: config.from,
-          to: [row.recipient],
+          to: [recipient],
           subject: rendered.subject,
           html: rendered.html,
           text: rendered.text,

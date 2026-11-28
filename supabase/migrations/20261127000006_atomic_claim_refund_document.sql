@@ -39,60 +39,153 @@ declare
   v_inserted            public.billing_refunds;
   v_number              text;
   v_lock_key            text;
+  v_refund_id           text := nullif(btrim(p_razorpay_refund_id), '');
+  v_payment_ref         text := nullif(btrim(p_razorpay_payment_id), '');
+  v_currency            text := upper(coalesce(nullif(btrim(p_currency), ''), 'INR'));
   v_processed_count     int := 0;
   v_legacy_count        int := 0;
   v_total_receipt_count int := 0;
+  v_processed_refund_id text;
+  v_processed_amount    numeric;
+  v_processed_currency  text;
 begin
   v_lock_key := 'billing_refund:' || p_payment_id::text;
   perform pg_advisory_xact_lock(hashtext(v_lock_key));
 
-  if nullif(btrim(p_razorpay_refund_id), '') is not null then
+  select count(*)::int
+    into v_processed_count
+    from public.subscription_refunds
+   where payment_id = p_payment_id
+     and status = 'processed';
+
+  select count(*)::int,
+         count(*) filter (where razorpay_refund_id is null)::int
+    into v_total_receipt_count, v_legacy_count
+    from public.billing_refunds
+   where payment_id = p_payment_id
+     and tenant_id = p_tenant_id;
+
+  if v_refund_id is not null then
     select *
       into v_existing
       from public.billing_refunds
-     where razorpay_refund_id = p_razorpay_refund_id
+     where razorpay_refund_id = v_refund_id
      limit 1;
 
     if found then
+      if nullif(btrim(v_existing.pdf_path), '') is null then
+        update public.billing_refunds
+           set pdf_path = v_existing.tenant_id::text || '/' || v_existing.refund_number || '.pdf'
+         where id = v_existing.id
+        returning * into v_existing;
+      end if;
       return v_existing;
     end if;
 
-    -- Reconcile an unambiguous legacy ID-less receipt when the payment has
-    -- at most one processed refund and exactly one legacy receipt (and no
-    -- other refund receipts). Multi-refund payments stay unresolved.
-    select count(*)::int
-      into v_processed_count
-      from public.subscription_refunds
-     where payment_id = p_payment_id
-       and status = 'processed';
-
-    select count(*)::int,
-           count(*) filter (where razorpay_refund_id is null)::int
-      into v_total_receipt_count, v_legacy_count
-      from public.billing_refunds
-     where payment_id = p_payment_id;
-
+    -- Reconcile an unambiguous legacy ID-less receipt only when payment,
+    -- tenant, amount, currency, and available refund identifiers match.
+    -- Persist the association atomically and recover missing pdf_path.
     if v_processed_count <= 1 and v_total_receipt_count = 1 and v_legacy_count = 1 then
-      select *
-        into v_existing
-        from public.billing_refunds
-       where payment_id = p_payment_id
-         and razorpay_refund_id is null
-       limit 1;
-      if found then
-        return v_existing;
+      if v_processed_count = 1 then
+        select nullif(btrim(sr.razorpay_refund_id), ''),
+               sr.amount,
+               upper(coalesce(nullif(btrim(sr.currency), ''), 'INR'))
+          into v_processed_refund_id, v_processed_amount, v_processed_currency
+          from public.subscription_refunds sr
+         where sr.payment_id = p_payment_id
+           and sr.status = 'processed'
+         limit 1;
+      end if;
+
+      if v_processed_count = 0
+         or (
+           (v_processed_refund_id is null or v_processed_refund_id = v_refund_id)
+           and (v_processed_amount is null or p_amount is null or v_processed_amount = p_amount)
+           and (v_processed_currency = v_currency)
+         )
+      then
+        select *
+          into v_existing
+          from public.billing_refunds br
+         where br.payment_id = p_payment_id
+           and br.tenant_id = p_tenant_id
+           and br.razorpay_refund_id is null
+           and br.amount is not null
+           and p_amount is not null
+           and br.amount = p_amount
+           and upper(coalesce(nullif(btrim(br.currency), ''), 'INR')) = v_currency
+           and (
+             v_payment_ref is null
+             or nullif(btrim(br.razorpay_payment_id), '') is null
+             or br.razorpay_payment_id = v_payment_ref
+           )
+         limit 1;
+        if found then
+          update public.billing_refunds
+             set razorpay_refund_id = v_refund_id,
+                 pdf_path = coalesce(nullif(btrim(pdf_path), ''), tenant_id::text || '/' || refund_number || '.pdf')
+           where id = v_existing.id
+             and razorpay_refund_id is null
+          returning * into v_existing;
+          return v_existing;
+        end if;
       end if;
     end if;
   else
     select *
       into v_existing
-      from public.billing_refunds
-     where payment_id = p_payment_id
-       and razorpay_refund_id is null
+      from public.billing_refunds br
+     where br.payment_id = p_payment_id
+       and br.tenant_id = p_tenant_id
+       and br.razorpay_refund_id is null
+       and (br.amount is null or p_amount is null or br.amount = p_amount)
+       and upper(coalesce(nullif(btrim(br.currency), ''), 'INR')) = v_currency
+       and (
+         v_payment_ref is null
+         or nullif(btrim(br.razorpay_payment_id), '') is null
+         or br.razorpay_payment_id = v_payment_ref
+       )
      limit 1;
 
     if found then
+      if nullif(btrim(v_existing.pdf_path), '') is null then
+        update public.billing_refunds
+           set pdf_path = v_existing.tenant_id::text || '/' || v_existing.refund_number || '.pdf'
+         where id = v_existing.id
+        returning * into v_existing;
+      end if;
       return v_existing;
+    end if;
+
+    -- Reverse delivery order: if a provider-keyed receipt already exists as
+    -- the sole receipt on a single-refund payment with matching amount/currency,
+    -- reuse it rather than minting a duplicate ID-less receipt.
+    if v_processed_count <= 1 and v_total_receipt_count = 1 then
+      select *
+        into v_existing
+        from public.billing_refunds br
+       where br.payment_id = p_payment_id
+         and br.tenant_id = p_tenant_id
+         and br.amount is not null
+         and p_amount is not null
+         and br.amount = p_amount
+         and upper(coalesce(nullif(btrim(br.currency), ''), 'INR')) = v_currency
+         and (
+           v_payment_ref is null
+           or nullif(btrim(br.razorpay_payment_id), '') is null
+           or br.razorpay_payment_id = v_payment_ref
+         )
+       limit 1;
+
+      if found then
+        if nullif(btrim(v_existing.pdf_path), '') is null then
+          update public.billing_refunds
+             set pdf_path = v_existing.tenant_id::text || '/' || v_existing.refund_number || '.pdf'
+           where id = v_existing.id
+          returning * into v_existing;
+        end if;
+        return v_existing;
+      end if;
     end if;
   end if;
 

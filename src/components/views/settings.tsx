@@ -343,6 +343,8 @@ type BillingPayment = {
     buyer_address?: string | null
     original_invoice_number: string | null
     original_invoice_date: string | null
+    razorpay_payment_id?: string | null
+    razorpay_order_id?: string | null
     razorpay_refund_id: string | null
   } | null
   refundDocuments?: Array<{
@@ -361,6 +363,8 @@ type BillingPayment = {
     buyer_address?: string | null
     original_invoice_number: string | null
     original_invoice_date: string | null
+    razorpay_payment_id?: string | null
+    razorpay_order_id?: string | null
     razorpay_refund_id: string | null
   }>
   processedRefunds?: Array<{
@@ -386,6 +390,8 @@ type BillingPayment = {
       buyer_address?: string | null
       original_invoice_number: string | null
       original_invoice_date: string | null
+      razorpay_payment_id?: string | null
+      razorpay_order_id?: string | null
       razorpay_refund_id: string | null
     } | null
   }>
@@ -1272,8 +1278,8 @@ export function SettingsView() {
         detailTitle: 'REFUND DETAILS',
         detailRows: ([
           ['Razorpay refund ID', refund.razorpay_refund_id] as [string, string | null],
-          ['Razorpay payment ID', p.razorpay_payment_id ?? p.transaction_id],
-          ['Razorpay order ID', p.razorpay_order_id],
+          ['Razorpay payment ID', refund.razorpay_payment_id ?? null],
+          ['Razorpay order ID', refund.razorpay_order_id ?? null],
           ['Refunded on', docDate(refund.refund_date ?? paidIso)],
           ['Status', 'Refunded'],
         ] as Array<[string, string | null]>).filter((row): row is [string, string] => Boolean(row[1])),

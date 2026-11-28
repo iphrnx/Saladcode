@@ -318,10 +318,21 @@ export async function issueRefundDocument(
     return null;
   }
 
+  const pdfPath = claimed.pdf_path || `${tenantId}/${claimed.refund_number}.pdf`;
   const bytes = buildRefundPdf(refundFactsFromRow(claimed, seller));
-  const uploaded = await uploadPdf(db, claimed.pdf_path, bytes);
+  const uploaded = await uploadPdf(db, pdfPath, bytes);
   if (!uploaded) {
     return null;
+  }
+  if (!claimed.pdf_path) {
+    const { error: pathErr } = await db
+      .from("billing_refunds")
+      .update({ pdf_path: pdfPath })
+      .eq("id", claimed.id)
+      .is("pdf_path", null);
+    if (!pathErr) {
+      claimed.pdf_path = pdfPath;
+    }
   }
   return claimed;
 }

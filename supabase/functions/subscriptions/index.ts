@@ -708,13 +708,14 @@ async function state(req: Request, tenantId: string): Promise<Response> {
   const { data: refunds, error: refundsError } = await admin()
     .from("billing_refunds")
     .select(
-      "id, payment_id, razorpay_payment_id, refund_number, refund_date, amount, currency, description, seller_name, seller_address, seller_email, seller_phone, buyer_name, buyer_email, buyer_address, original_invoice_number, original_invoice_date, razorpay_refund_id",
+      "id, payment_id, razorpay_payment_id, razorpay_order_id, refund_number, refund_date, amount, currency, description, seller_name, seller_address, seller_email, seller_phone, buyer_name, buyer_email, buyer_address, original_invoice_number, original_invoice_date, razorpay_refund_id",
     )
     .eq("tenant_id", tenantId)
     .order("refund_date", { ascending: false })
     .order("created_at", { ascending: false });
   if (refundsError) {
     console.error("subscriptions state: refunds unreadable", refundsError.message);
+    return json(req, { error: "Could not load billing documents just now." }, 503);
   }
   const { data: processedRefundRows, error: processedRefundsError } = await admin()
     .from("subscription_refunds")
@@ -727,6 +728,7 @@ async function state(req: Request, tenantId: string): Promise<Response> {
     .order("created_at", { ascending: false });
   if (processedRefundsError) {
     console.error("subscriptions state: processed refunds unreadable", processedRefundsError.message);
+    return json(req, { error: "Could not load billing documents just now." }, 503);
   }
   const invoiceByPayment = new Map(
     (invoices ?? []).map((row) => [row.razorpay_payment_id, row]),
@@ -807,7 +809,8 @@ async function state(req: Request, tenantId: string): Promise<Response> {
         rawProcessed.length === 1 &&
         !rawProcessed[0].receipt &&
         legacyDocs.length === 1 &&
-        refundDocs.length === 1;
+        refundDocs.length === 1 &&
+        canReconcileLegacyReceipt(rawProcessed[0], legacyDocs[0], row);
       const processedRefunds = canReconcileLegacy
         ? [{ ...rawProcessed[0], receipt: legacyDocs[0] }]
         : rawProcessed;
@@ -820,6 +823,23 @@ async function state(req: Request, tenantId: string): Promise<Response> {
       };
     }),
   });
+}
+
+function canReconcileLegacyReceipt(processed: any, receipt: any, payment: any): boolean {
+  if (!processed || !receipt || receipt.razorpay_refund_id) return false;
+  if (processed.amount == null || receipt.amount == null) return false;
+  if (Number(processed.amount) !== Number(receipt.amount)) return false;
+  const procCurrency = String(processed.currency || payment?.currency || "INR").trim().toUpperCase();
+  const docCurrency = String(receipt.currency || "INR").trim().toUpperCase();
+  if (procCurrency !== docCurrency) return false;
+  if (
+    payment?.razorpay_payment_id &&
+    receipt.razorpay_payment_id &&
+    payment.razorpay_payment_id !== receipt.razorpay_payment_id
+  ) {
+    return false;
+  }
+  return true;
 }
 
 /** The part of the plan the browser is allowed to see. */
@@ -2226,31 +2246,19 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
           .eq("razorpay_refund_id", targetRefund.razorpay_refund_id)
           .maybeSingle();
         existing = byRefundId ?? null;
-        if (!existing && (processedRefunds ?? []).length === 1) {
-          // Reconcile an unambiguous legacy ID-less receipt on a single-refund payment
-          // so we reuse its existing receipt number instead of issuing a second one.
-          const { data: allPaymentRefundDocs } = await db
-            .from("billing_refunds")
-            .select("*")
-            .eq("payment_id", paymentId)
-            .order("refund_date", { ascending: false })
-            .order("created_at", { ascending: false });
-          if (
-            (allPaymentRefundDocs ?? []).length === 1 &&
-            !allPaymentRefundDocs![0].razorpay_refund_id
-          ) {
-            existing = allPaymentRefundDocs![0];
-          }
-        }
       } else {
         const { data: existingRows } = await db
           .from("billing_refunds")
           .select("*")
           .eq("payment_id", paymentId)
+          .is("razorpay_refund_id", null)
           .order("refund_date", { ascending: false })
           .order("created_at", { ascending: false })
           .limit(1);
-        existing = existingRows?.[0] ?? null;
+        const candidate = existingRows?.[0] ?? null;
+        if (candidate && (!targetRefund || canReconcileLegacyReceipt(targetRefund, candidate, payment))) {
+          existing = candidate;
+        }
       }
 
       row = existing ?? await issueRefundDocument(
