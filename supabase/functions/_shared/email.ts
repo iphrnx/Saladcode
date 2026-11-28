@@ -102,6 +102,7 @@ export type EmailEvent = {
   currency?: string | null;
   billingInterval?: string | null;
   payload?: Record<string, unknown>;
+  throwOnInsertError?: boolean;
 };
 
 type Rendered = { subject: string; html: string; text: string };
@@ -376,7 +377,7 @@ export function renderEmail(event: EmailEvent): Rendered {
         subject: "Your The Salad account has been deleted",
         html: frame({
           heading: "Your account has been deleted",
-          intro: `<strong>${restaurant}</strong> and its data — menu, orders, staff, reservations — have been permanently removed, as you asked.`,
+          intro: `<strong>${restaurant}</strong> and its data — menu, orders, staff — have been permanently removed, as you asked.`,
           rows: [
             ["Deleted on", fmtDate(p.deletedAt)],
             ["Plan at deletion", String(p.plan ?? "")],
@@ -469,10 +470,12 @@ export async function queueEmail(db: SupabaseClient, event: EmailEvent): Promise
       event_key: event.eventKey,
       event_type: event.eventType,
       tenant_id: event.tenantId,
+      to_email: event.recipient,
       recipient: event.recipient,
       recipient_name: event.recipientName ?? null,
       restaurant_name: event.restaurantName ?? null,
       subject: rendered.subject,
+      template: event.eventType,
       plan_name: event.planName ?? null,
       amount: event.amount ?? null,
       currency: event.currency ?? null,
@@ -484,11 +487,15 @@ export async function queueEmail(db: SupabaseClient, event: EmailEvent): Promise
     .maybeSingle();
 
   if (error) {
-    // 23505 = unique violation: this event was already queued. Anything else
-    // is a real failure and is worth a log line, but never a throw — an email
-    // must not be able to fail a payment webhook.
-    if (!String(error.message).includes("duplicate key")) {
-      console.error("email: could not queue", event.eventType, error.message);
+    const isDuplicate =
+      String((error as any).code ?? "") === "23505" ||
+      String(error.message).includes("duplicate key");
+    if (isDuplicate) {
+      return null;
+    }
+    console.error("email: could not queue", event.eventType, error.message);
+    if ((event as any).throwOnInsertError) {
+      throw new Error(`email queue insert failed: ${error.message}`);
     }
     return null;
   }
@@ -504,6 +511,25 @@ const MAX_ATTEMPTS = 5;
  * provider outage delays delivery instead of losing it, and a permanently
  * failing address stops after five tries rather than retrying for ever.
  */
+const KNOWN_EVENT_TYPES = new Set([
+  "subscription_activated",
+  "plan_changed",
+  "payment_succeeded",
+  "invoice_issued",
+  "payment_refunded",
+  "payment_failed",
+  "subscription_cancelled",
+  "renewal_reminder",
+  "trial_started",
+  "trial_ending",
+  "trial_ended",
+  "account_deleted",
+  "daily_digest",
+  "order_alert",
+]);
+
+const EMAIL_ADDRESS_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
 export async function dispatchPending(
   db: SupabaseClient,
   limit = 25,
@@ -515,21 +541,35 @@ export async function dispatchPending(
     return { sent: 0, failed: 0, skipped: 0, problems: configCheck.problems };
   }
 
-  const { data: due } = await db
-    .from("email_events")
-    .select("*")
-    .eq("status", "pending")
-    .lte("next_attempt_at", new Date().toISOString())
-    .order("created_at", { ascending: true })
-    .limit(limit);
+  const { data: due, error: claimError } = await db.rpc("claim_pending_emails", {
+    p_limit: limit,
+    p_lease_seconds: 120,
+  });
+  if (claimError) {
+    console.error("email: could not claim pending outbox rows", claimError.message);
+    return { sent: 0, failed: 0, skipped: 0 };
+  }
 
   let sent = 0, failed = 0, skipped = 0;
   for (const row of (due ?? []) as any[]) {
+    const recipient = String(row.recipient ?? row.to_email ?? "").trim();
+    const eventType = String(row.event_type ?? row.template ?? "").trim();
+    const eventKey = String(row.event_key ?? (row.id ? `legacy:${row.id}` : "")).trim();
+
+    if (!EMAIL_ADDRESS_RE.test(recipient) || !KNOWN_EVENT_TYPES.has(eventType) || !eventKey) {
+      await db.from("email_events").update({
+        status: "failed",
+        error: "unsendable legacy email row: missing or unsupported dispatch fields",
+        claim_token: null,
+      }).eq("id", row.id).eq("claim_token", row.claim_token);
+      continue;
+    }
+
     const rendered = renderEmail({
-      eventKey: row.event_key,
-      eventType: row.event_type,
+      eventKey,
+      eventType,
       tenantId: row.tenant_id,
-      recipient: row.recipient,
+      recipient,
       recipientName: row.recipient_name,
       restaurantName: row.restaurant_name,
       planName: row.plan_name,
@@ -543,10 +583,14 @@ export async function dispatchPending(
     try {
       res = await fetch(RESEND_API, {
         method: "POST",
-        headers: { authorization: `Bearer ${config.key}`, "content-type": "application/json" },
+        headers: {
+          authorization: `Bearer ${config.key}`,
+          "content-type": "application/json",
+          "Idempotency-Key": eventKey,
+        },
         body: JSON.stringify({
           from: config.from,
-          to: [row.recipient],
+          to: [recipient],
           subject: rendered.subject,
           html: rendered.html,
           text: rendered.text,
@@ -572,7 +616,8 @@ export async function dispatchPending(
         provider_id: (body as any)?.id ?? null,
         sent_at: new Date().toISOString(),
         error: null,
-      }).eq("id", row.id);
+        claim_token: null,
+      }).eq("id", row.id).eq("claim_token", row.claim_token);
       continue;
     }
 
@@ -588,7 +633,8 @@ export async function dispatchPending(
       error: String(reason).slice(0, 400),
       // 1, 2, 4, 8 minutes — enough to ride out a blip, not enough to spam.
       next_attempt_at: new Date(Date.now() + Math.min(60_000 * 2 ** (attempts - 1), 3_600_000)).toISOString(),
-    }).eq("id", row.id);
+      claim_token: null,
+    }).eq("id", row.id).eq("claim_token", row.claim_token);
   }
 
   if (due) skipped = Math.max(0, (due as any[]).length - sent - failed);
@@ -606,14 +652,17 @@ export async function dispatchPending(
 export async function queueForTenant(
   db: SupabaseClient,
   tenantId: string,
-  event: Omit<EmailEvent, "tenantId" | "recipient"> & { recipient?: string | null },
+  event: Omit<EmailEvent, "tenantId" | "recipient"> & {
+    recipient?: string | null;
+    throwOnInsertError?: boolean;
+  },
 ): Promise<string | null> {
   let recipient = event.recipient ?? null;
   let recipientName = event.recipientName ?? null;
   let restaurantName = event.restaurantName ?? null;
 
   if (!recipient || !restaurantName) {
-    const [{ data: tenant }, { data: owner }] = await Promise.all([
+    const [{ data: tenant, error: tenantErr }, { data: owner, error: ownerErr }] = await Promise.all([
       db.from("tenants").select("name, email").eq("id", tenantId).maybeSingle(),
       db
         .from("profiles")
@@ -623,6 +672,10 @@ export async function queueForTenant(
         .limit(1)
         .maybeSingle(),
     ]);
+    if (event.throwOnInsertError && (tenantErr || ownerErr)) {
+      const msg = tenantErr?.message ?? ownerErr?.message ?? "recipient lookup failed";
+      throw new Error(`email recipient lookup failed: ${msg}`);
+    }
     recipient = recipient ?? (owner as any)?.email ?? (tenant as any)?.email ?? null;
     recipientName = recipientName ?? (owner as any)?.name ?? null;
     restaurantName = restaurantName ?? (tenant as any)?.name ?? null;
@@ -630,6 +683,9 @@ export async function queueForTenant(
 
   if (!recipient) {
     console.error("email: no address for tenant", tenantId, event.eventType);
+    if (event.throwOnInsertError) {
+      throw new Error(`email: no recipient address for tenant ${tenantId}`);
+    }
     return null;
   }
 

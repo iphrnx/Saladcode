@@ -60,7 +60,6 @@ interface QrTableItem {
 
 const TABLE_STATUS_META: Record<string, { label: string; color: string }> = {
   OCCUPIED: { label: 'Occupied', color: '#ef4444' },
-  RESERVED: { label: 'Reserved', color: '#fbbf24' },
   AVAILABLE: { label: 'Available', color: '#4ade80' },
   CLEANING: { label: 'Cleaning', color: '#60a5fa' },
 }

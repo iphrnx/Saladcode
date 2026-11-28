@@ -9,6 +9,7 @@ import { appOrigin, body, json, preflight, subPath } from "../_shared/http.ts";
 import { trialFields } from "../_shared/plans.ts";
 import { dispatchPending, queueForTenant } from "../_shared/email.ts";
 import { clientIp } from "../_shared/ip.ts";
+import { publishSecuritySignal } from "../_shared/realtime.ts";
 import { pruneSessionsForDevice, stampSession } from "../_shared/sessions.ts";
 
 /**
@@ -141,7 +142,7 @@ async function login(req: Request): Promise<Response> {
         // null: attributing it would blame the account holder for a stranger's
         // attempt. The email the attempt used goes in `meta` and is shown as an
         // *attempted* identity.
-        await db.from("security_logs").insert({
+        const { error: failLogErr } = await db.from("security_logs").insert({
           tenant_id: p.tenant_id,
           user_id: null,
           action: "LOGIN_FAILED",
@@ -149,6 +150,9 @@ async function login(req: Request): Promise<Response> {
           user_agent: req.headers.get("user-agent") || "unknown",
           meta: `Failed login for ${String(email).toLowerCase().trim()}`,
         });
+        if (!failLogErr) {
+          await publishSecuritySignal(p.tenant_id);
+        }
       }
     } catch {
       /* never fail the auth response over an audit row */
@@ -229,7 +233,11 @@ async function login(req: Request): Promise<Response> {
     }),
   ]);
   if (updateRes.error) console.error("auth: could not stamp last_login", updateRes.error.message);
-  if (logRes.error) console.error("auth: could not write the login audit row", logRes.error.message);
+  if (logRes.error) {
+    console.error("auth: could not write the login audit row", logRes.error.message);
+  } else {
+    await publishSecuritySignal(profile.tenant_id);
+  }
 
   /**
    * One session per browser.
@@ -731,6 +739,7 @@ async function register(req: Request): Promise<Response> {
       meta: "Registered new account and created tenant",
     });
     if (logError) return await rollbackSignup(logError.message);
+    await publishSecuritySignal(tenant.id);
 
     // Welcome mail, with the trial's real end date from the row just written.
     try {

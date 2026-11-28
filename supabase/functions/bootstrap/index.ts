@@ -1,7 +1,7 @@
 // deno-lint-ignore-file no-explicit-any
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { guard } from "../_shared/auth.ts";
-import { staffTopic } from "../_shared/realtime.ts";
+import { securityTopic, staffTopic } from "../_shared/realtime.ts";
 import { admin } from "../_shared/db.ts";
 import { toCamel } from "../_shared/case.ts";
 import { json, preflight } from "../_shared/http.ts";
@@ -443,6 +443,9 @@ Deno.serve(async (req: Request) => {
         effectivePermissions.some((p: string) => ["orders.view", "tables.view"].includes(p))
           ? await staffTopic(g.session.tenantId)
           : null,
+      securityTopic: effectivePermissions.includes("security.view")
+        ? await securityTopic(g.session.tenantId)
+        : null,
       users: canSeePeople ? users : [],
       roles: canSeePeople ? roles : [],
       staff: canSeePeople ? staff : [],

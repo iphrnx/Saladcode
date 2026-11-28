@@ -80,6 +80,39 @@ function dateKey(d: Date): string {
  * The core dataset, fetched once and reused by most of the read routes.
  * Every query is checked; a failure is a 500, never a silent empty list.
  */
+/**
+ * Resolve display metadata (name, email) for platform admin IDs.
+ * Platform admins live in `public.super_admins` and often have no row in
+ * `public.profiles` (which is for restaurant users), so querying `profiles`
+ * via a PostgREST FK join fails or returns null. Check `super_admins` first
+ * and fall back to `profiles`.
+ */
+async function resolveAdminActors(
+  db: ReturnType<typeof admin>,
+  adminIds: Array<string | null | undefined>,
+): Promise<Map<string, { email: string | null; name: string | null }>> {
+  const ids = [...new Set(adminIds.filter((id): id is string => Boolean(id)))];
+  const map = new Map<string, { email: string | null; name: string | null }>();
+  if (ids.length === 0) return map;
+
+  const [saRes, profRes] = await Promise.all([
+    db.from("super_admins").select("user_id, email, label").in("user_id", ids),
+    db.from("profiles").select("id, email, name").in("id", ids),
+  ]);
+
+  for (const p of (profRes.data ?? []) as any[]) {
+    map.set(p.id, { email: p.email ?? null, name: p.name ?? null });
+  }
+  for (const s of (saRes.data ?? []) as any[]) {
+    const existing = map.get(s.user_id);
+    map.set(s.user_id, {
+      email: s.email ?? existing?.email ?? null,
+      name: s.label ?? existing?.name ?? s.email ?? null,
+    });
+  }
+  return map;
+}
+
 async function loadCore() {
   const db = admin();
 
@@ -368,7 +401,7 @@ async function getCrmDetail(req: Request, tenantId: string) {
       db.from("profiles").select("id, email, name, last_login").eq("tenant_id", tenantId),
       db
         .from("tenant_notes")
-        .select("*, author:profiles!tenant_notes_admin_id_fkey(email, name)")
+        .select("*")
         .eq("tenant_id", tenantId)
         .order("created_at", { ascending: false })
         .limit(50),
@@ -403,10 +436,17 @@ async function getCrmDetail(req: Request, tenantId: string) {
   );
   if (firstError?.error) return json(req, { error: firstError.error.message }, 500);
 
+  const rawNotes = (noteRes.data ?? []) as any[];
+  const actorMap = await resolveAdminActors(db, rawNotes.map((n) => n.admin_id));
+  const notes = rawNotes.map((n) => ({
+    ...n,
+    author: n.admin_id ? actorMap.get(n.admin_id) ?? null : null,
+  }));
+
   return json(req, {
     tenant,
     owners: ownerRes.data ?? [],
-    notes: noteRes.data ?? [],
+    notes,
     issues: issueRes.data ?? [],
     payments: payRes.data ?? [],
     recentOrders: orderRes.data ?? [],
@@ -1002,13 +1042,21 @@ async function getCsvReport(req: Request) {
 // --- Audit, search, issues, tenant management -------------------------------
 
 async function getAudit(req: Request) {
-  const { data, error } = await admin()
+  const db = admin();
+  const { data, error } = await db
     .from("super_admin_audit_logs")
-    .select("*, admin:profiles!super_admin_audit_logs_admin_id_fkey(email, name)")
+    .select("*")
     .order("created_at", { ascending: false })
     .limit(200);
   if (error) return json(req, { error: error.message }, 500);
-  return json(req, data ?? []);
+
+  const rows = (data ?? []) as any[];
+  const actorMap = await resolveAdminActors(db, rows.map((r) => r.admin_id));
+  const enriched = rows.map((r) => ({
+    ...r,
+    admin: r.admin_id ? actorMap.get(r.admin_id) ?? null : null,
+  }));
+  return json(req, enriched);
 }
 
 async function getSearch(req: Request) {

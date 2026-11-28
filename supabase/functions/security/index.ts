@@ -15,6 +15,7 @@ import { body, json, preflight } from "../_shared/http.ts";
 
 import { cleanIp, clientIp } from "../_shared/ip.ts";
 import { auditStats } from "../_shared/audit.ts";
+import { publishSecuritySignal } from "../_shared/realtime.ts";
 
 import { actorMaps, presentLog } from "../_shared/security-identity.ts";
 /**
@@ -258,6 +259,8 @@ async function remove(req: Request, sessionId: string | null): Promise<Response>
     meta: targetName ? `Session ended for ${targetName}` : "Session ended",
   });
 
+  await publishSecuritySignal(tenantId);
+
   return json(req, { success: true, revoked });
 }
 
@@ -301,6 +304,8 @@ async function patch(req: Request): Promise<Response> {
       user_agent: req.headers.get("user-agent") || "unknown",
       meta: `All sessions revoked (${revoked})`,
     });
+
+    await publishSecuritySignal(tenantId);
 
     return json(req, { success: true, revoked });
   }

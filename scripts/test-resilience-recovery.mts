@@ -170,7 +170,7 @@ async function runResilienceTests() {
     const res = await submitEntry(entry, mockFetcherAuthExpired as any);
     report(
       "Classified 401/403 as definitive 'rejected' (aborts retry loop)",
-      res.outcome === "rejected" && (res as any).error === "Session ended"
+      res.outcome === "rejected" && (res as any).error === "SESSION_EXPIRED" && (res as any).code === "SESSION_ENDED"
     );
   }
 

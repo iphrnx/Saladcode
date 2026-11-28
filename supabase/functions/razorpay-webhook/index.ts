@@ -5,7 +5,7 @@ import { json, preflight } from "../_shared/http.ts";
 import { dispatchPending, queueForTenant } from "../_shared/email.ts";
 import { cancelSubscription, fetchPayment, fetchRefund, fetchSubscription, verifyWebhookSignature } from "../_shared/razorpay.ts";
 import { eventCreatedAt, fromMinorUnits, webhookEventId } from "../_shared/billing.ts";
-import { issueInvoiceDocument, issueRefundDocument } from "../_shared/billing-documents.ts";
+import { issueInvoiceDocument, issueRefundDocument, ensureRefundAuditIdempotent } from "../_shared/billing-documents.ts";
 import { cancelSupersededLink } from "../_shared/mandate-switch.ts";
 import { decideChargeLink, type LiveSubscription } from "../_shared/subscription-guard.ts";
 
@@ -950,64 +950,103 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       }
 
       const refundOutcome = String((refundRpcRes as any)?.outcome ?? "");
-      if (refundOutcome === "pending_recorded" || refundOutcome === "failed_recorded") {
-        return { summary: `refund ${verifiedRefundStatus} (not finalized)`, tenantId };
+      if (
+        refundOutcome === "pending_recorded" ||
+        refundOutcome === "failed_recorded" ||
+        refundOutcome === "pending_reconciliation"
+      ) {
+        return {
+          summary: refundOutcome === "pending_reconciliation"
+            ? "refund pending reconciliation"
+            : `refund ${verifiedRefundStatus} (not finalized)`,
+          tenantId,
+        };
       }
+
+      if (refundOutcome === "processed" || refundOutcome === "already_processed") {
+        const internalRefundId: string | null = (refundRpcRes as any)?.refund_uuid ?? null;
+        // Confirm the refund audit entry (written atomically by
+        // record_subscription_refund) before PDF/email work that may retry.
+        await auditRefundIdempotent(db, tenantId, tenant.plan, planId, eventId, {
+          paymentId: targetPaymentId,
+          refundId: verifiedRefundId,
+          internalRefundId,
+          totalRefunded: (refundRpcRes as any)?.total_refunded ?? null,
+          isFullyRefunded: (refundRpcRes as any)?.is_fully_refunded ?? null,
+        });
+
+        // Ensure the refund document and notification email are issued even on
+        // retries where the ledger update already succeeded on an earlier run.
+        // issueRefundDocument and queueForTenant are idempotent by durable refund identity.
+        const refund = refundEntity;
+        const { data: ledgerRow, error: ledgerErr } = await db
+          .from("subscription_payments")
+          .select(
+            "id, amount, currency, status, payment_method, plan_id, billing_period, created_at, razorpay_payment_id, razorpay_order_id",
+          )
+          .eq("razorpay_payment_id", String(targetPaymentId))
+          .maybeSingle();
+        if (ledgerErr) {
+          throw new Error(`could not load refunded payment row: ${ledgerErr.message}`);
+        }
+        if (ledgerRow) {
+          const docAmount = verifiedRefundAmount > 0 ? verifiedRefundAmount : Number((ledgerRow as any).amount ?? 0);
+          const refundDoc = await issueRefundDocument(db, tenantId, ledgerRow, {
+            refundedAt: refund?.created_at ? new Date(refund.created_at * 1000) : undefined,
+            razorpayRefundId: verifiedRefundId,
+            amount: docAmount,
+          });
+          if (!refundDoc) {
+            throw new Error(`could not issue refund document for ${String(targetPaymentId)}`);
+          }
+          const emailEventKey = internalRefundId
+            ? `payment_refunded:${internalRefundId}`
+            : `payment_refunded:${String(targetPaymentId)}:${verifiedRefundId ?? "doc"}`;
+          const legacyEmailKeys = [
+            emailEventKey,
+            ...(verifiedRefundId
+              ? [`payment_refunded:${String(targetPaymentId)}:${verifiedRefundId}`]
+              : [`payment_refunded:${String(targetPaymentId)}:doc`]),
+          ];
+          const { data: existingRefundEmails, error: existingEmailErr } = await db
+            .from("email_events")
+            .select("id, status, event_key")
+            .eq("tenant_id", tenantId)
+            .eq("event_type", "payment_refunded")
+            .in("event_key", Array.from(new Set(legacyEmailKeys)))
+            .in("status", ["pending", "sent"])
+            .limit(1);
+          if (existingEmailErr) {
+            throw new Error(`could not check refund email outbox: ${existingEmailErr.message}`);
+          }
+          if (!existingRefundEmails || existingRefundEmails.length === 0) {
+            await queueForTenant(db, tenantId, {
+              eventKey: emailEventKey,
+              eventType: "payment_refunded",
+              planName: (ledgerRow as any).plan_id,
+              amount: docAmount,
+              currency: (ledgerRow as any).currency ?? verifiedCurrency,
+              throwOnInsertError: true,
+              payload: {
+                refundedAt: refund?.created_at ? new Date(refund.created_at * 1000).toISOString() : now,
+                refundId: verifiedRefundId,
+                refundNumber: (refundDoc as any)?.refund_number ?? null,
+                paymentRef: String(targetPaymentId),
+              },
+            });
+          }
+          try {
+            await dispatchPending(db, 5);
+          } catch (e) {
+            console.error("webhook: refund email dispatch failed", (e as Error)?.message);
+          }
+        }
+      }
+
       if (refundOutcome === "already_processed") {
         return { summary: "refund already processed", tenantId };
       }
 
-      if (refundOutcome === "processed") {
-        // The refund document, linked to the original invoice (issuing
-        // that invoice first if needed — the payment succeeded at some
-        // point, so the invoice is a fact). Best-effort like the renewal
-        // invoice; the refund itself is already recorded above.
-        try {
-          const refund = refundEntity;
-          const { data: ledgerRow } = await db
-            .from("subscription_payments")
-            .select(
-              "id, amount, currency, status, payment_method, plan_id, billing_period, created_at, razorpay_payment_id, razorpay_order_id",
-            )
-            .eq("razorpay_payment_id", String(targetPaymentId))
-            .maybeSingle();
-          if (ledgerRow) {
-            const docAmount = verifiedRefundAmount > 0 ? verifiedRefundAmount : Number((ledgerRow as any).amount ?? 0);
-            const refundDoc = await issueRefundDocument(db, tenantId, ledgerRow, {
-              refundedAt: refund?.created_at ? new Date(refund.created_at * 1000) : undefined,
-              razorpayRefundId: verifiedRefundId,
-              amount: docAmount,
-            });
-            try {
-              await queueForTenant(db, tenantId, {
-                eventKey: `payment_refunded:${String(targetPaymentId)}:${verifiedRefundId ?? "doc"}`,
-                eventType: "payment_refunded",
-                planName: (ledgerRow as any).plan_id,
-                amount: docAmount,
-                currency: (ledgerRow as any).currency ?? verifiedCurrency,
-                payload: {
-                  refundedAt: refund?.created_at ? new Date(refund.created_at * 1000).toISOString() : now,
-                  refundId: verifiedRefundId,
-                  refundNumber: (refundDoc as any)?.refund_number ?? null,
-                  paymentRef: String(targetPaymentId),
-                },
-              });
-              await dispatchPending(db, 5);
-            } catch (e) {
-              console.error("webhook: refund email failed", (e as Error)?.message);
-            }
-          }
-        } catch (e) {
-          console.error("razorpay webhook: refund document issuance failed", (e as Error)?.message);
-        }
-      }
-
-      await audit(db, tenantId, tenant.plan, planId, "refunded", eventId, {
-        paymentId: targetPaymentId,
-        refundId: verifiedRefundId,
-        totalRefunded: (refundRpcRes as any)?.total_refunded ?? null,
-        isFullyRefunded: (refundRpcRes as any)?.is_fully_refunded ?? null,
-      });
       return { summary: "payment refunded", tenantId };
     }
 
@@ -1078,6 +1117,32 @@ async function rejectIncomingCharge(
       refundReview: decision === "reject-linked-billable",
     },
   });
+}
+
+async function auditRefundIdempotent(
+  db: any,
+  tenantId: string,
+  oldPlan: string | null,
+  newPlan: string | null,
+  eventId: string,
+  detail: {
+    paymentId: unknown;
+    refundId: string | null;
+    internalRefundId?: string | null;
+    totalRefunded: unknown;
+    isFullyRefunded: unknown;
+  },
+) {
+  const res = await ensureRefundAuditIdempotent(db, {
+    tenantId,
+    oldPlan,
+    newPlan,
+    eventId,
+    detail,
+  });
+  if (!res.ok) {
+    throw new Error(`could not write refund audit log: ${res.error}`);
+  }
 }
 
 async function audit(

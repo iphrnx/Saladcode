@@ -96,10 +96,11 @@ node scripts/deploy-all-fns.mjs
 node scripts/deploy-fn.mjs menu
 ```
 
-`deploy-all-fns.mjs` also deletes the retired `reservations` Edge Function from the target project (`SUPABASE_PROJECT_ID` or `NEXT_PUBLIC_SUPABASE_URL` ref) and treats an already-absent function as a clean no-op so fresh deployments and repeated runs succeed. When deploying functions individually, remove the retired endpoint explicitly (safe to re-run when absent):
+`deploy-all-fns.mjs` also deletes retired Edge Functions (`reservations`, `test-shared`) from the target project (`SUPABASE_PROJECT_ID` or `NEXT_PUBLIC_SUPABASE_URL` ref) and treats an already-absent function as a clean no-op so fresh deployments and repeated runs succeed. When deploying functions individually, remove retired endpoints explicitly (safe to re-run when absent):
 
 ```bash
 npx supabase functions delete reservations --remote=<ref> --yes || true
+npx supabase functions delete test-shared --remote=<ref> --yes || true
 ```
 
 ## 3. Cloudflare Workers

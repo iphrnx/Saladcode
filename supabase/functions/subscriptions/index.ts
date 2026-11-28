@@ -42,6 +42,7 @@ import {
   type ScheduledChange,
 } from "../_shared/billing-manage.ts";
 import {
+  ensureRefundAuditIdempotent,
   issueInvoiceDocument,
   issueRefundDocument,
   invoiceFactsFromRow,
@@ -708,18 +709,86 @@ async function state(req: Request, tenantId: string): Promise<Response> {
   const { data: refunds, error: refundsError } = await admin()
     .from("billing_refunds")
     .select(
-      "razorpay_payment_id, refund_number, refund_date, original_invoice_number, original_invoice_date, razorpay_refund_id",
+      "id, payment_id, refund_id, razorpay_payment_id, razorpay_order_id, refund_number, refund_date, amount, currency, description, seller_name, seller_address, seller_email, seller_phone, buyer_name, buyer_email, buyer_address, original_invoice_number, original_invoice_date, razorpay_refund_id, linked_razorpay_refund_id",
     )
-    .eq("tenant_id", tenantId);
+    .eq("tenant_id", tenantId)
+    .order("refund_date", { ascending: false })
+    .order("created_at", { ascending: false });
   if (refundsError) {
     console.error("subscriptions state: refunds unreadable", refundsError.message);
+    return json(req, { error: "Could not load billing documents just now." }, 503);
+  }
+  const { data: processedRefundRows, error: processedRefundsError } = await admin()
+    .from("subscription_refunds")
+    .select(
+      "id, payment_id, razorpay_payment_id, razorpay_refund_id, amount, currency, processed_at, created_at",
+    )
+    .eq("tenant_id", tenantId)
+    .eq("status", "processed")
+    .order("processed_at", { ascending: false, nullsFirst: false })
+    .order("created_at", { ascending: false });
+  if (processedRefundsError) {
+    console.error("subscriptions state: processed refunds unreadable", processedRefundsError.message);
+    return json(req, { error: "Could not load billing documents just now." }, 503);
+  }
+  const { data: reconciliationRows, error: reconciliationsError } = await admin()
+    .from("subscription_refund_reconciliations")
+    .select("id, payment_id, razorpay_payment_id, amount, currency, status, created_at")
+    .eq("tenant_id", tenantId)
+    .eq("status", "pending_reconciliation")
+    .order("created_at", { ascending: false });
+  if (reconciliationsError) {
+    console.error("subscriptions state: refund reconciliations unreadable", reconciliationsError.message);
+    return json(req, { error: "Could not load billing documents just now." }, 503);
   }
   const invoiceByPayment = new Map(
     (invoices ?? []).map((row) => [row.razorpay_payment_id, row]),
   );
-  const refundByPayment = new Map(
-    (refunds ?? []).map((row) => [row.razorpay_payment_id, row]),
-  );
+  const refundsByPayment = new Map<string, any[]>();
+  const receiptByRefundId = new Map<string, any>();
+  for (const row of refunds ?? []) {
+    if (row.refund_id) receiptByRefundId.set(row.refund_id, row);
+    const linkKey = row.linked_razorpay_refund_id ?? row.razorpay_refund_id;
+    if (linkKey) {
+      receiptByRefundId.set(linkKey, row);
+    }
+    const k = row.payment_id ?? row.razorpay_payment_id;
+    if (!k) continue;
+    const list = refundsByPayment.get(k) ?? [];
+    list.push(row);
+    refundsByPayment.set(k, list);
+  }
+  const processedByPayment = new Map<string, any[]>();
+  for (const row of processedRefundRows ?? []) {
+    const k = row.payment_id ?? row.razorpay_payment_id;
+    if (!k) continue;
+    const list = processedByPayment.get(k) ?? [];
+    list.push({
+      id: row.id,
+      razorpay_refund_id: row.razorpay_refund_id,
+      amount: Number(row.amount),
+      currency: row.currency,
+      processed_at: row.processed_at,
+      created_at: row.created_at,
+      receipt: receiptByRefundId.get(row.id) ??
+        (row.razorpay_refund_id ? (receiptByRefundId.get(row.razorpay_refund_id) ?? null) : null),
+    });
+    processedByPayment.set(k, list);
+  }
+  const reconciliationsByPayment = new Map<string, any[]>();
+  for (const row of reconciliationRows ?? []) {
+    const k = row.payment_id ?? row.razorpay_payment_id;
+    if (!k) continue;
+    const list = reconciliationsByPayment.get(k) ?? [];
+    list.push({
+      id: row.id,
+      amount: row.amount === null || row.amount === undefined ? null : Number(row.amount),
+      currency: row.currency,
+      status: row.status,
+      created_at: row.created_at,
+    });
+    reconciliationsByPayment.set(k, list);
+  }
 
   // Every plan's display facts — retired ones included. The catalogue the
   // grid is built from is active-only, so without this a retired plan's
@@ -754,16 +823,24 @@ async function state(req: Request, tenantId: string): Promise<Response> {
     plan: publicPlan(plan),
     plans: catalogue,
     restaurant: { name: tenant?.name ?? null, email: tenant?.email ?? null },
+    seller: await sellerIdentity(admin()),
     razorpayConfigured: razorpayConfigured(),
     planDirectory: directoryFrom(allPlans ?? []),
     totals: summariseTotals(allPayments ?? []),
     locationCount: locationCount ?? 1,
     payments: (payments ?? []).map((row) => {
       const key = row.razorpay_payment_id ?? row.transaction_id;
+      const refundDocs = refundsByPayment.get(row.id) ?? refundsByPayment.get(key) ?? [];
+      const processedRefunds = processedByPayment.get(row.id) ?? processedByPayment.get(key) ?? [];
+      const pendingReconciliations =
+        reconciliationsByPayment.get(row.id) ?? reconciliationsByPayment.get(key) ?? [];
       return {
         ...row,
         document: invoiceByPayment.get(key) ?? null,
-        refundDocument: refundByPayment.get(key) ?? null,
+        refundDocument: refundDocs[0] ?? null,
+        refundDocuments: refundDocs,
+        processedRefunds,
+        pendingReconciliations,
       };
     }),
   });
@@ -2097,6 +2174,8 @@ async function cancel(req: Request, tenantId: string): Promise<Response> {
 async function invoice(req: Request, tenantId: string): Promise<Response> {
   const url = new URL(req.url);
   const paymentId = String(url.searchParams.get("paymentId") ?? "").trim();
+  const receiptIdParam = String(url.searchParams.get("receiptId") ?? "").trim() || null;
+  const refundIdParam = String(url.searchParams.get("refundId") ?? "").trim() || null;
   const kind = url.searchParams.get("kind") === "refund" ? "refund" : "invoice";
   const download = url.searchParams.get("download") === "1";
   if (!paymentId) return json(req, { error: "paymentId is required" }, 400);
@@ -2106,7 +2185,7 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
   const { data: payment, error: paymentError } = await db
     .from("subscription_payments")
     .select(
-      "id, tenant_id, amount, currency, status, payment_method, plan_id, billing_period, created_at, razorpay_payment_id, razorpay_order_id",
+      "id, tenant_id, amount, refunded_amount, currency, status, payment_method, plan_id, billing_period, created_at, razorpay_payment_id, razorpay_order_id",
     )
     .eq("id", paymentId)
     .maybeSingle();
@@ -2119,15 +2198,111 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
   }
 
   if (kind === "refund") {
-    if (payment.status !== "refunded") {
+    if (payment.status !== "refunded" && !(Number(payment.refunded_amount ?? 0) > 0)) {
       return json(req, { error: "No refund has been recorded for this payment." }, 404);
     }
-    const { data: existing } = await db
-      .from("billing_refunds")
-      .select("*")
-      .eq("payment_id", paymentId)
-      .maybeSingle();
-    const row = existing ?? await issueRefundDocument(db, tenantId, payment, {});
+
+    let row: any = null;
+    if (receiptIdParam) {
+      const { data: exactReceipt, error: exactErr } = await db
+        .from("billing_refunds")
+        .select("*")
+        .eq("id", receiptIdParam)
+        .eq("tenant_id", tenantId)
+        .eq("payment_id", paymentId)
+        .maybeSingle();
+      if (exactErr) {
+        console.error("subscriptions invoice: could not read refund receipt", exactErr.message);
+        return json(req, { error: "Could not read refund receipt just now." }, 503);
+      }
+      if (!exactReceipt) {
+        return json(req, { error: "No matching refund receipt for this payment." }, 404);
+      }
+      row = exactReceipt;
+    } else {
+      const { data: processedRefunds, error: refundsErr } = await db
+        .from("subscription_refunds")
+        .select("id, razorpay_refund_id, amount, currency, webhook_event_id, processed_at, created_at")
+        .eq("payment_id", paymentId)
+        .eq("status", "processed")
+        .order("processed_at", { ascending: false, nullsFirst: false })
+        .order("created_at", { ascending: false });
+      if (refundsErr) {
+        console.error("subscriptions invoice: could not read processed refunds", refundsErr.message);
+        return json(req, { error: "Could not read refund details just now." }, 503);
+      }
+
+      const targetRefund = refundIdParam
+        ? (processedRefunds ?? []).find(
+            (r: any) => r.id === refundIdParam || r.razorpay_refund_id === refundIdParam,
+          ) ?? null
+        : (processedRefunds ?? [])[0] ?? null;
+
+      if (refundIdParam && !targetRefund) {
+        return json(req, { error: "No matching processed refund for this payment." }, 404);
+      }
+
+      let existing: any = null;
+      if (targetRefund?.razorpay_refund_id) {
+        const { data: byRefundId } = await db
+          .from("billing_refunds")
+          .select("*")
+          .or(`refund_id.eq.${targetRefund.id},razorpay_refund_id.eq.${targetRefund.razorpay_refund_id},linked_razorpay_refund_id.eq.${targetRefund.razorpay_refund_id}`)
+          .maybeSingle();
+        existing = byRefundId ?? null;
+      } else if (!targetRefund && (processedRefunds ?? []).length === 0) {
+        const { data: existingRows } = await db
+          .from("billing_refunds")
+          .select("*")
+          .eq("payment_id", paymentId)
+          .is("razorpay_refund_id", null)
+          .is("linked_razorpay_refund_id", null)
+          .is("refund_id", null)
+          .order("refund_date", { ascending: false })
+          .order("created_at", { ascending: false })
+          .limit(1);
+        existing = existingRows?.[0] ?? null;
+      }
+
+      if (!existing) {
+        const auditRes = await ensureRefundAuditIdempotent(db, {
+          tenantId,
+          oldPlan: payment.plan_id ?? null,
+          newPlan: payment.plan_id ?? null,
+          eventId: targetRefund?.webhook_event_id ?? (
+            targetRefund?.razorpay_refund_id
+              ? `ondemand:${targetRefund.razorpay_refund_id}`
+              : `ondemand:${paymentId}`
+          ),
+          detail: {
+            paymentId: payment.razorpay_payment_id ?? paymentId,
+            refundId: targetRefund?.razorpay_refund_id ?? null,
+            internalRefundId: targetRefund?.id ?? null,
+            totalRefunded: payment.refunded_amount ?? null,
+            isFullyRefunded: payment.status === "refunded",
+          },
+        });
+        if (!auditRes.ok) {
+          console.error("subscriptions invoice: refund audit prerequisite failed", auditRes.error);
+          return json(req, { error: "The refund document is not available just now. Please try again." }, 503);
+        }
+      }
+
+      row = existing ?? await issueRefundDocument(
+        db,
+        tenantId,
+        payment,
+        targetRefund
+          ? {
+              razorpayRefundId: targetRefund.razorpay_refund_id,
+              amount: Number(targetRefund.amount),
+              refundedAt: targetRefund.processed_at ? new Date(targetRefund.processed_at) : undefined,
+            }
+          : {
+              amount: Number(payment.refunded_amount ?? payment.amount),
+            },
+      );
+    }
     if (!row) {
       return json(req, { error: "The refund document is not available just now. Please try again." }, 503);
     }

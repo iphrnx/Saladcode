@@ -578,6 +578,7 @@ export function SecurityView() {
   const stats = data?.securityStats ?? null
 
   const tenantId = data?.tenant.id ?? null
+  const securityTopic = data?.securityTopic ?? null
 
   const headers = {
     'x-tenant-id': data?.tenant.id ?? '',
@@ -635,19 +636,12 @@ export function SecurityView() {
       }, 350)
     }
 
-    const channel = supabase
-      .channel(`security:${tenantId}`)
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'security_logs', filter: `tenant_id=eq.${tenantId}` },
-        soon,
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'staff_sessions' },
-        soon,
-      )
-      .subscribe()
+    const channel = securityTopic
+      ? supabase
+          .channel(securityTopic)
+          .on('broadcast', { event: 'SECURITY_UPDATED' }, soon)
+          .subscribe()
+      : null
 
     /**
      * Sessions live in the `auth` schema, which cannot be published to
@@ -671,9 +665,9 @@ export function SecurityView() {
       clearInterval(poll)
       document.removeEventListener('visibilitychange', onVisible)
       window.removeEventListener('focus', onVisible)
-      void supabase.removeChannel(channel)
+      if (channel) void supabase.removeChannel(channel)
     }
-  }, [tenantId])
+  }, [tenantId, securityTopic])
 
   const revokeSession = async (sessionId: string, sessionIds?: string[]) => {
     setRevoking(sessionId)

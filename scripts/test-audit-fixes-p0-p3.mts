@@ -194,8 +194,10 @@ console.log("\n── P2 Findings (Medium / Data Integrity / UI) ──");
 // P2-4: 1-Paisa GST tax rounding discrepancy
 {
   check("P2-4: bill/index.ts ensures cgstAmount + sgstAmount strictly equals tax",
-    billFn.includes("const cgstAmount = +(tax / 2).toFixed(2);") &&
-    billFn.includes("const sgstAmount = +(tax - cgstAmount).toFixed(2);")
+    billFn.includes("const cgstPaise = Math.ceil(gstTotalPaise / 2);") &&
+    billFn.includes("const sgstPaise = gstTotalPaise - cgstPaise;") &&
+    billFn.includes("const cgstAmount = +(cgstPaise / 100).toFixed(2);") &&
+    billFn.includes("const sgstAmount = +(sgstPaise / 100).toFixed(2);")
   );
 }
 

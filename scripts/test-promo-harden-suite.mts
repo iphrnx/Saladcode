@@ -1478,7 +1478,7 @@ console.log('\n── 18. Issue 1 & 2 [P1 & P2]: Import Fix & Full Price Paise V
   check('Resubmission with reviewed pricing succeeds', reviewedCheck.ok === true)
 
   // Checkout with valid applied promo succeeds through actual Orders endpoint logic
-  const validOrderEval = await evaluatePromo(fakeDb([basePromo({ valid_to: '2026-11-25' })]), 'tenant-a', 'SAVE20', 200, { currencySymbol: '₹' })
+  const validOrderEval = await evaluatePromo(fakeDb([basePromo({ valid_to: '2099-12-31' })]), 'tenant-a', 'SAVE20', 200, { currencySymbol: '₹' })
   check('Checkout with valid applied promo evaluates successfully', validOrderEval.applied === true && validOrderEval.discount === 40)
   check('Normalized promo code matches expected code format', normalizePromoCode('  save20!  ') === 'SAVE20')
 }

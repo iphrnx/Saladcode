@@ -18,8 +18,8 @@ console.log("SittingCard regression checks:");
 
 // 1. Takeaway/Delivery payment & ended viewability
 check(
-  "Takeaway/Delivery routes to onPay(sitting.latest) when no tableId/checkId",
-  src.includes("else if (canPay && sitting.checkId) onCompletePay(sitting)") &&
+  "Takeaway/Delivery routes to onCompletePay when checkId or sessionId exists, else onPay(sitting.latest)",
+  src.includes("if (canPay && (sitting.checkId || sitting.sessionId)) onCompletePay(sitting)") &&
     src.includes("else if (canPay) onPay(sitting.latest)"),
 );
 check(
@@ -27,9 +27,9 @@ check(
   src.includes("disabled={active && !canPay}") && !src.includes("disabled={!sitting.tableId || (active && !canPay)}"),
 );
 check(
-  "OrderCard onViewBill falls back to setBillDoc when tableId is null",
-  src.includes("orderId: ticket.order.id,\n                        table: null,") ||
-    src.includes("orderId: order.id,\n                        table: null,"),
+  "OrderCard onViewBill passes checkId and orderId to setBillDoc even when table is null",
+  src.includes("checkId: ticket.order.checkId ?? null,") &&
+    src.includes("orderId: ticket.order.id,"),
 );
 
 // 2. Inline Accept / Reject for PENDING_ACTIVATION
@@ -128,8 +128,8 @@ check(
 
 // 13. Active vs Ended card footer actions and All Served indicator
 check(
-  "Active sessions always render Complete & Pay and replace with Session Details only when ended",
-  src.includes("active ? 'Complete & Pay' : 'Session Details'") &&
+  "Active or payable sessions render Complete & Pay and replace with Session Details when ended & paid",
+  src.includes("{active || canPay ? 'Complete & Pay' : 'Session Details'}") &&
   src.includes("disabled={active && !canPay}"),
 );
 check(

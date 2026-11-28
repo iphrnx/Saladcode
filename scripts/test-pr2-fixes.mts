@@ -51,143 +51,100 @@ describe('PR #2 Fix 1: Stop payment success screen from reloading repeatedly', (
   })
 })
 
-describe('PR #2 Fix 2: Keep settled shared-check amounts scoped to selected sitting', () => {
+describe('PR #2 Fix 2: Independent-session check amounts stay scoped to selected sitting', () => {
   const ordersCode = readFileSync(resolve('src/components/views/orders.tsx'), 'utf8')
 
-  it('sharedBill safeguard applies regardless of check payment status', () => {
+  it('uses session-scoped check figures directly without legacy sharedBill compatibility flag', () => {
     assert.ok(
-      ordersCode.includes('const sharedBill = Boolean(check) && check!.orderCount !== onTheBill.length'),
-      'sharedBill must check orderCount without being bypassed by isSettledCheck'
+      !ordersCode.includes('sharedBill'),
+      'legacy sharedBill compatibility flag must be removed'
     )
     assert.ok(
-      !ordersCode.includes('!isSettledCheck && check!.orderCount !== onTheBill.length'),
-      '!isSettledCheck must not disable sharedBill when check is settled'
+      ordersCode.includes('const total = !check ? fallbackTotal : check.total'),
+      'total must read directly from session check when present'
     )
   })
 
-  it('simulates shared check with 2 sittings of different amounts: open and settled states', () => {
-    // Check shared across Table 3 (Diner 1 and Diner 2)
-    // Check total = 1070, orderCount = 3
-    const check = {
-      id: 'chk-shared-1',
+  it('computes open and settled figures for two independent sessions on the same table', () => {
+    const check1 = {
+      id: 'chk-session-1',
       status: 'OPEN',
-      total: 1070.00,
-      subtotal: 950.00,
-      tax: 47.50,
-      serviceCharge: 72.50,
+      total: 450.00,
+      subtotal: 400.00,
+      tax: 20.00,
+      serviceCharge: 30.00,
       paid: 0,
-      outstanding: 1070.00,
-      orderCount: 3,
+      outstanding: 450.00,
+      orderCount: 1,
+      invoiceNumber: null as string | null,
+    }
+    const check2 = {
+      id: 'chk-session-2',
+      status: 'OPEN',
+      total: 620.00,
+      subtotal: 550.00,
+      tax: 27.50,
+      serviceCharge: 42.50,
+      paid: 0,
+      outstanding: 620.00,
+      orderCount: 2,
       invoiceNumber: null as string | null,
     }
 
-    // Sitting 1 (Diner 1): 1 order of 450.00
     const sitting1Orders = [
       { id: 'ord-d1', itemsTotal: 400.00, discount: 0, tax: 20.00, serviceCharge: 30.00, total: 450.00, status: 'SERVED', paymentStatus: 'UNPAID' }
     ]
-
-    // Sitting 2 (Diner 2): 2 orders totaling 620.00
     const sitting2Orders = [
       { id: 'ord-d2-1', itemsTotal: 300.00, discount: 0, tax: 15.00, serviceCharge: 25.00, total: 340.00, status: 'SERVED', paymentStatus: 'UNPAID' },
       { id: 'ord-d2-2', itemsTotal: 250.00, discount: 0, tax: 12.50, serviceCharge: 17.50, total: 280.00, status: 'SERVED', paymentStatus: 'UNPAID' },
     ]
 
-    // Calculate sitting amounts using orders.tsx logic
-    function calculateSitting(rows: any[], currentCheck: typeof check) {
+    function calculateSitting(rows: any[], currentCheck: typeof check1) {
       const onTheBill = rows.filter((o) => !['CANCELLED', 'PENDING_ACTIVATION'].includes(o.status))
       const fallbackTotal = +onTheBill.reduce((n, o) => n + o.total, 0).toFixed(2)
       const isSettledCheck = currentCheck.status === 'PAID' || Boolean(currentCheck.invoiceNumber)
-      const sharedBill = Boolean(currentCheck) && currentCheck.orderCount !== onTheBill.length
-      const total = !currentCheck || sharedBill ? fallbackTotal : currentCheck.total
+      const total = !currentCheck ? fallbackTotal : currentCheck.total
       const localSubtotal = +onTheBill.reduce((n, o) => n + o.itemsTotal - o.discount, 0).toFixed(2)
       const localTax = +onTheBill.reduce((n, o) => n + o.tax, 0).toFixed(2)
       const localService = +onTheBill.reduce((n, o) => n + (o.serviceCharge ?? 0), 0).toFixed(2)
-      const subtotal = !currentCheck || sharedBill ? localSubtotal : (currentCheck.subtotal ?? localSubtotal)
-      const tax = !currentCheck || sharedBill ? localTax : (currentCheck.tax ?? localTax)
-      const service = !currentCheck || sharedBill ? localService : (currentCheck.serviceCharge !== undefined ? currentCheck.serviceCharge : localService)
+      const subtotal = !currentCheck ? localSubtotal : (currentCheck.subtotal ?? localSubtotal)
+      const tax = !currentCheck ? localTax : (currentCheck.tax ?? localTax)
+      const service = !currentCheck ? localService : (currentCheck.serviceCharge !== undefined ? currentCheck.serviceCharge : localService)
       const allOrdersPaid = rows.every((o) => o.paymentStatus === 'PAID')
-      const paid = !currentCheck || sharedBill
+      const paid = !currentCheck
         ? (isSettledCheck ? fallbackTotal : (allOrdersPaid ? fallbackTotal : +onTheBill.reduce((n, o) => n + (o.paymentStatus === 'PAID' ? o.total : 0), 0).toFixed(2)))
         : (isSettledCheck ? (currentCheck.paid ?? currentCheck.total ?? fallbackTotal) : currentCheck.paid)
-      const due = isSettledCheck ? 0 : (!currentCheck || sharedBill ? +Math.max(0, total - paid).toFixed(2) : Math.max(0, currentCheck.outstanding))
+      const due = isSettledCheck ? 0 : (!currentCheck ? +Math.max(0, total - paid).toFixed(2) : Math.max(0, currentCheck.outstanding))
 
-      return { total, subtotal, tax, service, paid, due, sharedBill }
+      return { total, subtotal, tax, service, paid, due }
     }
 
-    // 1. OPEN STATE
-    const openS1 = calculateSitting(sitting1Orders, check)
-    const openS2 = calculateSitting(sitting2Orders, check)
+    const openS1 = calculateSitting(sitting1Orders, check1)
+    const openS2 = calculateSitting(sitting2Orders, check2)
 
-    assert.equal(openS1.sharedBill, true)
-    assert.equal(openS1.total, 450.00, 'Diner 1 open total must be 450, not combined 1070')
+    assert.equal(openS1.total, 450.00)
     assert.equal(openS1.subtotal, 400.00)
     assert.equal(openS1.tax, 20.00)
     assert.equal(openS1.service, 30.00)
     assert.equal(openS1.paid, 0.00)
     assert.equal(openS1.due, 450.00)
 
-    assert.equal(openS2.sharedBill, true)
-    assert.equal(openS2.total, 620.00, 'Diner 2 open total must be 620, not combined 1070')
+    assert.equal(openS2.total, 620.00)
     assert.equal(openS2.subtotal, 550.00)
     assert.equal(openS2.tax, 27.50)
     assert.equal(openS2.service, 42.50)
     assert.equal(openS2.paid, 0.00)
     assert.equal(openS2.due, 620.00)
 
-    // 2. SETTLED STATE
-    const settledCheck = {
-      ...check,
-      status: 'PAID',
-      paid: 1070.00,
-      outstanding: 0,
-      invoiceNumber: 'INV-2026-SHARED-01',
-    }
+    const settledS1 = calculateSitting(sitting1Orders, { ...check1, status: 'PAID', paid: 450.00, outstanding: 0, invoiceNumber: 'INV-2026-01' })
+    const settledS2 = calculateSitting(sitting2Orders, { ...check2, status: 'PAID', paid: 620.00, outstanding: 0, invoiceNumber: 'INV-2026-02' })
 
-    const settledS1 = calculateSitting(sitting1Orders, settledCheck)
-    const settledS2 = calculateSitting(sitting2Orders, settledCheck)
-
-    assert.equal(settledS1.sharedBill, true, 'Settled shared bill must remain flagged as sharedBill')
-    assert.equal(settledS1.total, 450.00, 'Diner 1 settled total must be 450, NOT combined 1070')
-    assert.equal(settledS1.subtotal, 400.00)
-    assert.equal(settledS1.tax, 20.00)
-    assert.equal(settledS1.service, 30.00)
-    assert.equal(settledS1.paid, 450.00, 'Diner 1 settled paid must be 450, NOT combined 1070')
+    assert.equal(settledS1.total, 450.00)
+    assert.equal(settledS1.paid, 450.00)
     assert.equal(settledS1.due, 0.00)
-
-    assert.equal(settledS2.sharedBill, true, 'Settled shared bill must remain flagged as sharedBill')
-    assert.equal(settledS2.total, 620.00, 'Diner 2 settled total must be 620, NOT combined 1070')
-    assert.equal(settledS2.subtotal, 550.00)
-    assert.equal(settledS2.tax, 27.50)
-    assert.equal(settledS2.service, 42.50)
-    assert.equal(settledS2.paid, 620.00, 'Diner 2 settled paid must be 620, NOT combined 1070')
+    assert.equal(settledS2.total, 620.00)
+    assert.equal(settledS2.paid, 620.00)
     assert.equal(settledS2.due, 0.00)
-  })
-
-  it('unshared check uses check authoritative figures', () => {
-    const singleSittingCheck = {
-      id: 'chk-single-1',
-      status: 'PAID',
-      total: 525.00,
-      subtotal: 500.00,
-      tax: 25.00,
-      serviceCharge: 0,
-      paid: 525.00,
-      outstanding: 0,
-      orderCount: 1,
-      invoiceNumber: 'INV-SINGLE-1',
-    }
-    const singleOrders = [
-      { id: 'ord-s1', itemsTotal: 500.00, discount: 0, tax: 25.00, serviceCharge: 0, total: 525.00, status: 'SERVED', paymentStatus: 'PAID' }
-    ]
-    const onTheBill = singleOrders
-    const fallbackTotal = +onTheBill.reduce((n, o) => n + o.total, 0).toFixed(2)
-    const isSettledCheck = singleSittingCheck.status === 'PAID'
-    const sharedBill = Boolean(singleSittingCheck) && singleSittingCheck.orderCount !== onTheBill.length
-    assert.equal(sharedBill, false, 'Single sitting must not be sharedBill')
-    const total = !singleSittingCheck || sharedBill ? fallbackTotal : singleSittingCheck.total
-    const paid = isSettledCheck ? (singleSittingCheck.paid ?? singleSittingCheck.total ?? fallbackTotal) : singleSittingCheck.paid
-    assert.equal(total, 525.00)
-    assert.equal(paid, 525.00)
   })
 })
 
@@ -279,17 +236,17 @@ describe('PR #2 Fix 4: Preserve configured service-charge rate after settlement'
   })
 })
 
-describe('PR #2 Fix 5: Reconcile service charges on open shared checks', () => {
+describe('PR #2 Fix 5: Reconcile service charges on session checks', () => {
   const ordersCode = readFileSync(resolve('src/components/views/orders.tsx'), 'utf8')
 
-  it('calculates selected sitting service charge from onTheBill on same basis as subtotal and tax', () => {
+  it('calculates selected sitting service charge from onTheBill when check is absent', () => {
     assert.ok(
       ordersCode.includes('const localService = +onTheBill.reduce((n, o) => n + (o.serviceCharge ?? 0), 0).toFixed(2)'),
       'localService must be reduced across onTheBill'
     )
     assert.ok(
-      ordersCode.includes('const service = !check || sharedBill\n        ? localService'),
-      'service must use localService when sharedBill is true'
+      ordersCode.includes('const service = !check\n        ? localService'),
+      'service must use localService when check is absent'
     )
   })
 

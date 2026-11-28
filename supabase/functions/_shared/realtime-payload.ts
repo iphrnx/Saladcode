@@ -83,9 +83,14 @@ export function staffTopicName(tenantId: string, secret: string): string {
   return `staff:${tenantId}:${secret}`;
 }
 
+/** Independent capability topic for the Security dashboard (requires security.view). */
+export function securityTopicName(tenantId: string, secret: string): string {
+  return `security:${tenantId}:${secret}`;
+}
+
 /** True for the capability topics; decides whether a channel is private. */
 export function isCapabilityTopic(topic: string): boolean {
-  return topic.startsWith("staff:") || topic.startsWith("diner:");
+  return topic.startsWith("staff:") || topic.startsWith("security:") || topic.startsWith("diner:");
 }
 
 /** The topic one diner listens on: their own session token is the capability. */

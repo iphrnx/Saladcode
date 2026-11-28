@@ -15,7 +15,7 @@ import { cn } from '@/lib/utils'
  *
  *   * It only ever shows orders from THIS session. The endpoint is pinned to
  *     the session token, so another diner at the same table is not visible
- *     here — their orders are on the shared bill, not on this list.
+ *     here — their orders belong to their own independent session and bill.
  *   * It is read-only. Nothing here can change an order's state; the kitchen
  *     does that, and the list follows.
  */

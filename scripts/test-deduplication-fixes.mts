@@ -60,9 +60,8 @@ console.log("\n── 2. Tax & Service Charge: Client Alignment ──");
     billDialog.includes("doc.taxBreakup?.cgstAmount")
   );
   check(
-    "bill-dialog defaults tax rate to 8% (not 5%)",
-    billDialog.includes("tenant.taxRate ?? 8") &&
-    !billDialog.includes("tenant.taxRate ?? 5")
+    "bill-dialog defaults tax rate to 5% (matching schema default)",
+    billDialog.includes("tenant.taxRate ?? 5")
   );
 }
 

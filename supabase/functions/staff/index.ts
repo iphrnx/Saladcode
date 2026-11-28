@@ -15,6 +15,7 @@ import { clientIp } from "../_shared/ip.ts";
 import { embedCount, toCamel } from "../_shared/case.ts";
 import { body, json, preflight, subPath } from "../_shared/http.ts";
 import { enforceWriteLimit } from "../_shared/plans.ts";
+import { publishSecuritySignal } from "../_shared/realtime.ts";
 import { staffModules } from "../_shared/staff-modules.ts";
 
 /**
@@ -134,7 +135,7 @@ function clearCookie(): string[] {
 
 type AuthResult =
   | { ok: true; staff: any; token: string }
-  | { ok: false; error: string; lockedUntil?: string };
+  | { ok: false; error: string; status?: number; lockedUntil?: string };
 
 async function authenticateStaff(tenantId: string, employeeId: string, pin: string, req: Request): Promise<AuthResult> {
   const db = admin();
@@ -231,7 +232,7 @@ async function authenticateStaff(tenantId: string, employeeId: string, pin: stri
   // Record the client the session was created from so the owner's Security
   // dashboard can show staff sessions with browser / OS / device / IP, like
   // owner sessions (migration 0055).
-  const { data: session } = await db
+  const { data: session, error: sessionErr } = await db
     .from("staff_sessions")
     .insert({
       tenant_id: tenantId,
@@ -242,6 +243,15 @@ async function authenticateStaff(tenantId: string, employeeId: string, pin: stri
     .select("token")
     .single();
 
+  if (sessionErr || !session?.token) {
+    console.error("staff_sessions insert failed:", sessionErr);
+    return {
+      ok: false,
+      status: 500,
+      error: "Could not start staff session. Please try again.",
+    };
+  }
+
   await db.from("staff_activities").insert({
     staff_id: staff.id,
     tenant_id: tenantId,
@@ -249,7 +259,9 @@ async function authenticateStaff(tenantId: string, employeeId: string, pin: stri
     meta: "Staff login via PIN",
   });
 
-  return { ok: true, staff, token: session!.token };
+  await publishSecuritySignal(tenantId);
+
+  return { ok: true, staff, token: session.token };
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +292,9 @@ async function endStaffSession(token: string): Promise<void> {
   }
 
   await db.from("staff_sessions").delete().eq("id", session.id);
+  if (tenantId) {
+    await publishSecuritySignal(tenantId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +447,11 @@ async function loginPost(req: Request): Promise<Response> {
 
   const result = await authenticateStaff(tenantId, employeeId, pin, req);
   if (!result.ok) {
-    return json(req, { error: result.error, lockedUntil: result.lockedUntil }, 401);
+    return json(
+      req,
+      { error: result.error, lockedUntil: result.lockedUntil },
+      result.status ?? 401,
+    );
   }
 
   return jsonWithCookie(req, {

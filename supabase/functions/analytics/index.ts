@@ -116,6 +116,7 @@ serve(async (req: Request) => {
   const rangeEnd = new Date(zonedStart(toStr, timeZone).getTime() + DAY_MS); // exclusive
 
   const selectedLocationId = url.searchParams.get("location_id") || url.searchParams.get("locationId") || null;
+  const compareEnabled = url.searchParams.get("compare") !== "0";
 
   /* -------------------------------------------------------------------------- */
   /* Pre-load tables and categories for menu items mapping                      */
@@ -131,13 +132,21 @@ serve(async (req: Request) => {
 
   const { data: menuRows } = await db
     .from("menu_items")
-    .select("id, category:categories(name)")
+    .select("id, name, available, category:categories(name)")
     .eq("tenant_id", tenantId)
     .limit(5000);
   const catMap: Record<string, string> = {};
+  const menuCatalog: { id: string; name: string; category: string; available: boolean }[] = [];
   for (const m of menuRows ?? []) {
     const category = Array.isArray((m as any).category) ? (m as any).category[0] : (m as any).category;
-    catMap[(m as any).id] = category?.name || "Other";
+    const catName = category?.name || "Other";
+    catMap[(m as any).id] = catName;
+    menuCatalog.push({
+      id: (m as any).id,
+      name: (m as any).name || "Unnamed Item",
+      category: catName,
+      available: Boolean((m as any).available ?? true),
+    });
   }
 
   /* -------------------------------------------------------------------------- */
@@ -330,7 +339,7 @@ serve(async (req: Request) => {
     const paidAtOrders = await fetchAllPages<any>(async (from, to) => {
       return await db
         .from("orders")
-        .select("id, order_number, order_type, table_id, table_session_id, check_id, status, payment_status, items_total, discount, tax, service_charge, total, paid_at, completed_at, created_at, served_by_id, payment_method, location_id, items:order_items(id, menu_item_id, name, price, quantity)")
+        .select("id, order_number, order_type, table_id, table_session_id, check_id, status, payment_status, items_total, discount, promo_code, tax, service_charge, total, paid_at, completed_at, created_at, served_by_id, payment_method, location_id, items:order_items(id, menu_item_id, name, price, quantity)")
         .eq("tenant_id", tenantId)
         .neq("status", "CANCELLED")
         .neq("status", "REJECTED")
@@ -351,7 +360,7 @@ serve(async (req: Request) => {
         const chunkOrders = await fetchAllPages<any>(async (from, to) => {
           return await db
             .from("orders")
-            .select("id, order_number, order_type, table_id, table_session_id, check_id, status, payment_status, items_total, discount, tax, service_charge, total, paid_at, completed_at, created_at, served_by_id, payment_method, location_id, items:order_items(id, menu_item_id, name, price, quantity)")
+            .select("id, order_number, order_type, table_id, table_session_id, check_id, status, payment_status, items_total, discount, promo_code, tax, service_charge, total, paid_at, completed_at, created_at, served_by_id, payment_method, location_id, items:order_items(id, menu_item_id, name, price, quantity)")
             .eq("tenant_id", tenantId)
             .neq("status", "CANCELLED")
             .neq("status", "REJECTED")
@@ -403,193 +412,412 @@ serve(async (req: Request) => {
   }
 
   /* -------------------------------------------------------------------------- */
-  /* Reconcile Main Reporting Window                                            */
+  /* Helper: Build Reconciled Summary for any Window                            */
   /* -------------------------------------------------------------------------- */
-  const { events: mainEvents, checkMap: mainCheckMap, orders: mainOrders } =
-    await getReconciledEventsForWindow(rangeStart, rangeEnd);
+  async function summarizeWindow(winStart: Date, winEnd: Date) {
+    const { events, checkMap, orders } = await getReconciledEventsForWindow(winStart, winEnd);
 
-  // Apply location filter uniformly
-  const filteredEvents = mainEvents.filter((e) => {
-    if (!selectedLocationId) return true;
-    return e.locationId === selectedLocationId;
-  });
+    const locEvents = events.filter((e) => !selectedLocationId || e.locationId === selectedLocationId);
+    const qualOrders: any[] = [];
 
-  const qualifyingOrders: any[] = [];
-  for (const o of mainOrders) {
-    const locId = resolveEntityLocation(o, mainCheckMap);
-    if (selectedLocationId && locId !== selectedLocationId) continue;
+    for (const o of orders) {
+      const locId = resolveEntityLocation(o, checkMap);
+      if (selectedLocationId && locId !== selectedLocationId) continue;
 
-    // Check if order belongs to a check that settled in this window
-    let settlementTime: Date | null = null;
-    if (o.check_id) {
-      // Find the check's authoritative settlement event
-      const chkEvent = mainEvents.find((e) => e.checkId === o.check_id);
-      if (chkEvent) settlementTime = chkEvent.settledAt;
-    } else if (o.paid_at) {
-      settlementTime = new Date(o.paid_at);
-    } else if (o.completed_at) {
-      settlementTime = new Date(o.completed_at);
+      let settlementTime: Date | null = null;
+      if (o.check_id) {
+        const chkEvent = events.find((e) => e.checkId === o.check_id);
+        if (chkEvent) settlementTime = chkEvent.settledAt;
+      } else if (o.paid_at) {
+        settlementTime = new Date(o.paid_at);
+      } else if (o.completed_at) {
+        settlementTime = new Date(o.completed_at);
+      }
+
+      if (!settlementTime || isNaN(settlementTime.getTime())) continue;
+      if (settlementTime < winStart || settlementTime >= winEnd) continue;
+
+      const chk = o.check_id ? checkMap.get(o.check_id) : null;
+      const effectiveTableId = o.table_id || chk?.table_id || null;
+      const resolvedTable = effectiveTableId ? tableMap.get(effectiveTableId) : null;
+
+      let normalizedType = String(o.order_type || chk?.order_type || (effectiveTableId ? "DINE_IN" : "TAKEAWAY"))
+        .toUpperCase()
+        .replace(/[-\s]/g, "_");
+      if (!["DINE_IN", "TAKEAWAY", "DELIVERY"].includes(normalizedType)) {
+        normalizedType = effectiveTableId ? "DINE_IN" : "TAKEAWAY";
+      }
+
+      const sessionKey = o.table_session_id || chk?.session_id || chk?.anchor_session_id || o.check_id || o.id;
+
+      qualOrders.push({
+        id: o.id,
+        orderNumber: o.order_number,
+        total: Number(o.total || 0),
+        itemsTotal: Number(o.items_total || o.total || 0),
+        discount: Number(o.discount || 0),
+        promoCode: o.promo_code || null,
+        tax: Number(o.tax || 0),
+        serviceCharge: Number(o.service_charge || 0),
+        orderType: normalizedType,
+        tableId: effectiveTableId,
+        tableName: resolvedTable?.name || (normalizedType === "DINE_IN" ? "Table" : normalizedType),
+        sessionKey,
+        settledAt: settlementTime,
+        createdAt: o.created_at ? new Date(o.created_at) : null,
+        completedAt: o.completed_at ? new Date(o.completed_at) : null,
+        checkId: o.check_id || null,
+        paymentMethod: o.payment_method || null,
+        items: (o.items ?? []).map((it: any) => ({
+          menuItemId: it.menu_item_id,
+          name: it.name,
+          price: Number(it.price || 0),
+          quantity: Number(it.quantity || 0),
+        })),
+      });
     }
 
-    if (!settlementTime || isNaN(settlementTime.getTime())) continue;
-    if (settlementTime < rangeStart || settlementTime >= rangeEnd) continue;
-
-    const chk = o.check_id ? mainCheckMap.get(o.check_id) : null;
-    const effectiveTableId = o.table_id || chk?.table_id || null;
-    const resolvedTable = effectiveTableId ? tableMap.get(effectiveTableId) : null;
-
-    let normalizedType = String(o.order_type || chk?.order_type || (effectiveTableId ? "DINE_IN" : "TAKEAWAY"))
-      .toUpperCase()
-      .replace(/[-\s]/g, "_");
-    if (!["DINE_IN", "TAKEAWAY", "DELIVERY"].includes(normalizedType)) {
-      normalizedType = effectiveTableId ? "DINE_IN" : "TAKEAWAY";
+    const daily: { date: string; label: string; revenue: number; orders: number }[] = [];
+    for (let t = winStart.getTime(); t < winEnd.getTime(); t += DAY_MS) {
+      const dayStart = new Date(t);
+      const dayEnd = new Date(t + DAY_MS);
+      const dayRevenue = locEvents
+        .filter((e) => e.settledAt >= dayStart && e.settledAt < dayEnd)
+        .reduce((s, e) => s + e.amount, 0);
+      const dayOrderCount = qualOrders.filter(
+        (o) => o.settledAt >= dayStart && o.settledAt < dayEnd
+      ).length;
+      const dateStr = zonedDateStr(dayStart, timeZone);
+      const dayOfWeek = new Date(`${dateStr}T00:00:00Z`).getUTCDay();
+      daily.push({
+        date: dateStr,
+        label: DAY_LABELS[dayOfWeek],
+        revenue: +dayRevenue.toFixed(2),
+        orders: dayOrderCount,
+      });
     }
 
-    qualifyingOrders.push({
-      id: o.id,
-      orderNumber: o.order_number,
-      total: Number(o.total || 0),
-      itemsTotal: Number(o.items_total || o.total || 0),
-      discount: Number(o.discount || 0),
-      tax: Number(o.tax || 0),
-      serviceCharge: Number(o.service_charge || 0),
-      orderType: normalizedType,
-      tableId: effectiveTableId,
-      tableName: resolvedTable?.name || (normalizedType === "DINE_IN" ? "Table" : normalizedType),
-      settledAt: settlementTime,
-      checkId: o.check_id || null,
-      paymentMethod: o.payment_method || null,
-      items: (o.items ?? []).map((it: any) => ({
-        menuItemId: it.menu_item_id,
-        name: it.name,
-        price: Number(it.price || 0),
-        quantity: Number(it.quantity || 0),
-      })),
-    });
+    const rev = +(daily.reduce((s, d) => s + d.revenue, 0)).toFixed(2);
+    const cnt = qualOrders.length;
+    const avg = cnt > 0 ? +(rev / cnt).toFixed(2) : 0;
+    const net = +(qualOrders.reduce((s: number, o: any) => s + Math.max(0, o.itemsTotal - o.discount), 0)).toFixed(2);
+
+    const catRev: Record<string, { revenue: number; units: number }> = {};
+    for (const o of qualOrders) {
+      for (const it of o.items) {
+        const cat = (it.menuItemId && catMap[it.menuItemId]) || "Other";
+        if (!catRev[cat]) catRev[cat] = { revenue: 0, units: 0 };
+        catRev[cat].revenue += Number(it.price || 0) * Number(it.quantity || 0);
+        catRev[cat].units += Number(it.quantity || 0);
+      }
+    }
+
+    return {
+      events: locEvents,
+      checkMap,
+      orders: qualOrders,
+      daily,
+      totalRevenue: rev,
+      totalOrders: cnt,
+      avgOrder: avg,
+      netSales: net,
+      catRev,
+    };
   }
 
-  // Payment method breakdowns (Cash, UPI, Card, Other accurately reported)
-  // Exclude zero-amount settlement events (e.g. ₹0 comped sales) from payment-method transaction counts
-  let cashAmount = 0, cashCount = 0;
-  let upiAmount = 0, upiCount = 0;
-  let cardAmount = 0, cardCount = 0;
-  let otherAmount = 0, otherCount = 0;
+  /* -------------------------------------------------------------------------- */
+  /* Reconcile Main Reporting Window & Previous Period                          */
+  /* -------------------------------------------------------------------------- */
+  const mainSummary = await summarizeWindow(rangeStart, rangeEnd);
+  const filteredEvents = mainSummary.events;
+  const mainCheckMap = mainSummary.checkMap;
+  const qualifyingOrders = mainSummary.orders;
+  const dailyRevenue = mainSummary.daily;
+  const totalRevenue = mainSummary.totalRevenue;
+  const totalOrders = mainSummary.totalOrders;
+  const avgOrder = mainSummary.avgOrder;
+  const netSales = mainSummary.netSales;
+
+  const taxCollected = +(qualifyingOrders.reduce((s: number, o: any) => s + o.tax, 0)).toFixed(2);
+  const serviceChargeCollected = +(qualifyingOrders.reduce((s: number, o: any) => s + o.serviceCharge, 0)).toFixed(2);
+
+  // Previous period of equal day count immediately preceding rangeStart
+  const periodDays = Math.max(1, dailyRevenue.length);
+  const prevEnd = rangeStart;
+  const prevStart = new Date(rangeStart.getTime() - periodDays * DAY_MS);
+  const prevFromStr = zonedDateStr(prevStart, timeZone);
+  const prevToStr = zonedDateStr(new Date(prevEnd.getTime() - DAY_MS), timeZone);
+  const prevSummary = compareEnabled ? await summarizeWindow(prevStart, prevEnd) : null;
+
+  /* -------------------------------------------------------------------------- */
+  /* Refunds & Discounts (Audited Attribution)                                  */
+  /* -------------------------------------------------------------------------- */
+  // 1. Voided ledger payments in window (explicit payment method)
+  const voidPayments = await fetchAllPages<any>(async (from, to) => {
+    return await db
+      .from("check_payments")
+      .select("id, check_id, amount, method, location_id, created_at")
+      .eq("tenant_id", tenantId)
+      .eq("status", "VOID")
+      .gte("created_at", rangeStart.toISOString())
+      .lt("created_at", rangeEnd.toISOString())
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true })
+      .range(from, to);
+  });
+
+  // 2. Refunded orders in window (may lack check_payments VOID record)
+  const refundedOrders = await fetchAllPages<any>(async (from, to) => {
+    return await db
+      .from("orders")
+      .select("id, order_number, check_id, table_id, total, payment_method, payment_status, location_id, paid_at, updated_at, created_at")
+      .eq("tenant_id", tenantId)
+      .in("payment_status", ["REFUNDED", "refunded"])
+      .gte("updated_at", rangeStart.toISOString())
+      .lt("updated_at", rangeEnd.toISOString())
+      .order("updated_at", { ascending: true })
+      .order("id", { ascending: true })
+      .range(from, to);
+  });
+
+  // Payment method breakdowns (Cash, UPI, Card, Other) + Refunds
+  const pmStats = {
+    CASH: { amount: 0, count: 0, refunds: 0, refundCount: 0 },
+    UPI: { amount: 0, count: 0, refunds: 0, refundCount: 0 },
+    CARD: { amount: 0, count: 0, refunds: 0, refundCount: 0 },
+    OTHER: { amount: 0, count: 0, refunds: 0, refundCount: 0 },
+  };
+  let unattributedRefundAmount = 0;
+  let unattributedRefundCount = 0;
 
   for (const e of filteredEvents) {
     if (e.amount <= 0) continue;
-    if (e.method === "CASH") {
-      cashAmount += e.amount;
-      cashCount++;
-    } else if (e.method === "UPI") {
-      upiAmount += e.amount;
-      upiCount++;
-    } else if (e.method === "CARD") {
-      cardAmount += e.amount;
-      cardCount++;
+    pmStats[e.method].amount += e.amount;
+    pmStats[e.method].count++;
+  }
+
+  const voidCheckIds = new Set<string>();
+  const refundDailyMap: Record<string, { amount: number; count: number }> = {};
+
+  for (const vp of voidPayments) {
+    const locId = resolveEntityLocation(vp, mainCheckMap);
+    if (selectedLocationId && locId !== selectedLocationId) continue;
+    if (vp.check_id) voidCheckIds.add(vp.check_id);
+    const amt = Number(vp.amount || 0);
+    if (amt <= 0) continue;
+    const rawM = String(vp.method || "").toUpperCase();
+    const m: "CASH" | "UPI" | "CARD" | "OTHER" =
+      rawM === "CASH" ? "CASH" : rawM === "UPI" ? "UPI" : rawM === "CARD" ? "CARD" : "OTHER";
+    pmStats[m].refunds += amt;
+    pmStats[m].refundCount++;
+    const dStr = zonedDateStr(new Date(vp.created_at), timeZone);
+    if (!refundDailyMap[dStr]) refundDailyMap[dStr] = { amount: 0, count: 0 };
+    refundDailyMap[dStr].amount += amt;
+    refundDailyMap[dStr].count++;
+  }
+
+  for (const ro of refundedOrders) {
+    if (ro.check_id && voidCheckIds.has(ro.check_id)) continue;
+    const locId = resolveEntityLocation(ro, mainCheckMap);
+    if (selectedLocationId && locId !== selectedLocationId) continue;
+    const amt = Number(ro.total || 0);
+    if (amt <= 0) continue;
+    const rawM = String(ro.payment_method || "").toUpperCase();
+    if (rawM === "CASH" || rawM === "UPI" || rawM === "CARD") {
+      pmStats[rawM].refunds += amt;
+      pmStats[rawM].refundCount++;
     } else {
-      otherAmount += e.amount;
-      otherCount++;
+      unattributedRefundAmount += amt;
+      unattributedRefundCount++;
     }
+    const ts = ro.paid_at || ro.updated_at || ro.created_at;
+    const dStr = zonedDateStr(new Date(ts), timeZone);
+    if (!refundDailyMap[dStr]) refundDailyMap[dStr] = { amount: 0, count: 0 };
+    refundDailyMap[dStr].amount += amt;
+    refundDailyMap[dStr].count++;
   }
 
   /* -------------------------------------------------------------------------- */
-  /* Daily Revenue Aggregation (Asia/Kolkata timezone boundaries)               */
+  /* Top & Least Selling Items, Order Types, Tables, Hourly, Categories         */
   /* -------------------------------------------------------------------------- */
-  const dailyRevenue: { date: string; label: string; revenue: number; orders: number }[] = [];
-  for (let t = rangeStart.getTime(); t < rangeEnd.getTime(); t += DAY_MS) {
-    const dayStart = new Date(t);
-    const dayEnd = new Date(t + DAY_MS);
-
-    const dayEvents = filteredEvents.filter(
-      (e) => e.settledAt >= dayStart && e.settledAt < dayEnd
-    );
-    const dayRevenue = dayEvents.reduce((s, e) => s + e.amount, 0);
-
-    const dayOrders = qualifyingOrders.filter(
-      (o) => o.settledAt >= dayStart && o.settledAt < dayEnd
-    );
-
-    const dateStr = zonedDateStr(dayStart, timeZone);
-    const dayOfWeek = new Date(`${dateStr}T00:00:00Z`).getUTCDay();
-
-    dailyRevenue.push({
-      date: dateStr,
-      label: DAY_LABELS[dayOfWeek],
-      revenue: +dayRevenue.toFixed(2),
-      orders: dayOrders.length,
-    });
-  }
-
-  // Gross Collected is the EXACT sum of daily reconciled revenues
-  const totalRevenue = +(dailyRevenue.reduce((s, d) => s + d.revenue, 0)).toFixed(2);
-  const totalOrders = qualifyingOrders.length;
-  const avgOrder = totalOrders > 0 ? +(totalRevenue / totalOrders).toFixed(2) : 0;
-
-  const netSales = qualifyingOrders.reduce((s: number, o: any) => s + Math.max(0, o.itemsTotal - o.discount), 0);
-  const taxCollected = qualifyingOrders.reduce((s: number, o: any) => s + o.tax, 0);
-  const serviceChargeCollected = qualifyingOrders.reduce((s: number, o: any) => s + o.serviceCharge, 0);
-
-  /* -------------------------------------------------------------------------- */
-  /* Top Items, Types, Tables, Hourly, Categories                               */
-  /* -------------------------------------------------------------------------- */
-  const itemCounts: Record<string, { name: string; qty: number; revenue: number }> = {};
+  const itemCounts: Record<string, { menuItemId: string | null; name: string; category: string; qty: number; revenue: number }> = {};
+  const soldMenuIds = new Set<string>();
   for (const o of qualifyingOrders) {
     for (const it of o.items) {
       const key = it.menuItemId || it.name;
-      if (!itemCounts[key]) itemCounts[key] = { name: it.name, qty: 0, revenue: 0 };
+      if (it.menuItemId) soldMenuIds.add(it.menuItemId);
+      const cat = (it.menuItemId && catMap[it.menuItemId]) || "Uncategorized / Historical";
+      if (!itemCounts[key]) {
+        itemCounts[key] = { menuItemId: it.menuItemId || null, name: it.name, category: cat, qty: 0, revenue: 0 };
+      }
       itemCounts[key].qty += it.quantity;
       itemCounts[key].revenue += it.price * it.quantity;
     }
   }
-  const topItems = Object.values(itemCounts)
-    .sort((a, b) => b.qty - a.qty || b.revenue - a.revenue)
-    .slice(0, 6)
-    .map((t) => ({ ...t, revenue: +t.revenue.toFixed(2) }));
+  const allItems = Object.values(itemCounts)
+    .map((t) => ({ ...t, revenue: +t.revenue.toFixed(2) }))
+    .sort((a, b) => b.qty - a.qty || b.revenue - a.revenue || a.name.localeCompare(b.name));
+  const topItems = allItems.slice(0, 6).map(({ name, qty, revenue }) => ({ name, qty, revenue }));
+  const zeroSaleItems = menuCatalog
+    .filter((m) => m.available && !soldMenuIds.has(m.id))
+    .map((m) => ({ menuItemId: m.id, name: m.name, category: m.category, qty: 0, revenue: 0 }))
+    .sort((a, b) => a.name.localeCompare(b.name));
 
-  const typeMap: Record<string, { count: number; revenue: number }> = {};
+  const typeMap: Record<string, { count: number; revenue: number }> = {
+    DINE_IN: { count: 0, revenue: 0 },
+    TAKEAWAY: { count: 0, revenue: 0 },
+    DELIVERY: { count: 0, revenue: 0 },
+  };
   for (const o of qualifyingOrders) {
     const t = o.orderType;
     if (!typeMap[t]) typeMap[t] = { count: 0, revenue: 0 };
     typeMap[t].count++;
     typeMap[t].revenue += Number(o.total || 0);
   }
+  const typeTotalRev = Object.values(typeMap).reduce((s, v) => s + v.revenue, 0);
   const typeBreakdown = Object.entries(typeMap)
-    .filter(([_, v]) => v.count > 0)
+    .filter(([k, v]) => ["DINE_IN", "TAKEAWAY", "DELIVERY"].includes(k) || v.count > 0)
     .map(([type, v]) => ({
       type,
       count: v.count,
       revenue: +v.revenue.toFixed(2),
+      share: typeTotalRev > 0 ? +((v.revenue / typeTotalRev) * 100).toFixed(1) : 0,
+      avgOrder: v.count > 0 ? +(v.revenue / v.count).toFixed(2) : 0,
     }));
 
-  const tablePerf: Record<string, { name: string; orders: number; revenue: number }> = {};
+  // Top Tables: Count distinct sessions and settled revenue per table
+  const tablePerf: Record<string, { tableId: string; name: string; orders: number; sessionKeys: Set<string>; revenue: number }> = {};
   for (const o of qualifyingOrders) {
     if (!o.tableId) continue;
     const name = o.tableName || tableMap.get(o.tableId)?.name || "Table";
-    if (!tablePerf[o.tableId]) tablePerf[o.tableId] = { name, orders: 0, revenue: 0 };
+    if (!tablePerf[o.tableId]) {
+      tablePerf[o.tableId] = { tableId: o.tableId, name, orders: 0, sessionKeys: new Set(), revenue: 0 };
+    }
     tablePerf[o.tableId].orders++;
+    tablePerf[o.tableId].sessionKeys.add(String(o.sessionKey));
     tablePerf[o.tableId].revenue += Number(o.total || 0);
   }
   const topTables = Object.values(tablePerf)
-    .sort((a, b) => b.revenue - a.revenue)
-    .slice(0, 6)
-    .map((t) => ({ ...t, revenue: +t.revenue.toFixed(2) }));
+    .map((t) => {
+      const sessions = t.sessionKeys.size;
+      const rev = +t.revenue.toFixed(2);
+      return {
+        tableId: t.tableId,
+        name: t.name,
+        orders: t.orders,
+        sessions,
+        revenue: rev,
+        avgBill: sessions > 0 ? +(rev / sessions).toFixed(2) : 0,
+      };
+    })
+    .sort((a, b) => b.revenue - a.revenue || b.sessions - a.sessions)
+    .slice(0, 10);
 
   const hourly: number[] = new Array(24).fill(0);
+  const hourlyRev: number[] = new Array(24).fill(0);
   for (const o of qualifyingOrders) {
     const h = zonedHour(o.settledAt, timeZone);
-    if (h >= 0 && h < 24) hourly[h]++;
-  }
-
-  const catRevenue: Record<string, number> = {};
-  for (const o of qualifyingOrders) {
-    for (const it of o.items) {
-      const cat = catMap[it.menuItemId] || "Other";
-      catRevenue[cat] = (catRevenue[cat] || 0) + Number(it.price || 0) * Number(it.quantity || 0);
+    if (h >= 0 && h < 24) {
+      hourly[h]++;
+      hourlyRev[h] += Number(o.total || 0);
     }
   }
-  const categoryBreakdown = Object.entries(catRevenue)
-    .map(([name, value]) => ({ name, value: +Number(value || 0).toFixed(2) }))
+  const hourlyDetailed = hourly.map((ordersCount, h) => ({
+    hour: h,
+    label: `${h}:00`,
+    displayHour: h === 0 ? "12 AM" : h === 12 ? "12 PM" : h > 12 ? `${h - 12} PM` : `${h} AM`,
+    orders: ordersCount,
+    revenue: +hourlyRev[h].toFixed(2),
+  }));
+
+  const totalCatRev = Object.values(mainSummary.catRev).reduce((s, v) => s + v.revenue, 0);
+  const categoryBreakdown = Object.entries(mainSummary.catRev)
+    .map(([name, v]) => {
+      const rev = +Number(v.revenue || 0).toFixed(2);
+      const prevVal = prevSummary ? +(prevSummary.catRev[name]?.revenue ?? 0).toFixed(2) : null;
+      const growthPct = prevVal !== null && prevVal > 0 ? +(((rev - prevVal) / prevVal) * 100).toFixed(1) : null;
+      return {
+        name,
+        value: rev,
+        units: v.units,
+        share: totalCatRev > 0 ? +((rev / totalCatRev) * 100).toFixed(1) : 0,
+        prevValue: prevVal,
+        growthPct,
+      };
+    })
     .sort((a, b) => b.value - a.value);
+
+  /* -------------------------------------------------------------------------- */
+  /* Operations Performance (Valid Timestamps Only)                             */
+  /* -------------------------------------------------------------------------- */
+  const serviceDurationsMin: number[] = [];
+  let excludedServiceCount = 0;
+  for (const o of qualifyingOrders) {
+    if (o.createdAt && o.completedAt && !isNaN(o.createdAt.getTime()) && !isNaN(o.completedAt.getTime())) {
+      const diffMin = (o.completedAt.getTime() - o.createdAt.getTime()) / 60000;
+      if (diffMin >= 0 && diffMin <= 1440) {
+        serviceDurationsMin.push(diffMin);
+      } else {
+        excludedServiceCount++;
+      }
+    } else {
+      excludedServiceCount++;
+    }
+  }
+  serviceDurationsMin.sort((a, b) => a - b);
+  const avgServiceMin = serviceDurationsMin.length > 0
+    ? +(serviceDurationsMin.reduce((s, d) => s + d, 0) / serviceDurationsMin.length).toFixed(1)
+    : null;
+  const medianServiceMin = serviceDurationsMin.length > 0
+    ? +serviceDurationsMin[Math.floor(serviceDurationsMin.length / 2)].toFixed(1)
+    : null;
+
+  /* -------------------------------------------------------------------------- */
+  /* Discounts & Refunds Summary                                                */
+  /* -------------------------------------------------------------------------- */
+  let totalDiscounts = 0;
+  let discountedOrders = 0;
+  const promoMap: Record<string, { code: string; count: number; amount: number }> = {};
+  const discountDailyMap: Record<string, { amount: number; count: number }> = {};
+
+  for (const o of qualifyingOrders) {
+    if (o.discount > 0) {
+      totalDiscounts += o.discount;
+      discountedOrders++;
+      const code = o.promoCode || "Manual / Direct Discount";
+      if (!promoMap[code]) promoMap[code] = { code, count: 0, amount: 0 };
+      promoMap[code].count++;
+      promoMap[code].amount += o.discount;
+
+      const dStr = zonedDateStr(o.settledAt, timeZone);
+      if (!discountDailyMap[dStr]) discountDailyMap[dStr] = { amount: 0, count: 0 };
+      discountDailyMap[dStr].amount += o.discount;
+      discountDailyMap[dStr].count++;
+    }
+  }
+
+  const totalRefunds = +(
+    pmStats.CASH.refunds +
+    pmStats.UPI.refunds +
+    pmStats.CARD.refunds +
+    pmStats.OTHER.refunds +
+    unattributedRefundAmount
+  ).toFixed(2);
+  const totalRefundCount =
+    pmStats.CASH.refundCount +
+    pmStats.UPI.refundCount +
+    pmStats.CARD.refundCount +
+    pmStats.OTHER.refundCount +
+    unattributedRefundCount;
+
+  const discountsAndRefundsTrend = dailyRevenue.map((d) => ({
+    date: d.date,
+    label: d.label,
+    discounts: +(discountDailyMap[d.date]?.amount ?? 0).toFixed(2),
+    discountCount: discountDailyMap[d.date]?.count ?? 0,
+    refunds: +(refundDailyMap[d.date]?.amount ?? 0).toFixed(2),
+    refundCount: refundDailyMap[d.date]?.count ?? 0,
+  }));
 
   /* -------------------------------------------------------------------------- */
   /* Independent Today & Yesterday Queries (Run through identical reconciliation)*/
@@ -598,21 +826,13 @@ serve(async (req: Request) => {
   const tomorrowStart = new Date(todayStart.getTime() + DAY_MS);
   const yesterdayStart = new Date(todayStart.getTime() - DAY_MS);
 
-  // Today's independent reconciliation
   const { events: todayEvents } = await getReconciledEventsForWindow(todayStart, tomorrowStart);
-  const filteredTodayEvents = todayEvents.filter((e) => {
-    if (!selectedLocationId) return true;
-    return e.locationId === selectedLocationId;
-  });
+  const filteredTodayEvents = todayEvents.filter((e) => !selectedLocationId || e.locationId === selectedLocationId);
   const todaysRevenue = +(filteredTodayEvents.reduce((s, e) => s + e.amount, 0)).toFixed(2);
   const todaysOrders = filteredTodayEvents.length;
 
-  // Yesterday's independent reconciliation
   const { events: yestEvents } = await getReconciledEventsForWindow(yesterdayStart, todayStart);
-  const filteredYestEvents = yestEvents.filter((e) => {
-    if (!selectedLocationId) return true;
-    return e.locationId === selectedLocationId;
-  });
+  const filteredYestEvents = yestEvents.filter((e) => !selectedLocationId || e.locationId === selectedLocationId);
   const yestRevenue = +(filteredYestEvents.reduce((s, e) => s + e.amount, 0)).toFixed(2);
 
   let revenueChange = 0;
@@ -634,18 +854,45 @@ serve(async (req: Request) => {
     .eq("active", true)
     .order("is_primary", { ascending: false });
 
-  const paymentBreakdownTotal = +(cashAmount + upiAmount + cardAmount + otherAmount).toFixed(2);
+  const totalCollected = +(
+    pmStats.CASH.amount +
+    pmStats.UPI.amount +
+    pmStats.CARD.amount +
+    pmStats.OTHER.amount
+  ).toFixed(2);
+
+  const pmEntry = (s: { amount: number; count: number; refunds: number; refundCount: number }) => ({
+    amount: +s.amount.toFixed(2),
+    count: s.count,
+    refunds: +s.refunds.toFixed(2),
+    refundCount: s.refundCount,
+    net: +(s.amount - s.refunds).toFixed(2),
+  });
 
   return json(req, {
     range: { from: fromStr, to: toStr, days: dailyRevenue.length, timezone: timeZone },
+    previousPeriod: prevSummary
+      ? {
+          from: prevFromStr,
+          to: prevToStr,
+          days: periodDays,
+          totalRevenue: prevSummary.totalRevenue,
+          totalOrders: prevSummary.totalOrders,
+          avgOrder: prevSummary.avgOrder,
+          netSales: prevSummary.netSales,
+          dailyRevenue: prevSummary.daily,
+        }
+      : null,
     totalRevenue,
     totalOrders,
     avgOrder: +avgOrder.toFixed(2),
     netSales: +netSales.toFixed(2),
-    taxCollected: +taxCollected.toFixed(2),
-    serviceChargeCollected: +serviceChargeCollected.toFixed(2),
+    taxCollected,
+    serviceChargeCollected,
     dailyRevenue,
     topItems: isAdvanced ? topItems : [],
+    allItems: isAdvanced ? allItems : [],
+    zeroSaleItems: isAdvanced ? zeroSaleItems : [],
     categoryBreakdown: isAdvanced ? categoryBreakdown : [],
     advanced: isAdvanced,
     todaysRevenue,
@@ -654,12 +901,55 @@ serve(async (req: Request) => {
     typeBreakdown: isAdvanced ? typeBreakdown : [],
     topTables: isAdvanced ? topTables : [],
     hourly: isAdvanced ? hourly : [],
+    hourlyDetailed: isAdvanced ? hourlyDetailed : [],
     paymentMethods: {
-      cash: { amount: +cashAmount.toFixed(2), count: cashCount },
-      upi: { amount: +upiAmount.toFixed(2), count: upiCount },
-      card: { amount: +cardAmount.toFixed(2), count: cardCount },
-      other: { amount: +otherAmount.toFixed(2), count: otherCount },
-      total: paymentBreakdownTotal > 0 ? paymentBreakdownTotal : totalRevenue,
+      cash: pmEntry(pmStats.CASH),
+      upi: pmEntry(pmStats.UPI),
+      card: pmEntry(pmStats.CARD),
+      other: pmEntry(pmStats.OTHER),
+      unattributedRefunds: {
+        amount: +unattributedRefundAmount.toFixed(2),
+        count: unattributedRefundCount,
+      },
+      totalCollected,
+      totalRefunds,
+      totalNet: +(totalCollected - totalRefunds).toFixed(2),
+      total: totalCollected > 0 ? totalCollected : totalRevenue,
+    },
+    operations: isAdvanced
+      ? {
+          orderVolume: totalOrders,
+          prepTime: {
+            available: false,
+            reason: "Kitchen stage timestamps (preparing_at / ready_at) are not recorded in the current schema.",
+          },
+          serviceTime: {
+            available: serviceDurationsMin.length > 0,
+            startEvent: "Order Created (created_at)",
+            endEvent: "Order Completed (completed_at)",
+            avgMinutes: avgServiceMin,
+            medianMinutes: medianServiceMin,
+            sampleCount: serviceDurationsMin.length,
+            excludedCount: excludedServiceCount,
+          },
+        }
+      : null,
+    discountsAndRefunds: {
+      totalDiscounts: +totalDiscounts.toFixed(2),
+      discountedOrders,
+      discountBreakdown: Object.values(promoMap)
+        .map((p) => ({ ...p, amount: +p.amount.toFixed(2) }))
+        .sort((a, b) => b.amount - a.amount),
+      totalRefunds,
+      refundCount: totalRefundCount,
+      refundBreakdown: [
+        ...(pmStats.CASH.refundCount > 0 ? [{ method: "Cash", count: pmStats.CASH.refundCount, amount: +pmStats.CASH.refunds.toFixed(2) }] : []),
+        ...(pmStats.UPI.refundCount > 0 ? [{ method: "UPI", count: pmStats.UPI.refundCount, amount: +pmStats.UPI.refunds.toFixed(2) }] : []),
+        ...(pmStats.CARD.refundCount > 0 ? [{ method: "Card", count: pmStats.CARD.refundCount, amount: +pmStats.CARD.refunds.toFixed(2) }] : []),
+        ...(pmStats.OTHER.refundCount > 0 ? [{ method: "Other / Legacy", count: pmStats.OTHER.refundCount, amount: +pmStats.OTHER.refunds.toFixed(2) }] : []),
+        ...(unattributedRefundCount > 0 ? [{ method: "Method Unavailable", count: unattributedRefundCount, amount: +unattributedRefundAmount.toFixed(2) }] : []),
+      ],
+      trend: discountsAndRefundsTrend,
     },
     locations: (locRows ?? []).map((l: any) => ({ id: l.id, name: l.name, isPrimary: l.is_primary })),
     multiLocationEnabled,

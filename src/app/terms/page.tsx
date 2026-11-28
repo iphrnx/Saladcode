@@ -43,7 +43,7 @@ export default function TermsPage() {
         <p>
           {BUSINESS.productName} is software for running a restaurant: point of sale, table QR
           ordering, order and kitchen flow, staff roles and permissions, menu and portion
-          management, promotions, reservations, customer reviews, GST-compliant billing and
+          management, promotions, customer reviews, GST-compliant billing and
           analytics. The service is delivered over the internet; nothing is installed at the
           restaurant beyond a browser.
         </p>

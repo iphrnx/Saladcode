@@ -85,7 +85,6 @@ export function SessionOrdersDrawer({
     total: number
     paid: number
     due: number
-    sharedBill: boolean
     awaiting: boolean
   }
   canPay?: boolean

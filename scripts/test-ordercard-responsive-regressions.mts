@@ -40,7 +40,7 @@ console.log('▶ 1. Order Header Responsive Layout & Wrapping Contracts...')
 
 test('OrderRow header has flex-wrap to avoid clipping on narrow viewports', () => {
   assert.ok(
-    ordersSrc.includes('flex min-h-9 flex-wrap items-center justify-between gap-x-1.5 gap-y-1 py-0.5'),
+    ordersSrc.includes('flex flex-wrap items-center justify-between gap-x-2 gap-y-1'),
     'OrderRow header must allow flex-wrap on narrow viewports',
   )
 })
@@ -69,7 +69,7 @@ test('OrderRow status badge handles long labels like "Awaiting Acceptance" with 
     'Must handle PENDING_ACTIVATION as Awaiting Acceptance',
   )
   assert.ok(
-    ordersSrc.includes('max-w-full shrink-0 items-center gap-1 sm:gap-1.5 rounded-full px-2 sm:px-2.5 py-0.5 text-xs font-semibold border transition-colors'),
+    ordersSrc.includes('ml-auto flex max-w-full shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11.5px] font-semibold border transition-colors'),
     'Status badge must be capped to max-w-full with responsive padding',
   )
   assert.ok(
@@ -81,10 +81,10 @@ test('OrderRow status badge handles long labels like "Awaiting Acceptance" with 
 // ── 2. Collapsed Order Preview Thumbnail Contracts ─────────────────────────
 console.log('\n▶ 2. Collapsed Order Preview Thumbnail & Name Space Contracts...')
 
-test('DishThumb uses responsive size (size-9 sm:size-10 / 36-40px)', () => {
+test('DishThumb uses responsive size (size-8 sm:size-9 / 32-36px)', () => {
   assert.ok(
-    ordersSrc.includes('relative grid size-9 sm:size-10 shrink-0 place-items-center overflow-hidden rounded-xl bg-orange-50/70'),
-    'DishThumb must use size-9 sm:size-10 (36px to 40px) instead of bloated 48px',
+    ordersSrc.includes('relative grid size-8 sm:size-9 shrink-0 place-items-center overflow-hidden rounded-lg bg-orange-50/70'),
+    'DishThumb must use size-8 sm:size-9 (32px to 36px) instead of bloated 48px',
   )
 })
 
@@ -109,18 +109,18 @@ test('Badge count responsive calculation adapts between viewports', () => {
     'When items count is exactly 3, +1 badge is shown only when 3rd thumbnail is hidden',
   )
   assert.ok(
-    ordersSrc.includes('className="min-[400px]:hidden sm:grid md:hidden lg:grid xl:hidden grid size-9 sm:size-10'),
+    ordersSrc.includes('className="min-[400px]:hidden sm:grid md:hidden lg:grid xl:hidden grid size-8 sm:size-9'),
     'When items count is 3, +1 badge renders with complementary visibility matching hidden 3rd thumbnail',
   )
 })
 
 test('Item names preview has flex-1, min-w-0, and line-clamp-2', () => {
   assert.ok(
-    ordersSrc.includes('span className="min-w-0 flex-1 pl-1 sm:pl-1.5"'),
+    ordersSrc.includes('span className="min-w-0 flex-1 pl-1"'),
     'Preview names wrapper must have flex-1 and min-w-0',
   )
   assert.ok(
-    ordersSrc.includes('className="line-clamp-2 text-xs sm:text-[12.5px] leading-snug font-medium text-foreground/80"'),
+    ordersSrc.includes('className="line-clamp-2 text-xs leading-snug font-medium text-foreground/80"'),
     'Preview names must be line-clamp-2 with readable font size',
   )
 })
@@ -130,7 +130,7 @@ console.log('\n▶ 3. Four-Column Session Strip Contracts...')
 
 test('Session information strip uses grid-cols-4 with divider lines', () => {
   assert.ok(
-    ordersSrc.includes('grid grid-cols-4 divide-x divide-orange-200/50 dark:divide-border/50 rounded-xl sm:rounded-2xl'),
+    ordersSrc.includes('grid grid-cols-4 divide-x divide-orange-200/50 dark:divide-border/50 rounded-[11px]'),
     'Strip must be grid-cols-4 with divider lines',
   )
 })
@@ -178,7 +178,7 @@ test('Amount due has accessible light-mode contrast (>= 4.5:1) against #fff7ed',
 
 test('Serving-status chip has accessible light-mode contrast (>= 4.5:1) against white card', () => {
   assert.ok(
-    ordersSrc.includes("border-orange-300 bg-white dark:bg-card text-orange-700 dark:border-orange-500/50 dark:text-orange-400"),
+    ordersSrc.includes("border-orange-300/80 bg-white dark:bg-card text-orange-700 dark:border-orange-500/50 dark:text-orange-400"),
     'Serving chip must use text-orange-700 for WCAG AA contrast against white background',
   )
   const contrast = ratio('#c2410c', '#ffffff')
@@ -207,17 +207,25 @@ test('Expanded-order controls (+N items and Order details) have accessible light
 
 test('Collapsed overflow badges (+N and +1) have accessible light-mode contrast (>= 4.5:1) against orange-50', () => {
   assert.ok(
-    ordersSrc.includes("bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs sm:text-[13px] font-bold text-orange-700 dark:text-orange-400"),
-    '+N badge must use text-orange-700 for WCAG AA contrast against bg-orange-50',
-  )
-  assert.ok(
     ordersSrc.includes("bg-orange-50 dark:bg-orange-950/40 border border-orange-200/70 dark:border-orange-900/50 text-xs font-bold text-orange-700 dark:text-orange-400"),
-    '+1 badge must use text-orange-700 for WCAG AA contrast against bg-orange-50',
+    '+N and +1 badges must use text-orange-700 for WCAG AA contrast against bg-orange-50',
   )
   const contrast = ratio('#c2410c', '#fff7ed')
   assert.ok(
     contrast >= 4.5,
     `Contrast ratio of overflow badges against #fff7ed must be >= 4.5:1, got ${contrast.toFixed(2)}:1`,
+  )
+})
+
+test('Complete & Pay button has accessible contrast (>= 4.5:1) in both themes', () => {
+  assert.ok(
+    ordersSrc.includes("from-[#c2410c] to-[#9a3412] hover:from-[#9a3412] hover:to-[#7c2d12] text-white"),
+    'Complete & Pay button must use dark orange gradient (#c2410c -> #9a3412) with white text',
+  )
+  const minContrast = Math.min(ratio('#ffffff', '#c2410c'), ratio('#ffffff', '#9a3412'))
+  assert.ok(
+    minContrast >= 4.5,
+    `Contrast ratio of Complete & Pay white text must be >= 4.5:1, got ${minContrast.toFixed(2)}:1`,
   )
 })
 
@@ -340,11 +348,11 @@ console.log('\n▶ 7. Session Card Footer Actions Layout & Wrapping Contracts...
 
 test('Footer container uses flex-wrap and button uses flex-1 min-w-[10.5rem] to allow wrapping', () => {
   assert.ok(
-    ordersSrc.includes('flex flex-wrap items-center gap-2.5'),
+    ordersSrc.includes('flex flex-wrap items-center gap-2'),
     'Footer container must allow wrapping with flex flex-wrap instead of rigid grid',
   )
   assert.ok(
-    ordersSrc.includes('flex-1 min-w-[10.5rem] gap-1.5 rounded-xl sm:rounded-2xl px-4 text-center font-bold text-xs sm:text-[14px] whitespace-nowrap'),
+    ordersSrc.includes('flex-1 min-w-[10.5rem] gap-1.5 rounded-xl px-3.5 text-center font-bold text-xs sm:text-[13px] whitespace-nowrap'),
     'Button must define min-w-[10.5rem] and flex-1 so it wraps when card is too narrow',
   )
 })
