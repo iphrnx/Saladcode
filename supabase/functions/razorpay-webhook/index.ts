@@ -950,23 +950,34 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       }
 
       const refundOutcome = String((refundRpcRes as any)?.outcome ?? "");
-      if (refundOutcome === "pending_recorded" || refundOutcome === "failed_recorded") {
-        return { summary: `refund ${verifiedRefundStatus} (not finalized)`, tenantId };
+      if (
+        refundOutcome === "pending_recorded" ||
+        refundOutcome === "failed_recorded" ||
+        refundOutcome === "pending_reconciliation"
+      ) {
+        return {
+          summary: refundOutcome === "pending_reconciliation"
+            ? "refund pending reconciliation"
+            : `refund ${verifiedRefundStatus} (not finalized)`,
+          tenantId,
+        };
       }
 
       if (refundOutcome === "processed" || refundOutcome === "already_processed") {
-        // Record the refund audit entry immediately once the ledger confirms
-        // the refund, before PDF/email side effects that may fail and retry.
+        const internalRefundId: string | null = (refundRpcRes as any)?.refund_uuid ?? null;
+        // Confirm the refund audit entry (written atomically by
+        // record_subscription_refund) before PDF/email work that may retry.
         await auditRefundIdempotent(db, tenantId, tenant.plan, planId, eventId, {
           paymentId: targetPaymentId,
           refundId: verifiedRefundId,
+          internalRefundId,
           totalRefunded: (refundRpcRes as any)?.total_refunded ?? null,
           isFullyRefunded: (refundRpcRes as any)?.is_fully_refunded ?? null,
         });
 
         // Ensure the refund document and notification email are issued even on
         // retries where the ledger update already succeeded on an earlier run.
-        // issueRefundDocument and queueForTenant are idempotent by refund/event key.
+        // issueRefundDocument and queueForTenant are idempotent by durable refund identity.
         const refund = refundEntity;
         const { data: ledgerRow, error: ledgerErr } = await db
           .from("subscription_payments")
@@ -988,8 +999,11 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
           if (!refundDoc) {
             throw new Error(`could not issue refund document for ${String(targetPaymentId)}`);
           }
+          const emailEventKey = internalRefundId
+            ? `payment_refunded:${internalRefundId}`
+            : `payment_refunded:${String(targetPaymentId)}:${verifiedRefundId ?? "doc"}`;
           await queueForTenant(db, tenantId, {
-            eventKey: `payment_refunded:${String(targetPaymentId)}:${verifiedRefundId ?? "doc"}`,
+            eventKey: emailEventKey,
             eventType: "payment_refunded",
             planName: (ledgerRow as any).plan_id,
             amount: docAmount,
@@ -1095,6 +1109,7 @@ async function auditRefundIdempotent(
   detail: {
     paymentId: unknown;
     refundId: string | null;
+    internalRefundId?: string | null;
     totalRefunded: unknown;
     isFullyRefunded: unknown;
   },

@@ -107,17 +107,22 @@ export function refundFactsFromRow(
   row: any,
   seller: SellerIdentity,
 ): RefundFacts {
+  const hasSellerSnapshot = row.seller_name != null;
   return {
     refundNumber: row.refund_number,
     refundDate: fmtDate(row.refund_date),
     originalInvoiceNumber: row.original_invoice_number,
     originalInvoiceDate: row.original_invoice_date ? fmtDate(row.original_invoice_date) : null,
-    sellerName: row.seller_name || seller.name,
-    sellerAddressLines: row.seller_address
-      ? String(row.seller_address).split("\n").map((l: string) => l.trim()).filter(Boolean)
+    sellerName: hasSellerSnapshot ? (row.seller_name || "The Salad") : seller.name,
+    sellerAddressLines: hasSellerSnapshot
+      ? String(row.seller_address ?? "").split("\n").map((l: string) => l.trim()).filter(Boolean)
       : seller.addressLines,
-    sellerEmail: row.seller_email || seller.email || null,
-    sellerPhone: row.seller_phone || seller.phone || null,
+    sellerEmail: hasSellerSnapshot
+      ? (String(row.seller_email ?? "").trim() || null)
+      : (seller.email || null),
+    sellerPhone: hasSellerSnapshot
+      ? (String(row.seller_phone ?? "").trim() || null)
+      : (seller.phone || null),
     buyerName: row.buyer_name,
     buyerEmail: row.buyer_email,
     buyerAddressLines: String(row.buyer_address ?? "").split("\n").map((l: string) => l.trim()).filter(Boolean),
@@ -351,6 +356,7 @@ export async function ensureRefundAuditIdempotent(
     detail: {
       paymentId: unknown;
       refundId: string | null;
+      internalRefundId?: string | null;
       totalRefunded: unknown;
       isFullyRefunded: unknown;
     };

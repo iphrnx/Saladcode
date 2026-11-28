@@ -395,6 +395,13 @@ type BillingPayment = {
       razorpay_refund_id: string | null
     } | null
   }>
+  pendingReconciliations?: Array<{
+    id: string
+    amount: number
+    currency: string
+    status: string
+    created_at: string
+  }>
 }
 
 type BillingRefundDoc = NonNullable<BillingPayment['refundDocument']>
@@ -587,6 +594,43 @@ function PaymentHistoryRows(props: {
                         </span>
                       )
                     })}
+                    {p.status === 'succeeded' && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-9 gap-1.5 rounded-lg border-[#f97316]/40 bg-[#f97316]/5 px-3.5 text-[12.5px] font-semibold text-[#ea580c] hover:bg-[#f97316]/15 hover:text-[#ea580c]"
+                        title="Print the invoice"
+                        onClick={() => onReceipt(p, null)}
+                      >
+                        <Printer className="h-4 w-4" />
+                        Print Invoice
+                      </Button>
+                    )}
+                    {(p.pendingReconciliations ?? []).map((rec) => (
+                      <span
+                        key={rec.id}
+                        className="inline-flex items-center rounded-lg border border-amber-300/70 bg-amber-50/70 px-2.5 py-1 text-[11.5px] font-medium text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300"
+                        title="Refund event is awaiting provider identity verification"
+                      >
+                        {money(rec.currency ?? p.currency, Number(rec.amount))} awaiting verification
+                      </span>
+                    ))}
+                  </>
+                )
+              }
+
+              if ((p.pendingReconciliations ?? []).length > 0) {
+                return (
+                  <>
+                    {(p.pendingReconciliations ?? []).map((rec) => (
+                      <span
+                        key={rec.id}
+                        className="inline-flex items-center rounded-lg border border-amber-300/70 bg-amber-50/70 px-2.5 py-1 text-[11.5px] font-medium text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300"
+                        title="Refund event is awaiting provider identity verification"
+                      >
+                        {money(rec.currency ?? p.currency, Number(rec.amount))} awaiting verification
+                      </span>
+                    ))}
                     {p.status === 'succeeded' && (
                       <Button
                         size="sm"
@@ -1248,18 +1292,23 @@ export function SettingsView() {
       ? new Date(new Date(periodStart ?? p.created_at).getTime() + 30 * 86_400_000).toISOString()
       : null)
     if (refund) {
+      const hasRefundSellerSnapshot = refund.seller_name != null
       return {
         kind: 'refund' as const,
         title: 'REFUND',
         number: refund.refund_number ?? doc?.invoice_number ?? p.transaction_id ?? p.id.slice(0, 8),
         date: docDate(refund.refund_date ?? paidIso),
         badge: 'REFUNDED',
-        sellerName: refund.seller_name || seller.name || 'The Salad',
-        sellerLines: refund.seller_address
-          ? String(refund.seller_address).split('\n').map((l) => l.trim()).filter(Boolean)
+        sellerName: hasRefundSellerSnapshot ? (refund.seller_name || 'The Salad') : (seller.name || 'The Salad'),
+        sellerLines: hasRefundSellerSnapshot
+          ? String(refund.seller_address ?? '').split('\n').map((l) => l.trim()).filter(Boolean)
           : seller.addressLines,
-        sellerEmail: refund.seller_email || seller.email || null,
-        sellerPhone: refund.seller_phone || seller.phone || null,
+        sellerEmail: hasRefundSellerSnapshot
+          ? (String(refund.seller_email ?? '').trim() || null)
+          : (seller.email || null),
+        sellerPhone: hasRefundSellerSnapshot
+          ? (String(refund.seller_phone ?? '').trim() || null)
+          : (seller.phone || null),
         buyerName: refund.buyer_name ?? '—',
         buyerEmail: refund.buyer_email ?? null,
         // Preserve explicit null buyer_address from the persisted refund snapshot.
@@ -1470,11 +1519,11 @@ export function SettingsView() {
    * PDF, and replays the same immutable document on every later
    * request. `kind` selects the invoice or its linked refund document.
    */
-  async function downloadInvoice(
+  const downloadInvoice = useCallback(async (
     p: (typeof payments)[number],
     kind: 'invoice' | 'refund' = 'invoice',
     target?: RefundDownloadTarget | string | null,
-  ) {
+  ) => {
     const normalized: RefundDownloadTarget =
       typeof target === 'string'
         ? { refundId: target }
@@ -1518,7 +1567,8 @@ export function SettingsView() {
     } finally {
       setInvoiceBusy(null)
     }
-  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadBilling])
 
   // ---- derived billing state ----
   const latestPayment = payments[0] ?? null
@@ -2791,10 +2841,25 @@ export function SettingsView() {
                   )}
                   {(latestPayment.status === 'succeeded' || latestPayment.status === 'refunded') && (() => {
                     const latestEntry = refundEntriesFor(latestPayment)[0] ?? null
+                    const latestRecon = latestPayment.pendingReconciliations?.[0] ?? null
                     const hasRefund =
                       latestPayment.status === 'refunded' ||
                       Number(latestPayment.refunded_amount ?? 0) > 0 ||
                       latestEntry !== null
+
+                    if (!hasRefund && latestRecon) {
+                      return (
+                        <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+                          <span className="inline-flex items-center rounded-lg border border-amber-300/70 bg-amber-50/70 px-2.5 py-1 text-[11.5px] font-medium text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+                            Refund {money(latestRecon.currency ?? latestPayment.currency, Number(latestRecon.amount))} awaiting verification
+                          </span>
+                          <Button size="sm" variant="outline" onClick={() => openReceipt(latestPayment, null)}>
+                            <Printer className="h-3.5 w-3.5 mr-1.5" />
+                            Receipt
+                          </Button>
+                        </div>
+                      )
+                    }
 
                     if (!hasRefund) {
                       return (
@@ -2823,6 +2888,7 @@ export function SettingsView() {
                           variant="outline"
                           disabled={invoiceBusy === busyKey}
                           onClick={() =>
+                            // eslint-disable-next-line react-hooks/refs
                             downloadInvoice(latestPayment, 'refund', {
                               receiptId: latestEntry?.receipt?.id ?? null,
                               refundId: latestEntry?.razorpayRefundId ?? latestEntry?.processedId ?? null,

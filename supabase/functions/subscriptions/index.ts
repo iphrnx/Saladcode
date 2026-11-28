@@ -709,7 +709,7 @@ async function state(req: Request, tenantId: string): Promise<Response> {
   const { data: refunds, error: refundsError } = await admin()
     .from("billing_refunds")
     .select(
-      "id, payment_id, razorpay_payment_id, razorpay_order_id, refund_number, refund_date, amount, currency, description, seller_name, seller_address, seller_email, seller_phone, buyer_name, buyer_email, buyer_address, original_invoice_number, original_invoice_date, razorpay_refund_id, linked_razorpay_refund_id",
+      "id, payment_id, refund_id, razorpay_payment_id, razorpay_order_id, refund_number, refund_date, amount, currency, description, seller_name, seller_address, seller_email, seller_phone, buyer_name, buyer_email, buyer_address, original_invoice_number, original_invoice_date, razorpay_refund_id, linked_razorpay_refund_id",
     )
     .eq("tenant_id", tenantId)
     .order("refund_date", { ascending: false })
@@ -731,12 +731,23 @@ async function state(req: Request, tenantId: string): Promise<Response> {
     console.error("subscriptions state: processed refunds unreadable", processedRefundsError.message);
     return json(req, { error: "Could not load billing documents just now." }, 503);
   }
+  const { data: reconciliationRows, error: reconciliationsError } = await admin()
+    .from("subscription_refund_reconciliations")
+    .select("id, payment_id, razorpay_payment_id, amount, currency, status, created_at")
+    .eq("tenant_id", tenantId)
+    .eq("status", "pending_reconciliation")
+    .order("created_at", { ascending: false });
+  if (reconciliationsError) {
+    console.error("subscriptions state: refund reconciliations unreadable", reconciliationsError.message);
+    return json(req, { error: "Could not load billing documents just now." }, 503);
+  }
   const invoiceByPayment = new Map(
     (invoices ?? []).map((row) => [row.razorpay_payment_id, row]),
   );
   const refundsByPayment = new Map<string, any[]>();
   const receiptByRefundId = new Map<string, any>();
   for (const row of refunds ?? []) {
+    if (row.refund_id) receiptByRefundId.set(row.refund_id, row);
     const linkKey = row.linked_razorpay_refund_id ?? row.razorpay_refund_id;
     if (linkKey) {
       receiptByRefundId.set(linkKey, row);
@@ -759,9 +770,24 @@ async function state(req: Request, tenantId: string): Promise<Response> {
       currency: row.currency,
       processed_at: row.processed_at,
       created_at: row.created_at,
-      receipt: row.razorpay_refund_id ? (receiptByRefundId.get(row.razorpay_refund_id) ?? null) : null,
+      receipt: receiptByRefundId.get(row.id) ??
+        (row.razorpay_refund_id ? (receiptByRefundId.get(row.razorpay_refund_id) ?? null) : null),
     });
     processedByPayment.set(k, list);
+  }
+  const reconciliationsByPayment = new Map<string, any[]>();
+  for (const row of reconciliationRows ?? []) {
+    const k = row.payment_id ?? row.razorpay_payment_id;
+    if (!k) continue;
+    const list = reconciliationsByPayment.get(k) ?? [];
+    list.push({
+      id: row.id,
+      amount: Number(row.amount),
+      currency: row.currency,
+      status: row.status,
+      created_at: row.created_at,
+    });
+    reconciliationsByPayment.set(k, list);
   }
 
   // Every plan's display facts — retired ones included. The catalogue the
@@ -805,50 +831,19 @@ async function state(req: Request, tenantId: string): Promise<Response> {
     payments: (payments ?? []).map((row) => {
       const key = row.razorpay_payment_id ?? row.transaction_id;
       const refundDocs = refundsByPayment.get(row.id) ?? refundsByPayment.get(key) ?? [];
-      const rawProcessed = processedByPayment.get(row.id) ?? processedByPayment.get(key) ?? [];
-      const legacyDocs = refundDocs.filter((d: any) => !d.razorpay_refund_id && !d.linked_razorpay_refund_id);
-      const canReconcileLegacy =
-        rawProcessed.length === 1 &&
-        !rawProcessed[0].receipt &&
-        legacyDocs.length === 1 &&
-        refundDocs.length === 1 &&
-        canReconcileLegacyReceipt(rawProcessed[0], legacyDocs[0], row);
-      const processedRefunds = canReconcileLegacy
-        ? [{ ...rawProcessed[0], receipt: legacyDocs[0] }]
-        : rawProcessed;
+      const processedRefunds = processedByPayment.get(row.id) ?? processedByPayment.get(key) ?? [];
+      const pendingReconciliations =
+        reconciliationsByPayment.get(row.id) ?? reconciliationsByPayment.get(key) ?? [];
       return {
         ...row,
         document: invoiceByPayment.get(key) ?? null,
         refundDocument: refundDocs[0] ?? null,
         refundDocuments: refundDocs,
         processedRefunds,
+        pendingReconciliations,
       };
     }),
   });
-}
-
-function canReconcileLegacyReceipt(processed: any, receipt: any, payment: any): boolean {
-  if (!processed || !receipt || receipt.razorpay_refund_id || receipt.linked_razorpay_refund_id) return false;
-  if (processed.amount == null || receipt.amount == null) return false;
-  if (Number(processed.amount) !== Number(receipt.amount)) return false;
-  const procCurrency = String(processed.currency || payment?.currency || "INR").trim().toUpperCase();
-  const docCurrency = String(receipt.currency || "INR").trim().toUpperCase();
-  if (procCurrency !== docCurrency) return false;
-  if (
-    payment?.razorpay_payment_id &&
-    receipt.razorpay_payment_id &&
-    payment.razorpay_payment_id !== receipt.razorpay_payment_id
-  ) {
-    return false;
-  }
-  const isFullPaymentRefund =
-    payment?.amount != null &&
-    Number(receipt.amount) === Number(payment.amount) &&
-    Number(processed.amount) === Number(payment.amount);
-  const timestampsMatch =
-    Boolean(processed.processed_at && receipt.refund_date) &&
-    Math.abs(new Date(processed.processed_at).getTime() - new Date(receipt.refund_date).getTime()) <= 2000;
-  return isFullPaymentRefund || timestampsMatch;
 }
 
 /** The part of the plan the browser is allowed to see. */
@@ -2252,23 +2247,21 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
         const { data: byRefundId } = await db
           .from("billing_refunds")
           .select("*")
-          .or(`razorpay_refund_id.eq.${targetRefund.razorpay_refund_id},linked_razorpay_refund_id.eq.${targetRefund.razorpay_refund_id}`)
+          .or(`refund_id.eq.${targetRefund.id},razorpay_refund_id.eq.${targetRefund.razorpay_refund_id},linked_razorpay_refund_id.eq.${targetRefund.razorpay_refund_id}`)
           .maybeSingle();
         existing = byRefundId ?? null;
-      } else {
+      } else if (!targetRefund && (processedRefunds ?? []).length === 0) {
         const { data: existingRows } = await db
           .from("billing_refunds")
           .select("*")
           .eq("payment_id", paymentId)
           .is("razorpay_refund_id", null)
           .is("linked_razorpay_refund_id", null)
+          .is("refund_id", null)
           .order("refund_date", { ascending: false })
           .order("created_at", { ascending: false })
           .limit(1);
-        const candidate = existingRows?.[0] ?? null;
-        if (candidate && (!targetRefund || canReconcileLegacyReceipt(targetRefund, candidate, payment))) {
-          existing = candidate;
-        }
+        existing = existingRows?.[0] ?? null;
       }
 
       if (!existing) {
@@ -2284,6 +2277,7 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
           detail: {
             paymentId: payment.razorpay_payment_id ?? paymentId,
             refundId: targetRefund?.razorpay_refund_id ?? null,
+            internalRefundId: targetRefund?.id ?? null,
             totalRefunded: payment.refunded_amount ?? null,
             isFullyRefunded: payment.status === "refunded",
           },
