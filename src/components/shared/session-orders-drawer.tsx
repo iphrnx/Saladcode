@@ -83,8 +83,8 @@ export function SessionOrdersDrawer({
     tax: number
     service: number
     total: number
-    paid: number
-    due: number
+    paid: number | null
+    due: number | null
     awaiting: boolean
   }
   canPay?: boolean
@@ -146,7 +146,7 @@ export function SessionOrdersDrawer({
   const effectiveStartedAt = startedAt || firstOrderTime
   const effectiveEndedAt = endedAt || (state === 'Ended' ? lastOrderTime : null)
 
-  const paidAmount = bill.paid > 0 ? bill.paid : bill.total
+  const paidAmount = bill.paid ?? 0
   const halfTax = bill.tax > 0 ? bill.tax / 2 : 0
   const taxRatePct = bill.subtotal > 0 && bill.tax > 0 ? (bill.tax / bill.subtotal) * 100 : 5
   const halfRatePct = (taxRatePct / 2).toFixed(1).replace(/\.0$/, '')
@@ -216,7 +216,7 @@ export function SessionOrdersDrawer({
   }
 
   // 4. Payment Completed
-  if (state === 'Ended' || bill.paid > 0 || bill.due <= 0) {
+  if ((bill.paid ?? 0) > 0 || bill.due === 0) {
     const payMethodStr = formatPaymentMethod(paymentMethod || orders[0]?.paymentMethod)
     const invStr = formatInvoiceNumber(invoiceNumber)
     timelineEvents.push({
@@ -300,7 +300,7 @@ export function SessionOrdersDrawer({
               <span className="flex size-4 items-center justify-center rounded-full bg-[#16A34A] text-white dark:bg-emerald-500">
                 <Check className="size-2.5 stroke-[3]" />
               </span>
-              <span>{state === 'Ended' || bill.due <= 0 ? 'Paid' : 'Active'}</span>
+              <span>{bill.due === null ? 'Payment allocation unknown' : bill.due === 0 ? 'Paid' : state}</span>
             </div>
           </div>
 
@@ -711,10 +711,10 @@ export function SessionOrdersDrawer({
                 </div>
                 <div className="flex items-baseline gap-1.5 text-[12.5px] font-bold text-foreground">
                   <span className="text-muted-foreground font-semibold">DUE</span>
-                  <span className="tabular-nums font-black text-[#16A34A]">{money(bill.due)}</span>
+                  <span className="tabular-nums font-black text-[#16A34A]">{bill.due === null ? 'Unknown' : money(bill.due)}</span>
                 </div>
                 <span className="rounded-full border border-[#C6F0D4] bg-[#E8F8EE] px-2.5 py-0.5 text-[11px] font-bold text-[#16A34A]">
-                  {state === 'Ended' || bill.due <= 0 ? 'Paid' : 'Active'}
+                  {bill.due === null ? 'Payment allocation unknown' : bill.due === 0 ? 'Paid' : state}
                 </span>
               </div>
             )

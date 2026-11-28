@@ -46,6 +46,7 @@ export function SessionPaymentDialog({
   tableName,
   tableHint,
   currencySymbol = '₹',
+  canCollectPayment,
   open,
   onOpenChange,
   onPaid,
@@ -61,6 +62,7 @@ export function SessionPaymentDialog({
   /** "Main Hall · Dine In" — the sitting's own description. */
   tableHint?: string
   currencySymbol?: string
+  canCollectPayment: boolean
   open: boolean
   onOpenChange: (v: boolean) => void
   /** Fired after a successful settle, so the board can refresh. */
@@ -387,7 +389,7 @@ export function SessionPaymentDialog({
    * For already-settled checks (Due = ₹0): Returns existing settlement and invoice idempotently.
    */
   const pay = async () => {
-    if (!totals || busy) return
+    if (!canCollectPayment || !totals || busy) return
     setBusy(true)
     setError(null)
     try {

@@ -1,0 +1,46 @@
+name: Saladcode launch checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  local-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+      NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:9
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: isolated-placeholder
+      NEXT_PUBLIC_SITE_URL: http://127.0.0.1:3001
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck && npm run lint && npm audit --omit=dev
+      - name: Run offline regressions
+        run: |
+          for suite in pr16-findings-offline table-activation-offline granular-rbac-offline realtime-privacy-offline order-queue-offline invoices-offline emails-offline; do
+            ./node_modules/.bin/tsx "scripts/test-${suite}.mts" || exit 1
+          done
+      - run: npm run build
+  migration-rehearsal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        mode: [fresh, upgrade]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull pinned local database images
+        run: |
+          docker pull public.ecr.aws/supabase/postgres:17.11.0.018
+          docker pull public.ecr.aws/supabase/gotrue:v2.198.0
+          docker pull public.ecr.aws/supabase/storage-api:v1.98.0
+      - run: bash scripts/test-launch-migrations-local.sh "${{ matrix.mode }}"

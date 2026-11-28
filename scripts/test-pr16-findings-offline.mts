@@ -25,7 +25,7 @@ const webhookSrc = fs.readFileSync(
 assert(
   'webhook checks existing email_events before queuing',
   webhookSrc.includes('.from("email_events")') &&
-    webhookSrc.includes('.in("status", ["pending", "sent"])') &&
+    webhookSrc.includes('.in("status", ["pending", "sent", "PENDING", "SENT"])') &&
     webhookSrc.includes('.in("event_key", Array.from(new Set(legacyEmailKeys)))'),
 )
 
@@ -84,7 +84,7 @@ console.log('\n── Finding 2: Historical shared-check totals ──')
 const ordersSrc = fs.readFileSync(path.resolve('src/components/views/orders.tsx'), 'utf8')
 assert(
   'orders.tsx restores sharedBill scoping in sitting builder and SittingCard',
-  ordersSrc.includes('const sharedBill = Boolean(check) && check!.orderCount !== onTheBill.length') &&
+  ordersSrc.includes('check.orderSessionIds[0] !== sessionId') &&
     ordersSrc.includes('const billTotal = sitting.sharedBill ? sitting.total : (check?.total ?? sitting.total)'),
 )
 
@@ -126,14 +126,14 @@ assert(
 // ---------------------------------------------------------------------------
 console.log('\n── Finding 3: Pending refund reconciliation & unknown amounts ──')
 const reconMigration = fs.readFileSync(
-  path.resolve('supabase/migrations/20261128000002_refund_reconciliation_resolution.sql'),
+  path.resolve('supabase/migrations/20261128000003_refund_reconciliation_resolution.sql'),
   'utf8',
 )
 assert(
   'migration drops NOT NULL on amount and adds resolved_refund_id',
   reconMigration.includes('alter column amount drop not null') &&
     reconMigration.includes('add column if not exists resolved_refund_id uuid') &&
-    reconMigration.includes('v_raw_amt         numeric(10, 2) := nullif(p_refund_amount, 0)') &&
+    reconMigration.includes('case when p_refund_amount > 0 then p_refund_amount end') &&
     reconMigration.includes('and webhook_event_id = p_webhook_event_id') &&
     reconMigration.includes('create or replace function public.resolve_pending_refund_reconciliation('),
 )

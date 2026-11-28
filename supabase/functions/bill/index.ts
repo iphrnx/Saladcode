@@ -886,7 +886,7 @@ async function finalize(req: Request): Promise<Response> {
  * 7. Idempotently returns existing invoice if already settled
  */
 async function settleCash(req: Request): Promise<Response> {
-  const g = await guard(req, { anyOf: ["payments.collect", "orders.complete"] });
+  const g = await guard(req, { permission: "payments.collect" });
   if (!g.ok) return g.response;
 
   const b = await req.json().catch(() => ({} as any));

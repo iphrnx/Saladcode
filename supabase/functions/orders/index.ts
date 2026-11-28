@@ -234,18 +234,6 @@ async function validateDinerSession(
   };
 }
 
-async function endTableSession(tenantId: string, tableId?: string, sessionId?: string) {
-  if (!sessionId && !tableId) return;
-  let query = admin()
-    .from("table_sessions")
-    .update({ status: "ENDED", ended_at: new Date().toISOString() })
-    .eq("tenant_id", tenantId)
-    .eq("status", "ACTIVE");
-  if (sessionId) query = query.eq("id", sessionId);
-  if (tableId) query = query.eq("table_id", tableId);
-  await query;
-}
-
 Deno.serve(async (req: Request) => {
   const pf = preflight(req);
   if (pf) return pf;
@@ -1679,7 +1667,7 @@ async function update(req: Request, id: string | null): Promise<Response> {
   // `let` because accepting a table re-reads this row inside the request.
   let { data: current, error: currentError } = await db
     .from("orders")
-    .select("id, status, payment_status, payment_method")
+    .select("id, status, payment_status, payment_method, table_session_id")
     .eq("id", id)
     .eq("tenant_id", g.session.tenantId) // tenant scoping — see header
     .maybeSingle();
@@ -2037,27 +2025,21 @@ async function update(req: Request, id: string | null): Promise<Response> {
 
   // If order was marked COMPLETED for a table or takeaway/delivery session, instantly end any active session
   // for that table or session. Best-effort — a failure must not fail the request.
-  if (order.status === "COMPLETED" && (order.tableId || order.tableSessionId)) {
+  let closedSitting = false;
+  if (order.status === "COMPLETED" && order.tableSessionId) {
     try {
       // End THIS order's session, not the whole table — and only once nothing
       // else on that session is still outstanding. A diner can place several
       // orders in one visit; completing the first must not close their menu
       // while the second is still being cooked.
-      if (order.tableSessionId) {
-        const { count: unresolved } = await admin()
-          .from("orders")
-          .select("id", { count: "exact", head: true })
-          .eq("tenant_id", order.tenantId)
-          .eq("table_session_id", order.tableSessionId)
-          .not("status", "in", "(COMPLETED,CANCELLED)");
-
-        if (!unresolved) {
-          await endTableSession(order.tenantId, undefined, order.tableSessionId);
-        }
-      }
+      const { data: ended, error: endError } = await db.rpc("close_completed_order_sitting", {
+        p_tenant: order.tenantId, p_session: order.tableSessionId,
+      });
+      if (endError) throw endError;
+      closedSitting = ended === true;
       // Ending the sitting does not end the bill: a settled check is closed
       // and numbered here, an unpaid one is left open and flagged.
-      await admin().rpc("settle_check_on_session_end", {
+      if (closedSitting) await admin().rpc("settle_check_on_session_end", {
         p_tenant: order.tenantId,
         p_table: order.tableId ?? null,
         p_actor: null,
@@ -2074,7 +2056,7 @@ async function update(req: Request, id: string | null): Promise<Response> {
     order,
     sessionToken: await sessionTokenFor(order),
   });
-  if (order.status === "COMPLETED" && (order.tableId || order.tableSessionId)) {
+  if (closedSitting) {
     await publishToStaff(order.tenantId, "SESSION_ENDED", {
       sessionId: order.tableSessionId ?? null,
       tableId: order.tableId ?? null,
@@ -2469,7 +2451,7 @@ async function sync(req: Request): Promise<Response> {
       ? db.from("table_checks").select("id, status, invoice_number, closed_at, subtotal, tax, service_charge, total, paid_total").in("id", checkIds).eq("tenant_id", tenantId)
       : Promise.resolve({ data: [] }),
     checkIds.length
-      ? db.from("orders").select("check_id, status, total, items_total, discount, tax").in("check_id", checkIds)
+      ? db.from("orders").select("check_id, table_session_id, status, total, items_total, discount, tax").in("check_id", checkIds)
         .eq("tenant_id", tenantId).not("status", "in", "(CANCELLED,PENDING_ACTIVATION)")
       : Promise.resolve({ data: [] }),
     checkIds.length
@@ -2477,12 +2459,13 @@ async function sync(req: Request): Promise<Response> {
         .eq("tenant_id", tenantId).eq("status", "SUCCEEDED")
       : Promise.resolve({ data: [] }),
     missingSessionIds.length
-      ? db.from("table_sessions").select("id, table_id, status, created_at, ended_at").in("id", missingSessionIds)
+      ? db.from("table_sessions").select("id, table_id, status, created_at, ended_at").eq("tenant_id", tenantId).in("id", missingSessionIds)
       : Promise.resolve({ data: [] }),
   ]);
 
   const checks: Record<string, {
     orderCount: number;
+    orderSessionIds: Array<string | null>;
     allServed: boolean;
     /** Before tax: the items, less discount. What the food cost. */
     subtotal: number;
@@ -2504,12 +2487,13 @@ async function sync(req: Request): Promise<Response> {
     for (const c of checkRows) {
       checks[c.id] = {
         orderCount: 0,
+        orderSessionIds: [],
         allServed: true,
         subtotal: 0,
         tax: 0,
         serviceCharge: Number(c.service_charge ?? 0),
         total: 0,
-        paid: Number(c.paid_total ?? 0),
+        paid: c.status === "PAID" ? Number(c.paid_total ?? 0) : 0,
         outstanding: 0,
         status: c.status,
         invoiceNumber: c.invoice_number ?? null,
@@ -2520,6 +2504,7 @@ async function sync(req: Request): Promise<Response> {
       const c = checks[(o as any).check_id];
       if (!c) continue;
       c.orderCount += 1;
+      if (!c.orderSessionIds.includes(o.table_session_id)) c.orderSessionIds.push(o.table_session_id);
       c.allServed = c.allServed && ["SERVED", "COMPLETED"].includes(String((o as any).status ?? "").toUpperCase());
       c.subtotal += Number((o as any).items_total ?? 0) - Number((o as any).discount ?? 0);
       c.tax += Number((o as any).tax ?? 0);

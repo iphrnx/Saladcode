@@ -78,9 +78,8 @@ Deno.serve(async (req: Request) => {
   const subscriptionEntity = event?.payload?.subscription?.entity ?? null;
   const createdAt = eventCreatedAt(event);
 
-  // Idempotency and ordering, in one transaction: the delivery is recorded once
-  // and an event older than the subscription's newest is not acted on.
-  const { data: gate, error: gateError } = await db.rpc("apply_subscription_event", {
+  // Claim the delivery without advancing the completed-event cursor.
+  const { data: gate, error: gateError } = await db.rpc("claim_subscription_delivery", {
     p_event_id: eventId,
     p_event_type: eventType,
     p_subscription_id: subscriptionEntity?.id ?? null,
@@ -94,47 +93,39 @@ Deno.serve(async (req: Request) => {
     return json(req, { error: "Could not record the event" }, 500);
   }
 
-  if (gate === "duplicate") {
+  if (gate?.status === "duplicate") {
     console.log("razorpay webhook: duplicate delivery", eventId, eventType);
     return json(req, { ok: true, duplicate: true });
   }
 
-  if (gate === "in_progress") {
+  if (gate?.status === "in_progress") {
     console.log("razorpay webhook: event currently being processed by another worker", eventId, eventType);
-    return json(req, { ok: true, in_progress: true });
+    return json(req, { error: "Delivery is not complete yet" }, 503);
   }
 
-  if (gate === "stale") {
-    console.log("razorpay webhook: stale delivery, not applied", eventId, eventType);
-    return json(req, { ok: true, stale: true });
+  if (gate?.status !== "claimed" || !Number.isInteger(gate.attempt)) {
+    return json(req, { error: "Could not claim the delivery" }, 503);
   }
 
   try {
     const result = await handleEvent(event, eventType, eventId);
-    await db
-      .from("subscription_webhook_events")
-      .update({
-        status: "processed",
-        processed_at: new Date().toISOString(),
-        result: result.summary,
-        last_error: null,
-      })
-      .eq("event_id", eventId);
+    const { data: finished, error: finishError } = await db.rpc("finish_subscription_delivery", {
+      p_event_id: eventId, p_attempt: gate.attempt, p_succeeded: true, p_result: result.summary,
+    });
+    if (finishError || finished !== true) {
+      console.error("razorpay webhook: could not confirm completion", finishError?.message);
+      return json(req, { error: "Could not confirm delivery completion" }, 503);
+    }
     return json(req, { ok: true, ...result });
   } catch (e) {
     const message = (e as Error).message ?? "Unexpected error";
     console.error("razorpay webhook: handling failed", eventId, message);
-    await db
-      .from("subscription_webhook_events")
-      .update({
-        status: "failed",
-        last_error: message,
-        result: `error: ${message}`,
-      })
-      .eq("event_id", eventId);
-    // A 500 makes Razorpay retry. The apply_subscription_event gate allows retries when status is 'failed',
-    // ensuring transient failures are safely retried rather than dropped as duplicates (Fix C5).
-    return json(req, { error: message }, 500);
+    const { error: finishError } = await db.rpc("finish_subscription_delivery", {
+      p_event_id: eventId, p_attempt: gate.attempt, p_succeeded: false, p_result: message,
+    });
+    if (finishError) console.error("razorpay webhook: could not record failed attempt", finishError.message);
+    // A failed claim remains retryable rather than being acknowledged.
+    return json(req, { error: "Could not process the delivery" }, 500);
   }
 });
 
@@ -170,7 +161,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       .from("tenants")
       .select("id")
       .eq("razorpay_subscription_id", String(subscription.id))
-      .maybeSingle();
+      .maybeSingle().throwOnError();
     tenantId = linked?.id ?? undefined;
   }
   const orderIdLookup = payment?.order_id ?? orderEntity?.id ?? null;
@@ -324,7 +315,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
           razorpay_subscription_id: razorpaySubscriptionId,
           ...(planInterval ? { billing_interval: planInterval } : {}),
         })
-        .eq("id", tenantId);
+        .eq("id", tenantId).throwOnError();
       // The tenant may have been linked to a different subscription before —
       // an upgrade that started a new mandate, or a duplicate from before
       // checkout dedupe existed. Whatever it was, if it can still take money
@@ -437,7 +428,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
           razorpay_subscription_id: razorpaySubscriptionId,
           ...(planInterval ? { billing_interval: planInterval } : {}),
         })
-        .eq("id", tenantId);
+        .eq("id", tenantId).throwOnError();
 
       // Same one-mandate sweep as activation: a charge that re-links the
       // tenant retires whatever mandate the tenant pointed at before.
@@ -469,7 +460,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
             updated_at: now,
           })
           .eq("razorpay_subscription_id", razorpaySubscriptionId)
-          .eq("status", "pending");
+          .eq("status", "pending").throwOnError();
       }
 
       if (payment?.id) {
@@ -596,14 +587,14 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
         .from("subscription_payments")
         .update({ renewal_status: ended ? "mandate_expired" : "mandate_cancelled" })
         .eq("razorpay_subscription_id", razorpaySubscriptionId)
-        .eq("renewal_status", "scheduled");
+        .eq("renewal_status", "scheduled").throwOnError();
       await db
         .from("tenants")
         .update({
           subscription_status: ended ? "expired" : "cancelled",
           cancel_at_period_end: !ended,
         })
-        .eq("id", tenantId);
+        .eq("id", tenantId).throwOnError();
       await audit(db, tenantId, tenant.plan, planId, ended ? "completed" : "cancelled", eventId, {
         periodEnd,
       });
@@ -632,7 +623,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       if (!aboutCurrentSubscription) {
         return { summary: `event for a previous subscription (${razorpaySubscriptionId})`, tenantId };
       }
-      await db.from("tenants").update({ subscription_status: "paused" }).eq("id", tenantId);
+      await db.from("tenants").update({ subscription_status: "paused" }).eq("id", tenantId).throwOnError();
       await audit(db, tenantId, tenant.plan, planId, "paused", eventId, {});
       return { summary: "paused", tenantId };
     }
@@ -646,11 +637,11 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
         .from("subscription_payments")
         .update({ renewal_status: "mandate_halted" })
         .eq("razorpay_subscription_id", razorpaySubscriptionId)
-        .eq("renewal_status", "scheduled");
+        .eq("renewal_status", "scheduled").throwOnError();
       await db
         .from("tenants")
         .update({ subscription_status: eventType === "subscription.halted" ? "past_due" : "pending" })
-        .eq("id", tenantId);
+        .eq("id", tenantId).throwOnError();
       await audit(db, tenantId, tenant.plan, planId, eventType.replace("subscription.", ""), eventId, {});
       return { summary: eventType, tenantId };
     }
@@ -735,7 +726,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
           subscription_status: "active",
           ...(periodEnd ? { current_period_end: periodEnd } : {}),
         })
-        .eq("id", tenantId);
+        .eq("id", tenantId).throwOnError();
       await audit(db, tenantId, tenant.plan, planId, "resumed", eventId, { periodEnd });
       return { summary: "resumed", tenantId };
     }
@@ -848,62 +839,8 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       return { summary: `recovered annual payment on ${activatedPlanId}`, tenantId };
     }
 
-    case "refund.created": {
-      const targetPaymentId = payment?.id ?? refundEntity?.payment_id ?? null;
-      const refundId = refundEntity?.id ? String(refundEntity.id) : null;
-      if (!targetPaymentId) {
-        return { summary: "refund.created missing payment id", tenantId };
-      }
-      // refund.created indicates an initiated/pending refund unless Razorpay
-      // explicitly marks it processed; do NOT mark payment refunded or issue
-      // refund documents/emails while pending.
-      const refundStatus = refundEntity?.status === "processed" ? "processed" : "pending";
-      const refundAmt = refundEntity?.amount
-        ? fromMinorUnits(Number(refundEntity.amount), String(refundEntity.currency ?? "INR"))
-        : 0;
-      const { error: refundRpcErr } = await db.rpc("record_subscription_refund", {
-        p_tenant_id: tenantId,
-        p_razorpay_payment_id: String(targetPaymentId),
-        p_razorpay_refund_id: refundId,
-        p_refund_amount: refundAmt,
-        p_currency: String(refundEntity?.currency ?? "INR"),
-        p_refund_status: refundStatus,
-        p_webhook_event_id: eventId,
-      });
-      if (refundRpcErr) {
-        throw new Error(`could not record refund.created: ${refundRpcErr.message}`);
-      }
-      return { summary: `refund created (${refundStatus})`, tenantId };
-    }
-
-    case "refund.failed": {
-      const targetPaymentId = payment?.id ?? refundEntity?.payment_id ?? null;
-      const refundId = refundEntity?.id ? String(refundEntity.id) : null;
-      if (!targetPaymentId) {
-        return { summary: "refund.failed missing payment id", tenantId };
-      }
-      const refundAmt = refundEntity?.amount
-        ? fromMinorUnits(Number(refundEntity.amount), String(refundEntity.currency ?? "INR"))
-        : 0;
-      const { error: refundRpcErr } = await db.rpc("record_subscription_refund", {
-        p_tenant_id: tenantId,
-        p_razorpay_payment_id: String(targetPaymentId),
-        p_razorpay_refund_id: refundId,
-        p_refund_amount: refundAmt,
-        p_currency: String(refundEntity?.currency ?? "INR"),
-        p_refund_status: "failed",
-        p_webhook_event_id: eventId,
-      });
-      if (refundRpcErr) {
-        throw new Error(`could not record refund.failed: ${refundRpcErr.message}`);
-      }
-      await audit(db, tenantId, tenant.plan, planId, "refund_failed", eventId, {
-        paymentId: targetPaymentId,
-        refundId,
-      });
-      return { summary: "refund failed", tenantId };
-    }
-
+    case "refund.created":
+    case "refund.failed":
     case "refund.processed":
     case "payment.refunded": {
       const targetPaymentId = payment?.id ?? refundEntity?.payment_id ?? null;
@@ -922,6 +859,9 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
         const liveRefund = await fetchRefund(verifiedRefundId);
         if (!liveRefund.ok) {
           throw new Error(`could not confirm refund ${verifiedRefundId} with Razorpay: ${liveRefund.error}`);
+        }
+        if (String(liveRefund.data.id) !== verifiedRefundId || String(liveRefund.data.payment_id) !== String(targetPaymentId)) {
+          throw new Error("Provider refund does not match the intended payment");
         }
         const liveStatus = String(liveRefund.data.status ?? "");
         verifiedRefundStatus = liveStatus === "processed"
@@ -950,6 +890,14 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
       }
 
       const refundOutcome = String((refundRpcRes as any)?.outcome ?? "");
+      if (!["pending_recorded", "failed_recorded", "pending_reconciliation", "processed", "already_processed"].includes(refundOutcome)) {
+        throw new Error(`Refund outcome not confirmed: ${refundOutcome || "missing"}`);
+      }
+      if (refundOutcome === "failed_recorded") {
+        await audit(db, tenantId, tenant.plan, planId, "refund_failed", eventId, {
+          paymentId: targetPaymentId, refundId: verifiedRefundId,
+        });
+      }
       if (
         refundOutcome === "pending_recorded" ||
         refundOutcome === "failed_recorded" ||
@@ -990,7 +938,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
           throw new Error(`could not load refunded payment row: ${ledgerErr.message}`);
         }
         if (ledgerRow) {
-          const docAmount = verifiedRefundAmount > 0 ? verifiedRefundAmount : Number((ledgerRow as any).amount ?? 0);
+          const docAmount = verifiedRefundAmount;
           const refundDoc = await issueRefundDocument(db, tenantId, ledgerRow, {
             refundedAt: refund?.created_at ? new Date(refund.created_at * 1000) : undefined,
             razorpayRefundId: verifiedRefundId,
@@ -1014,7 +962,7 @@ async function handleEvent(event: any, eventType: string, eventId: string): Prom
             .eq("tenant_id", tenantId)
             .eq("event_type", "payment_refunded")
             .in("event_key", Array.from(new Set(legacyEmailKeys)))
-            .in("status", ["pending", "sent"])
+            .in("status", ["pending", "sent", "PENDING", "SENT"])
             .limit(1);
           if (existingEmailErr) {
             throw new Error(`could not check refund email outbox: ${existingEmailErr.message}`);
@@ -1154,7 +1102,7 @@ async function audit(
   eventId: string,
   detail: Record<string, unknown>,
 ) {
-  await db.from("subscription_audit_logs").insert({
+  const { error } = await db.from("subscription_audit_logs").insert({
     tenant_id: tenantId,
     old_plan: oldPlan,
     new_plan: newPlan,
@@ -1162,4 +1110,5 @@ async function audit(
     razorpay_event_id: eventId,
     detail,
   });
+  if (error && error.code !== "23505") throw new Error(`could not write subscription audit: ${error.message}`);
 }

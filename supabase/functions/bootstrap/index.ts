@@ -1,6 +1,7 @@
 // deno-lint-ignore-file no-explicit-any
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { guard } from "../_shared/auth.ts";
+import { hasEffectivePermission } from "../_shared/permissions.ts";
 import { securityTopic, staffTopic } from "../_shared/realtime.ts";
 import { admin } from "../_shared/db.ts";
 import { toCamel } from "../_shared/case.ts";
@@ -54,15 +55,20 @@ Deno.serve(async (req: Request) => {
     // shell loads through it), so these fields must be gated individually —
     // otherwise any staff PIN could read the owner's session list and the
     // tenant's audit history from the bootstrap payload.
-    const canSeeSecurity =
-      g.session.kind !== "staff" ||
-      g.session.permissions.some((p: string) =>
-        ["security.view", "security.manage"].includes(p),
-      );
+    const can = (permission: string) => hasEffectivePermission(g.session.permissions, permission);
+    const canSeeSecurity = can("security.view");
+    const canSeeOrders = can("orders.view");
+    const canSeeTables = can("tables.view");
+    const canSeeMenu = can("menu.view") || can("orders.create");
+    const canSeePeople = can("staff.view");
+    const canSeeRoles = can("roles.view");
+    const canSeeSettings = can("settings.view");
+    const canSeeContacts = can("orders.edit") || can("payments.collect");
+    const noRows = { data: [], error: null };
 
     const { data: tenantRow, error: tenantError } = await db
       .from("tenants")
-      .select("*")
+      .select(`id, name, slug, tagline, logo, currency, currency_symbol, tax_rate, service_charge, active, onboarding_done, plan${canSeeSettings ? ", address, phone, email" : ""}`)
       .eq("id", tenantId)
       .maybeSingle();
     if (tenantError) return json(req, { error: tenantError.message }, 500);
@@ -82,54 +88,55 @@ Deno.serve(async (req: Request) => {
       securityBundle,
       tableSessionsRes,
     ] = await Promise.all([
-      db
+      canSeePeople || canSeeSecurity ? db
         .from("profiles")
-        .select("*, roleRef:roles(*)")
+        .select(canSeePeople ? "id, name, email, phone, avatar, role, role_id, active, created_at, roleRef:roles(id, name, permissions)" : "id, name")
         .eq("tenant_id", tenantId)
-        .order("created_at", { ascending: true }),
-      db.from("roles").select("*").eq("tenant_id", tenantId).order("created_at", {
+        .order("created_at", { ascending: true }) : noRows,
+      canSeeRoles || canSeePeople ? db.from("roles").select("id, tenant_id, name, description, permissions, is_system, color, created_at, updated_at").eq("tenant_id", tenantId).order("created_at", {
         ascending: true,
-      }),
-      db.from("categories").select("*").eq("tenant_id", tenantId).order("sort_order", {
+      }) : noRows,
+      canSeeMenu ? db.from("categories").select("*").eq("tenant_id", tenantId).order("sort_order", {
         ascending: true,
-      }),
-      db
+      }) : noRows,
+      canSeeMenu ? db
         .from("menu_items")
         .select("*, category:categories(*)")
         .eq("tenant_id", tenantId)
-        .order("sort_order", { ascending: true }),
-      db.from("tables").select("*").eq("tenant_id", tenantId).order("name", {
+        .order("sort_order", { ascending: true }) : noRows,
+      canSeeTables ? db.from("tables").select(`id, tenant_id, location_id, name, seats, area, active, created_at, updated_at${can("qr.manage") ? ", qr_token" : ""}`).eq("tenant_id", tenantId).order("name", {
         ascending: true,
-      }),
-      db
+      }) : noRows,
+      canSeeOrders ? db
         .from("orders")
-        .select("*, items:order_items(*), table:tables(*), servedBy:profiles(*)")
+        .select(`id, tenant_id, table_id, table_session_id, check_id, order_number, order_type, status, items_total, discount, tax, service_charge, total, promo_code, customer_name, notes, payment_method, payment_status, served_by_id, created_at, updated_at, completed_at, paid_at, location_id, items:order_items(*), table:tables(id, name, seats, area), servedBy:profiles(id, name)${canSeeContacts ? ", customer_phone" : ""}`)
         .eq("tenant_id", tenantId)
         .order("created_at", { ascending: false })
-        .limit(200),
-      db.from("promo_codes").select("*").eq("tenant_id", tenantId).order("created_at", {
+        .limit(200) : noRows,
+      can("promos.view") ? db.from("promo_codes").select("*").eq("tenant_id", tenantId).order("created_at", {
         ascending: false,
-      }),
+      }) : noRows,
       canSeeSecurity
         ? db
             .from("security_logs")
-            .select("*, user:profiles(*)")
+            .select("*, user:profiles(id, name)")
             .eq("tenant_id", tenantId)
             .order("created_at", { ascending: false })
             .limit(50)
         : Promise.resolve({ data: [], error: null }),
-      db
+      canSeePeople || canSeeSecurity ? db
         .from("staff")
         .select(
           "id, tenant_id, location_id, role_id, name, employee_id, avatar, active, locked_until, last_login, created_at, updated_at, role:roles(id, name, description, permissions, is_system, color)",
         )
         .eq("tenant_id", tenantId)
-        .order("name", { ascending: true }),
+        .order("name", { ascending: true }) : noRows,
       // Settings and the security trio join the same wave. They used to run as
       // two further sequential rounds (settings, then three more queries), so
       // every bootstrap paid three round trips for data that depends on
       // nothing but `tenantId` and the caller's permissions.
-      db.from("settings").select("key, value").eq("tenant_id", tenantId),
+      canSeeSettings ? db.from("settings").select("key, value").eq("tenant_id", tenantId)
+        : db.from("settings").select("key, value").eq("tenant_id", tenantId).in("key", ["timezone", "pref_theme", "pref_language", "pref_date_format", "pref_compact_mode"]),
       canSeeSecurity
         ? Promise.all([
             listAuthSessions(db, tenantId, g.session.sessionId),
@@ -141,11 +148,11 @@ Deno.serve(async (req: Request) => {
       // whether it is still open. Read-only; no totals live here. Deliberately
       // named `tableSessions` — `sessions` in this payload is already the
       // sign-in list the Security page reads.
-      db
+      canSeeOrders || canSeeTables ? db
         .from("table_sessions")
         .select("id, table_id, status, created_at, ended_at")
         .eq("tenant_id", tenantId)
-        .or(`status.eq.ACTIVE,created_at.gte.${new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()}`),
+        .or(`status.eq.ACTIVE,created_at.gte.${new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()}`) : noRows,
     ]);
 
     if (usersRes.error) return json(req, { error: usersRes.error.message }, 500);
@@ -225,10 +232,10 @@ Deno.serve(async (req: Request) => {
     // undercounted revenue and orders today. (tenant_order_summary, migration
     // 0060 — the same function the delta sync uses, so the numbers can never
     // disagree with each other.)
-    const { data: summaryRow, error: summaryError } = await db.rpc(
+    const { data: summaryRow, error: summaryError } = can("dashboard.view") && canSeeOrders ? await db.rpc(
       "tenant_order_summary",
       { p_tenant: tenantId },
-    );
+    ) : { data: null, error: null };
     if (summaryError) return json(req, { error: summaryError.message }, 500);
     const revenue = Number((summaryRow as any)?.revenue ?? 0);
     const ordersToday = Number((summaryRow as any)?.ordersToday ?? 0);
@@ -261,6 +268,7 @@ Deno.serve(async (req: Request) => {
       const { data: missingRows } = await db
         .from("table_sessions")
         .select("id, table_id, status, created_at, ended_at")
+        .eq("tenant_id", tenantId)
         .in("id", missingSessionIds);
       for (const row of missingRows ?? []) {
         tableSessions[row.id] = {
@@ -275,11 +283,11 @@ Deno.serve(async (req: Request) => {
 
     // Resolve checks for all bootstrap orders and open/recent checks (7 days)
     const recentCheckSince = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const { data: openChecks } = await db
+    const { data: openChecks } = canSeeOrders ? await db
       .from("table_checks")
       .select("id")
       .eq("tenant_id", tenantId)
-      .or(`status.in.(OPEN,UNSETTLED),opened_at.gte.${recentCheckSince}`);
+      .or(`status.in.(OPEN,UNSETTLED),opened_at.gte.${recentCheckSince}`) : noRows;
 
     const bootstrapCheckIds = [...new Set([
       ...(ordersRes.data ?? []).map((o: any) => o.check_id).filter(Boolean),
@@ -288,6 +296,7 @@ Deno.serve(async (req: Request) => {
 
     const checks: Record<string, {
       orderCount: number;
+      orderSessionIds: Array<string | null>;
       subtotal: number;
       tax: number;
       total: number;
@@ -301,7 +310,7 @@ Deno.serve(async (req: Request) => {
     if (bootstrapCheckIds.length) {
       const [{ data: checkRows }, { data: checkOrders }, { data: checkPayments }] = await Promise.all([
         db.from("table_checks").select("id, status, invoice_number, closed_at, subtotal, tax, total, paid_total").in("id", bootstrapCheckIds).eq("tenant_id", tenantId),
-        db.from("orders").select("check_id, total, items_total, discount, tax").in("check_id", bootstrapCheckIds)
+        db.from("orders").select("check_id, table_session_id, total, items_total, discount, tax").in("check_id", bootstrapCheckIds)
           .eq("tenant_id", tenantId).not("status", "in", "(CANCELLED,PENDING_ACTIVATION)"),
         db.from("check_payments").select("check_id, amount").in("check_id", bootstrapCheckIds)
           .eq("tenant_id", tenantId).eq("status", "SUCCEEDED"),
@@ -310,10 +319,11 @@ Deno.serve(async (req: Request) => {
       for (const c of checkRows ?? []) {
         checks[c.id] = {
           orderCount: 0,
-          subtotal: Number(c.subtotal ?? 0),
-          tax: Number(c.tax ?? 0),
-          total: Number(c.total ?? 0),
-          paid: Number(c.paid_total ?? 0),
+          orderSessionIds: [],
+          subtotal: c.status === "PAID" ? Number(c.subtotal ?? 0) : 0,
+          tax: c.status === "PAID" ? Number(c.tax ?? 0) : 0,
+          total: c.status === "PAID" ? Number(c.total ?? 0) : 0,
+          paid: c.status === "PAID" ? Number(c.paid_total ?? 0) : 0,
           outstanding: 0,
           status: c.status,
           invoiceNumber: c.invoice_number ?? null,
@@ -324,6 +334,7 @@ Deno.serve(async (req: Request) => {
         const c = checks[(o as any).check_id];
         if (!c) continue;
         c.orderCount += 1;
+        if (!c.orderSessionIds.includes(o.table_session_id)) c.orderSessionIds.push(o.table_session_id);
         if (c.status !== "PAID") {
           c.subtotal += Number((o as any).items_total ?? 0) - Number((o as any).discount ?? 0);
           c.tax += Number((o as any).tax ?? 0);
@@ -353,11 +364,6 @@ Deno.serve(async (req: Request) => {
 
     // users/roles/staff are a people directory. Only send them to a caller who
     // can actually reach the screens that show them.
-    const canSeePeople =
-      g.session.kind !== "staff" ||
-      g.session.permissions.some((p: string) =>
-        ["roles.view", "roles.manage", "staff.view", "staff.manage"].includes(p),
-      );
 
     // The caller's effective permissions, regardless of session kind. Exposing
     // this explicitly matters because previously an owner and a staff member
@@ -390,16 +396,17 @@ Deno.serve(async (req: Request) => {
       };
     }
 
-    const currentUser =
-      (users as any[])[0] ||
-      (currentStaff
-        ? {
-          id: currentStaff.id,
-          name: currentStaff.name,
-          email: `${currentStaff.employeeId}@staff.local`,
-          role: currentStaff.role,
-        }
-        : null);
+    const { data: ownProfile } = g.session.kind === "owner" ? await db.from("profiles")
+      .select("id, name, email, phone, avatar, role, role_id")
+      .eq("tenant_id", tenantId).eq("id", g.session.subjectId).maybeSingle() : { data: null };
+    const currentUser = {
+      ...toCamel(ownProfile ?? {}),
+      id: g.session.subjectId,
+      name: g.session.name,
+      email: g.session.email ?? (currentStaff?.employeeId ? `${currentStaff.employeeId}@staff.local` : ""),
+      role: g.session.roleName,
+      ...(currentStaff ? { avatar: currentStaff.avatar } : {}),
+    };
 
     // The plan in force, so the app knows whether to show the trial
     // countdown, the upgrade screen or nothing at all.
@@ -440,14 +447,14 @@ Deno.serve(async (req: Request) => {
       // id — that is what stops a diner (who knows the tenant id) from
       // subscribing. Absent for anyone without those keys.
       realtimeTopic:
-        effectivePermissions.some((p: string) => ["orders.view", "tables.view"].includes(p))
+        canSeeOrders
           ? await staffTopic(g.session.tenantId)
           : null,
-      securityTopic: effectivePermissions.includes("security.view")
+      securityTopic: canSeeSecurity
         ? await securityTopic(g.session.tenantId)
         : null,
       users: canSeePeople ? users : [],
-      roles: canSeePeople ? roles : [],
+      roles: canSeeRoles || canSeePeople ? roles : [],
       staff: canSeePeople ? staff : [],
       categories,
       menuItems,

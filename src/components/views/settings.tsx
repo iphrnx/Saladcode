@@ -467,6 +467,12 @@ type RefundDownloadTarget = {
   refundNumber?: string | null
 }
 
+function openRefundPdf(pdf: Blob) {
+  const url = URL.createObjectURL(pdf)
+  window.open(url, '_blank', 'noopener,noreferrer')
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
+}
+
 function PaymentHistoryRows(props: {
   payments: BillingPayment[]
   directory: PlanDirectory
@@ -474,8 +480,9 @@ function PaymentHistoryRows(props: {
   invoiceBusy: string | null
   onDownload: (p: BillingPayment, kind?: 'invoice' | 'refund', target?: RefundDownloadTarget | string | null) => void
   onReceipt: (p: BillingPayment, refund?: BillingRefundDoc | null) => void
+  downloadedRefunds: Record<string, Blob>
 }) {
-  const { payments, directory, timeZone, invoiceBusy, onDownload, onReceipt } = props
+  const { payments, directory, timeZone, invoiceBusy, onDownload, onReceipt, downloadedRefunds } = props
   const pillTone = (status: string): 'success' | 'warn' | 'danger' =>
     status === 'succeeded' ? 'success' : status === 'refunded' ? 'warn' : 'danger'
   return (
@@ -548,6 +555,7 @@ function PaymentHistoryRows(props: {
                     {entries.map((entry) => {
                       const targetId = entry.receipt?.id ?? entry.razorpayRefundId ?? entry.processedId ?? ''
                       const busyKey = `refund:${p.id}:${targetId}`
+                      const downloaded = downloadedRefunds[busyKey]
                       const amountLabel = entry.amount != null
                         ? money(entry.currency ?? p.currency, Number(entry.amount))
                         : entry.receipt?.refund_number ?? ''
@@ -582,11 +590,11 @@ function PaymentHistoryRows(props: {
                             size="sm"
                             variant="outline"
                             className="h-9 gap-1.5 rounded-lg border-[#f97316]/40 bg-[#f97316]/5 px-3.5 text-[12.5px] font-semibold text-[#ea580c] hover:bg-[#f97316]/15 hover:text-[#ea580c]"
-                            disabled={!entry.receipt}
+                            disabled={!entry.receipt && !downloaded}
                             title={entry.receipt
                               ? `Print refund ${entry.receipt.refund_number}`
-                              : 'Refund receipt is not issued yet — click Refund to generate PDF'}
-                            onClick={() => entry.receipt && onReceipt(p, entry.receipt)}
+                              : downloaded ? 'Open the issued PDF to print' : 'Refund receipt is not issued yet — click Refund to generate PDF'}
+                            onClick={() => downloaded ? openRefundPdf(downloaded) : entry.receipt && onReceipt(p, entry.receipt)}
                           >
                             <Printer className="h-4 w-4" />
                             Print
@@ -921,6 +929,8 @@ export function SettingsView() {
   const [payState, setPayState] = useState<'idle' | 'starting' | 'paying' | 'verifying' | 'success' | 'failed'>('idle')
   const [payingPlan, setPayingPlan] = useState<string | null>(null)
   const [invoiceBusy, setInvoiceBusy] = useState<string | null>(null)
+  const [downloadedRefunds, setDownloadedRefunds] = useState<Record<string, Blob>>({})
+  const invoiceRequests = useRef(new Set<string>())
   const [payError, setPayError] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
   // Every plan, retired included — the source of honest historical labels.
@@ -1540,7 +1550,10 @@ export function SettingsView() {
       ? (normalized.refundId ?? (receiptId ? null : defaultRf?.razorpay_refund_id ?? null))
       : null
     const busySuffix = receiptId ?? refundId ?? ''
-    setInvoiceBusy(kind === 'refund' ? `${kind}:${p.id}:${busySuffix}` : `${kind}:${p.id}`)
+    const requestKey = kind === 'refund' ? `${kind}:${p.id}:${busySuffix}` : `${kind}:${p.id}`
+    if (invoiceRequests.current.has(requestKey)) return
+    invoiceRequests.current.add(requestKey)
+    setInvoiceBusy(requestKey)
     const subject = kind === 'refund' ? 'the refund document' : 'the invoice'
     try {
       const qs = new URLSearchParams({ paymentId: p.id, kind, download: '1' })
@@ -1549,6 +1562,12 @@ export function SettingsView() {
       const res = await edgeFetch(`/api/subscriptions/invoice?${qs.toString()}`, { headers })
       await failIfNotOk(res, subject)
       const blob = await res.blob()
+      if (kind === 'refund') {
+        setDownloadedRefunds((previous) => Object.fromEntries([
+          ...Object.entries(previous).filter(([key]) => key !== requestKey).slice(-7),
+          [requestKey, blob],
+        ]))
+      }
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
@@ -1569,7 +1588,9 @@ export function SettingsView() {
     } catch (err) {
       toast.error(describeFailure(err, subject).message)
     } finally {
-      setInvoiceBusy(null)
+      invoiceRequests.current.delete(requestKey)
+      const nextBusy = Array.from(invoiceRequests.current).at(-1) ?? null
+      setInvoiceBusy((current) => current === requestKey ? nextBusy : current)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadBilling])
@@ -2655,6 +2676,7 @@ export function SettingsView() {
                 onBrowsePlans={() => setManaging(false)}
                 onDownload={downloadInvoice}
                 onReceipt={openReceipt}
+                downloadedRefunds={downloadedRefunds}
                 invoiceBusy={invoiceBusy}
               />
             )}
@@ -2851,7 +2873,7 @@ export function SettingsView() {
                       Number(latestPayment.refunded_amount ?? 0) > 0 ||
                       latestEntry !== null
 
-                    if (!hasRefund && latestRecon) {
+                    if (latestRecon && !hasRefund) {
                       return (
                         <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
                           <span className="inline-flex items-center rounded-lg border border-amber-300/70 bg-amber-50/70 px-2.5 py-1 text-[11.5px] font-medium text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
@@ -2881,9 +2903,17 @@ export function SettingsView() {
                     const targetId =
                       latestEntry?.receipt?.id ?? latestEntry?.razorpayRefundId ?? latestEntry?.processedId ?? ''
                     const busyKey = `refund:${latestPayment.id}:${targetId}`
+                    const downloaded = downloadedRefunds[busyKey]
                     const pendingReceipt = !latestEntry?.receipt
                     return (
                       <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+                        {latestRecon && (
+                          <span className="text-[11.5px] text-amber-700 dark:text-amber-300">
+                            {latestRecon.amount == null
+                              ? 'Refund amount awaiting verification'
+                              : `Refund ${money(latestRecon.currency ?? latestPayment.currency, Number(latestRecon.amount))} awaiting verification`}
+                          </span>
+                        )}
                         {pendingReceipt && (
                           <span className="text-[11.5px] text-amber-700 dark:text-amber-300">
                             Refund receipt pending
@@ -2912,13 +2942,13 @@ export function SettingsView() {
                         <Button
                           size="sm"
                           variant="outline"
-                          disabled={pendingReceipt}
+                          disabled={pendingReceipt && !downloaded}
                           title={
                             latestEntry?.receipt
                               ? `Print refund ${latestEntry.receipt.refund_number}`
-                              : 'Refund receipt is not issued yet — generate to print'
+                              : downloaded ? 'Open the issued PDF to print' : 'Refund receipt is not issued yet — generate to print'
                           }
-                          onClick={() => latestEntry?.receipt && openReceipt(latestPayment, latestEntry.receipt)}
+                          onClick={() => downloaded ? openRefundPdf(downloaded) : latestEntry?.receipt && openReceipt(latestPayment, latestEntry.receipt)}
                         >
                           <Printer className="h-3.5 w-3.5 mr-1.5" />
                           Print Refund
@@ -3153,6 +3183,7 @@ export function SettingsView() {
                     invoiceBusy={invoiceBusy}
                     onDownload={downloadInvoice}
                     onReceipt={openReceipt}
+                    downloadedRefunds={downloadedRefunds}
                   />
                 )}
               </BillingCard>
@@ -3802,12 +3833,13 @@ function ManageBillingView(props: {
   onBrowsePlans: () => void
   onDownload: (p: BillingPayment, kind?: 'invoice' | 'refund', target?: RefundDownloadTarget | string | null) => void
   onReceipt: (p: BillingPayment, refund?: BillingRefundDoc | null) => void
+  downloadedRefunds: Record<string, Blob>
   invoiceBusy: string | null
 }) {
   const {
     snapshot, plan, payments, restaurant, timeZone, directory, manage, loading, error,
     onRetry, onBack, onCancelSubscription, cancelling, onCancelScheduled,
-    onBrowsePlans, onDownload, onReceipt, invoiceBusy,
+    onBrowsePlans, onDownload, onReceipt, invoiceBusy, downloadedRefunds,
   } = props
 
   const d = (iso: string | null | undefined) => fmtDate(iso, timeZone)
@@ -4129,6 +4161,7 @@ function ManageBillingView(props: {
                 invoiceBusy={invoiceBusy}
                 onDownload={onDownload}
                 onReceipt={onReceipt}
+                downloadedRefunds={downloadedRefunds}
               />
             )}
           </BillingCard>

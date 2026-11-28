@@ -174,8 +174,8 @@ type Sitting = {
   service: number
   /** After tax and service charge. */
   total: number
-  paid: number
-  due: number
+  paid: number | null
+  due: number | null
   /** True when a historical check spans orders from multiple sessions. */
   sharedBill: boolean
   /** Nothing is owed because nothing has been accepted yet. */
@@ -414,7 +414,10 @@ export function OrdersView() {
        * paid for it.
        */
       const isSettledCheck = check?.status === 'PAID' || Boolean(check?.invoiceNumber)
-      const sharedBill = Boolean(check) && check!.orderCount !== onTheBill.length
+      const sharedBill = Boolean(check && (
+        check.orderCount !== onTheBill.length || !sessionId ||
+        check.orderSessionIds?.length !== 1 || check.orderSessionIds[0] !== sessionId
+      ))
       const total = !check || sharedBill ? fallbackTotal : check.total
       // Pre-tax and tax, from the same source as the total.
       const localSubtotal = +onTheBill
@@ -434,7 +437,7 @@ export function OrdersView() {
           : (localService > 0 ? localService : +Math.max(0, total - subtotal - tax).toFixed(2)))
       const allOrdersCompleted = rows.every((o) => ['COMPLETED', 'CANCELLED'].includes(o.status))
       const allOrdersPaid = rows.every((o) => o.paymentStatus === 'PAID')
-      const paid = !check || sharedBill
+      const paid = sharedBill && !isSettledCheck ? null : !check || sharedBill
         ? (isSettledCheck
           ? fallbackTotal
           : (allOrdersPaid
@@ -445,7 +448,7 @@ export function OrdersView() {
           : check.paid)
       const due = isSettledCheck
         ? 0
-        : (!check || sharedBill
+        : paid === null ? null : (!check || sharedBill
           ? +Math.max(0, total - paid).toFixed(2)
           : Math.max(0, check.outstanding))
 
@@ -1738,7 +1741,8 @@ export function OrdersView() {
         }
         currencySymbol={cs}
         startedAt={paySitting?.startedAt ?? null}
-        open={paySitting !== null}
+        canCollectPayment={canCollectPay}
+        open={canCollectPay && paySitting !== null}
         onOpenChange={(v) => !v && setPaySitting(null)}
         onPaid={handlePaid}
         onViewBill={(originKey) => {

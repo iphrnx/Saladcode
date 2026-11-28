@@ -2247,6 +2247,8 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
         const { data: byRefundId } = await db
           .from("billing_refunds")
           .select("*")
+          .eq("tenant_id", tenantId)
+          .eq("payment_id", paymentId)
           .or(`refund_id.eq.${targetRefund.id},razorpay_refund_id.eq.${targetRefund.razorpay_refund_id},linked_razorpay_refund_id.eq.${targetRefund.razorpay_refund_id}`)
           .maybeSingle();
         existing = byRefundId ?? null;
@@ -2264,6 +2266,9 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
         existing = existingRows?.[0] ?? null;
       }
 
+      if (!existing && !targetRefund?.razorpay_refund_id) {
+        return json(req, { error: "This refund is awaiting verified provider details." }, 409);
+      }
       if (!existing) {
         const auditRes = await ensureRefundAuditIdempotent(db, {
           tenantId,
@@ -2298,9 +2303,7 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
               amount: Number(targetRefund.amount),
               refundedAt: targetRefund.processed_at ? new Date(targetRefund.processed_at) : undefined,
             }
-          : {
-              amount: Number(payment.refunded_amount ?? payment.amount),
-            },
+          : undefined,
       );
     }
     if (!row) {

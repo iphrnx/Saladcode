@@ -62,15 +62,7 @@ begin
     (v_tenant_id, v_loc_id, v_role_waiter, 'Pooja Nair', 'EMP004', '7a5e8c1b3d6f4a2e8c1b3d6f4a2e8c1b3d6f4a2e8c1b3d6f4a2e8c1b3d6f4a2e8c1b3d6f4a2e8c1b3d6f4a2e8c1b3d6f4a2e8c1b3d6f4a2e8c1b3d6f4a2e8c1b', '0123456789abcdef0123456789abcdef', true)
   on conflict (tenant_id, employee_id) do nothing;
 
-  -- 5. Dining Areas
-  insert into public.dining_areas (tenant_id, location_id, name, sort_order)
-  values
-    (v_tenant_id, v_loc_id, 'Main Hall', 1),
-    (v_tenant_id, v_loc_id, 'Terrace Garden', 2),
-    (v_tenant_id, v_loc_id, 'Window Lounge', 3)
-  on conflict do nothing;
-
-  -- 6. Tables
+  -- 5. Tables (area labels belong directly to each table)
   insert into public.tables (id, tenant_id, location_id, name, seats, area, qr_token, active)
   values
     (v_table_1, v_tenant_id, v_loc_id, 'Table 1', 2, 'Window Lounge', 'qr-bistro-t1', true),
@@ -89,7 +81,7 @@ begin
 
   -- 8. Menu Items
   insert into public.menu_items (
-    tenant_id, category_id, name, description, price, available,
+    category_id, tenant_id, name, description, price, available,
     prep_time, tags, rating, sort_order, portions
   ) values
     (v_cat_bowls, v_tenant_id, 'Harissa Paneer Warm Bowl', 'Spiced cottage cheese with quinoa, roasted veggies & citrus harissa dressing', 420.00, true, 15, 'VEG,BESTSELLER,GLUTEN-FREE', 4.9, 1, '[{"id":"reg","name":"Regular","price":420},{"id":"large","name":"Large","price":520}]'::jsonb),

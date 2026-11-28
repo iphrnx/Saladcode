@@ -267,6 +267,7 @@ export async function issueRefundDocument(
   payment: any,
   details: { refundedAt?: Date; razorpayRefundId?: string | null; amount?: number } = {},
 ): Promise<any | null> {
+  if (!details.razorpayRefundId || !Number.isFinite(details.amount) || !(Number(details.amount) > 0)) return null;
   // The original invoice must exist for the link.
   let { data: invoice } = await db
     .from("billing_invoices")
@@ -310,7 +311,7 @@ export async function issueRefundDocument(
     p_buyer_address: tenant?.address ?? null,
     p_original_invoice_number: invoice?.invoice_number ?? null,
     p_original_invoice_date: invoice?.invoice_date ?? null,
-    p_amount: details.amount ?? Number(payment.amount),
+    p_amount: details.amount,
     p_currency: payment.currency ?? "INR",
     p_description: planRow?.name ?? payment.plan_id,
     p_razorpay_payment_id: payment.razorpay_payment_id ?? null,
@@ -362,20 +363,14 @@ export async function ensureRefundAuditIdempotent(
     };
   },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const { error } = await db.from("subscription_audit_logs").insert({
-    tenant_id: opts.tenantId,
-    old_plan: opts.oldPlan,
-    new_plan: opts.newPlan,
-    change_type: "refunded",
-    razorpay_event_id: opts.eventId,
-    detail: opts.detail,
-  });
+  const { refundId, internalRefundId, paymentId } = opts.detail;
+  if (!refundId || !internalRefundId || !paymentId) return { ok: false, error: "Missing verified refund identity" };
+  const { data, error } = await db.from("subscription_audit_logs").select("id")
+    .eq("tenant_id", opts.tenantId).eq("change_type", "refunded")
+    .contains("detail", { refundId, internalRefundId, paymentId }).limit(1);
   if (error) {
-    const isDuplicate =
-      String((error as any).code ?? "") === "23505" ||
-      String(error.message).includes("duplicate key");
-    if (isDuplicate) return { ok: true };
     return { ok: false, error: error.message };
   }
+  if (!data?.length) return { ok: false, error: "Refund audit has not committed for this payment and refund" };
   return { ok: true };
 }
