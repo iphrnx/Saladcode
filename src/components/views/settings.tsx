@@ -856,6 +856,12 @@ export function SettingsView() {
     setReceiptFor({ payment, refund: resolvedRefund })
   }
   const [restaurant, setRestaurant] = useState<{ name: string | null; email: string | null }>({ name: null, email: null })
+  const [seller, setSeller] = useState<{
+    name: string
+    addressLines: string[]
+    email: string | null
+    phone: string | null
+  }>({ name: 'The Salad', addressLines: [], email: null, phone: null })
   const [razorpayConfigured, setRazorpayConfigured] = useState(true)
   const [billingLoading, setBillingLoading] = useState(true)
   const [payState, setPayState] = useState<'idle' | 'starting' | 'paying' | 'verifying' | 'success' | 'failed'>('idle')
@@ -1106,9 +1112,11 @@ export function SettingsView() {
     }
   }, [tenantId, canViewReviews])
 
-  // Billing load — guarded by a monotonic sequence ref so slower earlier
-  // refreshes never overwrite newer receipt state from a concurrent download.
+  // Billing load — track the latest successfully applied refresh sequence so
+  // slower earlier refreshes never overwrite newer state, while a failed later
+  // refresh never discards an earlier successful refresh that arrives after it.
   const billingReqSeqRef = useRef(0)
+  const billingAppliedSeqRef = useRef(0)
   const loadBilling = useCallback(async () => {
     const seq = ++billingReqSeqRef.current
     setBillingLoading(true)
@@ -1116,18 +1124,28 @@ export function SettingsView() {
       const res = await edgeFetch('/api/subscriptions', { headers: { 'x-tenant-id': tenantId } })
       await failIfNotOk(res, 'your billing details')
       const body = await res.json()
-      if (seq !== billingReqSeqRef.current) return
+      if (seq <= billingAppliedSeqRef.current) return
+      billingAppliedSeqRef.current = seq
       setPlans(body.plans ?? [])
       setPayments(body.payments ?? [])
       setRestaurant(body.restaurant ?? { name: null, email: null })
+      if (body.seller) {
+        setSeller({
+          name: body.seller.name || 'The Salad',
+          addressLines: Array.isArray(body.seller.addressLines) ? body.seller.addressLines : [],
+          email: body.seller.email ?? null,
+          phone: body.seller.phone ?? null,
+        })
+      }
       setRazorpayConfigured(body.razorpayConfigured !== false)
       setBillingDirectory(body.planDirectory ?? {})
       setBillingTotals(body.totals ?? null)
       setLocationCount(typeof body.locationCount === 'number' ? body.locationCount : null)
       setStatePlan(body.plan ?? null)
     } catch (err) {
-      if (seq !== billingReqSeqRef.current) return
-      handleLoad(err, 'your billing details')
+      if (seq > billingAppliedSeqRef.current && seq === billingReqSeqRef.current) {
+        handleLoad(err, 'your billing details')
+      }
     } finally {
       if (seq === billingReqSeqRef.current) {
         setBillingLoading(false)
@@ -1230,11 +1248,12 @@ export function SettingsView() {
         number: refund.refund_number ?? doc?.invoice_number ?? p.transaction_id ?? p.id.slice(0, 8),
         date: docDate(refund.refund_date ?? paidIso),
         badge: 'REFUNDED',
-        sellerName: refund.seller_name || 'The Salad',
-        sellerLines: String(refund.seller_address ?? '')
-          .split('\n').map((l) => l.trim()).filter(Boolean),
-        sellerEmail: refund.seller_email || null,
-        sellerPhone: refund.seller_phone || null,
+        sellerName: refund.seller_name || seller.name || 'The Salad',
+        sellerLines: refund.seller_address
+          ? String(refund.seller_address).split('\n').map((l) => l.trim()).filter(Boolean)
+          : seller.addressLines,
+        sellerEmail: refund.seller_email || seller.email || null,
+        sellerPhone: refund.seller_phone || seller.phone || null,
         buyerName: refund.buyer_name ?? '—',
         buyerEmail: refund.buyer_email ?? null,
         // Preserve explicit null buyer_address from the persisted refund snapshot.

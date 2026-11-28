@@ -793,6 +793,7 @@ async function state(req: Request, tenantId: string): Promise<Response> {
     plan: publicPlan(plan),
     plans: catalogue,
     restaurant: { name: tenant?.name ?? null, email: tenant?.email ?? null },
+    seller: await sellerIdentity(admin()),
     razorpayConfigured: razorpayConfigured(),
     planDirectory: directoryFrom(allPlans ?? []),
     totals: summariseTotals(allPayments ?? []),

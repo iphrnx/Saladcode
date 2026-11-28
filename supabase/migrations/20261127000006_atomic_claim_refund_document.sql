@@ -35,12 +35,15 @@ security definer
 set search_path = public, pg_temp
 as $$
 declare
-  v_existing public.billing_refunds;
-  v_inserted public.billing_refunds;
-  v_number   text;
-  v_lock_key text;
+  v_existing            public.billing_refunds;
+  v_inserted            public.billing_refunds;
+  v_number              text;
+  v_lock_key            text;
+  v_processed_count     int := 0;
+  v_legacy_count        int := 0;
+  v_total_receipt_count int := 0;
 begin
-  v_lock_key := 'billing_refund:' || coalesce(nullif(btrim(p_razorpay_refund_id), ''), p_payment_id::text);
+  v_lock_key := 'billing_refund:' || p_payment_id::text;
   perform pg_advisory_xact_lock(hashtext(v_lock_key));
 
   if nullif(btrim(p_razorpay_refund_id), '') is not null then
@@ -49,6 +52,37 @@ begin
       from public.billing_refunds
      where razorpay_refund_id = p_razorpay_refund_id
      limit 1;
+
+    if found then
+      return v_existing;
+    end if;
+
+    -- Reconcile an unambiguous legacy ID-less receipt when the payment has
+    -- at most one processed refund and exactly one legacy receipt (and no
+    -- other refund receipts). Multi-refund payments stay unresolved.
+    select count(*)::int
+      into v_processed_count
+      from public.subscription_refunds
+     where payment_id = p_payment_id
+       and status = 'processed';
+
+    select count(*)::int,
+           count(*) filter (where razorpay_refund_id is null)::int
+      into v_total_receipt_count, v_legacy_count
+      from public.billing_refunds
+     where payment_id = p_payment_id;
+
+    if v_processed_count <= 1 and v_total_receipt_count = 1 and v_legacy_count = 1 then
+      select *
+        into v_existing
+        from public.billing_refunds
+       where payment_id = p_payment_id
+         and razorpay_refund_id is null
+       limit 1;
+      if found then
+        return v_existing;
+      end if;
+    end if;
   else
     select *
       into v_existing
@@ -56,10 +90,10 @@ begin
      where payment_id = p_payment_id
        and razorpay_refund_id is null
      limit 1;
-  end if;
 
-  if found then
-    return v_existing;
+    if found then
+      return v_existing;
+    end if;
   end if;
 
   v_number := public.billing_next_document_number('RFND', p_fiscal_year);

@@ -14,6 +14,9 @@ alter table public.email_events
   add constraint email_events_status_check
   check (status in ('pending', 'sent', 'failed', 'PENDING', 'SENT', 'FAILED'));
 
+alter table public.email_events
+  add column if not exists claim_token uuid;
+
 create or replace function public.claim_pending_emails(
   p_limit int default 25,
   p_lease_seconds int default 120
@@ -35,7 +38,8 @@ begin
      limit greatest(1, coalesce(p_limit, 25))
   )
   update public.email_events e
-     set next_attempt_at = now() + make_interval(secs => greatest(10, coalesce(p_lease_seconds, 120)))
+     set next_attempt_at = now() + make_interval(secs => greatest(10, coalesce(p_lease_seconds, 120))),
+         claim_token = gen_random_uuid()
     from due
    where e.id = due.id
   returning e.*;

@@ -470,10 +470,12 @@ export async function queueEmail(db: SupabaseClient, event: EmailEvent): Promise
       event_key: event.eventKey,
       event_type: event.eventType,
       tenant_id: event.tenantId,
+      to_email: event.recipient,
       recipient: event.recipient,
       recipient_name: event.recipientName ?? null,
       restaurant_name: event.restaurantName ?? null,
       subject: rendered.subject,
+      template: event.eventType,
       plan_name: event.planName ?? null,
       amount: event.amount ?? null,
       currency: event.currency ?? null,
@@ -582,7 +584,8 @@ export async function dispatchPending(
         provider_id: (body as any)?.id ?? null,
         sent_at: new Date().toISOString(),
         error: null,
-      }).eq("id", row.id);
+        claim_token: null,
+      }).eq("id", row.id).eq("claim_token", row.claim_token);
       continue;
     }
 
@@ -598,7 +601,8 @@ export async function dispatchPending(
       error: String(reason).slice(0, 400),
       // 1, 2, 4, 8 minutes — enough to ride out a blip, not enough to spam.
       next_attempt_at: new Date(Date.now() + Math.min(60_000 * 2 ** (attempts - 1), 3_600_000)).toISOString(),
-    }).eq("id", row.id);
+      claim_token: null,
+    }).eq("id", row.id).eq("claim_token", row.claim_token);
   }
 
   if (due) skipped = Math.max(0, (due as any[]).length - sent - failed);
