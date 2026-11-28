@@ -60,7 +60,9 @@ type TenantRow = {
 
 function csvEscape(value: unknown): string {
   if (value === null || value === undefined) return "";
-  const s = String(value);
+  const raw = String(value);
+  const s = /^[\s\u0000-\u001f]*[=+\-@]|^[\t\r\n]/.test(raw) && typeof value === "string" && !/^-?\d+(\.\d+)?$/.test(raw)
+    ? `'${raw}` : raw;
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 

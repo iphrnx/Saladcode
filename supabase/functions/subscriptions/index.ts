@@ -47,10 +47,10 @@ import {
   issueRefundDocument,
   invoiceFactsFromRow,
   readStoredPdf,
+  readIssuedRefundPdf,
   sellerIdentity,
-  refundFactsFromRow,
 } from "../_shared/billing-documents.ts";
-import { buildInvoicePdf, buildRefundPdf } from "../_shared/pdf.ts";
+import { buildInvoicePdf } from "../_shared/pdf.ts";
 import {
   decideScheduledCancel,
   decideCheckoutAction,
@@ -2247,6 +2247,8 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
         const { data: byRefundId } = await db
           .from("billing_refunds")
           .select("*")
+          .eq("tenant_id", tenantId)
+          .eq("payment_id", paymentId)
           .or(`refund_id.eq.${targetRefund.id},razorpay_refund_id.eq.${targetRefund.razorpay_refund_id},linked_razorpay_refund_id.eq.${targetRefund.razorpay_refund_id}`)
           .maybeSingle();
         existing = byRefundId ?? null;
@@ -2264,6 +2266,9 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
         existing = existingRows?.[0] ?? null;
       }
 
+      if (!existing && !targetRefund?.razorpay_refund_id) {
+        return json(req, { error: "This refund is awaiting verified provider details." }, 409);
+      }
       if (!existing) {
         const auditRes = await ensureRefundAuditIdempotent(db, {
           tenantId,
@@ -2298,18 +2303,14 @@ async function invoice(req: Request, tenantId: string): Promise<Response> {
               amount: Number(targetRefund.amount),
               refundedAt: targetRefund.processed_at ? new Date(targetRefund.processed_at) : undefined,
             }
-          : {
-              amount: Number(payment.refunded_amount ?? payment.amount),
-            },
+          : undefined,
       );
     }
     if (!row) {
       return json(req, { error: "The refund document is not available just now. Please try again." }, 503);
     }
-    // The re-render fallback reconstructs from the immutable row; the
-    // snapshot on it keeps even a re-render faithful to the original.
-    const bytes = await readStoredPdf(db, row.pdf_path)
-      ?? buildRefundPdf(refundFactsFromRow(row, await sellerIdentity(db)));
+    const bytes = await readIssuedRefundPdf(db, tenantId, row);
+    if (!bytes) return json(req, { error: "The stored refund PDF is unavailable. Please try again." }, 503);
     return pdfResponse(req, bytes, `Refund-${row.refund_number}.pdf`, download);
   }
 

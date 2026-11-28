@@ -125,8 +125,10 @@ console.log("\n── the clients subscribe where they are allowed to ──");
   check("staff channels are not opened private either", !/private:\s*true/.test(ctx));
 
   const bootstrap = readFileSync("supabase/functions/bootstrap/index.ts", "utf8");
-  check("bootstrap issues the topic only to orders/tables readers",
-    /orders\.view.*tables\.view/.test(bootstrap) && /staffTopic\(/.test(bootstrap));
+  check("bootstrap issues the order topic only to orders readers",
+    /canSeeOrders\s*\?\s*await staffTopic\(/.test(bootstrap));
+  check("missing order capability falls back to polling, not a public tenant topic",
+    /const channel = topic \?/.test(ctx) && !/\|\| `orders:/.test(ctx));
 
   check("the dead second publisher is gone", !existsSync("src/lib/order-events.ts"));
 }

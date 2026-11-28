@@ -518,12 +518,76 @@ async function getCheck(req: Request): Promise<Response> {
   });
 }
 
+/** Ended-card collection has no table/session fallback and must not close any
+ * other sitting, including through a historical shared check. */
+async function validateEndedCollection(req: Request, tenantId: string, body: any, replayMethod?: string): Promise<Response | null> {
+  if (body.endedSessionId === undefined) return null;
+  if (typeof body.checkId !== "string" || !body.checkId || typeof body.endedSessionId !== "string" ||
+      !body.endedSessionId || body.sessionId !== body.endedSessionId) {
+    return json(req, { error: "Select the ended session's check." }, 400);
+  }
+  const db = admin();
+  const [check, session, orders] = await Promise.all([
+    db.from("table_checks").select("status, invoice_number, session_id, anchor_session_id, closed_at, total, paid_total, subtotal, discount, tax, service_charge")
+      .eq("tenant_id", tenantId).eq("id", body.checkId).maybeSingle(),
+    db.from("table_sessions").select("status").eq("tenant_id", tenantId).eq("id", body.endedSessionId).maybeSingle(),
+    db.from("orders").select("status, table_session_id").eq("tenant_id", tenantId).eq("check_id", body.checkId),
+  ]);
+  if (check.error || session.error || orders.error) return json(req, { error: "Could not verify the selected check." }, 500);
+  const row = check.data;
+  const linkedSessions = new Set([row?.session_id, row?.anchor_session_id, ...(orders.data ?? []).map((o) => o.table_session_id)].filter(Boolean));
+  if (!row || session.data?.status !== "ENDED" || linkedSessions.size !== 1 || !linkedSessions.has(body.endedSessionId)) {
+    return json(req, { error: "This check does not belong exclusively to the selected ended session." }, 409);
+  }
+  if (!["OPEN", "UNSETTLED"].includes(row.status) || row.invoice_number) {
+    // An already-invoiced check is never charged here. Only replay the receipt
+    // for the original succeeded attempt on this tenant, check and method.
+    const key = body.idempotencyKey;
+    if (row.status === "PAID" && row.invoice_number && row.closed_at && row.paid_total != null &&
+        replayMethod && typeof key === "string" && key.length > 0) {
+      const { data: payment, error } = await db.from("check_payments").select("id, amount, method")
+        .eq("tenant_id", tenantId).eq("check_id", body.checkId).eq("idempotency_key", key)
+        .eq("status", "SUCCEEDED").eq("method", replayMethod).maybeSingle();
+      if (error) return json(req, { error: "Could not confirm the original payment. Retry with the same attempt." }, 503);
+      if (payment) {
+        const tax = Number(row.tax);
+        const cgstPaise = Math.ceil(Math.round(tax * 100) / 2);
+        return json(req, {
+          ok: true, status: "PAID", checkId: body.checkId, sessionId: body.endedSessionId,
+          invoiceNumber: row.invoice_number, closedAt: row.closed_at,
+          paymentId: payment.id, paymentAmount: Number(payment.amount), paymentMethod: payment.method,
+          total: Number(row.total), paid: Number(row.paid_total), outstanding: 0,
+          subtotal: Number(row.subtotal), discount: Number(row.discount), tax,
+          serviceCharge: Number(row.service_charge), cgst: cgstPaise / 100,
+          sgst: (Math.round(tax * 100) - cgstPaise) / 100,
+        });
+      }
+    }
+    return json(req, { error: "This check is no longer open for payment." }, 409);
+  }
+  const billable = (orders.data ?? []).filter((o) => o.status !== "CANCELLED");
+  if (!billable.length || !billable.every((o) => ["SERVED", "COMPLETED"].includes(o.status))) {
+    return json(req, { error: "Serve all orders on the selected check before collecting payment.", code: "orders_open" }, 409);
+  }
+  return null;
+}
+
+async function confirmEndedCollection(req: Request, tenantId: string, body: any, method: string): Promise<Response> {
+  return await validateEndedCollection(req, tenantId, body, method) ??
+    json(req, { error: "The payment is not yet confirmed. Retry with the same attempt." }, 503);
+}
+
 /** Cash against the table's check. Idempotent on the client's key. */
 async function recordPayment(req: Request): Promise<Response> {
   const g = await guard(req, { permission: "payments.collect" });
   if (!g.ok) return g.response;
 
   const b = await req.json().catch(() => ({} as any));
+  const method = ({ CASH: "CASH", UPI: "UPI", CARD: "CARD", WALLET: "UPI" } as Record<string, string>)[
+    String(b.method ?? "CASH").toUpperCase()
+  ] ?? "CASH";
+  const scopeResponse = await validateEndedCollection(req, g.session.tenantId, b, method);
+  if (scopeResponse) return scopeResponse;
   let data;
   try {
     data = await checkForTenant(
@@ -552,15 +616,6 @@ async function recordPayment(req: Request): Promise<Response> {
   if (amount !== null && (!Number.isFinite(amount) || amount <= 0)) {
     return json(req, { error: "Enter an amount greater than zero." }, 400);
   }
-
-  // How the money arrived. The dialog has offered Cash / UPI / Card all along
-  // and this endpoint recorded every one of them as CASH — widening the ledger
-  // (0085) makes the stored method match the one the cashier pressed.
-  const METHOD_ALIASES: Record<string, string> = {
-    CASH: "CASH", UPI: "UPI", CARD: "CARD",
-    WALLET: "UPI",          // the old dialog's third button
-  };
-  const method = METHOD_ALIASES[String(b.method ?? "CASH").toUpperCase()] ?? "CASH";
 
   // Use the RPC as the atomic authority for row lock, balance validation, and settlement
   const { data: result, error } = await admin().rpc("record_check_payment", {
@@ -611,11 +666,13 @@ async function recordPayment(req: Request): Promise<Response> {
   }
 
   if ((result as any)?.already) {
+    if (b.endedSessionId !== undefined) return await confirmEndedCollection(req, g.session.tenantId, b, method);
     return json(req, { ok: true, already: true, deduplicated: true, ...(result as any) }, 200);
   }
 
   await auditMoney(req, g.session, "CHECK_PAYMENT", g.session.tenantId, `${amount} ${method} on check ${data.check.id}`);
   await broadcastCheck(g.session.tenantId, data.check.id, "PAYMENT");
+  if (b.endedSessionId !== undefined) return await confirmEndedCollection(req, g.session.tenantId, b, method);
   return json(req, result, 201);
 }
 
@@ -651,7 +708,7 @@ async function auditMoney(
   } catch {}
 }
 
-async function broadcastCheck(tenantId: string, checkId: string, reason: string) {
+async function broadcastCheck(tenantId: string, checkId: string, reason: string, announceEnded = true) {
   const { data: check } = await admin()
     .from("table_checks")
     .select("table_id, session_id, anchor_session_id, status, invoice_number")
@@ -673,7 +730,7 @@ async function broadcastCheck(tenantId: string, checkId: string, reason: string)
   });
 
   if (check.session_id) {
-    if (reason === "FINALISED") {
+    if (announceEnded && reason === "FINALISED") {
       await publishToStaff(tenantId, "SESSION_ENDED", {
         tableId: check.table_id,
         sessionId: check.session_id,
@@ -695,7 +752,7 @@ async function broadcastCheck(tenantId: string, checkId: string, reason: string)
       .maybeSingle();
     if (s?.token) {
       publishToDiner(s.token, "CHECK_UPDATED", { checkId, reason, status: isPaid ? "PAID" : check.status });
-      if (reason === "FINALISED") {
+      if (announceEnded && reason === "FINALISED") {
         publishToDiner(s.token, "SESSION_ENDED", {
           tableId: check.table_id,
           sessionId: check.session_id,
@@ -704,7 +761,7 @@ async function broadcastCheck(tenantId: string, checkId: string, reason: string)
       }
     }
   } else if (targetSessionId) {
-    if (reason === "FINALISED") {
+    if (announceEnded && reason === "FINALISED") {
       await publishToStaff(tenantId, "SESSION_ENDED", {
         tableId: check.table_id,
         sessionId: targetSessionId,
@@ -726,7 +783,7 @@ async function broadcastCheck(tenantId: string, checkId: string, reason: string)
       .maybeSingle();
     if (s?.token) {
       publishToDiner(s.token, "CHECK_UPDATED", { checkId, reason, status: isPaid ? "PAID" : check.status });
-      if (reason === "FINALISED") {
+      if (announceEnded && reason === "FINALISED") {
         publishToDiner(s.token, "SESSION_ENDED", {
           tableId: check.table_id,
           sessionId: targetSessionId,
@@ -786,6 +843,8 @@ async function finalize(req: Request): Promise<Response> {
   if (!g.ok) return g.response;
 
   const b = await req.json().catch(() => ({} as any));
+  const scopeError = await validateEndedCollection(req, g.session.tenantId, b);
+  if (scopeError) return scopeError;
   let data;
   try {
     data = await checkForTenant(
@@ -859,7 +918,7 @@ async function finalize(req: Request): Promise<Response> {
     g.session.tenantId,
     `check ${data.check.id} invoiced ${(result as any)?.invoiceNumber ?? ""}`,
   );
-  await broadcastCheck(g.session.tenantId, data.check.id, "FINALISED");
+  await broadcastCheck(g.session.tenantId, data.check.id, "FINALISED", b.endedSessionId === undefined);
   return json(req, {
     ...(result as any),
     subtotal,
@@ -886,10 +945,12 @@ async function finalize(req: Request): Promise<Response> {
  * 7. Idempotently returns existing invoice if already settled
  */
 async function settleCash(req: Request): Promise<Response> {
-  const g = await guard(req, { anyOf: ["payments.collect", "orders.complete"] });
+  const g = await guard(req, { permission: "payments.collect" });
   if (!g.ok) return g.response;
 
   const b = await req.json().catch(() => ({} as any));
+  const scopeResponse = await validateEndedCollection(req, g.session.tenantId, b, "CASH");
+  if (scopeResponse) return scopeResponse;
   let data;
   try {
     data = await checkForTenant(
@@ -936,6 +997,7 @@ async function settleCash(req: Request): Promise<Response> {
   }
 
   const tid = g.session.tenantId;
+  if (b.endedSessionId !== undefined && result?.already) return await confirmEndedCollection(req, tid, b, "CASH");
   const chkId = data.check.id;
   const tblId = data.check.table_id;
   const sessId = data.check.session_id ?? (result as any)?.endedSessionId ?? null;
@@ -971,7 +1033,7 @@ async function settleCash(req: Request): Promise<Response> {
     serviceCharge,
     orderCount: live.length,
   });
-  if (sessId) {
+  if (sessId && b.endedSessionId === undefined) {
     await publishToStaff(tid, "SESSION_UPDATED", {
       tableId: tblId,
       sessionId: sessId,
@@ -990,7 +1052,9 @@ async function settleCash(req: Request): Promise<Response> {
   }
 
   // Broadcast to Diner
-  await broadcastCheck(tid, chkId, "FINALISED");
+  await broadcastCheck(tid, chkId, "FINALISED", b.endedSessionId === undefined);
+
+  if (b.endedSessionId !== undefined) return await confirmEndedCollection(req, tid, b, "CASH");
 
   return json(req, {
     ...(result as any),

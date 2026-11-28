@@ -206,6 +206,7 @@ export interface SecurityLog {
 /** What one table check owes, as the server computed it. */
 export interface CheckSummary {
   orderCount: number
+  orderSessionIds?: Array<string | null>
   /** Before tax: item prices less discount, as the server sums them. */
   subtotal?: number
   tax?: number
@@ -768,7 +769,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
           } else if (event.data.type === 'ORDER_DELETED' && event.data.order?.id) {
             removeOrder(event.data.order.id)
           } else if (event.data.type === 'CHECK_UPDATED' || event.data.type === 'SESSION_ENDED' || event.data.type === 'SESSION_UPDATED' || event.data.type === 'CHECK_SETTLED') {
-            if (event.data.sessionId && (event.data.type === 'SESSION_ENDED' || event.data.type === 'SESSION_UPDATED')) {
+            if (event.data.sessionId && (event.data.type === 'SESSION_ENDED' || (event.data.type === 'SESSION_UPDATED' && event.data.status === 'ENDED'))) {
               setTableSessions((prev) => ({
                 ...prev,
                 [event.data.sessionId]: {
@@ -778,7 +779,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
                 },
               }))
             }
-            if (event.data.checkId) {
+            if (event.data.checkId && event.data.type === 'CHECK_SETTLED') {
               setChecks((prev) => ({
                 ...prev,
                 [event.data.checkId]: {
@@ -891,15 +892,12 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
 
     // 2. Supabase Realtime
     const supabase = createClient()
-    // The server-issued topic, or the legacy tenant topic for a bundle talking
-    // to an older function. A capability topic is a private channel: Realtime
-    // checks it against `realtime.messages` RLS, where a signed-in user may
-    // only read their own tenant's.
-    const topic = data?.realtimeTopic || `orders:${activeTenantId}`
+    // Without a server-issued capability, use authenticated polling only.
+    const topic = data?.realtimeTopic
     // Public channel, capability topic — see migration 0075: this project
     // cannot authorise private channels, and a private channel with no policy
     // is silent.
-    const channel = supabase.channel(topic)
+    const channel = topic ? supabase.channel(topic)
       .on(
         'postgres_changes',
         {
@@ -1009,6 +1007,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         }
       })
 
+      : null
+
     scheduleNextSync()
 
     // Immediate reconciliation when user returns to tab or comes back online
@@ -1028,7 +1028,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       isCancelled = true
       if (bc) bc.close()
       if (realtimeDebounce) clearTimeout(realtimeDebounce)
-      void supabase.removeChannel(channel)
+      if (channel) void supabase.removeChannel(channel)
       if (syncTimer) clearTimeout(syncTimer)
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', onVisibilityOrOnline)

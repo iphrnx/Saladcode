@@ -1,5 +1,5 @@
 -- ============================================================================
--- Migration: 20261128000002_refund_reconciliation_resolution.sql
+-- Migration: 20261128000003_refund_reconciliation_resolution.sql
 -- Purpose:
 --   1. Preserve unknown refund amounts (NULL) on subscription_refund_reconciliations
 --      instead of substituting the full payment amount.
@@ -41,7 +41,7 @@ declare
   v_existing        record;
   v_refund_uuid     uuid;
   v_now             timestamptz := now();
-  v_raw_amt         numeric(10, 2) := nullif(p_refund_amount, 0);
+  v_raw_amt         numeric(10, 2) := case when p_refund_amount > 0 then p_refund_amount end;
   v_effective_amt   numeric(10, 2);
   v_total_refunded  numeric(10, 2);
   v_fully_refunded  boolean;
@@ -73,7 +73,7 @@ begin
 
   -- Events without a verified provider refund ID cannot be tied to a verified
   -- refund: preserve unknown amounts as NULL and keep them pending reconciliation.
-  if v_refund_id is null then
+  if v_refund_id is null or v_raw_amt is null or v_raw_amt <= 0 then
     insert into public.subscription_refund_reconciliations (
       tenant_id,
       payment_id,
@@ -104,7 +104,11 @@ begin
     );
   end if;
 
-  v_effective_amt := coalesce(v_raw_amt, v_payment.amount);
+  v_effective_amt := v_raw_amt;
+  if v_effective_amt > v_payment.amount
+     or (nullif(btrim(p_currency), '') is not null and upper(btrim(p_currency)) <> upper(v_payment.currency)) then
+    return jsonb_build_object('outcome', 'identity_mismatch', 'reason', 'refund amount or currency does not match payment');
+  end if;
 
   select *
     into v_existing
@@ -113,6 +117,12 @@ begin
      for update;
 
   if found then
+    if v_existing.tenant_id is distinct from p_tenant_id
+       or v_existing.payment_id is distinct from v_payment.id
+       or v_existing.razorpay_payment_id is distinct from p_razorpay_payment_id
+       or v_existing.amount is distinct from v_effective_amt then
+      return jsonb_build_object('outcome', 'identity_mismatch', 'reason', 'refund does not match its recorded payment or amount');
+    end if;
     v_refund_uuid := v_existing.id;
     if v_existing.status = 'processed' then
       -- Resolve any pending reconciliation tied to the same verified webhook_event_id.
@@ -321,6 +331,12 @@ begin
   end if;
 
   if v_rec.status = 'reconciled' then
+    if not exists (select 1 from public.subscription_refunds r
+                   where r.id = v_rec.resolved_refund_id
+                     and r.tenant_id = v_rec.tenant_id and r.payment_id = v_rec.payment_id
+                     and r.razorpay_refund_id = p_razorpay_refund_id) then
+      return jsonb_build_object('outcome', 'identity_mismatch');
+    end if;
     return jsonb_build_object(
       'outcome', 'already_reconciled',
       'reconciliation_id', v_rec.id,
@@ -328,11 +344,18 @@ begin
     );
   end if;
 
+  -- A new provider ID is not by itself evidence that this pending entry and
+  -- that refund are the same event. Leave historical ambiguities pending.
+  if p_webhook_event_id is null or p_webhook_event_id is distinct from v_rec.webhook_event_id
+     or p_refund_amount is null or p_refund_amount <= 0 then
+    return jsonb_build_object('outcome', 'verification_required');
+  end if;
+
   v_rpc_res := public.record_subscription_refund(
     v_rec.tenant_id,
     v_rec.razorpay_payment_id,
     p_razorpay_refund_id,
-    coalesce(p_refund_amount, v_rec.amount, 0),
+    p_refund_amount,
     coalesce(p_currency, v_rec.currency),
     p_refund_status,
     coalesce(p_webhook_event_id, v_rec.webhook_event_id)

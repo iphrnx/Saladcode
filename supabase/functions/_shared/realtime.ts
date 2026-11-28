@@ -35,23 +35,21 @@ const securityTopicCache = new Map<string, string>();
 /**
  * Resolve (and cache for this invocation) the staff topic of a tenant.
  *
- * Falls back to the legacy topic if the secret cannot be read, so a database
- * hiccup degrades realtime rather than breaking it — the client polls every
- * four seconds either way.
+ * If the secret cannot be read, rely on authenticated polling.
  */
-export async function staffTopic(tenantId: string): Promise<string> {
+export async function staffTopic(tenantId: string): Promise<string | null> {
   const cached = topicCache.get(tenantId);
   if (cached) return cached;
   try {
     const { data, error } = await admin().rpc("ensure_tenant_realtime_secret", {
       p_tenant: tenantId,
     });
-    if (error || !data) return `orders:${tenantId}`;
+    if (error || !data) return null;
     const topic = staffTopicName(tenantId, String(data));
     topicCache.set(tenantId, topic);
     return topic;
   } catch {
-    return `orders:${tenantId}`;
+    return null;
   }
 }
 
@@ -99,7 +97,8 @@ export async function publishToStaff(
   type: string,
   payload: Record<string, unknown>,
 ): Promise<void> {
-  send(await staffTopic(tenantId), type, payload);
+  const topic = await staffTopic(tenantId);
+  if (topic) send(topic, type, payload);
 }
 
 /**
@@ -156,5 +155,5 @@ export function publishEvent(event: {
   [key: string]: unknown;
 }): void {
   const { topic, ...rest } = event;
-  send(topic ?? `orders:${event.tenantId}`, event.type, rest);
+  if (topic) send(topic, event.type, rest);
 }

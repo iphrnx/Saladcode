@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef, Fragment } from 'react'
+import { useState, useEffect, useRef, Fragment, type ReactNode } from 'react'
 import { cn } from '@/lib/utils'
 import { formatCurrency } from '@/lib/constants'
 import { edgeFetch } from '@/lib/edge'
@@ -440,6 +440,7 @@ export function BillDialog({
   checkId,
   tableHint,
   autoPrint,
+  staffActions,
 }: {
   orderId: string | null
   open: boolean
@@ -469,6 +470,7 @@ export function BillDialog({
   tableHint?: { name: string; seats: number; area: string } | null
   /** Open the print dialog as soon as the document is loaded. */
   autoPrint?: boolean
+  staffActions?: ReactNode
 }) {
   const [bill, setBill] = useState<BillData | null>(null)
   const [loading, setLoading] = useState(false)
@@ -587,6 +589,12 @@ export function BillDialog({
             </Button>
           </div>
         </div>
+
+        {!sessionToken && !autoPrint && !loading && bill && staffActions && (
+          <div className="flex flex-wrap justify-end gap-2 border-b border-gray-200 px-4 py-2.5">
+            {staffActions}
+          </div>
+        )}
 
         {loading && (
           <div className="flex items-center justify-center py-16">

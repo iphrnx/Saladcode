@@ -27,7 +27,12 @@ function zoneOffsetMinutes(at: Date, timeZone: string): number {
 function zonedStart(dateStr: string, timeZone: string): Date {
   const [y, m, d] = dateStr.split("-").map(Number);
   const guess = Date.UTC(y, m - 1, d, 0, 0, 0);
-  return new Date(guess - zoneOffsetMinutes(new Date(guess), timeZone) * 60000);
+  const adjusted = guess - zoneOffsetMinutes(new Date(guess), timeZone) * 60000;
+  return new Date(guess - zoneOffsetMinutes(new Date(adjusted), timeZone) * 60000);
+}
+
+function shiftDay(date: string, days: number): string {
+  return new Date(Date.parse(`${date}T00:00:00Z`) + days * DAY_MS).toISOString().slice(0, 10);
 }
 
 function zonedDateStr(at: Date, timeZone: string): string {
@@ -111,9 +116,15 @@ serve(async (req: Request) => {
     toStr = todayStr;
   }
   if (fromStr > toStr) [fromStr, toStr] = [toStr, fromStr];
+  const isCalendarDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+    Number.isFinite(Date.parse(`${value}T00:00:00Z`)) && shiftDay(value, 0) === value;
+  if (!isCalendarDate(fromStr) || !isCalendarDate(toStr) ||
+      Date.parse(`${toStr}T00:00:00Z`) - Date.parse(`${fromStr}T00:00:00Z`) > 365 * DAY_MS) {
+    return json(req, { error: "Select a valid date range of up to 366 days" }, 400);
+  }
 
   const rangeStart = zonedStart(fromStr, timeZone);
-  const rangeEnd = new Date(zonedStart(toStr, timeZone).getTime() + DAY_MS); // exclusive
+  const rangeEnd = zonedStart(shiftDay(toStr, 1), timeZone); // exclusive
 
   const selectedLocationId = url.searchParams.get("location_id") || url.searchParams.get("locationId") || null;
   const compareEnabled = url.searchParams.get("compare") !== "0";
@@ -478,9 +489,9 @@ serve(async (req: Request) => {
     }
 
     const daily: { date: string; label: string; revenue: number; orders: number }[] = [];
-    for (let t = winStart.getTime(); t < winEnd.getTime(); t += DAY_MS) {
-      const dayStart = new Date(t);
-      const dayEnd = new Date(t + DAY_MS);
+    for (let day = zonedDateStr(winStart, timeZone); zonedStart(day, timeZone) < winEnd; day = shiftDay(day, 1)) {
+      const dayStart = zonedStart(day, timeZone);
+      const dayEnd = zonedStart(shiftDay(day, 1), timeZone);
       const dayRevenue = locEvents
         .filter((e) => e.settledAt >= dayStart && e.settledAt < dayEnd)
         .reduce((s, e) => s + e.amount, 0);
@@ -544,24 +555,26 @@ serve(async (req: Request) => {
   // Previous period of equal day count immediately preceding rangeStart
   const periodDays = Math.max(1, dailyRevenue.length);
   const prevEnd = rangeStart;
-  const prevStart = new Date(rangeStart.getTime() - periodDays * DAY_MS);
+  const prevStart = zonedStart(shiftDay(fromStr, -periodDays), timeZone);
   const prevFromStr = zonedDateStr(prevStart, timeZone);
-  const prevToStr = zonedDateStr(new Date(prevEnd.getTime() - DAY_MS), timeZone);
+  const prevToStr = shiftDay(fromStr, -1);
   const prevSummary = compareEnabled ? await summarizeWindow(prevStart, prevEnd) : null;
 
   /* -------------------------------------------------------------------------- */
   /* Refunds & Discounts (Audited Attribution)                                  */
   /* -------------------------------------------------------------------------- */
+  // Legacy reversals without a verified date are not attributed to any period.
+  // Both selection and chart bucketing use the same persisted reversal time.
   // 1. Voided ledger payments in window (explicit payment method)
   const voidPayments = await fetchAllPages<any>(async (from, to) => {
     return await db
       .from("check_payments")
-      .select("id, check_id, amount, method, location_id, created_at")
+      .select("id, check_id, amount, method, location_id, reversed_at")
       .eq("tenant_id", tenantId)
       .eq("status", "VOID")
-      .gte("created_at", rangeStart.toISOString())
-      .lt("created_at", rangeEnd.toISOString())
-      .order("created_at", { ascending: true })
+      .gte("reversed_at", rangeStart.toISOString())
+      .lt("reversed_at", rangeEnd.toISOString())
+      .order("reversed_at", { ascending: true })
       .order("id", { ascending: true })
       .range(from, to);
   });
@@ -570,12 +583,12 @@ serve(async (req: Request) => {
   const refundedOrders = await fetchAllPages<any>(async (from, to) => {
     return await db
       .from("orders")
-      .select("id, order_number, check_id, table_id, total, payment_method, payment_status, location_id, paid_at, updated_at, created_at")
+      .select("id, order_number, check_id, table_id, total, payment_method, payment_status, location_id, reversed_at")
       .eq("tenant_id", tenantId)
       .in("payment_status", ["REFUNDED", "refunded"])
-      .gte("updated_at", rangeStart.toISOString())
-      .lt("updated_at", rangeEnd.toISOString())
-      .order("updated_at", { ascending: true })
+      .gte("reversed_at", rangeStart.toISOString())
+      .lt("reversed_at", rangeEnd.toISOString())
+      .order("reversed_at", { ascending: true })
       .order("id", { ascending: true })
       .range(from, to);
   });
@@ -610,7 +623,7 @@ serve(async (req: Request) => {
       rawM === "CASH" ? "CASH" : rawM === "UPI" ? "UPI" : rawM === "CARD" ? "CARD" : "OTHER";
     pmStats[m].refunds += amt;
     pmStats[m].refundCount++;
-    const dStr = zonedDateStr(new Date(vp.created_at), timeZone);
+    const dStr = zonedDateStr(new Date(vp.reversed_at), timeZone);
     if (!refundDailyMap[dStr]) refundDailyMap[dStr] = { amount: 0, count: 0 };
     refundDailyMap[dStr].amount += amt;
     refundDailyMap[dStr].count++;
@@ -630,8 +643,7 @@ serve(async (req: Request) => {
       unattributedRefundAmount += amt;
       unattributedRefundCount++;
     }
-    const ts = ro.paid_at || ro.updated_at || ro.created_at;
-    const dStr = zonedDateStr(new Date(ts), timeZone);
+    const dStr = zonedDateStr(new Date(ro.reversed_at), timeZone);
     if (!refundDailyMap[dStr]) refundDailyMap[dStr] = { amount: 0, count: 0 };
     refundDailyMap[dStr].amount += amt;
     refundDailyMap[dStr].count++;
@@ -768,9 +780,9 @@ serve(async (req: Request) => {
   const avgServiceMin = serviceDurationsMin.length > 0
     ? +(serviceDurationsMin.reduce((s, d) => s + d, 0) / serviceDurationsMin.length).toFixed(1)
     : null;
-  const medianServiceMin = serviceDurationsMin.length > 0
-    ? +serviceDurationsMin[Math.floor(serviceDurationsMin.length / 2)].toFixed(1)
-    : null;
+  const mid = Math.floor(serviceDurationsMin.length / 2);
+  const medianServiceMin = serviceDurationsMin.length === 0 ? null
+    : +((serviceDurationsMin[mid] + serviceDurationsMin[Math.floor((serviceDurationsMin.length - 1) / 2)]) / 2).toFixed(1);
 
   /* -------------------------------------------------------------------------- */
   /* Discounts & Refunds Summary                                                */
@@ -823,8 +835,8 @@ serve(async (req: Request) => {
   /* Independent Today & Yesterday Queries (Run through identical reconciliation)*/
   /* -------------------------------------------------------------------------- */
   const todayStart = zonedStart(todayStr, timeZone);
-  const tomorrowStart = new Date(todayStart.getTime() + DAY_MS);
-  const yesterdayStart = new Date(todayStart.getTime() - DAY_MS);
+  const tomorrowStart = zonedStart(shiftDay(todayStr, 1), timeZone);
+  const yesterdayStart = zonedStart(shiftDay(todayStr, -1), timeZone);
 
   const { events: todayEvents } = await getReconciledEventsForWindow(todayStart, tomorrowStart);
   const filteredTodayEvents = todayEvents.filter((e) => !selectedLocationId || e.locationId === selectedLocationId);
